@@ -1,0 +1,20 @@
+[package]
+name = "swap-nexus-tx"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Nexus transactions for NEX<->BTC swaps: Lattice encoding, signing and a node RPC client"
+
+[dependencies]
+swap-nexus = { path = "../swap-nexus" }
+base64 = "0.22"
+data-encoding = "2"
+ed25519-dalek = "2"
+hex = "0.4"
+serde_json = "1"
+sha2 = "0.10"
+ureq = { version = "2", default-features = false, features = ["json"] }
+
+[dev-dependencies]
+ciborium = "0.2"
+rand_core = { version = "0.6", features = ["getrandom"] }

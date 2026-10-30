@@ -37,3 +37,16 @@ jobs:
           curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - run: ./interop/run.sh 25
+
+  # Transfers and joint-key claims built here, submitted to and mined by a real
+  # Lattice node. Host networking: the node's RPC listens on loopback only.
+  nexus-node:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      # lattice-node 3.2.0
+      NEXUS_NODE_IMAGE: ghcr.io/0xlattice/lattice-node@sha256:b9951cdce3469add47d1c086a46185edc0f3da4d715309b94ed553e008de1d26
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker pull "$NEXUS_NODE_IMAGE"
+      - run: cargo test -p swap-nexus-tx --test node -- --ignored --nocapture
