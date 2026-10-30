@@ -112,7 +112,7 @@ fn sign_with_scalar(secret: &Scalar, public: &CompressedEdwardsY, message: &[u8]
     let mut nonce = Scalar::from_hash(
         Sha512::new()
             .chain_update(entropy)
-            .chain_update(*secret_bytes)
+            .chain_update(secret_bytes.as_slice())
             .chain_update(message),
     );
     entropy.zeroize();
