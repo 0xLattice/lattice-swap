@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use cbor::Value;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use swap_nexus::JointKey;
 
@@ -46,14 +47,14 @@ fn public_key_node(multikey: &str) -> Vec<u8> {
 }
 
 /// One balance change. Negative is a debit, which its owner must sign.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountAction {
     pub owner: String,
     pub delta: i64,
 }
 
 /// A `TransactionBody` whose only actions are account actions.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransactionBody {
     pub account_actions: Vec<AccountAction>,
     /// Addresses whose keys sign; every debited owner must be one.
@@ -198,7 +199,7 @@ fn lowercase_hex<const N: usize>(text: &str) -> Option<[u8; N]> {
 }
 
 /// A body and its signatures, keyed by signer Multikey hex.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Transaction {
     pub body: TransactionBody,
     pub signatures: BTreeMap<String, String>,
@@ -255,6 +256,37 @@ impl Transaction {
             a.delta != 0 && a.delta != i64::MIN && (a.delta > 0 || signers.contains(&a.owner))
         });
         signed == signers && actions_valid
+    }
+
+    /// The signed transaction as Lattice stores it: the body by its CID
+    /// (`rawCID`, as text) and the signatures as `{key, value}` pairs sorted
+    /// by key.
+    pub fn to_dag_cbor(&self) -> Vec<u8> {
+        let signatures = self
+            .signatures
+            .iter()
+            .map(|(key, value)| {
+                Value::Map(vec![
+                    ("key", Value::Text(key.clone())),
+                    ("value", Value::Text(value.clone())),
+                ])
+            })
+            .collect();
+        Value::Map(vec![
+            (
+                "body",
+                Value::Map(vec![("rawCID", Value::Text(self.body.cid()))]),
+            ),
+            ("signatures", Value::Array(signatures)),
+        ])
+        .encode()
+    }
+
+    /// The CID a node names this transaction by. It covers the signatures:
+    /// the same body signed again with fresh randomness is another
+    /// transaction.
+    pub fn cid(&self) -> String {
+        cid(&self.to_dag_cbor())
     }
 
     /// The request body of `POST /transactions`.

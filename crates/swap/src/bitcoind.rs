@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use base64::Engine;
 use bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
-use bitcoin::{Address, Amount, Block, Denomination, Network, OutPoint, Script, Transaction, Txid};
+use bitcoin::{Address, Amount, Denomination, Network, Script, Transaction, Txid};
 use serde_json::{json, Value};
 
 #[derive(Debug)]
@@ -25,18 +25,15 @@ pub trait Bitcoin {
     fn broadcast(&self, tx: &Transaction) -> Result<()>;
     /// The height of the tip.
     fn height(&self) -> Result<u32>;
-    /// `None` if the node does not know `txid`; 0 while it is in the
-    /// mempool.
-    fn confirmations(&self, txid: Txid) -> Result<Option<u32>>;
-    /// The transaction spending `outpoint` in the mempool or in a block at
-    /// height `from` or above.
-    fn spending_tx(&self, outpoint: OutPoint, from: u32) -> Result<Option<Transaction>>;
+    /// The transaction `txid` in the mempool or the chain, with its
+    /// confirmations (0 in the mempool); `None` if the node knows neither.
+    fn transaction(&self, txid: Txid) -> Result<Option<(Transaction, u32)>>;
     /// A transaction from the wallet paying `amount` to `script`, signed but
     /// not broadcast.
     fn fund_lock(&self, script: &Script, amount: Amount) -> Result<Transaction>;
 }
 
-/// bitcoind's JSON-RPC. `confirmations` reads any transaction, so the node
+/// bitcoind's JSON-RPC. `transaction` reads any transaction, so the node
 /// needs `-txindex`; `fund_lock` needs a wallet, so `url` names one
 /// (`http://host:port/wallet/<name>`).
 pub struct Bitcoind {
@@ -80,11 +77,6 @@ impl Bitcoind {
         }
         Ok(body["result"].clone())
     }
-
-    fn transaction(&self, txid: Txid) -> Result<Transaction> {
-        let hex = self.call("getrawtransaction", json!([txid]))?;
-        decode(&hex)
-    }
 }
 
 fn decode<T: bitcoin::consensus::Decodable>(hex: &Value) -> Result<T> {
@@ -108,35 +100,16 @@ impl Bitcoin for Bitcoind {
             .ok_or_else(|| Error(format!("height {height}")))
     }
 
-    fn confirmations(&self, txid: Txid) -> Result<Option<u32>> {
+    fn transaction(&self, txid: Txid) -> Result<Option<(Transaction, u32)>> {
         match self.call("getrawtransaction", json!([txid, 1])) {
-            Ok(tx) => Ok(Some(tx["confirmations"].as_u64().unwrap_or(0) as u32)),
+            Ok(tx) => {
+                let confirmations = tx["confirmations"].as_u64().unwrap_or(0) as u32;
+                Ok(Some((decode(&tx["hex"])?, confirmations)))
+            }
             // RPC_INVALID_ADDRESS_OR_KEY: no such transaction.
             Err(Error(e)) if e.contains("\"code\":-5") => Ok(None),
             Err(e) => Err(e),
         }
-    }
-
-    fn spending_tx(&self, outpoint: OutPoint, from: u32) -> Result<Option<Transaction>> {
-        let prevout = json!([{"txid": outpoint.txid, "vout": outpoint.vout}]);
-        let mempool = self.call("gettxspendingprevout", json!([prevout]))?;
-        if let Some(txid) = mempool[0]["spendingtxid"].as_str() {
-            let txid = txid.parse().map_err(|e| Error(format!("{e}")))?;
-            return self.transaction(txid).map(Some);
-        }
-        for height in from..=self.height()? {
-            let hash = self.call("getblockhash", json!([height]))?;
-            let block: Block = decode(&self.call("getblock", json!([hash, 0]))?)?;
-            let spend = block.txdata.into_iter().find(|tx| {
-                tx.input
-                    .iter()
-                    .any(|input| input.previous_output == outpoint)
-            });
-            if spend.is_some() {
-                return Ok(spend);
-            }
-        }
-        Ok(None)
     }
 
     fn fund_lock(&self, script: &Script, amount: Amount) -> Result<Transaction> {

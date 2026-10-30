@@ -18,7 +18,7 @@
 //!    adaptor signature. B -> S `BuyerSignatures`: B's cancel signature;
 //!    then B broadcasts the funding transaction.
 //! 4. Once the lock is `btc_confirmations` deep, S transfers `nex_amount`
-//!    to the lock address and sends `NexLocked`.
+//!    to the lock address and, once that is mined, sends `NexLocked`.
 //! 5. B checks the NEX lock on its own node, then sends `RedeemSignature`,
 //!    its redeem adaptor signature.
 //! 6. S redeems the BTC, which reveals `s`; B claims the NEX.
@@ -81,6 +81,8 @@ pub struct Terms {
     /// Blocks of slack before a timelock: the seller stops redeeming once
     /// the lock is `t1 - margin + 1` deep, `margin - 1` blocks before
     /// cancel can be broadcast, so a redeem it sends has time to confirm.
+    /// At least 2: a block can land between the view the seller judges the
+    /// window on and its broadcast.
     pub margin: u16,
 }
 
@@ -88,11 +90,14 @@ impl Terms {
     /// Whether the terms can work at all. Each party also checks them
     /// against its own policy before starting.
     pub fn check(&self) -> bool {
+        let margin = u32::from(self.margin);
         self.btc_confirmations >= 1
             && self.nex_confirmations >= 1
-            && self.margin >= 1
-            && self.btc_confirmations + u32::from(self.margin) < u32::from(self.t1)
-            && self.margin < self.t2
+            && self.margin >= 2
+            && self.btc_confirmations + margin < u32::from(self.t1)
+            // The buyer refunds once cancel is `btc_confirmations` deep, and
+            // the refund needs time to confirm before punish is valid.
+            && self.btc_confirmations + margin < u32::from(self.t2)
             && self.nex_amount > self.nex_fee
     }
 
@@ -176,8 +181,10 @@ pub enum Event {
     Nexus(NexusView),
     /// The buyer's wallet built and signed the funding transaction.
     Funded(Transaction),
-    /// The Nexus node took the transaction last submitted, under this CID.
-    Submitted(String),
+    /// The seller's Nexus wallet signed the transaction asked for.
+    NexSigned(swap_nexus_tx::Transaction),
+    /// The last message went out on the session.
+    Sent,
     /// The counterparty went quiet before anything was at stake.
     Timeout,
 }
@@ -196,12 +203,17 @@ pub enum Action {
         amount: Amount,
     },
     Broadcast(Transaction),
+    /// Sign with the seller's Nexus wallet key, which the state never
+    /// holds, and answer with [`Event::NexSigned`].
+    SignNex(TransactionBody),
     Submit(swap_nexus_tx::Transaction),
 }
 
 /// The swap's Bitcoin transactions as one node sees them.
 #[derive(Clone, Debug)]
 pub struct BitcoinView {
+    /// The height of the tip.
+    pub height: u32,
     /// Confirmations of the funding transaction: `None` if unseen, 0 in
     /// the mempool.
     pub funding: Option<u32>,
@@ -226,6 +238,8 @@ pub struct NexusView {
     pub own: Account,
     /// The lock address at the tip.
     pub lock: Account,
+    /// The smallest fee the node pools.
+    pub min_relay_fee: u64,
     /// The transaction the machine watches, if it watches one and the node
     /// holds it, with its confirmations.
     pub watched: Option<(TransactionStatus, Option<u64>)>,
@@ -297,9 +311,9 @@ impl Secrets {
     }
 }
 
-/// 32 secret bytes, as hex in the state file.
-#[derive(Clone, Serialize, Deserialize)]
-pub struct SecretBytes(#[serde(with = "hex::serde")] pub [u8; 32]);
+/// A Nexus wallet's Ed25519 seed.
+#[derive(Clone)]
+pub struct SecretBytes(pub [u8; 32]);
 
 impl SecretBytes {
     /// The Nexus address of these bytes as an Ed25519 seed.
@@ -338,8 +352,6 @@ pub struct Setup {
     /// This party's Nexus address: where the seller's NEX comes from and
     /// returns to, or where the buyer's arrives.
     nex_address: String,
-    /// The key that funds the seller's lock; `None` for the buyer.
-    nex_key: Option<SecretBytes>,
 }
 
 struct Payouts {
@@ -351,7 +363,6 @@ struct Payouts {
 impl Setup {
     /// Checks the counterparty's hello: its share proof, that it did not
     /// mirror ours, and that the Bitcoin transactions can be built.
-    #[allow(clippy::too_many_arguments)]
     fn new(
         terms: Terms,
         side: Side,
@@ -360,7 +371,6 @@ impl Setup {
         other_share: &ShareProof,
         payouts: Payouts,
         nex_address: String,
-        nex_key: Option<SecretBytes>,
     ) -> Result<Self, Refusal> {
         let other = other_share.verify().ok_or(Refusal::ShareProof)?;
         if secrets.public_share().lock_key(&other).is_none()
@@ -379,7 +389,6 @@ impl Setup {
             refund_payout: payouts.refund,
             punish_payout: payouts.punish,
             nex_address,
-            nex_key,
         };
         Swap::new(setup.params()).map_err(|_| Refusal::Parameters)?;
         Ok(setup)
@@ -508,8 +517,25 @@ fn nex_lock_holds(terms: &Terms, lock_address: &str, view: &NexusView) -> bool {
         && confirmations.is_some_and(|c| c >= terms.nex_confirmations)
         && view.lock.balance >= terms.nex_amount
         && view.lock.nonce == 0
-        && view.health.phase == "active"
-        && view.health.best_header_height == Some(view.health.height)
+        && synced(&view.health)
+}
+
+/// The node is active and has executed the best chain it knows.
+fn synced(health: &Health) -> bool {
+    health.phase == "active" && health.best_header_height == Some(health.height)
+}
+
+/// What the claimer knows of the NEX lock, which decides whether an empty
+/// lock address is final.
+#[derive(Clone, Copy, Serialize, Deserialize)]
+enum Lock {
+    /// The seller never signed one: an empty lock stays empty.
+    Unsigned,
+    /// The seller signed one at this nonce of its own. It can still land
+    /// until the seller's nonce moves past it.
+    Signed(u64),
+    /// The buyer saw it confirmed: it is waited for.
+    Seen,
 }
 
 /// Claiming the lock address once both shares are known.
@@ -519,11 +545,11 @@ pub struct Claim {
     /// The counterparty's recovered share.
     #[serde(with = "hex::serde")]
     other: [u8; 32],
-    /// The claim the node took, once it took one.
-    cid: Option<String>,
-    /// Whether NEX is known to have been locked. If not, an empty lock
-    /// ends the claim instead of being waited for.
-    expect_lock: bool,
+    lock: Lock,
+    /// The claim, signed once and submitted again, byte for byte, until it
+    /// is mined. The joint key signs with fresh randomness: signed again,
+    /// it would be another transaction under another CID.
+    claim: Option<swap_nexus_tx::Transaction>,
 }
 
 #[allow(clippy::large_enum_variant)] // Short-lived: matched on as soon as made.
@@ -531,64 +557,91 @@ enum Claimed {
     Pending(Claim, Vec<Action>),
     /// The claim is `nex_confirmations` deep.
     Done,
-    /// Nothing was locked.
+    /// Nothing was locked, and nothing can be any more.
     Empty,
     /// Someone else spent the lock.
     Drained,
 }
 
 impl Claim {
-    fn new(setup: Setup, other: [u8; 32], expect_lock: bool) -> Self {
+    fn new(setup: Setup, other: [u8; 32], lock: Lock) -> Self {
         Self {
             setup,
             other,
-            cid: None,
-            expect_lock,
+            lock,
+            claim: None,
         }
     }
 
     /// Transfers everything at the lock address, less the fee, to this
     /// party: the lock's first and only transaction, nonce 0.
     fn step(mut self, event: Event) -> Claimed {
+        let Event::Nexus(view) = event else {
+            return Claimed::Pending(self, vec![]);
+        };
         let terms = &self.setup.terms;
-        match event {
-            Event::Submitted(cid) => {
-                self.cid = Some(cid);
-                Claimed::Pending(self, vec![])
-            }
-            Event::Nexus(view) => match (&self.cid, &view.watched) {
-                (Some(_), Some((_, Some(depth)))) if *depth >= terms.nex_confirmations => {
-                    Claimed::Done
+        let depth = view.watched.as_ref().and_then(|(_, depth)| *depth);
+        if let Some(claim) = &self.claim {
+            return match depth {
+                Some(depth) if depth >= terms.nex_confirmations => Claimed::Done,
+                Some(_) => Claimed::Pending(self, vec![]),
+                // The lock signed something, and it is not our claim.
+                None if view.lock.nonce > 0 => Claimed::Drained,
+                None => {
+                    let submit = vec![Action::Submit(claim.clone())];
+                    Claimed::Pending(self, submit)
                 }
-                // Our claim is gone and the lock has signed something else.
-                (Some(_), None) if view.lock.nonce > 0 => Claimed::Drained,
-                (Some(_), _) => Claimed::Pending(self, vec![]),
-                (None, _) if view.lock.nonce > 0 => Claimed::Drained,
-                (None, _) if view.lock.balance > terms.nex_fee => {
-                    let claim = self.transaction(view.lock.balance - terms.nex_fee);
-                    Claimed::Pending(self, vec![Action::Submit(claim)])
-                }
-                (None, _) if !self.expect_lock => Claimed::Empty,
-                (None, _) => Claimed::Pending(self, vec![]),
-            },
-            _ => Claimed::Pending(self, vec![]),
+            };
+        }
+        if view.lock.nonce > 0 {
+            return Claimed::Drained;
+        }
+        // The claim is signed once, for the balance it sees: only a synced
+        // node shows the lock as it is.
+        if !synced(&view.health) {
+            return Claimed::Pending(self, vec![]);
+        }
+        let fee = terms.nex_fee.max(view.min_relay_fee);
+        if view.lock.balance > fee {
+            let claim = self.transaction(view.lock.balance - fee, fee);
+            self.claim = Some(claim.clone());
+            return Claimed::Pending(self, vec![Action::Submit(claim)]);
+        }
+        let empty = match self.lock {
+            Lock::Unsigned => true,
+            // The seller's nonce moved past its lock, which did not credit
+            // the lock address: the lock can never land.
+            Lock::Signed(nonce) => view.own.nonce > nonce,
+            Lock::Seen => false,
+        };
+        if empty {
+            Claimed::Empty
+        } else {
+            Claimed::Pending(self, vec![])
         }
     }
 
-    fn transaction(&self, amount: u64) -> swap_nexus_tx::Transaction {
+    fn transaction(&self, amount: u64, fee: u64) -> swap_nexus_tx::Transaction {
         let other = KeyShare::from_bytes(self.other).expect("a recovered share");
         let key = JointKey::from_shares(&self.setup.secrets.share(), &other);
         let body = TransactionBody::transfer(
             &self.setup.lock_address(),
             &self.setup.nex_address,
             amount,
-            self.setup.terms.nex_fee,
+            fee,
             0,
         )
         .expect("the amount is positive and fits");
         let mut transaction = swap_nexus_tx::Transaction::new(body);
         transaction.sign_joint(&key);
         transaction
+    }
+
+    fn watch(&self) -> Watch {
+        Watch {
+            bitcoin: None,
+            nexus: self.setup.watch_nexus(self.claim.as_ref().map(|c| c.cid())),
+        }
     }
 }
 
@@ -619,11 +672,11 @@ pub struct NexusWatch {
 }
 
 impl Setup {
-    fn watch_nexus(&self, cid: Option<&String>) -> Option<NexusWatch> {
+    fn watch_nexus(&self, cid: Option<String>) -> Option<NexusWatch> {
         Some(NexusWatch {
             lock_address: self.lock_address(),
             own_address: self.nex_address.clone(),
-            cid: cid.cloned(),
+            cid,
         })
     }
 }

@@ -12,32 +12,37 @@ pub enum Seller {
         refund: EncryptedSignature,
     },
     /// Waits for the funding transaction to be `btc_confirmations` deep.
+    /// `since` is the height it started waiting at: if the funding is still
+    /// unseen `t1` blocks later, the seller stops.
     AwaitFunding {
         locked: SellerLocked,
-        seen: bool,
+        since: Option<u32>,
     },
-    /// Submits the NEX lock until the node takes it.
+    /// Signs the NEX lock at the nonce a synced node shows, then submits it
+    /// until it is mined. Once signed, the lock is the same transaction
+    /// whenever it is submitted, and can land only once.
     LockingNex {
         locked: SellerLocked,
-        nonce: Option<u64>,
+        nex_lock: Option<swap_nexus_tx::Transaction>,
     },
     AwaitRedeemSignature {
         locked: SellerLocked,
-        cid: String,
+        nex_lock: swap_nexus_tx::Transaction,
     },
-    /// Has broadcast the redeem; waits for it to confirm.
+    /// Holds the redeem; broadcasts it on every view that shows the redeem
+    /// window open, until it confirms.
     Redeeming {
         locked: SellerLocked,
-        cid: String,
+        nex_lock: swap_nexus_tx::Transaction,
         #[serde(with = "hex_tx")]
         redeem: Transaction,
     },
     /// No longer redeems: cancels, then claims the NEX back if the buyer
-    /// refunds, or punishes if it does not. `cid` is the NEX lock, if the
-    /// node took one.
+    /// refunds, or punishes if it does not. `nex_lock` is the NEX lock, if
+    /// one was signed: it may have landed.
     Cancelling {
         locked: SellerLocked,
-        cid: Option<String>,
+        nex_lock: Option<swap_nexus_tx::Transaction>,
     },
     ClaimingNex(Claim),
     Done(Outcome),
@@ -47,7 +52,7 @@ pub enum Seller {
 pub struct SellerStart {
     terms: Terms,
     secrets: Secrets,
-    nex_key: SecretBytes,
+    nex_address: String,
     redeem_payout: ScriptBuf,
     punish_payout: ScriptBuf,
 }
@@ -63,11 +68,11 @@ pub struct SellerLocked {
 }
 
 impl Seller {
-    /// A swap with fresh secrets. `nex_key` holds the NEX to sell; a
-    /// reclaimed lock returns to its address.
+    /// A swap with fresh secrets. `nex_address` holds the NEX to sell, and
+    /// a reclaimed lock returns to it; the driver holds its key.
     pub fn new(
         terms: Terms,
-        nex_key: SecretBytes,
+        nex_address: String,
         redeem_payout: ScriptBuf,
         punish_payout: ScriptBuf,
     ) -> Result<Self, Refusal> {
@@ -77,7 +82,7 @@ impl Seller {
         Ok(Seller::AwaitBuyerHello(SellerStart {
             terms,
             secrets: Secrets::random(),
-            nex_key,
+            nex_address,
             redeem_payout,
             punish_payout,
         }))
@@ -105,7 +110,6 @@ impl Machine for Seller {
                     refund: refund_payout,
                     punish: start.punish_payout,
                 };
-                let nex_address = start.nex_key.nex_address();
                 let setup = match Setup::new(
                     start.terms,
                     Side::Seller,
@@ -113,8 +117,7 @@ impl Machine for Seller {
                     key,
                     &share,
                     payouts,
-                    nex_address,
-                    Some(start.nex_key),
+                    start.nex_address,
                 ) {
                     Ok(setup) => setup,
                     Err(refusal) => return abort(refusal),
@@ -173,80 +176,108 @@ impl Machine for Seller {
                 (
                     AwaitFunding {
                         locked,
-                        seen: false,
+                        since: None,
                     },
                     vec![],
                 )
             }
-            (AwaitFunding { locked, seen }, Event::Bitcoin(view)) => {
+            (AwaitFunding { locked, since }, Event::Bitcoin(view)) => {
                 let terms = &locked.setup.terms;
-                if view.funding.unwrap_or(0) < terms.btc_confirmations {
-                    let seen = seen || view.funding.is_some();
-                    (AwaitFunding { locked, seen }, vec![])
+                let since = since.unwrap_or(view.height);
+                if view.funding.is_none() && view.height >= since + u32::from(terms.t1) {
+                    abort(Refusal::Timeout)
+                } else if view.funding.unwrap_or(0) < terms.btc_confirmations {
+                    let since = Some(since);
+                    (AwaitFunding { locked, since }, vec![])
                 } else if terms.redeem_closed(&view) {
-                    Cancelling { locked, cid: None }.step(Event::Bitcoin(view))
+                    let nex_lock = None;
+                    Cancelling { locked, nex_lock }.step(Event::Bitcoin(view))
                 } else {
-                    (
-                        LockingNex {
-                            locked,
-                            nonce: None,
-                        },
-                        vec![],
-                    )
+                    let nex_lock = None;
+                    (LockingNex { locked, nex_lock }, vec![])
                 }
             }
-            (AwaitFunding { seen: false, .. }, Event::Timeout) => abort(Refusal::Timeout),
-            (LockingNex { locked, nonce }, Event::Nexus(view)) => {
-                // The nonce is fixed the first time, so the lock submitted
-                // again after an error or a restart is the same transaction
-                // and can land only once.
-                let nonce = nonce.unwrap_or(view.own.nonce);
-                let lock = locked.nex_lock(nonce);
-                let nonce = Some(nonce);
-                (LockingNex { locked, nonce }, vec![Action::Submit(lock)])
-            }
-            (LockingNex { locked, .. }, Event::Submitted(cid)) => {
-                let message = Message::NexLocked { cid: cid.clone() };
-                (
-                    AwaitRedeemSignature { locked, cid },
-                    vec![Action::Send(message)],
-                )
-            }
-            (LockingNex { locked, nonce }, Event::Bitcoin(view)) => {
-                if locked.gives_up(&view) {
-                    Cancelling { locked, cid: None }.step(Event::Bitcoin(view))
-                } else {
-                    (LockingNex { locked, nonce }, vec![])
+            (LockingNex { locked, nex_lock }, Event::Nexus(view)) => match nex_lock {
+                // Only a synced node knows the next nonce.
+                None if !synced(&view.health) => (LockingNex { locked, nex_lock }, vec![]),
+                None => {
+                    let sign = Action::SignNex(locked.nex_lock(view.own.nonce));
+                    (LockingNex { locked, nex_lock }, vec![sign])
                 }
-            }
-            (AwaitRedeemSignature { locked, cid }, Event::Bitcoin(view)) => {
-                if locked.gives_up(&view) {
-                    let cid = Some(cid);
-                    Cancelling { locked, cid }.step(Event::Bitcoin(view))
-                } else {
-                    (AwaitRedeemSignature { locked, cid }, vec![])
+                Some(lock)
+                    if view
+                        .watched
+                        .as_ref()
+                        .is_some_and(|(_, depth)| depth.is_some()) =>
+                {
+                    let message = Message::NexLocked { cid: lock.cid() };
+                    let state = AwaitRedeemSignature {
+                        locked,
+                        nex_lock: lock,
+                    };
+                    (state, vec![Action::Send(message)])
                 }
-            }
-            // The driver feeds a fresh Bitcoin view before every message, so
-            // being here means the redeem window was open a moment ago.
+                // The same bytes again: the node answers with their CID
+                // while it pools them, and takes them back if it dropped
+                // them.
+                Some(lock) => {
+                    let submit = Action::Submit(lock.clone());
+                    let nex_lock = Some(lock);
+                    (LockingNex { locked, nex_lock }, vec![submit])
+                }
+            },
             (
-                AwaitRedeemSignature { locked, cid },
+                LockingNex {
+                    locked,
+                    nex_lock: None,
+                },
+                Event::NexSigned(lock),
+            ) => {
+                if lock.body != locked.nex_lock(lock.body.nonce) || !lock.verify() {
+                    let nex_lock = None;
+                    return (LockingNex { locked, nex_lock }, vec![]);
+                }
+                // Saved before it is submitted: from here on it may land.
+                let submit = Action::Submit(lock.clone());
+                let nex_lock = Some(lock);
+                (LockingNex { locked, nex_lock }, vec![submit])
+            }
+            (LockingNex { locked, nex_lock }, Event::Bitcoin(view)) => {
+                if locked.gives_up(&view) {
+                    Cancelling { locked, nex_lock }.step(Event::Bitcoin(view))
+                } else {
+                    (LockingNex { locked, nex_lock }, vec![])
+                }
+            }
+            (AwaitRedeemSignature { locked, nex_lock }, Event::Bitcoin(view)) => {
+                if locked.gives_up(&view) {
+                    let nex_lock = Some(nex_lock);
+                    Cancelling { locked, nex_lock }.step(Event::Bitcoin(view))
+                } else {
+                    (AwaitRedeemSignature { locked, nex_lock }, vec![])
+                }
+            }
+            // Only kept: the redeem goes out on the next Bitcoin view, and
+            // only if that view shows the window open. The view this
+            // message arrived on may be stale.
+            (
+                AwaitRedeemSignature { locked, nex_lock },
                 Event::Message(Message::RedeemSignature { redeem }),
             ) => match locked.redeem(&redeem) {
                 Some(redeem) => (
                     Redeeming {
                         locked,
-                        cid,
-                        redeem: redeem.clone(),
+                        nex_lock,
+                        redeem,
                     },
-                    vec![Action::Broadcast(redeem)],
+                    vec![],
                 ),
-                None => (AwaitRedeemSignature { locked, cid }, vec![]),
+                None => (AwaitRedeemSignature { locked, nex_lock }, vec![]),
             },
             (
                 Redeeming {
                     locked,
-                    cid,
+                    nex_lock,
                     redeem,
                 },
                 Event::Bitcoin(view),
@@ -259,29 +290,31 @@ impl Machine for Seller {
                     Some((Spend::Redeem, _)) => (
                         Redeeming {
                             locked,
-                            cid,
+                            nex_lock,
                             redeem,
                         },
                         vec![],
                     ),
-                    // Not seen, perhaps never sent: send it again, but only
-                    // while the window is open.
+                    // Not seen, perhaps never sent: send it, but only while
+                    // the window is open.
                     None if !terms.redeem_closed(&view) => {
                         let actions = vec![Action::Broadcast(redeem.clone())];
                         let state = Redeeming {
                             locked,
-                            cid,
+                            nex_lock,
                             redeem,
                         };
                         (state, actions)
                     }
                     _ => {
-                        let cid = Some(cid);
-                        Cancelling { locked, cid }.step(Event::Bitcoin(view))
+                        let nex_lock = Some(nex_lock);
+                        Cancelling { locked, nex_lock }.step(Event::Bitcoin(view))
                     }
                 }
             }
-            (Cancelling { locked, cid }, Event::Bitcoin(view)) => locked.cancelling(cid, view),
+            (Cancelling { locked, nex_lock }, Event::Bitcoin(view)) => {
+                locked.cancelling(nex_lock, view)
+            }
             (ClaimingNex(claim), event) => match claim.step(event) {
                 Claimed::Pending(claim, actions) => (ClaimingNex(claim), actions),
                 Claimed::Done | Claimed::Empty => (Done(Outcome::Refunded), vec![]),
@@ -308,7 +341,6 @@ impl Machine for Seller {
             Seller::AwaitBuyerHello(_)
                 | Seller::AwaitLockProposal(_)
                 | Seller::AwaitBuyerSignatures { .. }
-                | Seller::AwaitFunding { seen: false, .. }
         )
     }
 
@@ -323,14 +355,11 @@ impl Machine for Seller {
                 bitcoin: bitcoin(locked),
                 nexus: None,
             },
-            LockingNex { locked, .. } => Watch {
+            LockingNex { locked, nex_lock } => Watch {
                 bitcoin: bitcoin(locked),
-                nexus: locked.setup.watch_nexus(None),
+                nexus: locked.setup.watch_nexus(nex_lock.as_ref().map(|t| t.cid())),
             },
-            ClaimingNex(claim) => Watch {
-                bitcoin: None,
-                nexus: claim.setup.watch_nexus(claim.cid.as_ref()),
-            },
+            ClaimingNex(claim) => claim.watch(),
             AwaitBuyerHello(_) | AwaitLockProposal(_) | AwaitBuyerSignatures { .. } | Done(_) => {
                 Watch {
                     bitcoin: None,
@@ -348,20 +377,16 @@ impl SellerLocked {
     }
 
     /// The transfer of `nex_amount` to the lock address.
-    fn nex_lock(&self, nonce: u64) -> swap_nexus_tx::Transaction {
+    fn nex_lock(&self, nonce: u64) -> TransactionBody {
         let terms = &self.setup.terms;
-        let key = self.setup.nex_key.as_ref().expect("the seller's setup");
-        let body = TransactionBody::transfer(
+        TransactionBody::transfer(
             &self.setup.nex_address,
             &self.setup.lock_address(),
             terms.nex_amount,
             terms.nex_fee,
             nonce,
         )
-        .expect("the terms were checked");
-        let mut transaction = swap_nexus_tx::Transaction::new(body);
-        transaction.sign(&key.signing_key());
-        transaction
+        .expect("the terms were checked")
     }
 
     /// The redeem, if `adaptor` is the buyer's signature on it encrypted to
@@ -377,7 +402,11 @@ impl SellerLocked {
             .ok()
     }
 
-    fn cancelling(self, cid: Option<String>, view: BitcoinView) -> (Seller, Vec<Action>) {
+    fn cancelling(
+        self,
+        nex_lock: Option<swap_nexus_tx::Transaction>,
+        view: BitcoinView,
+    ) -> (Seller, Vec<Action>) {
         let setup = &self.setup;
         let terms = &setup.terms;
         let mut actions = vec![];
@@ -398,7 +427,11 @@ impl SellerLocked {
                 Some((Spend::Refund, _)) => {
                     let refund = &view.cancel_spend.as_ref().expect("matched").tx;
                     if let Some(b) = setup.recover(self.lock, Spend::Refund, &self.refund, refund) {
-                        let claim = Claim::new(self.setup, b, cid.is_some());
+                        let lock = match &nex_lock {
+                            Some(lock) => Lock::Signed(lock.body.nonce),
+                            None => Lock::Unsigned,
+                        };
+                        let claim = Claim::new(self.setup, b, lock);
                         return (Seller::ClaimingNex(claim), vec![]);
                     }
                 }
@@ -417,6 +450,7 @@ impl SellerLocked {
                 _ => {}
             },
         }
-        (Seller::Cancelling { locked: self, cid }, actions)
+        let locked = self;
+        (Seller::Cancelling { locked, nex_lock }, actions)
     }
 }

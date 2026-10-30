@@ -23,8 +23,8 @@ use swap::bitcoind::Bitcoind;
 use swap::driver::{Driver, Store};
 use swap::transport::{Ivy, PeerKey};
 use swap::{Buyer, Outcome, SecretBytes, Seller, Terms};
-use swap_nexus_tx::address;
 use swap_nexus_tx::rpc::Client;
+use swap_nexus_tx::{address, Transaction, TransactionBody};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 /// Nexus's block reward over its first halving interval.
@@ -385,7 +385,7 @@ fn spawn_seller(
 ) -> Party<Seller> {
     let seller = Seller::new(
         world.terms.clone(),
-        world.seller_nex.clone(),
+        world.seller_nex.nex_address(),
         world.script(&world.seller_wallet),
         world.script(&world.seller_wallet),
     )
@@ -395,10 +395,12 @@ fn spawn_seller(
         world.nexus.client(),
         world.store("seller"),
     );
+    let key = world.seller_nex.clone();
     thread::spawn(move || {
         let transport = Ivy::accept(listener, &config, buyer, TIMEOUT * 6, TIMEOUT).unwrap();
         let mut driver =
             Driver::start(seller, vec![], bitcoin, nexus, Some(transport), store).unwrap();
+        driver.nex_key = Some(key);
         let outcome = driver.run_until(stop).unwrap();
         (outcome, driver.state().clone())
     })
@@ -518,13 +520,25 @@ fn seller_never_locks_nex() {
     // The seller holds no NEX: its node refuses the lock every time.
     let world = World::new(0);
     let (seller, buyer, lock) = start(&world, |_| false);
-    world.drive(Pace::Steady, true, || finished(&seller) && finished(&buyer));
-    assert_eq!(outcome(seller).0, Some(Outcome::Refunded));
+    world.drive(Pace::Steady, true, || finished(&buyer));
     assert_eq!(outcome(buyer).0, Some(Outcome::Refunded));
-
+    // The seller signed a lock at nonce 0, so it cannot tell it will never
+    // land, and keeps the shares to claim it, until its nonce moves on.
+    assert!(!finished(&seller));
     let n = &world.nexus;
+    let seller_nex = world.seller_nex.nex_address();
+    n.mine(Some(&seller_nex));
+    let fee = world.terms.nex_fee;
+    let elsewhere = address(&[9; 32]);
+    let body = TransactionBody::transfer(&seller_nex, &elsewhere, 1, fee, 0).unwrap();
+    let mut spend = Transaction::new(body);
+    spend.sign(&SigningKey::from_bytes(&world.seller_nex.0));
+    n.client().submit(&spend).unwrap();
+    world.drive(Pace::OnDemand, true, || finished(&seller));
+    assert_eq!(outcome(seller).0, Some(Outcome::Refunded));
+
     assert_eq!(n.balance(&world.buyer_nex), 0);
-    assert_eq!(n.balance(&world.seller_nex.nex_address()), 0);
+    assert_eq!(n.balance(&seller_nex), REWARD - 1 - fee);
     assert_eq!(n.balance(&lock_address(&lock)), 0);
     assert_eq!(btc_balance(&world.seller_wallet), Amount::ZERO);
     assert_eq!(
@@ -538,8 +552,8 @@ fn seller_never_locks_nex() {
 fn buyer_never_sends_redeem_signature() {
     let world = World::new(2);
     let (seller, buyer, lock) = start(&world, |_| false);
-    // Nexus stalls with the lock still pending, so the buyer never sees it
-    // confirmed and never signs: it cancels and refunds at t1.
+    // Nexus stalls with the lock still pending, so the seller never names
+    // it and the buyer never signs: it cancels and refunds at t1.
     world.drive(Pace::Steady, false, || finished(&buyer));
     assert_eq!(outcome(buyer).0, Some(Outcome::Refunded));
     // Nexus moves again; the seller, which learned `b` from the refund,

@@ -14,6 +14,9 @@ pub enum Buyer {
         funding: Transaction,
         lock: OutPoint,
     },
+    /// Has verified the seller's signatures and is sending its own; once
+    /// they are out, broadcasts the funding transaction.
+    SendingSignatures(BuyerLocked),
     /// Has broadcast the funding transaction. `cid` is the NEX lock the
     /// seller named.
     AwaitNexLock {
@@ -111,7 +114,6 @@ impl Machine for Buyer {
                     &share,
                     payouts,
                     start.nex_address,
-                    None,
                 ) {
                     Ok(setup) => {
                         let fund = Action::FundLock {
@@ -163,10 +165,7 @@ impl Machine for Buyer {
                     return abort(Refusal::Signature);
                 }
                 let own = swap.sign(lock, Spend::Cancel, &setup.secrets.key());
-                let actions = vec![
-                    Action::Send(Message::BuyerSignatures { cancel: own }),
-                    Action::Broadcast(funding.clone()),
-                ];
+                let send = Action::Send(Message::BuyerSignatures { cancel: own });
                 let locked = BuyerLocked {
                     setup,
                     funding,
@@ -174,7 +173,13 @@ impl Machine for Buyer {
                     seller_cancel: cancel,
                     refund,
                 };
-                (AwaitNexLock { locked, cid: None }, actions)
+                (SendingSignatures(locked), vec![send])
+            }
+            // A seller without our cancel signature would never lock, so
+            // the funding waits for them to be sent.
+            (SendingSignatures(locked), Event::Sent) => {
+                let broadcast = Action::Broadcast(locked.funding.clone());
+                (AwaitNexLock { locked, cid: None }, vec![broadcast])
             }
             (AwaitNexLock { locked, cid: None }, Event::Message(Message::NexLocked { cid })) => {
                 let cid = Some(cid);
@@ -233,7 +238,10 @@ impl Machine for Buyer {
                 Claimed::Empty | Claimed::Drained => (Done(Outcome::Drained), vec![]),
             },
             (
-                AwaitSellerHello(_) | AwaitFunded(_) | AwaitSellerSignatures { .. },
+                AwaitSellerHello(_)
+                | AwaitFunded(_)
+                | AwaitSellerSignatures { .. }
+                | SendingSignatures(_),
                 Event::Timeout,
             ) => abort(Refusal::Timeout),
             (state, _) => (state, vec![]),
@@ -253,6 +261,7 @@ impl Machine for Buyer {
             Buyer::AwaitSellerHello(_)
                 | Buyer::AwaitFunded(_)
                 | Buyer::AwaitSellerSignatures { .. }
+                | Buyer::SendingSignatures(_)
         )
     }
 
@@ -264,22 +273,21 @@ impl Machine for Buyer {
                 bitcoin: bitcoin(locked),
                 nexus: cid
                     .as_ref()
-                    .and_then(|cid| locked.setup.watch_nexus(Some(cid))),
+                    .and_then(|cid| locked.setup.watch_nexus(Some(cid.clone()))),
             },
             AwaitRedeem { locked, .. } | Cancelling { locked, .. } => Watch {
                 bitcoin: bitcoin(locked),
                 nexus: None,
             },
-            ClaimingNex(claim) => Watch {
+            ClaimingNex(claim) => claim.watch(),
+            AwaitSellerHello(_)
+            | AwaitFunded(_)
+            | AwaitSellerSignatures { .. }
+            | SendingSignatures(_)
+            | Done(_) => Watch {
                 bitcoin: None,
-                nexus: claim.setup.watch_nexus(claim.cid.as_ref()),
+                nexus: None,
             },
-            AwaitSellerHello(_) | AwaitFunded(_) | AwaitSellerSignatures { .. } | Done(_) => {
-                Watch {
-                    bitcoin: None,
-                    nexus: None,
-                }
-            }
         }
     }
 }
@@ -291,7 +299,8 @@ impl Buyer {
         use Buyer::*;
         match self {
             AwaitFunded(setup) | AwaitSellerSignatures { setup, .. } => Some(setup.lock_address()),
-            AwaitNexLock { locked, .. }
+            SendingSignatures(locked)
+            | AwaitNexLock { locked, .. }
             | AwaitRedeem { locked, .. }
             | Cancelling { locked, .. } => Some(locked.setup.lock_address()),
             ClaimingNex(claim) => Some(claim.setup.lock_address()),
@@ -301,6 +310,14 @@ impl Buyer {
 }
 
 impl BuyerLocked {
+    /// How deep cancel must be before the refund, which reveals `b`.
+    fn refund_depth(&self, redeem: &Option<EncryptedSignature>) -> u32 {
+        match redeem {
+            Some(_) => self.setup.terms.btc_confirmations,
+            None => 1,
+        }
+    }
+
     /// The lock was spent, or cancel is due.
     fn gives_up(&self, view: &BitcoinView) -> bool {
         view.lock_spend.is_some() || self.setup.terms.cancel_due(view)
@@ -323,7 +340,8 @@ impl BuyerLocked {
                     .as_ref()
                     .and_then(|adaptor| setup.recover(self.lock, Spend::Redeem, adaptor, tx));
                 if let Some(s) = s {
-                    return (Buyer::ClaimingNex(Claim::new(self.setup, s, true)), vec![]);
+                    let claim = Claim::new(self.setup, s, Lock::Seen);
+                    return (Buyer::ClaimingNex(claim), vec![]);
                 }
             }
             None if terms.cancel_due(&view) => {
@@ -334,8 +352,11 @@ impl BuyerLocked {
             None => {}
             // Refund only once cancel is in a block: a refund spending a
             // cancel that a redeem then displaces would hand the seller `b`.
+            // Once the seller holds our redeem signature, a seller that
+            // orphans the block could do just that, so cancel must be
+            // `btc_confirmations` deep.
             Some((_, cancel_depth)) => match setup.spend(self.lock, &view.cancel_spend) {
-                None if cancel_depth >= 1 => {
+                None if cancel_depth >= self.refund_depth(&redeem) => {
                     let swap = setup.swap();
                     let seller = setup.decrypt(&self.refund);
                     let own = swap.sign(self.lock, Spend::Refund, &setup.secrets.key());

@@ -3,7 +3,7 @@
 
 use super::*;
 use bitcoin::hashes::Hash;
-use bitcoin::{TxIn, TxOut, Txid, WPubkeyHash, Witness};
+use bitcoin::{Script, TxIn, TxOut, Txid, WPubkeyHash, Witness};
 use swap_nexus_tx::rpc::Inclusion;
 
 const SELLER_NEX: SecretBytes = SecretBytes([7; 32]);
@@ -97,6 +97,7 @@ fn funding(actions: &[Action]) -> Transaction {
     }
 }
 
+/// The lock at `funding` confirmations, mined at height 101.
 fn btc(
     funding: u32,
     lock_spend: Option<(&Transaction, u32)>,
@@ -109,6 +110,7 @@ fn btc(
         })
     };
     Event::Bitcoin(BitcoinView {
+        height: 100 + funding,
         funding: Some(funding),
         lock_spend: spent(lock_spend),
         cancel_spend: spent(cancel_spend),
@@ -123,16 +125,45 @@ fn healthy() -> Health {
     }
 }
 
+fn syncing() -> Health {
+    Health {
+        best_header_height: Some(11),
+        ..healthy()
+    }
+}
+
 fn nexus(lock: Account, watched: Option<(TransactionStatus, Option<u64>)>) -> Event {
+    nexus_at(healthy(), account(10_000_000, 3), lock, watched)
+}
+
+fn nexus_at(
+    health: Health,
+    own: Account,
+    lock: Account,
+    watched: Option<(TransactionStatus, Option<u64>)>,
+) -> Event {
     Event::Nexus(NexusView {
-        health: healthy(),
-        own: Account {
-            balance: 10_000_000,
-            nonce: 3,
-        },
+        health,
+        own,
         lock,
+        min_relay_fee: 0,
         watched,
     })
+}
+
+/// The seller's wallet answering its request to sign.
+fn signed_nex(actions: &[Action]) -> Event {
+    let [Action::SignNex(body)] = actions else {
+        panic!("expected a request to sign in {actions:?}");
+    };
+    let mut transaction = swap_nexus_tx::Transaction::new(body.clone());
+    transaction.sign(&SELLER_NEX.signing_key());
+    Event::NexSigned(transaction)
+}
+
+/// A party saved to disk and loaded again.
+fn restart<M: Machine>(machine: &M) -> M {
+    serde_json::from_str(&serde_json::to_string(machine).unwrap()).unwrap()
 }
 
 fn account(balance: u64, nonce: u64) -> Account {
@@ -158,15 +189,27 @@ struct Locked {
 }
 
 fn hellos() -> (Seller, Buyer, Vec<Action>) {
-    let seller = Seller::new(terms(), SELLER_NEX, payout(1), payout(2)).unwrap();
-    let (buyer, actions) = Buyer::start(terms(), payout(3), BUYER_NEX.into()).unwrap();
+    hellos_with(terms())
+}
+
+fn new_seller(terms: Terms) -> Seller {
+    Seller::new(terms, SELLER_NEX.nex_address(), payout(1), payout(2)).unwrap()
+}
+
+fn hellos_with(terms: Terms) -> (Seller, Buyer, Vec<Action>) {
+    let seller = new_seller(terms.clone());
+    let (buyer, actions) = Buyer::start(terms, payout(3), BUYER_NEX.into()).unwrap();
     let (seller, actions) = seller.step(message(sent(&actions)));
     let (buyer, actions) = buyer.step(message(sent(&actions)));
     (seller, buyer, actions)
 }
 
 fn locked() -> Locked {
-    let (seller, buyer, actions) = hellos();
+    locked_with(terms())
+}
+
+fn locked_with(terms: Terms) -> Locked {
+    let (seller, buyer, actions) = hellos_with(terms);
     let funding = funding(&actions);
     let (buyer, actions) = buyer.step(Event::Funded(funding.clone()));
     let Message::LockProposal {
@@ -182,8 +225,11 @@ fn locked() -> Locked {
     let (seller, actions) = seller.step(message(sent(&actions)));
     let (buyer, actions) = buyer.step(message(sent(&actions)));
     // The buyer sends its cancel signature, then broadcasts.
-    assert_eq!(broadcasts(&actions), [funding]);
-    let (seller, none) = seller.step(message(sent(&actions)));
+    let signatures = sent(&actions);
+    assert!(broadcasts(&actions).is_empty(), "not before they are sent");
+    let (buyer, broadcast) = buyer.step(Event::Sent);
+    assert_eq!(broadcasts(&broadcast), [funding]);
+    let (seller, none) = seller.step(message(signatures));
     assert!(none.is_empty());
     assert!(matches!(seller, Seller::AwaitFunding { .. }));
     Locked { seller, buyer }
@@ -200,14 +246,23 @@ impl Locked {
         buyer.watch().nexus.unwrap().lock_address
     }
 
-    /// The seller locks NEX and the buyer has the CID.
-    fn nex_locked(self) -> (Seller, Buyer, swap_nexus_tx::Transaction) {
-        let (seller, actions) = self.seller.step(btc(1, None, None));
+    /// The seller signs and submits its NEX lock; it is not mined yet.
+    fn nex_signed(self) -> (Seller, Buyer, swap_nexus_tx::Transaction) {
+        let (seller, actions) = self.seller.step(btc(2, None, None));
         assert!(actions.is_empty());
         let (seller, actions) = seller.step(nexus(account(0, 0), None));
-        let lock = submitted(&actions);
-        let (seller, actions) = seller.step(Event::Submitted("bafylock".into()));
-        let (buyer, _) = self.buyer.step(message(sent(&actions)));
+        let (seller, actions) = seller.step(signed_nex(&actions));
+        (seller, self.buyer, submitted(&actions))
+    }
+
+    /// The seller's NEX lock is mined and the buyer has its CID.
+    fn nex_locked(self) -> (Seller, Buyer, swap_nexus_tx::Transaction) {
+        let (seller, buyer, lock) = self.nex_signed();
+        let (seller, actions) =
+            seller.step(nexus(account(500_000, 0), mined(lock.body.clone(), 1)));
+        let cid = sent(&actions);
+        assert!(matches!(&cid, Message::NexLocked { cid } if *cid == lock.cid()));
+        let (buyer, _) = buyer.step(message(cid));
         (seller, buyer, lock)
     }
 }
@@ -230,7 +285,9 @@ fn a_swap_completes() {
     let (buyer, actions) = buyer.step(nexus(account(500_000, 0), mined(nex_lock.body.clone(), 1)));
     let (seller, none) = seller.step(btc(2, None, None));
     assert!(none.is_empty());
-    let (seller, actions) = seller.step(message(sent(&actions)));
+    let (seller, none) = seller.step(message(sent(&actions)));
+    assert!(none.is_empty(), "the redeem waits for a fresh view");
+    let (seller, actions) = seller.step(btc(2, None, None));
     let [redeem] = &broadcasts(&actions)[..] else {
         panic!("the seller redeems");
     };
@@ -249,7 +306,6 @@ fn a_swap_completes() {
         TransactionBody::transfer(&lock_address, BUYER_NEX, 499_900, 100, 0).unwrap()
     );
     assert!(claim.verify(), "signed with the joint key");
-    let (buyer, _) = buyer.step(Event::Submitted("bafyclaim".into()));
     let (buyer, _) = buyer.step(nexus(account(0, 1), mined(claim.body.clone(), 1)));
     assert_eq!(buyer.outcome(), Some(Outcome::Swapped));
 
@@ -266,7 +322,8 @@ fn the_seller_stops_redeeming_at_the_margin() {
     // t1 = 20, margin = 3: the lock 17 deep (tip = lock height + 16) is the
     // last chance.
     let (open, _) = seller.clone().step(btc(17, None, None));
-    let (_, actions) = open.step(message(redeem.clone()));
+    let (open, _) = open.step(message(redeem.clone()));
+    let (_, actions) = open.step(btc(17, None, None));
     assert_eq!(broadcasts(&actions).len(), 1);
 
     let (closed, actions) = seller.step(btc(18, None, None));
@@ -274,6 +331,8 @@ fn the_seller_stops_redeeming_at_the_margin() {
     assert!(actions.is_empty(), "cancel is not valid yet");
     let (closed, actions) = closed.step(message(redeem));
     assert!(actions.is_empty(), "no redeem once the window closed");
+    let (closed, actions) = closed.step(btc(19, None, None));
+    assert!(actions.is_empty(), "cancel is not valid one block early");
     let (_, actions) = closed.step(btc(20, None, None));
     assert_eq!(broadcasts(&actions).len(), 1, "cancel at t1");
 }
@@ -296,6 +355,11 @@ fn no_redeem_signature_cancels_refunds_and_reclaims_the_nex() {
         panic!("the buyer cancels");
     };
     assert_eq!(same.compute_txid(), cancel.compute_txid());
+    let (early, _) = locked_buyer_at_t1_minus_one();
+    assert!(
+        early.is_empty(),
+        "the buyer does not cancel one block early"
+    );
 
     // The buyer refunds only once cancel is in a block.
     let (buyer, actions) = buyer.step(btc(21, Some((cancel, 0)), None));
@@ -319,7 +383,6 @@ fn no_redeem_signature_cancels_refunds_and_reclaims_the_nex() {
         TransactionBody::transfer(&lock_address, &home, 499_900, 100, 0).unwrap()
     );
     assert!(claim.verify());
-    let (seller, _) = seller.step(Event::Submitted("bafyclaim".into()));
     let (seller, _) = seller.step(nexus(account(0, 1), mined(claim.body, 1)));
     assert_eq!(seller.outcome(), Some(Outcome::Refunded));
 
@@ -345,14 +408,23 @@ fn a_silent_buyer_is_punished_after_t2() {
 }
 
 #[test]
-fn a_seller_that_never_locks_ends_with_nothing_to_claim() {
+fn a_seller_that_never_signed_a_lock_ends_with_nothing_to_claim() {
     let locked = locked();
-    let (seller, _) = locked.seller.step(btc(1, None, None));
-    // Its node refuses the lock: no CID, so nothing was locked.
-    let (seller, actions) = seller.step(nexus(account(0, 0), None));
-    submitted(&actions);
+    let (seller, _) = locked.seller.step(btc(2, None, None));
+    // Its node never shows itself synced: no nonce, so no lock.
+    let (seller, actions) = seller.step(nexus_at(syncing(), account(0, 0), account(0, 0), None));
+    assert!(actions.is_empty());
     let (seller, _) = seller.step(btc(18, None, None));
-    let (buyer, actions) = locked.buyer.step(btc(20, None, None));
+    let (cancel, refund) = cancel_and_refund(locked.buyer);
+    let (seller, _) = seller.step(btc(21, Some((&cancel, 1)), Some((&refund, 0))));
+    let (seller, actions) = seller.step(nexus(account(0, 0), None));
+    assert!(actions.is_empty());
+    assert_eq!(seller.outcome(), Some(Outcome::Refunded));
+}
+
+/// The buyer, never having signed the redeem, cancels at t1 and refunds.
+fn cancel_and_refund(buyer: Buyer) -> (Transaction, Transaction) {
+    let (buyer, actions) = buyer.step(btc(20, None, None));
     let [cancel] = &broadcasts(&actions)[..] else {
         panic!("cancel");
     };
@@ -360,21 +432,27 @@ fn a_seller_that_never_locks_ends_with_nothing_to_claim() {
     let [refund] = &broadcasts(&actions)[..] else {
         panic!("refund");
     };
-    let (seller, _) = seller.step(btc(21, Some((cancel, 1)), Some((refund, 0))));
-    let (seller, actions) = seller.step(nexus(account(0, 0), None));
-    assert!(actions.is_empty());
-    assert_eq!(seller.outcome(), Some(Outcome::Refunded));
+    (cancel.clone(), refund.clone())
+}
+
+/// What a buyer with the NEX lock's CID does the block before cancel.
+fn locked_buyer_at_t1_minus_one() -> (Vec<Action>, Buyer) {
+    let (_, buyer, _) = locked().nex_locked();
+    let (buyer, actions) = buyer.step(btc(19, None, None));
+    (actions, buyer)
 }
 
 #[test]
 fn state_survives_a_restart() {
     let (seller, buyer, nex_lock) = locked().nex_locked();
     let (buyer, actions) = buyer.step(nexus(account(500_000, 0), mined(nex_lock.body, 1)));
-    let restored: Buyer = serde_json::from_str(&serde_json::to_string(&buyer).unwrap()).unwrap();
+    let restored = restart(&buyer);
     let (seller, _) = seller.step(btc(2, None, None));
-    let restored_seller: Seller =
-        serde_json::from_str(&serde_json::to_string(&seller).unwrap()).unwrap();
-    let (_, actions) = restored_seller.step(message(sent(&actions)));
+    let seller = restart(&seller);
+    let (seller, _) = seller.step(message(sent(&actions)));
+    let seller = restart(&seller);
+    assert!(matches!(seller, Seller::Redeeming { .. }));
+    let (_, actions) = seller.step(btc(3, None, None));
     let redeem = &broadcasts(&actions)[0];
     let (buyer, _) = restored.step(btc(3, Some((redeem, 1)), None));
     let (_, actions) = buyer.step(nexus(account(500_000, 0), None));
@@ -393,7 +471,7 @@ fn messages_carry_the_swap_id() {
 
 #[test]
 fn a_bad_share_proof_aborts() {
-    let seller = Seller::new(terms(), SELLER_NEX, payout(1), payout(2)).unwrap();
+    let seller = new_seller(terms());
     let (_, actions) = Buyer::start(terms(), payout(3), BUYER_NEX.into()).unwrap();
     let Message::BuyerHello {
         key,
@@ -513,12 +591,7 @@ fn the_buyer_signs_only_for_a_real_nex_lock() {
     let lock_address = locked.lock_address();
     let (_, buyer, nex_lock) = locked.nex_locked();
     let holds = |lock: Account, watched, health: Health| {
-        let event = Event::Nexus(NexusView {
-            health,
-            own: account(0, 0),
-            lock,
-            watched,
-        });
+        let event = nexus_at(health, account(0, 0), lock, watched);
         let (_, actions) = buyer.clone().step(event);
         !sends(&actions).is_empty()
     };
@@ -549,9 +622,370 @@ fn the_buyer_signs_only_for_a_real_nex_lock() {
     let mut child = nex_lock.body.clone();
     child.chain_path.push("Child".into());
     assert!(!holds(account(500_000, 0), mined(child, 1), healthy()));
-    let syncing = Health {
-        best_header_height: Some(11),
+    assert!(!holds(account(500_000, 0), good(), syncing()));
+}
+
+// The review's findings, each pinned.
+
+/// The seller's node took its lock but the answer was lost, and the lock
+/// was mined only after the buyer refunded. The seller keeps `s` and `b`
+/// until the lock can no longer land, and claims it back when it does.
+#[test]
+fn a_lock_whose_answer_was_lost_is_still_claimed_back() {
+    let locked = locked();
+    let lock_address = locked.lock_address();
+    let (seller, buyer, lock) = locked.nex_signed();
+    assert_eq!(lock.body.nonce, 3, "the nonce the synced node showed");
+
+    // Restarted, and on a node that has moved on: the same bytes again,
+    // never a lock at a new nonce.
+    let seller = restart(&seller);
+    let moved_on = nexus_at(healthy(), account(9_000_000, 4), account(0, 0), None);
+    let (seller, actions) = seller.step(moved_on);
+    assert_eq!(submitted(&actions), lock);
+    assert_eq!(seller.watch().nexus.unwrap().cid, Some(lock.cid()));
+
+    let (seller, _) = seller.step(btc(18, None, None));
+    assert!(matches!(seller, Seller::Cancelling { .. }));
+    let (cancel, refund) = cancel_and_refund(buyer);
+    let (seller, _) = seller.step(btc(21, Some((&cancel, 1)), Some((&refund, 0))));
+    assert!(matches!(seller, Seller::ClaimingNex(_)));
+
+    // An empty lock is not final while the lock can still land: the
+    // seller's nonce has not passed it, or the node is not synced.
+    let lagging = nexus_at(healthy(), account(0, 3), account(0, 0), None);
+    let (seller, actions) = seller.step(lagging);
+    assert!(actions.is_empty());
+    assert_eq!(seller.outcome(), None, "the lock's nonce is unused");
+    let syncing = nexus_at(syncing(), account(0, 4), account(0, 0), None);
+    let (seller, actions) = seller.step(syncing);
+    assert!(actions.is_empty());
+    assert_eq!(seller.outcome(), None, "the node is still syncing");
+
+    // Once the seller's nonce has passed it with nothing at the lock, it
+    // never will.
+    let passed = nexus_at(healthy(), account(0, 4), account(0, 0), None);
+    let (done, _) = seller.clone().step(passed);
+    assert_eq!(done.outcome(), Some(Outcome::Refunded));
+
+    // The lock lands: the seller claims it back.
+    let landed = nexus_at(healthy(), account(0, 4), account(500_000, 0), None);
+    let (seller, actions) = seller.step(landed);
+    let claim = submitted(&actions);
+    let home = SELLER_NEX.nex_address();
+    assert_eq!(
+        claim.body,
+        TransactionBody::transfer(&lock_address, &home, 499_900, 100, 0).unwrap()
+    );
+    let (seller, _) = seller.step(nexus(account(0, 1), mined(claim.body, 1)));
+    assert_eq!(seller.outcome(), Some(Outcome::Refunded));
+}
+
+/// The node took the claim but the answer was lost: the claim is the one
+/// transaction it signed, submitted again until it is mined.
+#[test]
+fn a_claim_whose_answer_was_lost_ends_swapped() {
+    let (buyer, actions) = buyer_claiming().step(nexus(account(500_000, 0), None));
+    let claim = submitted(&actions);
+    assert_eq!(buyer.watch().nexus.unwrap().cid, Some(claim.cid()));
+    // Dropped, or never answered: the same bytes again.
+    let buyer = restart(&buyer);
+    let (buyer, actions) = buyer.step(nexus(account(500_000, 0), None));
+    assert_eq!(submitted(&actions), claim);
+    // Pooled: nothing to do.
+    let pooled = mined(claim.body.clone(), 1).map(|(tx, _)| (tx, None));
+    let (buyer, actions) = buyer.step(nexus(account(500_000, 0), pooled));
+    assert_eq!(submitted(&actions), claim);
+    let (buyer, _) = buyer.step(nexus(account(0, 1), mined(claim.body, 1)));
+    assert_eq!(buyer.outcome(), Some(Outcome::Swapped));
+}
+
+/// A redeem signature that arrives on a stale view is only kept: the
+/// redeem goes out on the next view, and only if it shows the window open.
+#[test]
+fn a_redeem_signature_waits_for_a_fresh_view() {
+    let (seller, buyer, nex_lock) = locked().nex_locked();
+    let (_, actions) = buyer.step(nexus(account(500_000, 0), mined(nex_lock.body, 1)));
+    // The seller's last view is 2 deep; the chain is really 18 deep.
+    let (seller, _) = seller.step(btc(2, None, None));
+    let (seller, actions) = seller.step(message(sent(&actions)));
+    assert!(actions.is_empty(), "no redeem on the stale view");
+    assert!(matches!(seller, Seller::Redeeming { .. }));
+
+    let (open, actions) = seller.clone().step(btc(17, None, None));
+    assert_eq!(broadcasts(&actions).len(), 1, "the window is open");
+    // Not seen yet, and the window closed: not again.
+    let (closed, actions) = open.step(btc(18, None, None));
+    assert!(actions.is_empty());
+    assert!(matches!(closed, Seller::Cancelling { .. }));
+    let (closed, actions) = seller.step(btc(18, None, None));
+    assert!(actions.is_empty(), "the window closed");
+    assert!(matches!(closed, Seller::Cancelling { .. }));
+}
+
+#[test]
+fn terms_leave_room_for_a_block_and_for_the_refund() {
+    assert!(terms().check());
+    let margin_one = Terms {
+        margin: 1,
+        ..terms()
+    };
+    assert!(!margin_one.check(), "a block can land before the redeem");
+    // The buyer refunds on a cancel `btc_confirmations` deep, `margin`
+    // blocks before punish.
+    let tight = Terms {
+        btc_confirmations: 7,
+        t1: 30,
+        ..terms()
+    };
+    assert!(!tight.check(), "7 + 3 = t2");
+    assert!(Terms { t2: 11, ..tight }.check());
+}
+
+/// Once the seller holds its redeem signature, the buyer refunds only on
+/// a cancel `btc_confirmations` deep.
+#[test]
+fn a_buyer_that_signed_the_redeem_refunds_on_a_deep_cancel() {
+    let deep = Terms {
+        btc_confirmations: 2,
+        ..terms()
+    };
+    let (_, buyer, nex_lock) = locked_with(deep.clone()).nex_locked();
+    let (signed, _) = buyer
+        .clone()
+        .step(nexus(account(500_000, 0), mined(nex_lock.body, 1)));
+    assert!(matches!(signed, Buyer::AwaitRedeem { .. }));
+    let (signed, actions) = signed.step(btc(20, None, None));
+    let [cancel] = &broadcasts(&actions)[..] else {
+        panic!("cancel");
+    };
+    let (signed, actions) = signed.step(btc(21, Some((cancel, 1)), None));
+    assert!(actions.is_empty(), "one block of cancel is not enough");
+    let (_, actions) = signed.step(btc(22, Some((cancel, 2)), None));
+    assert_eq!(broadcasts(&actions).len(), 1, "the refund");
+
+    // A buyer that never signed it has nothing a reorg could take.
+    let (unsigned, _) = buyer.step(btc(20, None, None));
+    let (_, actions) = unsigned.step(btc(21, Some((cancel, 1)), None));
+    assert_eq!(broadcasts(&actions).len(), 1, "the refund");
+}
+
+#[test]
+fn the_claim_pays_at_least_the_node_relay_fee() {
+    let buyer = buyer_claiming();
+    let lock_address = buyer.lock_address().unwrap();
+    let event = Event::Nexus(NexusView {
+        min_relay_fee: 250,
+        ..nexus_view(nexus(account(500_000, 0), None))
+    });
+    let (_, actions) = buyer.step(event);
+    assert_eq!(
+        submitted(&actions).body,
+        TransactionBody::transfer(&lock_address, BUYER_NEX, 499_750, 250, 0).unwrap()
+    );
+}
+
+fn nexus_view(event: Event) -> NexusView {
+    let Event::Nexus(view) = event else {
+        panic!("a Nexus view");
+    };
+    view
+}
+
+/// The buyer, having seen the redeem, about to claim.
+fn buyer_claiming() -> Buyer {
+    let (seller, buyer, nex_lock) = locked().nex_locked();
+    let (buyer, actions) = buyer.step(nexus(account(500_000, 0), mined(nex_lock.body, 1)));
+    let (seller, _) = seller.step(message(sent(&actions)));
+    let (_, actions) = seller.step(btc(2, None, None));
+    let redeem = &broadcasts(&actions)[0];
+    let (buyer, _) = buyer.step(btc(3, Some((redeem, 0)), None));
+    assert!(matches!(buyer, Buyer::ClaimingNex(_)));
+    buyer
+}
+
+/// A lock that has signed something the claimer did not: drained, with
+/// nothing submitted.
+#[test]
+fn a_lock_spent_by_someone_else_is_drained() {
+    let (buyer, actions) = buyer_claiming().step(nexus(account(500_000, 1), None));
+    assert!(actions.is_empty());
+    assert_eq!(buyer.outcome(), Some(Outcome::Drained));
+}
+
+#[test]
+fn the_seller_waits_blocks_not_seconds_for_the_funding() {
+    let seller = locked().seller;
+    let view = |height, funding| {
+        Event::Bitcoin(BitcoinView {
+            height,
+            funding,
+            lock_spend: None,
+            cancel_spend: None,
+        })
+    };
+    let unseen = |height| view(height, None);
+    let (seller, _) = seller.step(unseen(100));
+    let (seller, _) = seller.step(Event::Timeout);
+    assert!(matches!(seller, Seller::AwaitFunding { .. }), "no clock");
+    assert!(!seller.awaits_message());
+    let (seller, _) = seller.step(unseen(119));
+    assert!(matches!(seller, Seller::AwaitFunding { .. }));
+    let (stopped, actions) = seller.clone().step(unseen(120));
+    assert!(actions.is_empty());
+    assert_eq!(stopped.outcome(), Some(Outcome::Aborted(Refusal::Timeout)));
+    // In the mempool, it is waited for.
+    let (seller, _) = seller.step(view(130, Some(0)));
+    assert!(matches!(seller, Seller::AwaitFunding { .. }));
+}
+
+#[test]
+fn the_buyer_broadcasts_the_funding_only_once_its_signatures_are_out() {
+    let (seller, buyer, actions) = hellos();
+    let funding = funding(&actions);
+    let (buyer, actions) = buyer.step(Event::Funded(funding.clone()));
+    let (_, actions) = seller.step(message(sent(&actions)));
+    let (buyer, actions) = buyer.step(message(sent(&actions)));
+    assert!(matches!(sent(&actions), Message::BuyerSignatures { .. }));
+    assert!(broadcasts(&actions).is_empty());
+    // The session failed: nothing sent, so the buyer stops.
+    let (stopped, actions) = buyer.clone().step(Event::Timeout);
+    assert!(actions.is_empty());
+    assert_eq!(stopped.outcome(), Some(Outcome::Aborted(Refusal::Timeout)));
+    let (_, actions) = buyer.step(Event::Sent);
+    assert_eq!(broadcasts(&actions), [funding]);
+}
+
+#[test]
+fn the_seller_signs_its_lock_only_on_a_synced_node() {
+    let (seller, _) = locked().seller.step(btc(2, None, None));
+    assert!(matches!(seller, Seller::LockingNex { .. }));
+    let stale = nexus_at(syncing(), account(10_000_000, 2), account(0, 0), None);
+    let (seller, actions) = seller.step(stale);
+    assert!(actions.is_empty());
+    let inactive = Health {
+        phase: "syncing".into(),
         ..healthy()
     };
-    assert!(!holds(account(500_000, 0), good(), syncing));
+    let (seller, actions) = seller.step(nexus_at(inactive, account(0, 2), account(0, 0), None));
+    assert!(actions.is_empty());
+    let (_, actions) = seller.step(nexus(account(0, 0), None));
+    let Event::NexSigned(lock) = signed_nex(&actions) else {
+        unreachable!();
+    };
+    assert_eq!(lock.body.nonce, 3);
+}
+
+/// The seller's Nexus wallet key is never in its state file.
+#[test]
+fn the_seller_state_never_holds_its_nexus_key() {
+    let key = hex::encode(SELLER_NEX.0);
+    let unsaved = |seller: &Seller| !serde_json::to_string(seller).unwrap().contains(&key);
+    assert!(unsaved(&new_seller(terms())));
+    assert!(unsaved(&hellos().0));
+    let locked = locked();
+    assert!(unsaved(&locked.seller));
+    let (seller, _, _) = locked.nex_signed();
+    assert!(unsaved(&seller));
+}
+
+/// A wallet that answers with another transaction than the lock is not
+/// submitted.
+#[test]
+fn the_seller_submits_only_the_lock_it_asked_for() {
+    let (seller, _) = locked().seller.step(btc(2, None, None));
+    let (seller, actions) = seller.step(nexus(account(0, 0), None));
+    let Event::NexSigned(lock) = signed_nex(&actions) else {
+        unreachable!();
+    };
+    let mut other = lock.body.clone();
+    other.account_actions[1].owner = "someone-else".into();
+    let mut wrong = swap_nexus_tx::Transaction::new(other);
+    wrong.sign(&SELLER_NEX.signing_key());
+    let (seller, actions) = seller.step(Event::NexSigned(wrong));
+    assert!(actions.is_empty());
+    let unsigned = swap_nexus_tx::Transaction::new(lock.body.clone());
+    let (seller, actions) = seller.step(Event::NexSigned(unsigned));
+    assert!(actions.is_empty());
+    let (_, actions) = seller.step(Event::NexSigned(lock.clone()));
+    assert_eq!(submitted(&actions), lock);
+}
+
+#[test]
+fn a_wrong_cancel_signature_aborts_before_funding() {
+    let (seller, buyer, actions) = hellos();
+    let (buyer, actions) = buyer.step(Event::Funded(funding(&actions)));
+    let (_, actions) = seller.step(message(sent(&actions)));
+    let Message::SellerSignatures { mut cancel, refund } = sent(&actions) else {
+        panic!("signatures");
+    };
+    cancel.s = schnorr_fun::fun::s!(cancel.s + 1).public();
+    let (buyer, actions) = buyer.step(message(Message::SellerSignatures { cancel, refund }));
+    assert_eq!(buyer.outcome(), Some(Outcome::Aborted(Refusal::Signature)));
+    assert!(actions.is_empty());
+}
+
+#[test]
+fn a_funding_transaction_with_two_lock_outputs_is_refused() {
+    let (seller, buyer, actions) = hellos();
+    let (_, actions) = buyer.step(Event::Funded(funding(&actions)));
+    let Message::LockProposal { mut funding, .. } = sent(&actions) else {
+        panic!("a proposal");
+    };
+    // The first of two outputs paying the lock.
+    funding.output[0] = funding.output[1].clone();
+    let lock = OutPoint::new(funding.compute_txid(), 0);
+    let (seller, _) = seller.step(message(Message::LockProposal { funding, lock }));
+    assert_eq!(seller.outcome(), Some(Outcome::Aborted(Refusal::Funding)));
+}
+
+#[test]
+fn a_swap_cannot_be_started_twice() {
+    use crate::driver::{Driver, Store};
+    use crate::transport::Transport;
+    use std::time::Duration;
+    use swap_nexus_tx::rpc::Client;
+
+    struct Offline;
+    impl crate::bitcoind::Bitcoin for Offline {
+        fn broadcast(&self, _: &Transaction) -> crate::bitcoind::Result<()> {
+            unreachable!()
+        }
+        fn height(&self) -> crate::bitcoind::Result<u32> {
+            unreachable!()
+        }
+        fn transaction(&self, _: Txid) -> crate::bitcoind::Result<Option<(Transaction, u32)>> {
+            unreachable!()
+        }
+        fn fund_lock(&self, _: &Script, _: Amount) -> crate::bitcoind::Result<Transaction> {
+            unreachable!()
+        }
+    }
+    impl Transport for Offline {
+        fn send(&mut self, _: &[u8]) -> std::io::Result<()> {
+            unreachable!()
+        }
+        fn recv(&mut self, _: Duration) -> std::io::Result<Option<Vec<u8>>> {
+            unreachable!()
+        }
+    }
+    let start = |seller: Seller, directory: &std::path::Path| {
+        let client = Client::new("http://127.0.0.1:9", "", Duration::from_secs(1));
+        let store = Store::new(directory, terms().swap_id);
+        Driver::<_, _, Offline>::start(seller, vec![], Offline, client, None, store).map(drop)
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let first = new_seller(terms());
+    start(first.clone(), directory.path()).unwrap();
+    let again = start(new_seller(terms()), directory.path()).unwrap_err();
+    assert_eq!(again.kind(), std::io::ErrorKind::AlreadyExists);
+    let saved: Seller = Store::new(directory.path(), terms().swap_id)
+        .load()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_string(&saved).unwrap(),
+        serde_json::to_string(&first).unwrap(),
+        "the first swap's secrets are kept"
+    );
 }

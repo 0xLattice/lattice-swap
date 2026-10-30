@@ -148,7 +148,7 @@ impl Client {
     }
 
     /// Submits to the node's pool and returns the transaction CID (of the
-    /// signed transaction, not of its body).
+    /// signed transaction, not of its body: [`Transaction::cid`]).
     pub fn submit(&self, transaction: &Transaction) -> Result<String> {
         let response = self
             .agent

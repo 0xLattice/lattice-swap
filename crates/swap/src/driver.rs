@@ -12,7 +12,8 @@ use swap_nexus_tx::rpc::Client;
 
 use crate::bitcoind::{self, Bitcoin};
 use crate::transport::Transport;
-use crate::{Action, BitcoinView, Event, Machine, Message, NexusView, NexusWatch, Outcome, Spent};
+use crate::{Action, BitcoinView, Event, Machine, Message, NexusView, NexusWatch, Outcome};
+use crate::{SecretBytes, Spent};
 
 /// One JSON file per swap, replaced atomically: written to a temporary
 /// file, synced, then renamed over the old one. It holds the party's
@@ -32,6 +33,17 @@ impl Store {
         &self.path
     }
 
+    /// Saves the state of a new swap; fails if the file exists, so a swap
+    /// started twice keeps its first secrets.
+    fn create<M: Machine>(&self, state: &M) -> io::Result<()> {
+        let temporary = self.write_temporary(state)?;
+        // A hard link, unlike a rename, never replaces its target.
+        let linked = fs::hard_link(&temporary, &self.path);
+        fs::remove_file(&temporary)?;
+        linked?;
+        self.sync_directory()
+    }
+
     pub fn load<M: Machine>(&self) -> io::Result<Option<M>> {
         match fs::read(&self.path) {
             Ok(bytes) => serde_json::from_slice(&bytes)
@@ -43,6 +55,12 @@ impl Store {
     }
 
     fn save<M: Machine>(&self, state: &M) -> io::Result<()> {
+        let temporary = self.write_temporary(state)?;
+        fs::rename(&temporary, &self.path)?;
+        self.sync_directory()
+    }
+
+    fn write_temporary<M: Machine>(&self, state: &M) -> io::Result<PathBuf> {
         let temporary = self.path.with_extension("json.tmp");
         let mut options = OpenOptions::new();
         options.write(true).create(true).truncate(true);
@@ -51,8 +69,11 @@ impl Store {
         let mut file = options.open(&temporary)?;
         file.write_all(&serde_json::to_vec_pretty(state).map_err(io::Error::other)?)?;
         file.sync_all()?;
-        fs::rename(&temporary, &self.path)?;
-        // The rename is durable once the directory is.
+        Ok(temporary)
+    }
+
+    /// A rename or link is durable once its directory is.
+    fn sync_directory(&self) -> io::Result<()> {
         if let Some(directory) = self.path.parent() {
             File::open(directory)?.sync_all()?;
         }
@@ -75,11 +96,14 @@ pub struct Driver<M, B, T> {
     pub poll: Duration,
     /// How long a counterparty may stay quiet before anything is at stake.
     pub message_timeout: Duration,
+    /// The seller's Nexus wallet key, which signs the NEX lock: set it
+    /// before running a seller. Kept here and never in the state file.
+    pub nex_key: Option<SecretBytes>,
 }
 
 impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
     /// A new swap: saves `state` and carries out `actions` (the buyer's
-    /// hello).
+    /// hello). Fails if `store` already holds a swap.
     pub fn start(
         state: M,
         actions: Vec<Action>,
@@ -88,7 +112,7 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
         transport: Option<T>,
         store: Store,
     ) -> io::Result<Self> {
-        store.save(&state)?;
+        store.create(&state)?;
         let mut driver = Self::with(state, bitcoin, nexus, transport, store);
         for action in actions {
             driver.act(action)?;
@@ -118,6 +142,7 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
             store,
             poll: Duration::from_millis(250),
             message_timeout: Duration::from_secs(60),
+            nex_key: None,
         }
     }
 
@@ -143,9 +168,6 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
                 return Ok(None);
             }
             if let Some(message) = self.receive() {
-                // Act on a message against the chain as it is now: the
-                // seller's redeem window is judged on a fresh height.
-                self.observe_bitcoin()?;
                 self.apply(Event::Message(message))?;
             }
             if self.state.awaits_message() && since.elapsed() > self.message_timeout {
@@ -224,9 +246,12 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
         match action {
             Action::Send(message) => {
                 if let Some(transport) = &mut self.transport {
-                    if let Err(e) = transport.send(&message.encode(self.store.swap_id)) {
-                        warn(&format!("session ended: {e}"));
-                        self.transport = None;
+                    match transport.send(&message.encode(self.store.swap_id)) {
+                        Ok(()) => self.apply(Event::Sent)?,
+                        Err(e) => {
+                            warn(&format!("session ended: {e}"));
+                            self.transport = None;
+                        }
                     }
                 }
             }
@@ -247,10 +272,21 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
                     warn(&format!("broadcast {}: {e}", tx.compute_txid()));
                 }
             }
-            Action::Submit(transaction) => match self.nexus.submit(&transaction) {
-                Ok(cid) => self.apply(Event::Submitted(cid))?,
-                Err(e) => warn(&format!("nexus submit: {e}")),
+            Action::SignNex(body) => match &self.nex_key {
+                Some(key) => {
+                    let mut transaction = swap_nexus_tx::Transaction::new(body);
+                    transaction.sign(&key.signing_key());
+                    self.apply(Event::NexSigned(transaction))?;
+                }
+                None => warn("no Nexus key to sign with"),
             },
+            // The machine watches the transaction by its CID: the answer
+            // adds nothing.
+            Action::Submit(transaction) => {
+                if let Err(e) = self.nexus.submit(&transaction) {
+                    warn(&format!("nexus submit {}: {e}", transaction.cid()));
+                }
+            }
         }
         Ok(())
     }
@@ -260,39 +296,43 @@ fn warn(what: &str) {
     eprintln!("lattice-swap: {what}");
 }
 
+/// Only the swap's own transactions can spend the lock and cancel outputs,
+/// and their txids are fixed before any is signed, so each is looked up by
+/// txid.
 fn bitcoin_view(
     bitcoin: &impl Bitcoin,
     swap: &Swap,
     lock: OutPoint,
 ) -> bitcoind::Result<BitcoinView> {
     let height = bitcoin.height()?;
-    let funding = bitcoin.confirmations(lock.txid)?;
-    // Nothing spends the lock before the block that confirms it.
-    let from = match funding {
-        Some(depth) if depth > 0 => height + 1 - depth,
-        _ => height + 1,
+    let funding = bitcoin.transaction(lock.txid)?.map(|(_, depth)| depth);
+    let spent = |spends: [Spend; 2]| -> bitcoind::Result<Option<Spent>> {
+        for spend in spends {
+            let txid = swap.unsigned_tx(lock, spend).compute_txid();
+            if let Some((tx, confirmations)) = bitcoin.transaction(txid)? {
+                return Ok(Some(Spent { tx, confirmations }));
+            }
+        }
+        Ok(None)
     };
-    let spent = |outpoint| -> bitcoind::Result<Option<Spent>> {
-        let Some(tx) = bitcoin.spending_tx(outpoint, from)? else {
-            return Ok(None);
-        };
-        let confirmations = bitcoin.confirmations(tx.compute_txid())?.unwrap_or(0);
-        Ok(Some(Spent { tx, confirmations }))
-    };
-    let lock_spend = spent(lock)?;
-    let cancel = OutPoint::new(swap.unsigned_tx(lock, Spend::Cancel).compute_txid(), 0);
-    let cancel_spend = match &lock_spend {
-        Some(spend) if spend.tx.compute_txid() == cancel.txid => spent(cancel)?,
-        _ => None,
-    };
+    let lock_spend = spent([Spend::Redeem, Spend::Cancel])?;
+    let cancel_spend = spent([Spend::Refund, Spend::Punish])?;
     Ok(BitcoinView {
+        height,
         funding,
         lock_spend,
         cancel_spend,
     })
 }
 
+/// The lock account is read before the watched transaction: a lock that
+/// has signed something, read first, shows that transaction mined in the
+/// later read if it is ours.
 fn nexus_view(client: &Client, watch: &NexusWatch) -> swap_nexus_tx::rpc::Result<NexusView> {
+    let health = client.health()?;
+    let own = client.account(&watch.own_address)?;
+    let lock = client.account(&watch.lock_address)?;
+    let min_relay_fee = client.min_relay_fee()?;
     let watched = match &watch.cid {
         Some(cid) => match client.transaction(cid)? {
             Some(transaction) => Some((transaction, client.confirmations(cid)?)),
@@ -301,9 +341,10 @@ fn nexus_view(client: &Client, watch: &NexusWatch) -> swap_nexus_tx::rpc::Result
         None => None,
     };
     Ok(NexusView {
-        health: client.health()?,
-        own: client.account(&watch.own_address)?,
-        lock: client.account(&watch.lock_address)?,
+        health,
+        own,
+        lock,
+        min_relay_fee,
         watched,
     })
 }
