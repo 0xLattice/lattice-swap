@@ -28,11 +28,19 @@
 //! `t2` and keeps the BTC.
 //!
 //! A seller that signed a NEX lock at nonce `n` and then learned `b` keeps
-//! the shares and waits in `ClaimingNex` while the lock address is empty:
+//! the shares and waits in `ClaimingNex` while the lock address holds less
+//! than `nex_amount`:
 //! the lock can still land until the seller's nonce passes `n`. If its node
 //! refused that lock for good, the operator ends the wait by spending once
 //! from the seller's Nexus wallet, at nonce `n`, with any transaction. Once
 //! that is mined the lock can never land, and the swap ends `Refunded`.
+//!
+//! A buyer whose node never shows its funding transaction rebroadcasts it
+//! and waits, keeping its secrets: other nodes may still hold the funding
+//! and confirm it, and only those secrets can then refund it. The operator
+//! ends the wait by spending one of the funding's inputs elsewhere; once
+//! that is confirmed the funding can never confirm and the swap file can
+//! be discarded.
 //!
 //! Every timelock counts blocks after a confirmation, so every deadline here
 //! is a number of confirmations: a transaction with a relative timelock of
@@ -616,7 +624,8 @@ impl Claim {
             self.claim = Some(claim.clone());
             return Claimed::Pending(self, vec![Action::Submit(claim)]);
         }
-        let empty = view.lock.balance == 0
+        // Below `nex_amount` the lock never landed: anyone may send it dust.
+        let empty = view.lock.balance < terms.nex_amount
             && match self.lock {
                 Lock::Unsigned => true,
                 // The seller's nonce moved past its lock, which did not credit

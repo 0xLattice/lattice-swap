@@ -1009,19 +1009,18 @@ fn the_claim_takes_exactly_the_locked_amount() {
     assert_eq!(buyer.outcome(), None);
 }
 
-/// Dust at the lock address is not an empty lock: the seller keeps its
-/// shares.
+/// A lock that never landed is empty whatever dust anyone sends the
+/// address: dust must not keep the seller waiting forever.
 #[test]
-fn an_empty_lock_holds_nothing_at_all() {
+fn dust_does_not_keep_an_empty_lock_open() {
     let locked = locked();
     let (seller, _) = locked.seller.step(btc(18, None, None));
     let (cancel, refund) = cancel_and_refund(locked.buyer);
     let (seller, _) = seller.step(btc(21, Some((&cancel, 1)), Some((&refund, 0))));
     assert!(matches!(seller, Seller::ClaimingNex(_)));
-    let (seller, actions) = seller.step(nexus(account(1, 0), None));
+    // More than any fee, less than the lock.
+    let (seller, actions) = seller.step(nexus(account(499_999, 0), None));
     assert!(actions.is_empty());
-    assert_eq!(seller.outcome(), None, "dust");
-    let (seller, _) = seller.step(nexus(account(0, 0), None));
     assert_eq!(seller.outcome(), Some(Outcome::Refunded));
 }
 
@@ -1052,28 +1051,26 @@ fn the_seller_names_its_lock_only_once_mined() {
     assert!(matches!(sent(&actions), Message::NexLocked { .. }));
 }
 
-/// A funding the buyer's node never shows, however often it is broadcast,
-/// cannot confirm: `t1` blocks on, the buyer stops. One in the mempool may
-/// yet confirm, and is waited for.
+/// A funding the buyer's node never shows is broadcast again, and waited
+/// for with the secrets kept, however long it takes.
 #[test]
-fn the_buyer_stops_on_a_funding_that_never_shows() {
+fn a_buyer_whose_funding_does_not_show_keeps_its_secrets() {
+    // Its own node may have dropped a funding that others still hold and
+    // can yet confirm: stopping would discard the keys its refund needs.
     let buyer = locked().buyer;
     assert!(matches!(buyer, Buyer::AwaitNexLock { .. }));
-    let view = |height, funding| {
+    let view = |height| {
         Event::Bitcoin(BitcoinView {
             height,
-            funding,
+            funding: None,
             lock_spend: None,
             cancel_spend: None,
         })
     };
-    let (buyer, actions) = buyer.step(view(100, None));
+    let (buyer, actions) = buyer.step(view(100));
     assert_eq!(broadcasts(&actions).len(), 1, "broadcast again");
-    let (buyer, _) = buyer.step(view(119, None));
+    let (buyer, actions) = buyer.step(view(10_000));
     assert!(matches!(buyer, Buyer::AwaitNexLock { .. }));
-    let (stopped, actions) = buyer.clone().step(view(120, None));
-    assert!(actions.is_empty());
-    assert_eq!(stopped.outcome(), Some(Outcome::Aborted(Refusal::Timeout)));
-    let (pooled, _) = buyer.step(view(130, Some(0)));
-    assert!(matches!(pooled, Buyer::AwaitNexLock { .. }));
+    assert_eq!(broadcasts(&actions).len(), 1, "still broadcasting");
+    assert_eq!(buyer.outcome(), None);
 }
