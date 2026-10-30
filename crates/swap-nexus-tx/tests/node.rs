@@ -1,6 +1,7 @@
-//! Against a real lattice-node in Docker. Runs only when `NEXUS_NODE_IMAGE`
-//! names the image (e.g. `ghcr.io/0xlattice/lattice-node:3.2.0`); otherwise
-//! it passes without doing anything.
+//! Against a real lattice-node in Docker. Ignored by a plain `cargo test`;
+//! run it with `NEXUS_NODE_IMAGE` naming the image (e.g.
+//! `ghcr.io/0xlattice/lattice-node:3.2.0`) and `-- --ignored`. Without the
+//! image it fails rather than passing untested.
 //!
 //! The node's RPC listens on loopback only, so the container shares the
 //! host's network (`--network host`): Linux, or Docker Desktop with host
@@ -15,6 +16,8 @@ use rand_core::{OsRng, RngCore};
 use swap_nexus::{JointKey, KeyShare};
 use swap_nexus_tx::rpc::{Client, Error};
 use swap_nexus_tx::{address, Transaction, TransactionBody};
+
+const TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Nexus's block reward over its first halving interval.
 const REWARD: u64 = 1_048_576;
@@ -47,7 +50,7 @@ impl Node {
         ]);
         let url = format!("http://127.0.0.1:{rpc}");
         let mut node = Node {
-            client: Client::new(&url, ""),
+            client: Client::new(&url, "", TIMEOUT),
             container,
             url,
         };
@@ -60,7 +63,7 @@ impl Node {
                 .success()
                 .then(|| String::from_utf8(out.stdout).unwrap())
         });
-        node.client = Client::new(&node.url, &cookie);
+        node.client = Client::new(&node.url, &cookie, TIMEOUT);
         wait_for("node RPC", || node.client.min_relay_fee().ok());
         node
     }
@@ -68,7 +71,7 @@ impl Node {
     /// Mines one block, paying its reward and fees to `recipient` or, with
     /// `None`, burning them, and waits until the node executes it.
     fn mine(&self, recipient: Option<&str>) {
-        let height = self.client.height().unwrap();
+        let height = self.client.health().unwrap().height;
         let mut args = vec![
             "exec".to_string(),
             self.container.clone(),
@@ -87,7 +90,7 @@ impl Node {
             args.extend(["--recipient".into(), format!("Nexus={address}")]);
         }
         wait_for("a mined block", || {
-            if self.client.height().unwrap() > height {
+            if self.client.health().unwrap().height > height {
                 return Some(());
             }
             let out = Command::new("docker").args(&args).output().unwrap();
@@ -98,7 +101,7 @@ impl Node {
             );
             None
         });
-        assert_eq!(self.client.height().unwrap(), height + 1);
+        assert_eq!(self.client.health().unwrap().height, height + 1);
     }
 
     /// Submits, mines it into a block that burns its fee, and waits until the
@@ -107,7 +110,8 @@ impl Node {
         let cid = self.client.submit(transaction).unwrap();
         assert_eq!(self.client.confirmations(&cid).unwrap(), None);
         self.mine(None);
-        // The node caches inclusion answers for 3 s.
+        // Inclusion is read from the executed chain, which can trail the
+        // mining reply.
         let depth = wait_for("inclusion", || self.client.confirmations(&cid).unwrap());
         assert_eq!(depth, 1);
         cid
@@ -169,12 +173,13 @@ fn refusal(node: &Node, transaction: &Transaction) -> String {
 }
 
 #[test]
+#[ignore = "needs Docker and NEXUS_NODE_IMAGE"]
 fn node_accepts_transfers_and_joint_key_spends() {
-    let Ok(image) = std::env::var("NEXUS_NODE_IMAGE") else {
-        eprintln!("NEXUS_NODE_IMAGE unset: skipping the node tests");
-        return;
-    };
+    let image = std::env::var("NEXUS_NODE_IMAGE").expect("NEXUS_NODE_IMAGE names the node image");
     let node = Node::start(&image);
+    let health = node.client.health().unwrap();
+    assert_eq!(health.phase, "active");
+    assert_eq!(health.best_header_height, Some(health.height));
     let fee = node.client.min_relay_fee().unwrap();
     let (a, b, c) = (random_key(), random_key(), random_key());
     let (a_addr, b_addr, c_addr) = (addr(&a), addr(&b), addr(&c));
@@ -199,10 +204,20 @@ fn node_accepts_transfers_and_joint_key_spends() {
     // 2. Lock at the joint key's address, then claim with the joint key.
     let joint = JointKey::from_shares(&KeyShare::random(), &KeyShare::random());
     let lock = address(&joint.public_key());
+    let unseen = node.client.account(&lock).unwrap();
+    assert_eq!((unseen.balance, unseen.nonce), (0, 0));
     let mut fund =
         Transaction::new(TransactionBody::transfer(&a_addr, &lock, 50_000, fee, 1).unwrap());
     fund.sign(&a);
-    node.confirm(&fund);
+    let fund_cid = node.confirm(&fund);
+    // What the claimer checks before trusting the lock: the funding
+    // transaction's contents and where it was mined.
+    let seen = node.client.transaction(&fund_cid).unwrap().unwrap();
+    assert_eq!(seen.body, fund.body);
+    let block = seen.block.unwrap();
+    assert_eq!(block.height, node.client.health().unwrap().height);
+    assert!(block.hash.starts_with("bafy"));
+    assert!(node.client.transaction(&fund.body.cid()).unwrap().is_none());
     assert_eq!(node.client.account(&lock).unwrap().balance, 50_000);
 
     let mut claim =

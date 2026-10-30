@@ -9,7 +9,7 @@
 mod cbor;
 pub mod rpc;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use cbor::Value;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -66,8 +66,12 @@ pub struct TransactionBody {
 impl TransactionBody {
     /// Moves `amount` from `from` to `to` on Nexus and leaves `fee` to the
     /// miner. Lattice has no fee field: the fee is what the debits exceed the
-    /// credits by. `None` if the debit does not fit an `i64`.
+    /// credits by. `None` if `amount` is 0 (consensus refuses a zero delta)
+    /// or the debit does not fit an `i64`.
     pub fn transfer(from: &str, to: &str, amount: u64, fee: u64, nonce: u64) -> Option<Self> {
+        if amount == 0 {
+            return None;
+        }
         let debit = i64::try_from(amount.checked_add(fee)?).ok()?;
         Some(Self {
             account_actions: vec![
@@ -225,27 +229,32 @@ impl Transaction {
             .insert(multikey_hex(public_key), hex::encode(signature));
     }
 
-    /// Every signature verifies, the signing keys' addresses are exactly the
-    /// body's signers, and every debited owner is a signer.
+    /// Lattice's signature and account-action consensus rules:
+    /// `signaturesAreValid` (at least one signature, each verifying),
+    /// `signaturesMatchSigners` (the signing keys' addresses, as a set, equal
+    /// the signers as a set) and `accountActionsAreValid` (every debited
+    /// owner signs; no delta is 0 or `i64::MIN`). It does not check the
+    /// state-atom grammar of addresses and path components
+    /// (`stateAtomsAreValid`), funding, or the nonce. Keys and signatures
+    /// must be in their canonical lowercase spelling, which Lattice would
+    /// otherwise normalize.
     pub fn verify(&self) -> bool {
+        if self.signatures.is_empty() {
+            return false;
+        }
         let preimage = self.body.signing_preimage();
-        let mut signed = Vec::new();
+        let mut signed = BTreeSet::new();
         for (key, signature) in &self.signatures {
             if !verify(&preimage, key, signature) {
                 return false;
             }
-            signed.push(cid(&public_key_node(key)));
+            signed.insert(cid(&public_key_node(key)));
         }
-        let mut signers = self.body.signers.clone();
-        signed.sort();
-        signers.sort();
-        signers.dedup();
-        let debits_signed = self
-            .body
-            .account_actions
-            .iter()
-            .all(|a| a.delta >= 0 || signers.contains(&a.owner));
-        signed == signers && signers.len() == self.body.signers.len() && debits_signed
+        let signers: BTreeSet<_> = self.body.signers.iter().cloned().collect();
+        let actions_valid = self.body.account_actions.iter().all(|a| {
+            a.delta != 0 && a.delta != i64::MIN && (a.delta > 0 || signers.contains(&a.owner))
+        });
+        signed == signers && actions_valid
     }
 
     /// The request body of `POST /transactions`.
@@ -280,6 +289,46 @@ mod tests {
         assert_eq!(body.signers, ["a"]);
         assert!(TransactionBody::transfer("a", "b", i64::MAX as u64, 1, 0).is_none());
         assert!(TransactionBody::transfer("a", "b", u64::MAX, 1, 0).is_none());
+        assert!(TransactionBody::transfer("a", "b", 0, 1, 0).is_none());
+    }
+
+    fn signed_by(key: &SigningKey, edit: impl FnOnce(&mut TransactionBody)) -> Transaction {
+        let mut body =
+            TransactionBody::transfer(&addr(key), &addr(&self::key(9)), 5, 1, 0).unwrap();
+        edit(&mut body);
+        let mut transaction = Transaction::new(body);
+        transaction.sign(key);
+        transaction
+    }
+
+    #[test]
+    fn verify_applies_the_account_action_rules() {
+        let alice = key(1);
+        assert!(signed_by(&alice, |_| {}).verify());
+        let bob = addr(&key(2));
+        let unsigned_debit = signed_by(&alice, |body| {
+            body.account_actions.push(AccountAction {
+                owner: bob,
+                delta: -1,
+            })
+        });
+        assert!(!unsigned_debit.verify(), "every debited owner must sign");
+        let alice_addr = addr(&alice);
+        let zero = AccountAction {
+            owner: alice_addr.clone(),
+            delta: 0,
+        };
+        assert!(!signed_by(&alice, |body| body.account_actions.push(zero)).verify());
+        assert!(!signed_by(&alice, |body| body.account_actions[0].delta = i64::MIN).verify());
+        // Consensus compares signers as a set, so a repeated signer is fine.
+        assert!(signed_by(&alice, |body| body.signers.push(alice_addr)).verify());
+        // No debits and no signers still needs a signature.
+        let mut unsigned = signed_by(&alice, |body| {
+            body.account_actions.remove(0);
+            body.signers.clear();
+        });
+        unsigned.signatures.clear();
+        assert!(!unsigned.verify(), "at least one signature");
     }
 
     #[test]

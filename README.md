@@ -11,12 +11,16 @@ no Nexus consensus change is required.
 
 ## Crates
 
+- `swap-core`: key setup: one secret per party on two curves, and the proof
+  that ties them.
+- `swap-bitcoin`: the Taproot lock, with cancel, refund and punish paths
+  using adaptor signatures.
 - `swap-nexus`: the joint key, `(s + b)·G`, and Ed25519 signing with it.
 - `swap-nexus-tx`: Nexus transfers encoded and signed exactly as Lattice
   54.2.1 does, checked against Lattice's conformance vectors, and a small
-  client for a lattice-node's RPC. Its node test runs when
-  `NEXUS_NODE_IMAGE` names a lattice-node image and Docker can share the
-  host's network.
+  client for a lattice-node's RPC. Its node test is ignored by default; run
+  it with `NEXUS_NODE_IMAGE` naming a lattice-node image and `-- --ignored`,
+  where Docker can share the host's network.
 
 ## License
 
