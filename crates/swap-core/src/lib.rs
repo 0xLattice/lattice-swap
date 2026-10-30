@@ -31,10 +31,18 @@ use swap_nexus::{joint_public_key, KeyShare};
 type ProofSystem = CrossCurveDLEQ<HashTranscript<Sha256, ChaCha20Rng>>;
 
 /// The proof system, with second generators no one knows the discrete log
-/// of: each is the first point found by hashing a fixed label and a counter.
-static PROOF_SYSTEM: LazyLock<ProofSystem> = LazyLock::new(|| {
-    let secp = Point::hash_to_curve_sswu::<Sha256>(b"H", b"lattice-swap/dleq/secp256k1/v1");
-    let ed = (0u32..)
+/// of.
+static PROOF_SYSTEM: LazyLock<ProofSystem> =
+    LazyLock::new(|| ProofSystem::new(secp256k1_generator(), ed25519_generator()));
+
+fn secp256k1_generator() -> Point {
+    Point::hash_to_curve_sswu::<Sha256>(b"H", b"lattice-swap/dleq/secp256k1/v1").normalize()
+}
+
+/// The first point in the prime-order subgroup found by hashing a fixed
+/// label and a counter.
+fn ed25519_generator() -> ng::edwards::EdwardsPoint {
+    (0u32..)
         .find_map(|counter| {
             let hash = Sha512::new()
                 .chain_update(b"lattice-swap/dleq/ed25519/v1")
@@ -45,9 +53,8 @@ static PROOF_SYSTEM: LazyLock<ProofSystem> = LazyLock::new(|| {
                 .mul_by_cofactor();
             (!point.is_small_order()).then_some(point)
         })
-        .expect("some counter lands on the curve");
-    ProofSystem::new(secp.normalize(), ed)
-});
+        .expect("some counter lands on the curve")
+}
 
 /// One party's share as public points on both curves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,10 +91,7 @@ impl ShareProof {
     /// usable: the Ed25519 point in the prime-order subgroup and not of
     /// small order.
     pub fn verify(&self) -> Option<PublicShare> {
-        let ed25519 = CompressedEdwardsY(self.ed25519).decompress()?;
-        if !ed25519.is_torsion_free() || ed25519.is_small_order() {
-            return None;
-        }
+        let ed25519 = usable_ed25519(self.ed25519)?;
         let claim = ng::edwards::CompressedEdwardsY(self.ed25519).decompress()?;
         PROOF_SYSTEM
             .verify(&self.proof, (self.secp256k1, claim))
@@ -98,9 +102,22 @@ impl ShareProof {
     }
 }
 
+/// The point `bytes` encode, if it is usable as a share: in the
+/// prime-order subgroup and not of small order. A torsion component would
+/// carry into the lock key, which no pair of scalars could then sign for.
+fn usable_ed25519(bytes: [u8; 32]) -> Option<EdwardsPoint> {
+    let point = CompressedEdwardsY(bytes).decompress()?;
+    (point.is_torsion_free() && !point.is_small_order()).then_some(point)
+}
+
 impl PublicShare {
-    /// The Nexus lock key for this share and the counterparty's.
+    /// The Nexus lock key for this share and the counterparty's. None if
+    /// the counterparty sent back our own share: neither party alone may
+    /// know the lock key's secret.
     pub fn lock_key(&self, other: &PublicShare) -> Option<[u8; 32]> {
+        if self.ed25519 == other.ed25519 || self.secp256k1 == other.secp256k1 {
+            return None;
+        }
         joint_public_key(&self.ed25519, &other.ed25519)
     }
 }
@@ -114,12 +131,17 @@ pub fn secp256k1_scalar(share: &KeyShare) -> Scalar<Secret, NonZero> {
         .expect("key shares are nonzero and below the secp256k1 order")
 }
 
-/// The key share a secp256k1 scalar recovered from Bitcoin stands for, if
-/// it is one: nonzero and below 2^252.
-pub fn share_from_secp256k1(scalar: &Scalar<impl Secrecy, impl ZeroChoice>) -> Option<KeyShare> {
+/// The counterparty's key share, from the secp256k1 scalar recovered on
+/// Bitcoin: None unless it is the share behind `expected` on both curves.
+pub fn share_from_secp256k1(
+    scalar: &Scalar<impl Secrecy, impl ZeroChoice>,
+    expected: &PublicShare,
+) -> Option<KeyShare> {
     let mut bytes = scalar.to_bytes();
     bytes.reverse();
-    KeyShare::from_bytes(bytes)
+    let share = KeyShare::from_bytes(bytes)?;
+    (share.public() == expected.ed25519 && secp256k1_point(&share) == expected.secp256k1)
+        .then_some(share)
 }
 
 /// `share`'s secp256k1 point.
@@ -154,12 +176,41 @@ mod tests {
     }
 
     #[test]
-    fn a_small_order_ed25519_point_is_refused() {
+    fn ed25519_points_with_torsion_are_refused() {
         use curve25519_dalek::constants::EIGHT_TORSION;
-        let share = KeyShare::random();
-        let mut proof = ShareProof::new(&share);
-        proof.ed25519 = (share.public() + EIGHT_TORSION[1]).compress().to_bytes();
-        assert!(proof.verify().is_none());
+        let point = KeyShare::random().public();
+        assert_eq!(usable_ed25519(point.compress().to_bytes()), Some(point));
+        // The identity is torsion-free but of small order.
+        assert!(usable_ed25519(EIGHT_TORSION[0].compress().to_bytes()).is_none());
+        for torsion in &EIGHT_TORSION[1..] {
+            // A point with a torsion component, and a small-order point.
+            assert!(usable_ed25519((point + torsion).compress().to_bytes()).is_none());
+            assert!(usable_ed25519(torsion.compress().to_bytes()).is_none());
+        }
+    }
+
+    /// Two builds that derive different generators cannot verify each
+    /// other's proofs.
+    #[test]
+    fn the_generators_are_pinned() {
+        assert_eq!(
+            hex(&secp256k1_generator().to_bytes()),
+            "0231fec8a8da0398e3fd2de3e2a6db0c6d0282f053f303c3bf425653800e264b66"
+        );
+        assert_eq!(
+            hex(ed25519_generator().compress().as_bytes()),
+            "914cfa94d58753eb0c0acdeea58064cff5a13f40e40e8978e9750ec5afd8437f"
+        );
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn a_mirrored_share_gives_no_lock_key() {
+        let public = ShareProof::new(&KeyShare::random()).verify().unwrap();
+        assert!(public.lock_key(&public).is_none());
     }
 
     #[test]
@@ -193,16 +244,25 @@ mod tests {
             secp256kfun::g!(secp * G).normalize()
         );
         // And back from a scalar recovered on Bitcoin.
-        let recovered = share_from_secp256k1(&secp256k1_scalar(&share)).unwrap();
+        let public = PublicShare {
+            ed25519: share.public(),
+            secp256k1: secp256k1_point(&share),
+        };
+        let recovered = share_from_secp256k1(&secp256k1_scalar(&share), &public).unwrap();
         assert_eq!(recovered.to_bytes(), le);
     }
 
     #[test]
-    fn recovered_scalars_at_or_above_2_pow_252_are_not_shares() {
+    fn only_the_expected_share_is_recovered() {
+        let (share, other) = (KeyShare::random(), KeyShare::random());
+        let public = ShareProof::new(&share).verify().unwrap();
+        assert!(share_from_secp256k1(&secp256k1_scalar(&other), &public).is_none());
+        // Negated, as BIP340 parity handling might leave it.
+        assert!(share_from_secp256k1(&-secp256k1_scalar(&share), &public).is_none());
         let mut be = [0u8; 32];
         be[0] = 0x10;
-        let scalar = Scalar::<Secret, NonZero>::from_bytes(be).unwrap();
-        assert!(share_from_secp256k1(&scalar).is_none());
+        let high = Scalar::<Secret, NonZero>::from_bytes(be).unwrap();
+        assert!(share_from_secp256k1(&high, &public).is_none());
     }
 
     #[test]
