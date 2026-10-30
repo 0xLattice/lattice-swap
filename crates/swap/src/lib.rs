@@ -1,0 +1,649 @@
+//! A NEX<->BTC swap end to end.
+//!
+//! The seller has NEX and wants BTC; the buyer has BTC and wants NEX. Each
+//! side runs a [`Seller`] or [`Buyer`]: a state machine that takes an
+//! [`Event`] (a message, what the chains show, a timeout) and returns the
+//! next state and the [`Action`]s to take. The machines do no I/O. A
+//! [`driver::Driver`] feeds them from a Bitcoin node, a Nexus node and an
+//! ivy session, carries out their actions, and writes their state to disk
+//! before any action, so a party that restarts picks up where it stopped.
+//!
+//! The order of a swap:
+//!
+//! 1. B -> S `BuyerHello`, S -> B `SellerHello`: Bitcoin keys, key shares
+//!    with their cross-curve proofs, payout scripts.
+//! 2. B -> S `LockProposal`: the funding transaction, unsigned. B has
+//!    signed it but keeps it until it holds S's signatures.
+//! 3. S -> B `SellerSignatures`: S's cancel signature and its refund
+//!    adaptor signature. B -> S `BuyerSignatures`: B's cancel signature;
+//!    then B broadcasts the funding transaction.
+//! 4. Once the lock is `btc_confirmations` deep, S transfers `nex_amount`
+//!    to the lock address and sends `NexLocked`.
+//! 5. B checks the NEX lock on its own node, then sends `RedeemSignature`,
+//!    its redeem adaptor signature.
+//! 6. S redeems the BTC, which reveals `s`; B claims the NEX.
+//!
+//! If S never redeems, B cancels after `t1` and refunds, which reveals
+//! `b`, and S claims its NEX back. If B never refunds, S punishes after
+//! `t2` and keeps the BTC.
+//!
+//! Every timelock counts blocks after a confirmation, so every deadline here
+//! is a number of confirmations: a transaction with a relative timelock of
+//! `t` blocks can be broadcast once the output it spends is `t` deep.
+
+pub mod bitcoind;
+mod buyer;
+pub mod driver;
+mod seller;
+pub mod transport;
+
+pub use buyer::Buyer;
+pub use seller::Seller;
+
+use bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
+use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction};
+use curve25519_dalek::edwards::CompressedEdwardsY;
+use rand_core::OsRng;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use swap_bitcoin::{EncryptedSignature, EvenY, KeyPair, Params, Point, Scalar, Signature};
+use swap_bitcoin::{Party, Spend, Swap};
+use swap_core::{secp256k1_point, secp256k1_scalar, share_from_secp256k1};
+use swap_core::{PublicShare, ShareProof};
+use swap_nexus::{JointKey, KeyShare};
+use swap_nexus_tx::rpc::{Account, Health, TransactionStatus};
+use swap_nexus_tx::{address, TransactionBody};
+
+/// The ivy topic every swap message travels on.
+pub const TOPIC: &str = "lattice-swap/v1";
+
+/// What both parties agreed to off-band, before either says anything here.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Terms {
+    /// Random, fresh for every swap; every message carries it.
+    #[serde(with = "hex::serde")]
+    pub swap_id: [u8; 32],
+    #[serde(with = "bitcoin::amount::serde::as_sat")]
+    pub btc_amount: Amount,
+    /// Paid by each Bitcoin swap transaction.
+    #[serde(with = "bitcoin::amount::serde::as_sat")]
+    pub btc_fee: Amount,
+    pub nex_amount: u64,
+    /// Paid by the NEX lock and by the claim from it.
+    pub nex_fee: u64,
+    /// Blocks after the lock confirms before cancel is valid. A short `t1`
+    /// favours the buyer.
+    pub t1: u16,
+    /// Blocks after cancel confirms before punish is valid. A short `t2`
+    /// favours the seller.
+    pub t2: u16,
+    pub btc_confirmations: u32,
+    pub nex_confirmations: u64,
+    /// Blocks of slack before a timelock: the seller stops redeeming once
+    /// the lock is `t1 - margin + 1` deep, `margin - 1` blocks before
+    /// cancel can be broadcast, so a redeem it sends has time to confirm.
+    pub margin: u16,
+}
+
+impl Terms {
+    /// Whether the terms can work at all. Each party also checks them
+    /// against its own policy before starting.
+    pub fn check(&self) -> bool {
+        self.btc_confirmations >= 1
+            && self.nex_confirmations >= 1
+            && self.margin >= 1
+            && self.btc_confirmations + u32::from(self.margin) < u32::from(self.t1)
+            && self.margin < self.t2
+            && self.nex_amount > self.nex_fee
+    }
+
+    /// The seller may no longer broadcast the redeem: the lock is
+    /// `t1 - margin + 1` deep, so the tip is `lock height + t1 - margin`.
+    fn redeem_closed(&self, view: &BitcoinView) -> bool {
+        view.funding.unwrap_or(0) > u32::from(self.t1 - self.margin)
+    }
+
+    /// Cancel may be broadcast.
+    fn cancel_due(&self, view: &BitcoinView) -> bool {
+        view.funding.unwrap_or(0) >= u32::from(self.t1)
+    }
+}
+
+/// The messages, in the order they are sent.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum Message {
+    BuyerHello {
+        key: Point<EvenY>,
+        share: Box<ShareProof>,
+        refund_payout: ScriptBuf,
+    },
+    SellerHello {
+        key: Point<EvenY>,
+        share: Box<ShareProof>,
+        redeem_payout: ScriptBuf,
+        punish_payout: ScriptBuf,
+    },
+    /// The funding transaction without its witnesses: its txid is final,
+    /// but the seller cannot broadcast it.
+    LockProposal {
+        #[serde(with = "hex_tx")]
+        funding: Transaction,
+        lock: OutPoint,
+    },
+    SellerSignatures {
+        cancel: Signature,
+        refund: EncryptedSignature,
+    },
+    BuyerSignatures {
+        cancel: Signature,
+    },
+    /// The CID of the transaction that funded the NEX lock.
+    NexLocked {
+        cid: String,
+    },
+    RedeemSignature {
+        redeem: EncryptedSignature,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+struct Envelope {
+    #[serde(with = "hex::serde")]
+    swap_id: [u8; 32],
+    message: Message,
+}
+
+impl Message {
+    pub fn encode(&self, swap_id: [u8; 32]) -> Vec<u8> {
+        let envelope = Envelope {
+            swap_id,
+            message: self.clone(),
+        };
+        serde_json::to_vec(&envelope).expect("messages serialize")
+    }
+
+    /// The message in `bytes`, if it is one and belongs to `swap_id`.
+    pub fn decode(bytes: &[u8], swap_id: [u8; 32]) -> Option<Self> {
+        let envelope: Envelope = serde_json::from_slice(bytes).ok()?;
+        (envelope.swap_id == swap_id).then_some(envelope.message)
+    }
+}
+
+/// Something the driver saw. The machines act only on these.
+#[derive(Clone, Debug)]
+pub enum Event {
+    Message(Message),
+    Bitcoin(BitcoinView),
+    Nexus(NexusView),
+    /// The buyer's wallet built and signed the funding transaction.
+    Funded(Transaction),
+    /// The Nexus node took the transaction last submitted, under this CID.
+    Submitted(String),
+    /// The counterparty went quiet before anything was at stake.
+    Timeout,
+}
+
+/// Something a machine wants done. Every action that can fail is asked for
+/// again on the next observation until what it was for is seen, so the
+/// driver only logs failures.
+#[allow(clippy::large_enum_variant)] // Short-lived: carried out as soon as made.
+#[derive(Clone, Debug)]
+pub enum Action {
+    Send(Message),
+    /// Build and sign, but do not broadcast, a transaction from the
+    /// buyer's wallet paying `amount` to `script_pubkey`.
+    FundLock {
+        script_pubkey: ScriptBuf,
+        amount: Amount,
+    },
+    Broadcast(Transaction),
+    Submit(swap_nexus_tx::Transaction),
+}
+
+/// The swap's Bitcoin transactions as one node sees them.
+#[derive(Clone, Debug)]
+pub struct BitcoinView {
+    /// Confirmations of the funding transaction: `None` if unseen, 0 in
+    /// the mempool.
+    pub funding: Option<u32>,
+    /// What spends the lock output, in the mempool or a block.
+    pub lock_spend: Option<Spent>,
+    /// What spends the cancel output, if cancel spent the lock.
+    pub cancel_spend: Option<Spent>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Spent {
+    pub tx: Transaction,
+    /// 0 in the mempool.
+    pub confirmations: u32,
+}
+
+/// Nexus as one node sees it.
+#[derive(Clone, Debug)]
+pub struct NexusView {
+    pub health: Health,
+    /// The party's own address: the seller's funds, the buyer's payout.
+    pub own: Account,
+    /// The lock address at the tip.
+    pub lock: Account,
+    /// The transaction the machine watches, if it watches one and the node
+    /// holds it, with its confirmations.
+    pub watched: Option<(TransactionStatus, Option<u64>)>,
+}
+
+/// How a swap ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Outcome {
+    /// Stopped before anything was at stake.
+    Aborted(Refusal),
+    /// The buyer has the NEX; the seller has the BTC.
+    Swapped,
+    /// The buyer has its BTC back; the seller its NEX, if it locked any.
+    Refunded,
+    /// The seller took the BTC through punish.
+    Punished,
+    /// This party learned the joint key, but the lock was already spent.
+    Drained,
+}
+
+/// Why a swap stopped before anything was at stake.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Refusal {
+    Terms,
+    ShareProof,
+    /// The counterparty sent back our own share or key.
+    MirroredShare,
+    /// `swap_bitcoin::Swap` refused the agreed parameters.
+    Parameters,
+    Funding,
+    Signature,
+    Timeout,
+}
+
+/// This party's secrets for one swap: fresh for every swap.
+#[derive(Clone, Serialize, Deserialize)]
+struct Secrets {
+    #[serde(with = "hex::serde")]
+    share: [u8; 32],
+    #[serde(with = "hex::serde")]
+    bitcoin: [u8; 32],
+}
+
+impl Secrets {
+    fn random() -> Self {
+        Self {
+            share: KeyShare::random().to_bytes(),
+            bitcoin: Scalar::random(&mut OsRng).to_bytes(),
+        }
+    }
+
+    fn share(&self) -> KeyShare {
+        KeyShare::from_bytes(self.share).expect("a key share")
+    }
+
+    fn key(&self) -> KeyPair<EvenY> {
+        let scalar = Scalar::from_bytes(self.bitcoin)
+            .and_then(|s| s.non_zero())
+            .expect("a nonzero scalar");
+        KeyPair::new_xonly(scalar)
+    }
+
+    fn public_share(&self) -> PublicShare {
+        let share = self.share();
+        PublicShare {
+            ed25519: share.public(),
+            secp256k1: secp256k1_point(&share),
+        }
+    }
+}
+
+/// 32 secret bytes, as hex in the state file.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct SecretBytes(#[serde(with = "hex::serde")] pub [u8; 32]);
+
+impl SecretBytes {
+    /// The Nexus address of these bytes as an Ed25519 seed.
+    pub fn nex_address(&self) -> String {
+        address(&self.signing_key().verifying_key().to_bytes())
+    }
+
+    fn signing_key(&self) -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&self.0)
+    }
+}
+
+/// Which side of the swap this party is on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum Side {
+    Seller,
+    Buyer,
+}
+
+/// Everything both sides know once the hellos are exchanged, and this
+/// side's secrets.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Setup {
+    terms: Terms,
+    side: Side,
+    secrets: Secrets,
+    /// The counterparty's Bitcoin key.
+    other_key: Point<EvenY>,
+    /// The counterparty's share, on both curves.
+    #[serde(with = "hex::serde")]
+    other_ed25519: [u8; 32],
+    other_secp256k1: Point,
+    redeem_payout: ScriptBuf,
+    refund_payout: ScriptBuf,
+    punish_payout: ScriptBuf,
+    /// This party's Nexus address: where the seller's NEX comes from and
+    /// returns to, or where the buyer's arrives.
+    nex_address: String,
+    /// The key that funds the seller's lock; `None` for the buyer.
+    nex_key: Option<SecretBytes>,
+}
+
+struct Payouts {
+    redeem: ScriptBuf,
+    refund: ScriptBuf,
+    punish: ScriptBuf,
+}
+
+impl Setup {
+    /// Checks the counterparty's hello: its share proof, that it did not
+    /// mirror ours, and that the Bitcoin transactions can be built.
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        terms: Terms,
+        side: Side,
+        secrets: Secrets,
+        other_key: Point<EvenY>,
+        other_share: &ShareProof,
+        payouts: Payouts,
+        nex_address: String,
+        nex_key: Option<SecretBytes>,
+    ) -> Result<Self, Refusal> {
+        let other = other_share.verify().ok_or(Refusal::ShareProof)?;
+        if secrets.public_share().lock_key(&other).is_none()
+            || other_key == secrets.key().public_key()
+        {
+            return Err(Refusal::MirroredShare);
+        }
+        let setup = Self {
+            terms,
+            side,
+            secrets,
+            other_key,
+            other_ed25519: other.ed25519.compress().to_bytes(),
+            other_secp256k1: other.secp256k1,
+            redeem_payout: payouts.redeem,
+            refund_payout: payouts.refund,
+            punish_payout: payouts.punish,
+            nex_address,
+            nex_key,
+        };
+        Swap::new(setup.params()).map_err(|_| Refusal::Parameters)?;
+        Ok(setup)
+    }
+
+    fn params(&self) -> Params {
+        let own_key = self.secrets.key().public_key();
+        let own_share = self.secrets.public_share().secp256k1;
+        let ((seller, seller_share), (buyer, buyer_share)) = match self.side {
+            Side::Seller => ((own_key, own_share), (self.other_key, self.other_secp256k1)),
+            Side::Buyer => ((self.other_key, self.other_secp256k1), (own_key, own_share)),
+        };
+        Params {
+            seller,
+            buyer,
+            seller_share,
+            buyer_share,
+            amount: self.terms.btc_amount,
+            fee: self.terms.btc_fee,
+            t1: self.terms.t1,
+            t2: self.terms.t2,
+            redeem_payout: self.redeem_payout.clone(),
+            refund_payout: self.refund_payout.clone(),
+            punish_payout: self.punish_payout.clone(),
+        }
+    }
+
+    fn swap(&self) -> Swap {
+        Swap::new(self.params()).expect("checked when the setup was made")
+    }
+
+    fn other_share(&self) -> PublicShare {
+        PublicShare {
+            ed25519: CompressedEdwardsY(self.other_ed25519)
+                .decompress()
+                .expect("checked when the setup was made"),
+            secp256k1: self.other_secp256k1,
+        }
+    }
+
+    fn lock_address(&self) -> String {
+        let key = self
+            .secrets
+            .public_share()
+            .lock_key(&self.other_share())
+            .expect("checked when the setup was made");
+        address(&key)
+    }
+
+    /// Which swap transaction spent an output, and how deep it is.
+    fn spend(&self, lock: OutPoint, spent: &Option<Spent>) -> Option<(Spend, u32)> {
+        let spent = spent.as_ref()?;
+        let swap = self.swap();
+        let txid = spent.tx.compute_txid();
+        [Spend::Redeem, Spend::Cancel, Spend::Refund, Spend::Punish]
+            .into_iter()
+            .find(|&spend| swap.unsigned_tx(lock, spend).compute_txid() == txid)
+            .map(|spend| (spend, spent.confirmations))
+    }
+
+    /// Cancel with both signatures; `other` is the counterparty's.
+    fn cancel(&self, lock: OutPoint, other: &Signature) -> Transaction {
+        let swap = self.swap();
+        let own = swap.sign(lock, Spend::Cancel, &self.secrets.key());
+        let (seller, buyer) = match self.side {
+            Side::Seller => (&own, other),
+            Side::Buyer => (other, &own),
+        };
+        swap.finalize(lock, Spend::Cancel, seller, Some(buyer))
+            .expect("both cancel signatures were verified")
+    }
+
+    /// The counterparty's share, from a redeem or refund it published and
+    /// the adaptor signature we gave it. `None` unless it is exactly the
+    /// share it proved at the start.
+    fn recover(
+        &self,
+        lock: OutPoint,
+        spend: Spend,
+        adaptor: &EncryptedSignature,
+        tx: &Transaction,
+    ) -> Option<[u8; 32]> {
+        let scalar = self.swap().recover_secret(lock, spend, adaptor, tx).ok()?;
+        share_from_secp256k1(&scalar, &self.other_share()).map(|share| share.to_bytes())
+    }
+
+    fn decrypt(&self, adaptor: &EncryptedSignature) -> Signature {
+        let secret = secp256k1_scalar(&self.secrets.share());
+        self.swap().decrypt(&secret, adaptor)
+    }
+}
+
+/// The lock output of a funding transaction: exactly one output pays the
+/// lock script, with exactly the agreed amount, and no input carries a
+/// scriptSig, which a segwit spend never needs.
+fn lock_output(swap: &Swap, funding: &Transaction) -> Option<OutPoint> {
+    let script = swap.lock_script_pubkey();
+    let mut paying = (0..)
+        .zip(&funding.output)
+        .filter(|(_, out)| out.script_pubkey == script);
+    let (vout, out) = paying.next()?;
+    let only = paying.next().is_none();
+    (only
+        && out.value == swap.params().amount
+        && funding.input.iter().all(|i| i.script_sig.is_empty()))
+    .then(|| OutPoint::new(funding.compute_txid(), vout))
+}
+
+/// Whether the NEX lock can be trusted: the transaction the seller named
+/// is on Nexus, credits the lock address at least `nex_amount` across all
+/// its account actions, and is deep enough; the lock address holds at least
+/// `nex_amount` and has never signed; and the node is synced.
+fn nex_lock_holds(terms: &Terms, lock_address: &str, view: &NexusView) -> bool {
+    let Some((tx, confirmations)) = &view.watched else {
+        return false;
+    };
+    let credited: i128 = tx
+        .body
+        .account_actions
+        .iter()
+        .filter(|action| action.owner == lock_address)
+        .map(|action| i128::from(action.delta))
+        .sum();
+    tx.body.chain_path == ["Nexus"]
+        && credited >= i128::from(terms.nex_amount)
+        && confirmations.is_some_and(|c| c >= terms.nex_confirmations)
+        && view.lock.balance >= terms.nex_amount
+        && view.lock.nonce == 0
+        && view.health.phase == "active"
+        && view.health.best_header_height == Some(view.health.height)
+}
+
+/// Claiming the lock address once both shares are known.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Claim {
+    setup: Setup,
+    /// The counterparty's recovered share.
+    #[serde(with = "hex::serde")]
+    other: [u8; 32],
+    /// The claim the node took, once it took one.
+    cid: Option<String>,
+    /// Whether NEX is known to have been locked. If not, an empty lock
+    /// ends the claim instead of being waited for.
+    expect_lock: bool,
+}
+
+#[allow(clippy::large_enum_variant)] // Short-lived: matched on as soon as made.
+enum Claimed {
+    Pending(Claim, Vec<Action>),
+    /// The claim is `nex_confirmations` deep.
+    Done,
+    /// Nothing was locked.
+    Empty,
+    /// Someone else spent the lock.
+    Drained,
+}
+
+impl Claim {
+    fn new(setup: Setup, other: [u8; 32], expect_lock: bool) -> Self {
+        Self {
+            setup,
+            other,
+            cid: None,
+            expect_lock,
+        }
+    }
+
+    /// Transfers everything at the lock address, less the fee, to this
+    /// party: the lock's first and only transaction, nonce 0.
+    fn step(mut self, event: Event) -> Claimed {
+        let terms = &self.setup.terms;
+        match event {
+            Event::Submitted(cid) => {
+                self.cid = Some(cid);
+                Claimed::Pending(self, vec![])
+            }
+            Event::Nexus(view) => match (&self.cid, &view.watched) {
+                (Some(_), Some((_, Some(depth)))) if *depth >= terms.nex_confirmations => {
+                    Claimed::Done
+                }
+                // Our claim is gone and the lock has signed something else.
+                (Some(_), None) if view.lock.nonce > 0 => Claimed::Drained,
+                (Some(_), _) => Claimed::Pending(self, vec![]),
+                (None, _) if view.lock.nonce > 0 => Claimed::Drained,
+                (None, _) if view.lock.balance > terms.nex_fee => {
+                    let claim = self.transaction(view.lock.balance - terms.nex_fee);
+                    Claimed::Pending(self, vec![Action::Submit(claim)])
+                }
+                (None, _) if !self.expect_lock => Claimed::Empty,
+                (None, _) => Claimed::Pending(self, vec![]),
+            },
+            _ => Claimed::Pending(self, vec![]),
+        }
+    }
+
+    fn transaction(&self, amount: u64) -> swap_nexus_tx::Transaction {
+        let other = KeyShare::from_bytes(self.other).expect("a recovered share");
+        let key = JointKey::from_shares(&self.setup.secrets.share(), &other);
+        let body = TransactionBody::transfer(
+            &self.setup.lock_address(),
+            &self.setup.nex_address,
+            amount,
+            self.setup.terms.nex_fee,
+            0,
+        )
+        .expect("the amount is positive and fits");
+        let mut transaction = swap_nexus_tx::Transaction::new(body);
+        transaction.sign_joint(&key);
+        transaction
+    }
+}
+
+/// A party's side of the swap: [`Seller`] or [`Buyer`].
+pub trait Machine: Clone + Serialize + serde::de::DeserializeOwned {
+    /// The next state, and what to do before anything else is fed in.
+    fn step(self, event: Event) -> (Self, Vec<Action>);
+    /// How the swap ended, once it has.
+    fn outcome(&self) -> Option<Outcome>;
+    /// Nothing is at stake yet and the machine waits on the counterparty:
+    /// if it stays quiet, the driver sends [`Event::Timeout`].
+    fn awaits_message(&self) -> bool;
+    fn watch(&self) -> Watch;
+}
+
+/// What a driver should watch for a machine in its current state.
+pub struct Watch {
+    /// The swap and its lock output, once the lock is agreed.
+    pub bitcoin: Option<(Swap, OutPoint)>,
+    pub nexus: Option<NexusWatch>,
+}
+
+pub struct NexusWatch {
+    pub lock_address: String,
+    pub own_address: String,
+    /// The transaction to report in [`NexusView::watched`].
+    pub cid: Option<String>,
+}
+
+impl Setup {
+    fn watch_nexus(&self, cid: Option<&String>) -> Option<NexusWatch> {
+        Some(NexusWatch {
+            lock_address: self.lock_address(),
+            own_address: self.nex_address.clone(),
+            cid: cid.cloned(),
+        })
+    }
+}
+
+/// A Bitcoin transaction as consensus hex.
+mod hex_tx {
+    use super::*;
+    use serde::de::Error;
+
+    pub fn serialize<S: Serializer>(tx: &Transaction, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&serialize_hex(tx))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Transaction, D::Error> {
+        let hex = String::deserialize(deserializer)?;
+        deserialize_hex(&hex).map_err(D::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod tests;
