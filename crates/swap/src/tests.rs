@@ -989,3 +989,91 @@ fn a_swap_cannot_be_started_twice() {
         "the first swap's secrets are kept"
     );
 }
+
+// The re-review's findings, each pinned.
+
+/// The claim debits exactly the `nex_amount` the lock credited: dust on
+/// top, which a reorg may take back, stays behind.
+#[test]
+fn the_claim_takes_exactly_the_locked_amount() {
+    let buyer = buyer_claiming();
+    let lock_address = buyer.lock_address().unwrap();
+    let (_, actions) = buyer.clone().step(nexus(account(500_007, 0), None));
+    assert_eq!(
+        submitted(&actions).body,
+        TransactionBody::transfer(&lock_address, BUYER_NEX, 499_900, 100, 0).unwrap()
+    );
+    // Dust alone is not the lock.
+    let (buyer, actions) = buyer.step(nexus(account(7, 0), None));
+    assert!(actions.is_empty());
+    assert_eq!(buyer.outcome(), None);
+}
+
+/// Dust at the lock address is not an empty lock: the seller keeps its
+/// shares.
+#[test]
+fn an_empty_lock_holds_nothing_at_all() {
+    let locked = locked();
+    let (seller, _) = locked.seller.step(btc(18, None, None));
+    let (cancel, refund) = cancel_and_refund(locked.buyer);
+    let (seller, _) = seller.step(btc(21, Some((&cancel, 1)), Some((&refund, 0))));
+    assert!(matches!(seller, Seller::ClaimingNex(_)));
+    let (seller, actions) = seller.step(nexus(account(1, 0), None));
+    assert!(actions.is_empty());
+    assert_eq!(seller.outcome(), None, "dust");
+    let (seller, _) = seller.step(nexus(account(0, 0), None));
+    assert_eq!(seller.outcome(), Some(Outcome::Refunded));
+}
+
+/// The buyer saw the lock confirmed: if it vanishes, a reorg took it, and
+/// the buyer keeps its shares to claim it when it comes back.
+#[test]
+fn a_lock_the_buyer_saw_is_waited_for() {
+    let buyer = buyer_claiming();
+    let (buyer, actions) = buyer.step(nexus(account(0, 0), None));
+    assert!(actions.is_empty());
+    assert_eq!(buyer.outcome(), None, "the lock was reorged out");
+    let (buyer, _) = buyer.step(nexus(account(0, 0), None));
+    let (_, actions) = buyer.step(nexus(account(500_000, 0), None));
+    assert!(submitted(&actions).verify(), "the lock is back: claimed");
+}
+
+/// The seller names its lock only once it is mined, never while it is
+/// only pooled.
+#[test]
+fn the_seller_names_its_lock_only_once_mined() {
+    let (seller, _, lock) = locked().nex_signed();
+    let pooled = mined(lock.body.clone(), 1).map(|(tx, _)| (tx, None));
+    let (seller, actions) = seller.step(nexus(account(500_000, 0), pooled));
+    assert!(sends(&actions).is_empty());
+    assert_eq!(submitted(&actions), lock);
+    assert!(matches!(seller, Seller::LockingNex { .. }));
+    let (_, actions) = seller.step(nexus(account(500_000, 0), mined(lock.body.clone(), 1)));
+    assert!(matches!(sent(&actions), Message::NexLocked { .. }));
+}
+
+/// A funding the buyer's node never shows, however often it is broadcast,
+/// cannot confirm: `t1` blocks on, the buyer stops. One in the mempool may
+/// yet confirm, and is waited for.
+#[test]
+fn the_buyer_stops_on_a_funding_that_never_shows() {
+    let buyer = locked().buyer;
+    assert!(matches!(buyer, Buyer::AwaitNexLock { .. }));
+    let view = |height, funding| {
+        Event::Bitcoin(BitcoinView {
+            height,
+            funding,
+            lock_spend: None,
+            cancel_spend: None,
+        })
+    };
+    let (buyer, actions) = buyer.step(view(100, None));
+    assert_eq!(broadcasts(&actions).len(), 1, "broadcast again");
+    let (buyer, _) = buyer.step(view(119, None));
+    assert!(matches!(buyer, Buyer::AwaitNexLock { .. }));
+    let (stopped, actions) = buyer.clone().step(view(120, None));
+    assert!(actions.is_empty());
+    assert_eq!(stopped.outcome(), Some(Outcome::Aborted(Refusal::Timeout)));
+    let (pooled, _) = buyer.step(view(130, Some(0)));
+    assert!(matches!(pooled, Buyer::AwaitNexLock { .. }));
+}

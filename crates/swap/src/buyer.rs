@@ -18,10 +18,13 @@ pub enum Buyer {
     /// they are out, broadcasts the funding transaction.
     SendingSignatures(BuyerLocked),
     /// Has broadcast the funding transaction. `cid` is the NEX lock the
-    /// seller named.
+    /// seller named. `since` is the height it started waiting at: if its
+    /// node still shows no funding `t1` blocks later, the funding cannot
+    /// confirm, so the seller never locks, and the buyer stops.
     AwaitNexLock {
         locked: BuyerLocked,
         cid: Option<String>,
+        since: Option<u32>,
     },
     /// Has sent its redeem adaptor signature.
     AwaitRedeem {
@@ -179,23 +182,39 @@ impl Machine for Buyer {
             // the funding waits for them to be sent.
             (SendingSignatures(locked), Event::Sent) => {
                 let broadcast = Action::Broadcast(locked.funding.clone());
-                (AwaitNexLock { locked, cid: None }, vec![broadcast])
+                let since = None;
+                (
+                    AwaitNexLock {
+                        locked,
+                        cid: None,
+                        since,
+                    },
+                    vec![broadcast],
+                )
             }
-            (AwaitNexLock { locked, cid: None }, Event::Message(Message::NexLocked { cid })) => {
+            (
+                AwaitNexLock {
+                    locked,
+                    cid: None,
+                    since,
+                },
+                Event::Message(Message::NexLocked { cid }),
+            ) => {
                 let cid = Some(cid);
-                (AwaitNexLock { locked, cid }, vec![])
+                (AwaitNexLock { locked, cid, since }, vec![])
             }
             (
                 AwaitNexLock {
                     locked,
                     cid: Some(cid),
+                    since,
                 },
                 Event::Nexus(view),
             ) => {
                 let setup = &locked.setup;
                 if !nex_lock_holds(&setup.terms, &setup.lock_address(), &view) {
                     let cid = Some(cid);
-                    return (AwaitNexLock { locked, cid }, vec![]);
+                    return (AwaitNexLock { locked, cid, since }, vec![]);
                 }
                 let redeem = setup
                     .swap()
@@ -206,7 +225,7 @@ impl Machine for Buyer {
                 };
                 (AwaitRedeem { locked, redeem }, vec![Action::Send(message)])
             }
-            (AwaitNexLock { locked, cid }, Event::Bitcoin(view)) => {
+            (AwaitNexLock { locked, cid, since }, Event::Bitcoin(view)) => {
                 if locked.gives_up(&view) {
                     return Cancelling {
                         locked,
@@ -214,12 +233,20 @@ impl Machine for Buyer {
                     }
                     .step(Event::Bitcoin(view));
                 }
+                let since = since.unwrap_or(view.height);
+                // Its inputs stay with the wallet. Only a funding no node of
+                // ours shows: one still in the mempool may yet confirm.
+                if view.funding.is_none() && view.height >= since + u32::from(locked.setup.terms.t1)
+                {
+                    return abort(Refusal::Timeout);
+                }
                 // Broadcast again until a node shows it.
                 let actions = match view.funding {
                     None => vec![Action::Broadcast(locked.funding.clone())],
                     Some(_) => vec![],
                 };
-                (AwaitNexLock { locked, cid }, actions)
+                let since = Some(since);
+                (AwaitNexLock { locked, cid, since }, actions)
             }
             (AwaitRedeem { locked, redeem }, Event::Bitcoin(view)) => {
                 if locked.gives_up(&view) {
@@ -269,7 +296,7 @@ impl Machine for Buyer {
         use Buyer::*;
         let bitcoin = |locked: &BuyerLocked| Some((locked.setup.swap(), locked.lock));
         match self {
-            AwaitNexLock { locked, cid } => Watch {
+            AwaitNexLock { locked, cid, .. } => Watch {
                 bitcoin: bitcoin(locked),
                 nexus: cid
                     .as_ref()

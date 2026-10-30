@@ -26,7 +26,8 @@ pub trait Bitcoin {
     /// The height of the tip.
     fn height(&self) -> Result<u32>;
     /// The transaction `txid` in the mempool or the chain, with its
-    /// confirmations (0 in the mempool); `None` if the node knows neither.
+    /// confirmations (0 in the mempool); `None` if the node knows neither,
+    /// as for a transaction only in a block that left the active chain.
     fn transaction(&self, txid: Txid) -> Result<Option<(Transaction, u32)>>;
     /// A transaction from the wallet paying `amount` to `script`, signed but
     /// not broadcast.
@@ -104,6 +105,12 @@ impl Bitcoin for Bitcoind {
         match self.call("getrawtransaction", json!([txid, 1])) {
             Ok(tx) => {
                 let confirmations = tx["confirmations"].as_u64().unwrap_or(0) as u32;
+                // `-txindex` still finds a transaction whose block left the
+                // active chain: with that block's hash and 0 confirmations.
+                // A mempool answer has no block hash.
+                if !tx["blockhash"].is_null() && confirmations == 0 {
+                    return Ok(None);
+                }
                 Ok(Some((decode(&tx["hex"])?, confirmations)))
             }
             // RPC_INVALID_ADDRESS_OR_KEY: no such transaction.

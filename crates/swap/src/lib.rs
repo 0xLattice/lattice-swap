@@ -27,6 +27,13 @@
 //! `b`, and S claims its NEX back. If B never refunds, S punishes after
 //! `t2` and keeps the BTC.
 //!
+//! A seller that signed a NEX lock at nonce `n` and then learned `b` keeps
+//! the shares and waits in `ClaimingNex` while the lock address is empty:
+//! the lock can still land until the seller's nonce passes `n`. If its node
+//! refused that lock for good, the operator ends the wait by spending once
+//! from the seller's Nexus wallet, at nonce `n`, with any transaction. Once
+//! that is mined the lock can never land, and the swap ends `Refunded`.
+//!
 //! Every timelock counts blocks after a confirmation, so every deadline here
 //! is a number of confirmations: a transaction with a relative timelock of
 //! `t` blocks can be broadcast once the output it spends is `t` deep.
@@ -573,7 +580,7 @@ impl Claim {
         }
     }
 
-    /// Transfers everything at the lock address, less the fee, to this
+    /// Transfers `nex_amount`, less the fee, from the lock address to this
     /// party: the lock's first and only transaction, nonce 0.
     fn step(mut self, event: Event) -> Claimed {
         let Event::Nexus(view) = event else {
@@ -596,24 +603,27 @@ impl Claim {
         if view.lock.nonce > 0 {
             return Claimed::Drained;
         }
-        // The claim is signed once, for the balance it sees: only a synced
-        // node shows the lock as it is.
+        // Only a synced node shows the lock as it is.
         if !synced(&view.health) {
             return Claimed::Pending(self, vec![]);
         }
+        // The claim is signed once, and debits exactly the `nex_amount` the
+        // lock credits: never the momentary balance, whose extra dust a
+        // reorg can take back and leave the claim refused forever.
         let fee = terms.nex_fee.max(view.min_relay_fee);
-        if view.lock.balance > fee {
-            let claim = self.transaction(view.lock.balance - fee, fee);
+        if view.lock.balance >= terms.nex_amount && terms.nex_amount > fee {
+            let claim = self.transaction(terms.nex_amount - fee, fee);
             self.claim = Some(claim.clone());
             return Claimed::Pending(self, vec![Action::Submit(claim)]);
         }
-        let empty = match self.lock {
-            Lock::Unsigned => true,
-            // The seller's nonce moved past its lock, which did not credit
-            // the lock address: the lock can never land.
-            Lock::Signed(nonce) => view.own.nonce > nonce,
-            Lock::Seen => false,
-        };
+        let empty = view.lock.balance == 0
+            && match self.lock {
+                Lock::Unsigned => true,
+                // The seller's nonce moved past its lock, which did not credit
+                // the lock address: the lock can never land.
+                Lock::Signed(nonce) => view.own.nonce > nonce,
+                Lock::Seen => false,
+            };
         if empty {
             Claimed::Empty
         } else {
