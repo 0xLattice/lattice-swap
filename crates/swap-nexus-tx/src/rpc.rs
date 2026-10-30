@@ -69,6 +69,9 @@ pub struct TransactionStatus {
     /// Rebuilt from the node's explorer view, which lists account actions,
     /// signers, nonce and chain path but not general `actions`; a transaction
     /// with deposit, receipt or withdrawal actions is an error instead.
+    /// Because `actions` may be missing, this is not necessarily the body that
+    /// was signed: do not hash or verify it. Use it only to read what the
+    /// transaction credits.
     pub body: TransactionBody,
     /// The canonical block that executed it, if any.
     pub block: Option<Inclusion>,
@@ -274,4 +277,57 @@ fn decimal<T: std::str::FromStr>(json: &Value, field: &str) -> Result<T> {
         .as_str()
         .and_then(|text| text.parse().ok())
         .ok_or_else(|| Error::Malformed(format!("{field} is not a decimal string in {json}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::net::TcpListener;
+
+    /// A client whose node answers every request with `json`.
+    fn answering(json: serde_json::Value) -> Client {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+            let body = json.to_string();
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.write_all(body.as_bytes()).unwrap();
+        });
+        Client::new(&url, "cookie", Duration::from_secs(5))
+    }
+
+    #[test]
+    fn transactions_with_other_actions_are_refused() {
+        let answer = serde_json::json!({
+            "accountActions": [{"owner": "a", "delta": "5"}],
+            "depositActions": [],
+            "receiptActions": [],
+            "withdrawalActions": [],
+            "signers": ["a"],
+            "nonce": "0",
+            "chainPath": ["Nexus"],
+        });
+        let status = answering(answer.clone())
+            .transaction("cid")
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.body.account_actions[0].delta, 5);
+        for kind in ["depositActions", "receiptActions", "withdrawalActions"] {
+            let mut answer = answer.clone();
+            answer[kind] = serde_json::json!([{}]);
+            let result = answering(answer).transaction("cid");
+            assert!(
+                matches!(result, Err(Error::Malformed(_))),
+                "{kind}: {result:?}"
+            );
+        }
+    }
 }
