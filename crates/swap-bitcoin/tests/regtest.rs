@@ -5,9 +5,13 @@ use corepc_node::{Conf, Node};
 use rand_core::OsRng;
 use swap_bitcoin::bitcoin::consensus::encode::deserialize_hex;
 use swap_bitcoin::bitcoin::hashes::Hash;
+use swap_bitcoin::bitcoin::sighash::{Prevouts, SighashCache};
+use swap_bitcoin::bitcoin::taproot::{LeafVersion, TapLeafHash};
 use swap_bitcoin::bitcoin::{
-    Address, Amount, Network, OutPoint, ScriptBuf, Transaction, Txid, WPubkeyHash,
+    Address, Amount, Network, OutPoint, Script, ScriptBuf, Sequence, TapSighashType, Transaction,
+    TxOut, Txid, WPubkeyHash,
 };
+use swap_bitcoin::schnorr_fun;
 use swap_bitcoin::{Error, EvenY, KeyPair, Params, Party, Point, Scalar, Spend, Swap};
 
 const T1: u16 = 10;
@@ -146,9 +150,43 @@ fn funded() -> (Chain, Parties, Swap, OutPoint) {
     (chain, parties, swap, lock)
 }
 
+/// `tx` with its relative timelock one block short, re-signed by `signers`
+/// (in witness order) so that only the script's own CSV can reject it.
+fn one_block_short(tx: &Transaction, prevout: TxOut, signers: &[&KeyPair<EvenY>]) -> Transaction {
+    let mut tx = tx.clone();
+    tx.input[0].sequence = Sequence(tx.input[0].sequence.0 - 1);
+    let items = tx.input[0].witness.to_vec();
+    let leaf = Script::from_bytes(&items[items.len() - 2]);
+    let sighash = SighashCache::new(&tx)
+        .taproot_script_spend_signature_hash(
+            0,
+            &Prevouts::All(&[prevout]),
+            TapLeafHash::from_script(leaf, LeafVersion::TapScript),
+            TapSighashType::Default,
+        )
+        .unwrap()
+        .to_byte_array();
+    let schnorr = schnorr_fun::new_with_deterministic_nonces::<sha2::Sha256>();
+    let mut items = items.clone();
+    for (item, key) in items.iter_mut().zip(signers) {
+        *item = schnorr
+            .sign(key, schnorr_fun::Message::raw(&sighash))
+            .to_bytes()
+            .to_vec();
+    }
+    tx.input[0].witness = items.into();
+    tx
+}
+
+fn assert_csv_rejects(chain: &Chain, tx: &Transaction) {
+    let err = chain.broadcast(tx).unwrap_err();
+    assert!(err.contains("Locktime requirement not satisfied"), "{err}");
+}
+
 /// Setup's cancel exchange: each signs, each checks the other's signature,
 /// then cancel is broadcast once the lock is `t1` blocks deep and mined.
-fn cancel(chain: &Chain, parties: &Parties, swap: &Swap, lock: OutPoint) {
+/// Returns cancel as mined.
+fn cancel(chain: &Chain, parties: &Parties, swap: &Swap, lock: OutPoint) -> Transaction {
     let seller_sig = swap.sign(lock, Spend::Cancel, &parties.seller);
     let buyer_sig = swap.sign(lock, Spend::Cancel, &parties.buyer);
     assert!(swap.verify(lock, Spend::Cancel, Party::Seller, &seller_sig));
@@ -162,9 +200,19 @@ fn cancel(chain: &Chain, parties: &Parties, swap: &Swap, lock: OutPoint) {
     chain.mine(T1 as usize - 2);
     let early = chain.broadcast(&tx).unwrap_err();
     assert!(early.contains("non-BIP68-final"), "{early}");
+
+    // A cancel asking for one block less passes BIP68 here, so only the
+    // leaf's `<t1> CSV` stops it.
+    let prevout = TxOut {
+        value: swap.params().amount,
+        script_pubkey: swap.lock_script_pubkey(),
+    };
+    let short = one_block_short(&tx, prevout, &[&parties.buyer, &parties.seller]);
+    assert_csv_rejects(chain, &short);
+
     chain.mine(1);
     let txid = chain.broadcast(&tx).unwrap();
-    chain.mine_and_fetch(txid);
+    chain.mine_and_fetch(txid)
 }
 
 #[test]
@@ -230,7 +278,7 @@ fn cancel_then_refund_reveals_b() {
 #[test]
 fn cancel_then_punish_after_t2() {
     let (chain, parties, swap, lock) = funded();
-    cancel(&chain, &parties, &swap, lock);
+    let cancel_tx = cancel(&chain, &parties, &swap, lock);
 
     let seller_sig = swap.sign(lock, Spend::Punish, &parties.seller);
     let tx = swap
@@ -241,6 +289,11 @@ fn cancel_then_punish_after_t2() {
     chain.mine(T2 as usize - 2);
     let early = chain.broadcast(&tx).unwrap_err();
     assert!(early.contains("non-BIP68-final"), "{early}");
+
+    // Same for punish against the leaf's `<t2> CSV`.
+    let short = one_block_short(&tx, cancel_tx.output[0].clone(), &[&parties.seller]);
+    assert_csv_rejects(&chain, &short);
+
     chain.mine(1);
     let txid = chain.broadcast(&tx).unwrap();
     chain.mine_and_fetch(txid);

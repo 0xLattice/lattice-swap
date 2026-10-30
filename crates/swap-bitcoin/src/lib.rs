@@ -18,6 +18,19 @@
 //! Every output uses the BIP341 NUMS point as its internal key, so every spend
 //! is a script-path spend. Each transaction pays one fixed absolute fee.
 //!
+//! Rules for whoever drives these transactions:
+//!
+//! - The buyer funds the lock with exactly `amount` to `lock_script_pubkey`,
+//!   from segwit inputs only, so the lock txid cannot be malleated after the
+//!   cancel and refund signatures are made.
+//! - Both parties use fresh shares and keys for every swap.
+//! - The seller stops trying to redeem a safe margin before `t1`: a redeem
+//!   still unconfirmed when cancel becomes valid can lose the race while `s`
+//!   is already public.
+//! - The buyer refunds a safe margin before `t2`, or the seller can punish.
+//! - Both parties watch the mempool, not only blocks. A redeem in the mempool
+//!   already reveals `s`, and a refund in the mempool already reveals `b`.
+//!
 //! TODO: fee bumping. The fee is fixed when the swap is set up; there is no
 //! CPFP anchor or RBF path, so a fee that is too low for the mempool at
 //! broadcast time cannot be raised.
@@ -99,6 +112,10 @@ pub enum Error {
     Timelock,
     /// After fees, an output would be dust or negative.
     Amount,
+    /// The fee is below 1 sat/vB for the largest of the four spends.
+    Fee,
+    /// `A == B` or `S == T_b`.
+    Keys,
     /// This party's signature does not verify.
     Signature(Party),
     /// The spend needs a signature that was not given, or was given one it
@@ -114,6 +131,8 @@ impl std::fmt::Display for Error {
         match self {
             Error::Timelock => write!(f, "timelocks must be at least one block"),
             Error::Amount => write!(f, "amount does not cover fees above dust"),
+            Error::Fee => write!(f, "fee is below the minimum relay fee"),
+            Error::Keys => write!(f, "the two parties' keys or shares are equal"),
             Error::Signature(party) => write!(f, "{party:?} signature does not verify"),
             Error::Signatures => write!(f, "wrong set of signatures for this spend"),
             Error::Recovery => write!(f, "no secret to recover from this transaction"),
@@ -137,9 +156,13 @@ pub struct Swap {
 }
 
 impl Swap {
-    /// Fails if a timelock is zero or any payout would be dust after fees:
-    /// a refund that cannot relay would strand the BTC.
+    /// Fails if the parties' keys or shares coincide, a timelock is zero, any
+    /// payout would be dust after fees, or the fee is below 1 sat/vB for any
+    /// spend: a refund that cannot relay would strand the BTC.
     pub fn new(params: Params) -> Result<Self, Error> {
+        if params.seller == params.buyer || params.seller_share == params.buyer_share {
+            return Err(Error::Keys);
+        }
         if params.t1 == 0 || params.t2 == 0 {
             return Err(Error::Timelock);
         }
@@ -184,7 +207,7 @@ impl Swap {
 
         let lock = two_leaves(&two_of_two, &cancel_leaf);
         let cancel = two_leaves(&two_of_two, &punish_leaf);
-        Ok(Self {
+        let swap = Self {
             params,
             two_of_two,
             cancel_leaf,
@@ -192,7 +215,24 @@ impl Swap {
             lock,
             cancel,
             schnorr: Bip340::default(),
-        })
+        };
+
+        // Size each spend with placeholder signatures: the witness has the
+        // same shape and size once signed.
+        let largest = [Spend::Redeem, Spend::Cancel, Spend::Refund, Spend::Punish]
+            .into_iter()
+            .map(|spend| {
+                let buyer = (spend != Spend::Punish).then_some([0; 64]);
+                let mut tx = swap.unsigned_tx(OutPoint::null(), spend);
+                tx.input[0].witness = swap.witness(spend, [0; 64], buyer);
+                tx.vsize() as u64
+            })
+            .max()
+            .expect("four spends");
+        if swap.params.fee < Amount::from_sat(largest) {
+            return Err(Error::Fee);
+        }
+        Ok(swap)
     }
 
     pub fn params(&self) -> &Params {
@@ -336,27 +376,9 @@ impl Swap {
             }
         }
 
-        let leaf = self.leaf(spend);
-        let tree = match spend {
-            Spend::Redeem | Spend::Cancel => &self.lock,
-            Spend::Refund | Spend::Punish => &self.cancel,
-        };
-        let control = tree
-            .control_block(&(leaf.clone(), LeafVersion::TapScript))
-            .expect("leaf is in the tree");
-
-        // The script checks A first, so A's signature must be on top of the
-        // stack: the last element before the script.
-        let mut witness = Witness::new();
-        if let Some(buyer) = buyer {
-            witness.push(buyer.to_bytes());
-        }
-        witness.push(seller.to_bytes());
-        witness.push(leaf.as_bytes());
-        witness.push(control.serialize());
-
         let mut tx = self.unsigned_tx(lock, spend);
-        tx.input[0].witness = witness;
+        tx.input[0].witness =
+            self.witness(spend, seller.to_bytes(), buyer.map(Signature::to_bytes));
         Ok(tx)
     }
 
@@ -391,6 +413,27 @@ impl Swap {
         self.schnorr
             .recover_decryption_key(&encryption_key, encrypted, &sig)
             .ok_or(Error::Recovery)
+    }
+
+    /// The script checks A first, so A's signature must be on top of the
+    /// stack: the last element before the script.
+    fn witness(&self, spend: Spend, seller: [u8; 64], buyer: Option<[u8; 64]>) -> Witness {
+        let leaf = self.leaf(spend);
+        let tree = match spend {
+            Spend::Redeem | Spend::Cancel => &self.lock,
+            Spend::Refund | Spend::Punish => &self.cancel,
+        };
+        let control = tree
+            .control_block(&(leaf.clone(), LeafVersion::TapScript))
+            .expect("leaf is in the tree");
+        let mut witness = Witness::new();
+        if let Some(buyer) = buyer {
+            witness.push(buyer);
+        }
+        witness.push(seller);
+        witness.push(leaf.as_bytes());
+        witness.push(control.serialize());
+        witness
     }
 
     fn cancel_output(&self) -> ScriptBuf {
@@ -446,4 +489,137 @@ fn two_leaves(first: &ScriptBuf, second: &ScriptBuf) -> TaprootSpendInfo {
         .expect("two leaves at depth 1")
         .finalize(&Secp256k1::verification_only(), nums)
         .expect("complete tree")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::{Txid, WPubkeyHash};
+    use sha2::Digest;
+
+    fn key(n: u8) -> KeyPair<EvenY> {
+        let mut bytes = [0u8; 32];
+        bytes[31] = n;
+        KeyPair::new_xonly(Scalar::from_bytes(bytes).unwrap().non_zero().unwrap())
+    }
+
+    fn payout() -> ScriptBuf {
+        ScriptBuf::new_p2wpkh(&WPubkeyHash::from_byte_array([7; 20]))
+    }
+
+    fn params() -> Params {
+        Params {
+            seller: key(1).public_key(),
+            buyer: key(2).public_key(),
+            seller_share: key(3).public_key().normalize(),
+            buyer_share: key(4).public_key().normalize(),
+            amount: Amount::from_sat(100_000_000),
+            fee: Amount::from_sat(1_000),
+            t1: 288,
+            t2: 144,
+            redeem_payout: payout(),
+            refund_payout: payout(),
+            punish_payout: payout(),
+        }
+    }
+
+    fn lock() -> OutPoint {
+        OutPoint::new(Txid::from_byte_array([9; 32]), 0)
+    }
+
+    fn rejects(params: Params) -> Error {
+        Swap::new(params).err().expect("rejected")
+    }
+
+    #[test]
+    fn nums_is_the_hash_of_the_generator() {
+        let g = schnorr_fun::fun::G.normalize().to_bytes_uncompressed();
+        assert_eq!(<[u8; 32]>::from(Sha256::digest(g)), NUMS);
+    }
+
+    #[test]
+    fn lock_output_key_is_pinned() {
+        let swap = Swap::new(params()).unwrap();
+        assert_eq!(
+            swap.lock.output_key().to_x_only_public_key().to_string(),
+            "9e6d383919aaf9fb2afab873372f44a7ce3573363068f630f05385e25e9ec67c"
+        );
+    }
+
+    #[test]
+    fn amount_must_cover_two_fees_above_dust() {
+        let dust = payout().minimal_non_dust().to_sat();
+        let fee = params().fee.to_sat();
+        let with = |amount| Params {
+            amount: Amount::from_sat(amount),
+            ..params()
+        };
+        assert_eq!(rejects(with(fee - 1)), Error::Amount);
+        assert_eq!(rejects(with(2 * fee - 1)), Error::Amount);
+        assert_eq!(rejects(with(2 * fee + dust - 1)), Error::Amount);
+        assert!(Swap::new(with(2 * fee + dust)).is_ok());
+    }
+
+    #[test]
+    fn timelocks_must_be_nonzero() {
+        assert_eq!(rejects(Params { t1: 0, ..params() }), Error::Timelock);
+        assert_eq!(rejects(Params { t2: 0, ..params() }), Error::Timelock);
+    }
+
+    #[test]
+    fn parties_must_differ() {
+        let p = params();
+        let same_key = Params {
+            buyer: p.seller,
+            ..params()
+        };
+        let same_share = Params {
+            buyer_share: p.seller_share,
+            ..params()
+        };
+        assert_eq!(rejects(same_key), Error::Keys);
+        assert_eq!(rejects(same_share), Error::Keys);
+    }
+
+    #[test]
+    fn fee_covers_one_sat_per_vbyte_of_the_largest_signed_spend() {
+        let swap = Swap::new(params()).unwrap();
+        let (seller, buyer) = (key(1), key(2));
+        let largest = [Spend::Redeem, Spend::Cancel, Spend::Refund, Spend::Punish]
+            .into_iter()
+            .map(|spend| {
+                let a = swap.sign(lock(), spend, &seller);
+                let b = (spend != Spend::Punish).then(|| swap.sign(lock(), spend, &buyer));
+                let tx = swap.finalize(lock(), spend, &a, b.as_ref()).unwrap();
+                tx.vsize() as u64
+            })
+            .max()
+            .unwrap();
+        let with = |fee| Params {
+            fee: Amount::from_sat(fee),
+            ..params()
+        };
+        assert_eq!(rejects(with(0)), Error::Fee);
+        assert_eq!(rejects(with(largest - 1)), Error::Fee);
+        assert!(Swap::new(with(largest)).is_ok());
+    }
+
+    #[test]
+    fn finalize_takes_exactly_the_spend_signers() {
+        let swap = Swap::new(params()).unwrap();
+        let (seller, buyer) = (key(1), key(2));
+
+        // Valid signatures, wrong count: punish is A alone, redeem needs both.
+        let a = swap.sign(lock(), Spend::Punish, &seller);
+        let b = swap.sign(lock(), Spend::Punish, &buyer);
+        assert_eq!(
+            swap.finalize(lock(), Spend::Punish, &a, Some(&b)),
+            Err(Error::Signatures)
+        );
+        let a = swap.sign(lock(), Spend::Redeem, &seller);
+        assert_eq!(
+            swap.finalize(lock(), Spend::Redeem, &a, None),
+            Err(Error::Signatures)
+        );
+    }
 }
