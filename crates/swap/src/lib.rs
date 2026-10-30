@@ -39,8 +39,8 @@
 //! and waits, keeping its secrets: other nodes may still hold the funding
 //! and confirm it, and only those secrets can then refund it. The operator
 //! ends the wait by spending one of the funding's inputs elsewhere; once
-//! that is confirmed the funding can never confirm and the swap file can
-//! be discarded.
+//! that is `btc_confirmations` deep the funding can no longer confirm and
+//! the swap file can be discarded.
 //!
 //! Every timelock counts blocks after a confirmation, so every deadline here
 //! is a number of confirmations: a transaction with a relative timelock of

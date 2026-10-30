@@ -1024,6 +1024,27 @@ fn dust_does_not_keep_an_empty_lock_open() {
     assert_eq!(seller.outcome(), Some(Outcome::Refunded));
 }
 
+/// A lock that landed but would cost more to claim than it holds is not
+/// empty: the seller keeps its shares.
+#[test]
+fn a_lock_too_small_to_claim_is_not_empty() {
+    let locked = locked();
+    let (seller, _) = locked.seller.step(btc(18, None, None));
+    let (cancel, refund) = cancel_and_refund(locked.buyer);
+    let (seller, _) = seller.step(btc(21, Some((&cancel, 1)), Some((&refund, 0))));
+    assert!(matches!(seller, Seller::ClaimingNex(_)));
+    let costly = Event::Nexus(NexusView {
+        health: healthy(),
+        own: account(10_000_000, 3),
+        lock: account(500_000, 0),
+        min_relay_fee: 500_000,
+        watched: None,
+    });
+    let (seller, actions) = seller.step(costly);
+    assert!(actions.is_empty());
+    assert_eq!(seller.outcome(), None);
+}
+
 /// The buyer saw the lock confirmed: if it vanishes, a reorg took it, and
 /// the buyer keeps its shares to claim it when it comes back.
 #[test]
