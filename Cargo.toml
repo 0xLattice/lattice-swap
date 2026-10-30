@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/swap-bitcoin", "crates/swap-core", "crates/swap-nexus", "crates/swap-nexus-tx"]
+members = ["crates/swap", "crates/swap-bitcoin", "crates/swap-core", "crates/swap-nexus", "crates/swap-nexus-tx"]
 
 [workspace.package]
 edition = "2021"

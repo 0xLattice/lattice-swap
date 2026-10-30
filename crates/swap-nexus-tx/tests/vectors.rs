@@ -254,3 +254,43 @@ fn encoding_boundaries_match_lattice() {
         assert_eq!(body.signing_preimage(), text(&v["preimage"]), "{name}");
     }
 }
+
+/// The signed-transaction envelope a node names a transaction by.
+#[test]
+fn signed_transactions_encode_byte_for_byte() {
+    let encoding = vectors("encoding");
+    let vector = |name: &str| encoding.iter().find(|v| v["name"] == name).unwrap();
+    let signing = vectors("signing");
+    let signed_body = |name: &str| {
+        let v = signing.iter().find(|v| v["name"] == name).unwrap();
+        body_from_cbor(&hex::decode(text(&v["transactionBodyDagCborHex"])).unwrap()).unwrap()
+    };
+    let cases = [
+        (
+            "transaction/signed",
+            body_from_json(&vector("transaction-body/account-action")["value"]).unwrap(),
+        ),
+        (
+            "transaction/signed-two-signers",
+            signed_body("transaction/two-signers/alice"),
+        ),
+    ];
+    for (name, body) in cases {
+        let v = vector(name);
+        assert_eq!(body.cid(), text(&v["value"]["body"]["rawCID"]), "{name}");
+        let mut transaction = Transaction::new(body);
+        for signature in v["value"]["signatures"].as_array().unwrap() {
+            transaction.signatures.insert(
+                text(&signature["key"]).into(),
+                text(&signature["value"]).into(),
+            );
+        }
+        assert!(transaction.verify(), "{name}");
+        assert_eq!(
+            hex::encode(transaction.to_dag_cbor()),
+            text(&v["dagCborHex"]),
+            "{name}"
+        );
+        assert_eq!(transaction.cid(), text(&v["cid"]), "{name}");
+    }
+}

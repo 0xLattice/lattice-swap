@@ -1,0 +1,30 @@
+[package]
+name = "swap"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "NEX<->BTC atomic swaps end to end: the protocol, its messages and the drivers that run it"
+
+[dependencies]
+swap-bitcoin = { path = "../swap-bitcoin" }
+swap-core = { path = "../swap-core" }
+swap-nexus = { path = "../swap-nexus" }
+swap-nexus-tx = { path = "../swap-nexus-tx" }
+base64 = "0.22"
+bitcoin = { version = "0.32", features = ["serde"] }
+curve25519-dalek = "4"
+ed25519-dalek = "2"
+hex = { version = "0.4", features = ["serde"] }
+ivy = { git = "https://github.com/0xLattice/ivy-rs", rev = "e020256" }
+# `ivy` does not re-export the peer key type.
+ivy-core = { git = "https://github.com/0xLattice/ivy-rs", rev = "e020256" }
+rand_core = { version = "0.6", features = ["getrandom"] }
+schnorr_fun = { version = "0.13", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["net", "rt", "time"] }
+ureq = { version = "2", default-features = false, features = ["json"] }
+
+[dev-dependencies]
+corepc-node = { version = "0.12", features = ["30_2", "download"] }
+tempfile = "3"

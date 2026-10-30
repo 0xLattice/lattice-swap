@@ -108,6 +108,7 @@ impl Node {
     /// node reports it in the tip.
     fn confirm(&self, transaction: &Transaction) -> String {
         let cid = self.client.submit(transaction).unwrap();
+        assert_eq!(cid, transaction.cid(), "the node names it as we do");
         assert_eq!(self.client.confirmations(&cid).unwrap(), None);
         self.mine(None);
         // Inclusion is read from the executed chain, which can trail the
