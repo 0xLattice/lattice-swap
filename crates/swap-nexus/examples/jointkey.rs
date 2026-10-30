@@ -22,7 +22,7 @@ fn main() {
             println!("b={}", hex::encode(b.to_bytes()));
             println!(
                 "A={}",
-                hex::encode(joint_public_key(&a.public(), &b.public()))
+                hex::encode(joint_public_key(&a.public(), &b.public()).unwrap())
             );
             println!("A_a={}", hex::encode(a.public().compress().to_bytes()));
         }

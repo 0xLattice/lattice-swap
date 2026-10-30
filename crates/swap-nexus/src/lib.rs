@@ -12,7 +12,7 @@ use curve25519_dalek::edwards::{CompressedEdwardsY, EdwardsPoint};
 use curve25519_dalek::scalar::Scalar;
 use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha512};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 /// One party's secret key share.
 ///
@@ -59,8 +59,17 @@ impl Drop for KeyShare {
 }
 
 /// The lock address key, computed from the two public shares.
-pub fn joint_public_key(a: &EdwardsPoint, b: &EdwardsPoint) -> [u8; 32] {
-    (a + b).compress().to_bytes()
+///
+/// `None` if either share or the sum is the identity or has a small-order
+/// component: such a lock key is not `x·G` for the joint secret, and
+/// cofactorless verifiers (BoringSSL) would reject most honest signatures,
+/// stranding the NEX. This does not stop a rogue key (`b·G = X - a·G`); the
+/// counterparty's share is only safe to use after its cross-curve proof
+/// verifies.
+pub fn joint_public_key(a: &EdwardsPoint, b: &EdwardsPoint) -> Option<[u8; 32]> {
+    let sum = a + b;
+    let usable = |p: &EdwardsPoint| p.is_torsion_free() && !p.is_small_order();
+    (usable(a) && usable(b) && usable(&sum)).then(|| sum.compress().to_bytes())
 }
 
 /// The spending key for the lock address, once both shares are known.
@@ -99,10 +108,11 @@ fn sign_with_scalar(secret: &Scalar, public: &CompressedEdwardsY, message: &[u8]
     // leak the joint key.
     let mut entropy = [0u8; 32];
     OsRng.fill_bytes(&mut entropy);
+    let secret_bytes = Zeroizing::new(secret.to_bytes());
     let mut nonce = Scalar::from_hash(
         Sha512::new()
             .chain_update(entropy)
-            .chain_update(secret.to_bytes())
+            .chain_update(*secret_bytes)
             .chain_update(message),
     );
     entropy.zeroize();
@@ -114,8 +124,10 @@ fn sign_with_scalar(secret: &Scalar, public: &CompressedEdwardsY, message: &[u8]
             .chain_update(public.as_bytes())
             .chain_update(message),
     );
-    let s = nonce + k * secret;
+    let mut k_secret = k * secret;
+    let s = nonce + k_secret;
     nonce.zeroize();
+    k_secret.zeroize();
 
     let mut signature = [0u8; 64];
     signature[..32].copy_from_slice(r.as_bytes());
@@ -143,9 +155,22 @@ mod tests {
         let joint = JointKey::from_shares(&a, &b);
         assert_eq!(
             joint.public_key(),
-            joint_public_key(&a.public(), &b.public())
+            joint_public_key(&a.public(), &b.public()).unwrap()
         );
         assert!(verifies(joint.public_key(), MESSAGE, joint.sign(MESSAGE)));
+    }
+
+    #[test]
+    fn lock_key_rejects_small_order_and_identity_shares() {
+        use curve25519_dalek::constants::EIGHT_TORSION;
+        use curve25519_dalek::traits::Identity;
+        let a = KeyShare::random().public();
+        let b = KeyShare::random().public();
+        let torsion = EIGHT_TORSION[1];
+        assert!(joint_public_key(&a, &(b + torsion)).is_none());
+        assert!(joint_public_key(&a, &torsion).is_none());
+        assert!(joint_public_key(&a, &EdwardsPoint::identity()).is_none());
+        assert!(joint_public_key(&a, &-a).is_none());
     }
 
     #[test]
