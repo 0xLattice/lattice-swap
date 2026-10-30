@@ -1,0 +1,21 @@
+[package]
+name = "swap-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Key setup for NEX<->BTC atomic swaps: one secret per party on two curves, and the proof that ties them"
+
+[dependencies]
+curve25519-dalek = { version = "4", features = ["rand_core"] }
+# sigma_fun proves over the curve25519-dalek-ng fork; values cross as bytes.
+curve25519-dalek-ng = { version = "4", default-features = false, features = ["u64_backend"] }
+rand_chacha = "0.3"
+rand_core = { version = "0.6", features = ["getrandom"] }
+secp256kfun = { version = "0.12", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+sigma_fun = { version = "0.9", features = ["ed25519", "secp256k1", "serde"] }
+swap-nexus = { path = "../swap-nexus" }
+
+[dev-dependencies]
+serde_json = "1"
