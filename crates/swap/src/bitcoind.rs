@@ -52,8 +52,14 @@ pub trait Bitcoin {
     /// show `outpoint` unspent, or no such spend is found.
     fn spender(&self, outpoint: OutPoint, from: u32) -> Result<Option<(Transaction, u32)>>;
     /// A transaction from the wallet paying `amount` to `script`, signed but
-    /// not broadcast.
-    fn fund_lock(&self, script: &Script, amount: Amount) -> Result<Transaction>;
+    /// not broadcast: at `fee_rate` if given, else at the wallet's own
+    /// estimate.
+    fn fund_lock(
+        &self,
+        script: &Script,
+        amount: Amount,
+        fee_rate: Option<FeeRate>,
+    ) -> Result<Transaction>;
     /// A feerate to confirm within a couple of blocks, if the node has an
     /// estimate; a conservative one for the next block if `urgent`.
     fn fee_rate(&self, urgent: bool) -> Result<Option<FeeRate>>;
@@ -350,14 +356,23 @@ impl Bitcoin for Bitcoind {
         Ok(None)
     }
 
-    fn fund_lock(&self, script: &Script, amount: Amount) -> Result<Transaction> {
+    fn fund_lock(
+        &self,
+        script: &Script,
+        amount: Amount,
+        fee_rate: Option<FeeRate>,
+    ) -> Result<Transaction> {
         let address = Address::from_script(script, self.network)
             .map_err(|e| Error(e.to_string()))?
             .to_string();
         let amount = amount.to_string_in(Denomination::Bitcoin);
         // Reserve the inputs, so the wallet does not spend them elsewhere
         // before the funding transaction is broadcast.
-        let options = json!({"lockUnspents": true});
+        let mut options = json!({"lockUnspents": true});
+        if let Some(rate) = fee_rate {
+            // sat/vB, exact: 250 sat/kwu is 1 sat/vB.
+            options["fee_rate"] = json!(rate.to_sat_per_kwu() as f64 / 250.0);
+        }
         let funded = self.call(
             "walletcreatefundedpsbt",
             json!([[], [{address: amount}], 0, options]),

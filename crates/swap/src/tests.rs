@@ -1358,6 +1358,8 @@ struct Node {
     /// broadcast.
     store: Option<std::path::PathBuf>,
     saved: Vec<String>,
+    /// The feerate each lock funding was asked at, if any.
+    funded: Vec<Option<FeeRate>>,
 }
 
 #[derive(Clone, Default)]
@@ -1406,8 +1408,17 @@ impl Bitcoin for Fake {
     fn spender(&self, _: OutPoint, _: u32) -> crate::bitcoind::Result<Option<(Transaction, u32)>> {
         Ok(None)
     }
-    fn fund_lock(&self, _: &Script, _: Amount) -> crate::bitcoind::Result<Transaction> {
-        unreachable!()
+    fn fund_lock(
+        &self,
+        script: &Script,
+        amount: Amount,
+        fee_rate: Option<FeeRate>,
+    ) -> crate::bitcoind::Result<Transaction> {
+        self.0.borrow_mut().funded.push(fee_rate);
+        Ok(funding(&[Action::FundLock {
+            script_pubkey: script.into(),
+            amount,
+        }]))
     }
     fn fee_rate(&self, urgent: bool) -> crate::bitcoind::Result<Option<FeeRate>> {
         let node = self.0.borrow();
@@ -1452,7 +1463,12 @@ impl Bitcoin for Offline {
     fn spender(&self, _: OutPoint, _: u32) -> crate::bitcoind::Result<Option<(Transaction, u32)>> {
         unreachable!()
     }
-    fn fund_lock(&self, _: &Script, _: Amount) -> crate::bitcoind::Result<Transaction> {
+    fn fund_lock(
+        &self,
+        _: &Script,
+        _: Amount,
+        _: Option<FeeRate>,
+    ) -> crate::bitcoind::Result<Transaction> {
         unreachable!()
     }
     fn fee_rate(&self, _: bool) -> crate::bitcoind::Result<Option<FeeRate>> {
@@ -3133,4 +3149,24 @@ fn a_sent_redeem_gone_from_the_view_goes_out_with_cancel_once_due() {
     let both = [redeem.compute_txid(), cancel.compute_txid()];
     assert_eq!(broadcast_txids(&actions), both);
     assert!(matches!(seller, Seller::Redeeming { .. }));
+}
+
+/// The buyer's driver funds the lock at the wallet's own estimate while
+/// bitcoind has one, and at `fallback_fee_rate` while it has none: a
+/// wallet without an estimate, or `-fallbackfee`, funds nothing otherwise.
+#[test]
+fn the_lock_is_funded_at_the_fallback_rate_without_an_estimate() {
+    let funded = |estimate: Option<u32>| {
+        let (_, buyer, actions) = hellos();
+        let node = Fake::default();
+        node.0.borrow_mut().estimate = estimate.map(FeeRate::from_sat_per_vb_u32);
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::new(directory.path(), terms().swap_id);
+        let client = Client::new("http://127.0.0.1:9", "", Duration::from_secs(1));
+        Driver::<_, _, Offline>::start(buyer, actions, node.clone(), client, None, store).unwrap();
+        let funded = node.0.borrow().funded.clone();
+        funded
+    };
+    assert_eq!(funded(Some(50)), [None]);
+    assert_eq!(funded(None), [Some(FeeRate::from_sat_per_vb_u32(10))]);
 }

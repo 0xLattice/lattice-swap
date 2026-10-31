@@ -289,8 +289,9 @@ struct BumpArgs {
     /// The most a bump pays for, in sat/vB.
     #[arg(long, value_parser = sat_per_vb, default_value = "1000")]
     max_fee_rate: FeeRate,
-    /// The feerate, in sat/vB, a bump pays for when bitcoind has no fee
-    /// estimate, as on regtest.
+    /// The feerate, in sat/vB, a bump, and the buyer's lock funding, pays
+    /// for when bitcoind has no fee estimate, as on regtest or a freshly
+    /// synced node.
     #[arg(long, value_parser = sat_per_vb, default_value = "10")]
     fallback_fee_rate: FeeRate,
     /// The share of a payout, from 0 to 1, its bump may pay in fees; 1 is
@@ -372,6 +373,11 @@ struct OfferArgs {
     /// seller needs to reclaim its NEX, pays btc-fee and is never bumped.
     #[arg(long)]
     min_btc_fee_rate: Option<u64>,
+    /// The least nex-fee to offer, and the Nexus node's minRelayFee if
+    /// higher: the NEX lock and the claim from it pay nex-fee, and a fee
+    /// this node pools may still be below what the network relays.
+    #[arg(long, default_value_t = 1)]
+    min_nex_fee: u64,
     /// The directory the swap file goes in.
     #[arg(long, default_value = ".")]
     dir: PathBuf,
@@ -417,6 +423,11 @@ struct PolicyArgs {
     /// The most the NEX lock and the claim from it may pay.
     #[arg(long, default_value_t = 1_000)]
     max_nex_fee: u64,
+    /// The least the NEX lock and the claim from it may pay, and the Nexus
+    /// node's minRelayFee if higher: a fee this node pools may still be
+    /// below what the network relays.
+    #[arg(long, default_value_t = 1)]
+    min_nex_fee: u64,
     /// The most Bitcoin blocks the BTC stays locked before cancel.
     #[arg(long, default_value_t = 288)]
     max_t1: u16,
@@ -563,15 +574,25 @@ fn btc_fee_floor(bitcoin: &Bitcoind, fallback: Option<u64>) -> Result<u64> {
     Ok(btc_fee_at(per_kvb))
 }
 
+/// The least `nex_fee` a party runs: `least`, or its Nexus node's relay
+/// floor if higher. A node's floor alone is not the network's: one that
+/// pools a fee its peers do not relay leaves the NEX lock, or the claim,
+/// unmined.
+fn nex_fee_floor(nexus: &Client, least: u64) -> Result<u64> {
+    Ok(least.max(nexus.min_relay_fee()?))
+}
+
 /// An offer the buyer takes: terms that work, on its Bitcoin network and
 /// its Nexus, the amounts it agreed to, a Bitcoin fee of at least
-/// `btc_fee_floor`, and every other term within its bounds.
+/// `btc_fee_floor`, a Nexus fee of at least `nex_fee_floor`, and every
+/// other term within its bounds.
 fn check_offer(
     offer: &Offer,
     policy: &PolicyArgs,
     network: Network,
     nexus_genesis: &str,
     btc_fee_floor: u64,
+    nex_fee_floor: u64,
 ) -> std::result::Result<(), String> {
     let terms = &offer.terms;
     check_terms(terms)?;
@@ -616,6 +637,13 @@ fn check_offer(
         return refused(format!(
             "pays {} NEX a Nexus transaction, above {}",
             terms.nex_fee, policy.max_nex_fee
+        ));
+    }
+    if terms.nex_fee < nex_fee_floor {
+        return refused(format!(
+            "pays {} NEX a Nexus transaction, below {nex_fee_floor}, --min-nex-fee or its \
+             node's minRelayFee",
+            terms.nex_fee
         ));
     }
     if terms.t1 > policy.max_t1 {
@@ -772,6 +800,15 @@ fn offer(args: OfferArgs) -> Result<Outcome> {
     }
     let nexus = args.nodes.nexus()?;
     args.nodes.check_nexus(&nexus)?;
+    let floor = nex_fee_floor(&nexus, args.min_nex_fee)?;
+    if terms.nex_fee < floor {
+        return Err(format!(
+            "nex_fee is {}, below {floor}, --min-nex-fee or the node's minRelayFee: a fee \
+             the network does not relay leaves the NEX lock unmined",
+            terms.nex_fee
+        )
+        .into());
+    }
     let redeem = args.nodes.payout(&bitcoin)?;
     let punish = args.nodes.payout(&bitcoin)?;
     let seller = Seller::new(terms.clone(), key.nex_address(), redeem, punish)
@@ -832,9 +869,10 @@ fn take(args: TakeArgs) -> Result<Outcome> {
     }
     let bitcoin = args.nodes.bitcoin()?;
     let floor = btc_fee_floor(&bitcoin, args.policy.min_btc_fee_rate)?;
-    let (network, genesis) = (args.nodes.btc_network, &args.nodes.nexus_genesis);
-    check_offer(&offer, &args.policy, network, genesis, floor)?;
     let nexus = args.nodes.nexus()?;
+    let nex_floor = nex_fee_floor(&nexus, args.policy.min_nex_fee)?;
+    let (network, genesis) = (args.nodes.btc_network, &args.nodes.nexus_genesis);
+    check_offer(&offer, &args.policy, network, genesis, floor, nex_floor)?;
     args.nodes.check_nexus(&nexus)?;
     let refund = args.nodes.payout(&bitcoin)?;
     let (buyer, actions) = Buyer::start(offer.terms.clone(), refund, args.nex_address)

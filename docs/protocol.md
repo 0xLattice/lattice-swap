@@ -173,6 +173,16 @@ only one small child, so nobody else can pin them.
   so the seller can spend the cancel output in a shape no refund can
   replace at any fee, and contesting a punish is best effort.
 
+The buyer funds the lock from its wallet, at its node's estimate, or at the
+rate a bump aims at where the node has none.
+
+The NEX lock and the claim from it each pay `nex_fee`, below `nex_amount`;
+the claim pays the claimant's node's relay floor if higher, out of
+`nex_amount`. A fee one node pools is no proof the network relays it: a lock
+no miner sees leaves the swap to refund at `t1`. Each side holds `nex_fee` to
+its own floor, the higher of an operator setting and its node's relay floor,
+and the seller offers, and the buyer takes, no fee below it.
+
 ## State
 
 Each party is a state machine that does no I/O. A driver feeds it what the

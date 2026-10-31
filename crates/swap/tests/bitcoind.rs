@@ -371,8 +371,13 @@ fn start(args: &[&'static str]) -> Node {
 /// times: under a parallel test run, bitcoind can fail to come up.
 fn start_bare(args: &[&'static str]) -> Node {
     let mut conf = Conf::default();
-    conf.args.push("-txindex");
     conf.args.extend(args);
+    start_with(conf)
+}
+
+/// A regtest bitcoind with `-txindex` and `conf`, at genesis.
+fn start_with(mut conf: Conf) -> Node {
+    conf.args.push("-txindex");
     let mut tries = 0;
     loop {
         match Node::from_downloaded_with_conf(&conf) {
@@ -645,8 +650,9 @@ impl Bitcoin for Flaky {
         &self,
         script: &bitcoin::Script,
         amount: Amount,
+        fee_rate: Option<FeeRate>,
     ) -> swap::bitcoind::Result<Transaction> {
-        self.inner.fund_lock(script, amount)
+        self.inner.fund_lock(script, amount, fee_rate)
     }
     fn fee_rate(&self, urgent: bool) -> swap::bitcoind::Result<Option<FeeRate>> {
         self.inner.fee_rate(urgent)
@@ -897,7 +903,7 @@ fn contest_a_refund(punish: impl FnOnce(&Bitcoind, &Transaction)) {
     else {
         panic!("fund the lock: {actions:?}");
     };
-    let funding = buyer_rpc.fund_lock(script_pubkey, *amount).unwrap();
+    let funding = buyer_rpc.fund_lock(script_pubkey, *amount, None).unwrap();
     let (buyer, actions) = buyer.step(Event::Funded(funding));
     let (seller, actions) = step(seller, &actions);
     let (buyer, actions) = buyer.step(Event::Message(sent(&actions)));
@@ -968,4 +974,68 @@ fn contest_a_refund(punish: impl FnOnce(&Bitcoind, &Transaction)) {
     });
     assert_eq!(party.join().unwrap(), Outcome::Refunded);
     assert!(default.transaction(refund).unwrap().unwrap().1 > 0);
+}
+
+/// A fresh node has no fee estimate, and without `-fallbackfee`, as on
+/// mainnet, its wallet funds nothing at its own estimate. The buyer's
+/// driver funds the lock at its fallback rate, which the wallet pays.
+#[test]
+fn the_buyers_driver_funds_the_lock_without_an_estimate_or_fallbackfee() {
+    let mut conf = Conf::default();
+    conf.args.retain(|arg| !arg.starts_with("-fallbackfee"));
+    let node = start_with(conf);
+    let miner = node.client.new_address().unwrap();
+    node.client.generate_to_address(101, &miner).unwrap();
+    let wallet = rpc(&node, "default");
+    assert_eq!(wallet.fee_rate(false).unwrap(), None, "no estimate");
+
+    let terms = Terms {
+        swap_id: [6; 32],
+        btc_amount: Amount::from_sat(1_000_000),
+        btc_fee: Amount::from_sat(1_000),
+        nex_amount: 1_000,
+        nex_fee: 1,
+        t1: 6,
+        t2: 6,
+        btc_confirmations: 1,
+        nex_confirmations: 1,
+        margin: 2,
+        nexus_genesis: swap_nexus_tx::MAINNET_GENESIS.into(),
+    };
+    let payout = node.client.new_address().unwrap().script_pubkey();
+    let seller_nex = SecretBytes([3; 32]).nex_address();
+    let seller = Seller::new(terms.clone(), seller_nex, payout.clone(), payout.clone());
+    let (buyer, actions) = Buyer::start(terms.clone(), payout, "buyer".into()).unwrap();
+    let (_, actions) = seller.unwrap().step(Event::Message(sent(&actions)));
+    let (buyer, actions) = buyer.step(Event::Message(sent(&actions)));
+    let [Action::FundLock {
+        script_pubkey,
+        amount,
+    }] = &actions[..]
+    else {
+        panic!("fund the lock: {actions:?}");
+    };
+    let refused = wallet.fund_lock(script_pubkey, *amount, None).unwrap_err();
+    assert!(refused.to_string().contains("Fallbackfee"), "{refused}");
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::new(directory.path(), terms.swap_id);
+    let client = Client::new("http://127.0.0.1:9", "", Duration::from_secs(1));
+    let mut driver = Driver::<_, _, Ivy>::start(buyer, actions, wallet, client, None, store);
+    let driver = driver.as_mut().unwrap();
+    let Buyer::AwaitSellerSignatures { funding, .. } = driver.state() else {
+        panic!("funded: {:?}", serde_json::to_value(driver.state()));
+    };
+    let rpc = rpc(&node, "default");
+    let accepted = rpc
+        .call("testmempoolaccept", json!([[serialize_hex(funding)]]))
+        .unwrap();
+    assert_eq!(accepted[0]["allowed"], true, "{accepted}");
+    let fee = Amount::from_btc(accepted[0]["fees"]["base"].as_f64().unwrap()).unwrap();
+    let vsize = accepted[0]["vsize"].as_u64().unwrap();
+    let rate = fee.to_sat() as f64 / vsize as f64;
+    assert!(
+        (9.9..11.0).contains(&rate),
+        "{rate} sat/vB, not the fallback 10"
+    );
 }
