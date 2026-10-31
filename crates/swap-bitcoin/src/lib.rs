@@ -803,4 +803,68 @@ mod tests {
             Err(Error::Signatures)
         );
     }
+
+    #[test]
+    fn finalize_refuses_a_bad_signature_from_either_party() {
+        let swap = Swap::new(params()).unwrap();
+        let (seller, buyer) = (key(1), key(2));
+        let a = swap.sign(lock(), Spend::Redeem, &seller);
+        let b = swap.sign(lock(), Spend::Redeem, &buyer);
+        // Each party's signature in the other's place, or on another spend.
+        let a_cancel = swap.sign(lock(), Spend::Cancel, &seller);
+        assert_eq!(
+            swap.finalize(lock(), Spend::Redeem, &b, Some(&b)),
+            Err(Error::Signature(Party::Seller))
+        );
+        assert_eq!(
+            swap.finalize(lock(), Spend::Redeem, &a_cancel, Some(&b)),
+            Err(Error::Signature(Party::Seller))
+        );
+        assert_eq!(
+            swap.finalize(lock(), Spend::Redeem, &a, Some(&a)),
+            Err(Error::Signature(Party::Buyer))
+        );
+        assert_eq!(
+            swap.finalize(lock(), Spend::Punish, &b, None),
+            Err(Error::Signature(Party::Seller))
+        );
+        assert!(swap.finalize(lock(), Spend::Redeem, &a, Some(&b)).is_ok());
+    }
+
+    #[test]
+    fn recover_secret_reads_only_the_expected_spend() {
+        let swap = Swap::new(params()).unwrap();
+        let (seller, buyer, s) = (key(1), key(2), key(3));
+        let encrypted = swap.encrypted_sign(lock(), Spend::Redeem, &buyer).unwrap();
+        let b = swap.decrypt(s.secret_key(), &encrypted);
+        let a = swap.sign(lock(), Spend::Redeem, &seller);
+        let redeem = swap.finalize(lock(), Spend::Redeem, &a, Some(&b)).unwrap();
+        let recover = |spend, tx: &Transaction| swap.recover_secret(lock(), spend, &encrypted, tx);
+        assert_eq!(recover(Spend::Redeem, &redeem), Ok(*s.secret_key()));
+
+        // No adaptor on cancel, and a redeem is not a refund.
+        assert_eq!(recover(Spend::Cancel, &redeem), Err(Error::Recovery));
+        assert_eq!(recover(Spend::Refund, &redeem), Err(Error::Recovery));
+        // Not the redeem this swap builds.
+        let mut other = redeem.clone();
+        other.lock_time = bitcoin::absolute::LockTime::from_consensus(1);
+        assert_eq!(recover(Spend::Redeem, &other), Err(Error::Recovery));
+
+        // The buyer's slot holds a valid signature, but on another spend.
+        let mut tx = redeem.clone();
+        let cancel = swap.sign(lock(), Spend::Cancel, &buyer).to_bytes();
+        let mut witness: Vec<Vec<u8>> = tx.input[0].witness.to_vec();
+        witness[0] = cancel.to_vec();
+        tx.input[0].witness = Witness::from_slice(&witness);
+        assert_eq!(
+            recover(Spend::Redeem, &tx),
+            Err(Error::Signature(Party::Buyer))
+        );
+        // No signature there at all.
+        tx.input[0].witness = Witness::from_slice(&witness[1..]);
+        assert_eq!(
+            recover(Spend::Redeem, &tx),
+            Err(Error::Signature(Party::Buyer))
+        );
+    }
 }

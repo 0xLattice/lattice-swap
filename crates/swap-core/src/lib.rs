@@ -27,6 +27,7 @@ use sigma_fun::ext::dl_secp256k1_ed25519_eq::{CrossCurveDLEQ, CrossCurveDLEQProo
 use sigma_fun::HashTranscript;
 use std::sync::LazyLock;
 use swap_nexus::{joint_public_key, KeyShare};
+use zeroize::Zeroizing;
 
 type ProofSystem = CrossCurveDLEQ<HashTranscript<Sha256, ChaCha20Rng>>;
 
@@ -77,8 +78,10 @@ pub struct ShareProof {
 impl ShareProof {
     /// Proves `share`. Takes several hundred milliseconds.
     pub fn new(share: &KeyShare) -> Self {
-        let secret = ng::scalar::Scalar::from_canonical_bytes(share.to_bytes())
-            .expect("key shares are canonical");
+        let bytes = Zeroizing::new(share.to_bytes());
+        let secret = Zeroizing::new(
+            ng::scalar::Scalar::from_canonical_bytes(*bytes).expect("key shares are canonical"),
+        );
         let (proof, (secp256k1, ed25519)) = PROOF_SYSTEM.prove(&secret, &mut OsRng);
         Self {
             ed25519: ed25519.compress().to_bytes(),
@@ -124,9 +127,9 @@ impl PublicShare {
 
 /// `share` as the secp256k1 scalar: the same integer, big-endian.
 pub fn secp256k1_scalar(share: &KeyShare) -> Scalar<Secret, NonZero> {
-    let mut bytes = share.to_bytes();
+    let mut bytes = Zeroizing::new(share.to_bytes());
     bytes.reverse();
-    Scalar::from_bytes(bytes)
+    Scalar::from_bytes(*bytes)
         .and_then(|scalar| scalar.non_zero())
         .expect("key shares are nonzero and below the secp256k1 order")
 }
@@ -137,9 +140,9 @@ pub fn share_from_secp256k1(
     scalar: &Scalar<impl Secrecy, impl ZeroChoice>,
     expected: &PublicShare,
 ) -> Option<KeyShare> {
-    let mut bytes = scalar.to_bytes();
+    let mut bytes = Zeroizing::new(scalar.to_bytes());
     bytes.reverse();
-    let share = KeyShare::from_bytes(bytes)?;
+    let share = KeyShare::from_bytes(*bytes)?;
     (share.public() == expected.ed25519 && secp256k1_point(&share) == expected.secp256k1)
         .then_some(share)
 }
@@ -214,6 +217,25 @@ mod tests {
     }
 
     #[test]
+    fn a_share_mirrored_on_either_curve_gives_no_lock_key() {
+        let (a, b) = (
+            ShareProof::new(&KeyShare::random()).verify().unwrap(),
+            ShareProof::new(&KeyShare::random()).verify().unwrap(),
+        );
+        assert!(a.lock_key(&b).is_some());
+        let secp_mirror = PublicShare {
+            secp256k1: a.secp256k1,
+            ..b
+        };
+        assert!(a.lock_key(&secp_mirror).is_none());
+        let ed_mirror = PublicShare {
+            ed25519: a.ed25519,
+            ..b
+        };
+        assert!(a.lock_key(&ed_mirror).is_none());
+    }
+
+    #[test]
     fn proofs_survive_serialization() {
         let share = KeyShare::random();
         let json = serde_json::to_string(&ShareProof::new(&share)).unwrap();
@@ -263,6 +285,27 @@ mod tests {
         be[0] = 0x10;
         let high = Scalar::<Secret, NonZero>::from_bytes(be).unwrap();
         assert!(share_from_secp256k1(&high, &public).is_none());
+    }
+
+    #[test]
+    fn a_recovered_share_must_match_both_points() {
+        let (share, other) = (KeyShare::random(), KeyShare::random());
+        let scalar = secp256k1_scalar(&share);
+        let public = PublicShare {
+            ed25519: share.public(),
+            secp256k1: secp256k1_point(&share),
+        };
+        assert!(share_from_secp256k1(&scalar, &public).is_some());
+        let wrong_ed25519 = PublicShare {
+            ed25519: other.public(),
+            ..public
+        };
+        assert!(share_from_secp256k1(&scalar, &wrong_ed25519).is_none());
+        let wrong_secp256k1 = PublicShare {
+            secp256k1: secp256k1_point(&other),
+            ..public
+        };
+        assert!(share_from_secp256k1(&scalar, &wrong_secp256k1).is_none());
     }
 
     #[test]
