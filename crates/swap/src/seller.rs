@@ -353,7 +353,7 @@ impl Machine for Seller {
                     // the window is open, on a view that is not stale. Seen
                     // once, it is sent whatever the window or the view, and
                     // against a cancel still in the mempool, which a bump of
-                    // it can replace, unless a refund already shows.
+                    // it can replace.
                     None if seen || view.stale.is_none() && !terms.redeem_closed(&view) => {
                         let actions = vec![Action::Broadcast(redeem.clone())];
                         let state = Redeeming {
@@ -375,7 +375,7 @@ impl Machine for Seller {
                         };
                         (state, vec![])
                     }
-                    Some((Spend::Cancel, 0)) if seen && view.cancel_spend.is_none() => {
+                    Some((Spend::Cancel, 0)) if seen => {
                         let actions = vec![Action::Broadcast(redeem.clone())];
                         let state = Redeeming {
                             locked,
@@ -501,10 +501,21 @@ impl SellerLocked {
         let setup = &self.setup;
         let terms = &setup.terms;
         let mut actions = vec![];
-        // A refund gives `b`, even with its cancel still in the mempool:
-        // the buyer, who holds `s` if our redeem went out, races for the
-        // NEX already.
-        if let Some((Spend::Refund, _)) = setup.spend(self.lock, &view.cancel_spend) {
+        // A redeem once seen may have revealed `s`, and the buyer may have
+        // taken the NEX with it already: while its cancel is not in a block,
+        // the redeem is fought for, even against a refund in the mempool,
+        // which only a buyer racing it sends.
+        let fighting = seen
+            && redeem.is_some()
+            && matches!(
+                setup.spend(self.lock, &view.lock_spend),
+                None | Some((Spend::Cancel, 0))
+            );
+        // Otherwise a refund gives `b`, even with its cancel still in the
+        // mempool.
+        if let (false, Some((Spend::Refund, _))) =
+            (fighting, setup.spend(self.lock, &view.cancel_spend))
+        {
             let refund = &view.cancel_spend.as_ref().expect("matched").tx;
             if let Some(b) = setup.recover(self.lock, Spend::Refund, &self.refund, refund) {
                 let lock = match &nex_lock {
@@ -516,9 +527,8 @@ impl SellerLocked {
             }
         }
         match setup.spend(self.lock, &view.lock_spend) {
-            // A redeem once seen may have revealed `s`: it beats any cancel
-            // not yet in a block, which a bump of it can replace.
-            None | Some((Spend::Cancel, 0)) if seen && redeem.is_some() => {
+            // A bump of it can replace a cancel not yet in a block.
+            None | Some((Spend::Cancel, 0)) if fighting => {
                 actions.extend(redeem.clone().map(Action::Broadcast));
             }
             None if terms.cancel_due(&view) => {

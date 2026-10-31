@@ -212,7 +212,7 @@ pub struct Driver<M, B, T> {
     /// a stale view the seller starts no redeem and locks no NEX, and the
     /// driver warns, once it has lasted [`WARN_AGAIN`] and again every
     /// [`WARN_AGAIN`], until the node catches up. Every other spend, and
-    /// every bump, goes on: a stale view only under-reports depth.
+    /// every bump, goes on: a stale view at worst delays them.
     pub max_tip_age: Duration,
     /// Our swap transactions waiting unconfirmed, by txid.
     waiting: HashMap<Txid, Waiting>,

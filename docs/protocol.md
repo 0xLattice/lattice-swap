@@ -69,12 +69,17 @@ swap id.
   block, may have made `s` public, so S keeps broadcasting it until it is
   `btc_confirmations` deep, in place of cancel, and against a cancel still
   in the mempool. Only a cancel in a block stops it; a reorg that puts that
-  cancel back in the mempool starts it again. A refund stops it too, even
-  one still in the mempool: it gives S `b`, and B, who may hold `s`, races
-  for the NEX, so S claims it at once.
+  cancel back in the mempool starts it again, even with a refund pooled on
+  that cancel: only a B racing the redeem sends one, and B holds `s` and
+  may have taken the NEX already. Once the cancel is in a block, a refund
+  gives S `b`, and S claims the NEX. A refund of a cancel S saw no redeem
+  of gives S `b` at once, even in the mempool.
 - Every deadline is read from the party's own Bitcoin node. A node that
   stalled, or that someone cut off from the network, shows fewer blocks
-  than there are: every depth it reports is too low. That only delays
+  than there are: every depth it reports is too low. A node fed a fork
+  reports that fork's depths instead; acting on them, even B's refund,
+  needs a cancel on the fork, which takes `t1` fork blocks of full
+  difficulty. That only delays
   cancel and punish, which consensus holds to their timelocks, and the
   refund, which waits on depth, so they and their bumps go on whatever the
   node shows. The one thing it

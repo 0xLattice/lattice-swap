@@ -2630,12 +2630,13 @@ fn an_urgent_bump_in_trouble_is_logged_at_every_block() {
     assert_eq!(clamped(&[117, 118, 119]), 3);
 }
 
-/// A refund gives `b` even with its cancel still in the mempool, and the
-/// buyer, who holds `s` if the redeem went out, races for the NEX: the
-/// seller claims at once, from `Redeeming` or `Cancelling`, rather than
-/// send its seen redeem again. With no refund showing, it sends the redeem.
+/// A refund pooled on a cancel that displaced a seen redeem comes only
+/// from a buyer racing it, who holds `s` and may have taken the NEX: the
+/// seller keeps sending its redeem, from `Redeeming` or `Cancelling`, and
+/// claims only once the cancel is in a block. A refund with no seen redeem
+/// gives `b` at once.
 #[test]
-fn a_pooled_refund_is_claimed_from_at_once() {
+fn a_pooled_refund_does_not_end_a_seen_redeem() {
     let (seller, buyer, nex_lock) = locked().nex_locked();
     let (buyer, actions) = buyer.step(nexus(account(500_000, 0), mined(nex_lock.body, 1)));
     let (seller, _) = seller.step(btc(17, None, None));
@@ -2648,15 +2649,29 @@ fn a_pooled_refund_is_claimed_from_at_once() {
     let (cancel, refund) = cancel_and_refund(buyer);
     let pooled = || btc(20, Some((&cancel, 0)), Some((&refund, 0)));
 
-    let (claiming, actions) = seller.clone().step(pooled());
-    assert!(actions.is_empty());
-    assert!(matches!(claiming, Seller::ClaimingNex(_)));
+    let (redeeming, actions) = seller.clone().step(pooled());
+    assert_eq!(broadcasts(&actions), std::slice::from_ref(redeem));
+    assert!(matches!(redeeming, Seller::Redeeming { .. }));
 
     let (cancelling, _) = seller.step(btc(20, Some((&cancel, 1)), None));
     assert!(matches!(cancelling, Seller::Cancelling { .. }));
     let (_, actions) = cancelling.clone().step(btc(20, Some((&cancel, 0)), None));
     assert_eq!(broadcasts(&actions), std::slice::from_ref(redeem));
-    let (claiming, actions) = cancelling.step(pooled());
+    let (cancelling, actions) = cancelling.step(pooled());
+    assert_eq!(broadcasts(&actions), std::slice::from_ref(redeem));
+    assert!(matches!(cancelling, Seller::Cancelling { .. }));
+    let (claiming, actions) = cancelling.step(btc(20, Some((&cancel, 1)), Some((&refund, 0))));
+    assert!(actions.is_empty());
+    assert!(matches!(claiming, Seller::ClaimingNex(_)));
+}
+
+/// With no redeem seen, a refund gives `b` while its cancel is still in
+/// the mempool.
+#[test]
+fn a_pooled_refund_with_no_seen_redeem_is_claimed_from_at_once() {
+    let (seller, buyer, _) = locked().nex_locked();
+    let (cancel, refund) = cancel_and_refund(buyer);
+    let (claiming, actions) = seller.step(btc(20, Some((&cancel, 0)), Some((&refund, 0))));
     assert!(actions.is_empty());
     assert!(matches!(claiming, Seller::ClaimingNex(_)));
 }
