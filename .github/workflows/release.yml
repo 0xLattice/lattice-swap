@@ -98,5 +98,5 @@ jobs:
           cat *.sha256 > SHA256SUMS
           cat SHA256SUMS
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-            --draft --verify-tag --title "$GITHUB_REF_NAME" \
+            --draft --prerelease --verify-tag --title "$GITHUB_REF_NAME" \
             *.tar.gz *.sha256 SHA256SUMS
