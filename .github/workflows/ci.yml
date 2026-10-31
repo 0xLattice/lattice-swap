@@ -52,3 +52,4 @@ jobs:
       - run: docker pull "$NEXUS_NODE_IMAGE"
       - run: cargo test -p swap-nexus-tx --test node -- --ignored --nocapture
       - run: cargo test -p swap --test e2e -- --ignored --nocapture --test-threads=1
+      - run: cargo test -p lattice-swap --test e2e -- --ignored --nocapture --test-threads=1

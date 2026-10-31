@@ -108,14 +108,14 @@ impl Terms {
     /// Whether the terms can work at all. Each party also checks them
     /// against its own policy before starting.
     pub fn check(&self) -> bool {
-        let margin = u32::from(self.margin);
+        let floor = u64::from(self.btc_confirmations) + u64::from(self.margin);
         self.btc_confirmations >= 1
             && self.nex_confirmations >= 1
             && self.margin >= 2
-            && self.btc_confirmations + margin < u32::from(self.t1)
+            && floor < u64::from(self.t1)
             // The buyer refunds once cancel is `btc_confirmations` deep, and
             // the refund needs time to confirm before punish is valid.
-            && self.btc_confirmations + margin < u32::from(self.t2)
+            && floor < u64::from(self.t2)
             && self.nex_amount > self.nex_fee
     }
 

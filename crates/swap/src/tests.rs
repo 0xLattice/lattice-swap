@@ -760,6 +760,11 @@ fn terms_leave_room_for_a_block_and_for_the_refund() {
     };
     assert!(!tight.check(), "7 + 3 = t2");
     assert!(Terms { t2: 11, ..tight }.check());
+    let deepest = Terms {
+        btc_confirmations: u32::MAX,
+        ..terms()
+    };
+    assert!(!deepest.check(), "no overflow");
 }
 
 /// Once the seller holds its redeem signature, the buyer refunds only on
@@ -907,6 +912,58 @@ fn the_seller_state_never_holds_its_nexus_key() {
     assert!(unsaved(&locked.seller));
     let (seller, _, _) = locked.nex_signed();
     assert!(unsaved(&seller));
+}
+
+/// Every seller state names the address it sells from until it is done,
+/// and asks for its key only until the NEX lock is signed.
+#[test]
+fn the_seller_needs_its_nexus_key_only_until_the_lock_is_signed() {
+    let funding = locked().seller;
+    let (locking, _) = funding.clone().step(btc(2, None, None));
+    let (signed, _, _) = locked().nex_signed();
+    let (awaiting, buyer, nex_lock) = locked().nex_locked();
+    let (_, actions) = buyer
+        .clone()
+        .step(nexus(account(500_000, 0), mined(nex_lock.body, 1)));
+    let (redeeming, _) = awaiting.clone().step(message(sent(&actions)));
+    let (cancelling, _) = awaiting.clone().step(btc(18, None, None));
+    let (cancel, refund) = cancel_and_refund(buyer);
+    let (claiming, _) = cancelling
+        .clone()
+        .step(btc(21, Some((&cancel, 1)), Some((&refund, 0))));
+    let states = [
+        (new_seller(terms()), true),
+        (hellos().0, true),
+        (proposal_answer(|_| {}), true),
+        (funding, true),
+        (locking, true),
+        (signed, false),
+        (awaiting, false),
+        (redeeming, false),
+        (cancelling, false),
+        (claiming, false),
+    ];
+    let names = [
+        "AwaitBuyerHello",
+        "AwaitLockProposal",
+        "AwaitBuyerSignatures",
+        "AwaitFunding",
+        "LockingNex",
+        "LockingNex",
+        "AwaitRedeemSignature",
+        "Redeeming",
+        "Cancelling",
+        "ClaimingNex",
+    ];
+    for ((seller, signs), name) in states.iter().zip(names) {
+        let json = serde_json::to_value(seller).unwrap();
+        assert!(json.get(name).is_some(), "{name}");
+        let home = SELLER_NEX.nex_address();
+        assert_eq!(seller.nex_address(), Some(&home[..]), "{name}");
+        assert_eq!(seller.signs_nex(), *signs, "{name}");
+    }
+    let done = Seller::Done(Outcome::Swapped);
+    assert_eq!((done.nex_address(), done.signs_nex()), (None, false));
 }
 
 /// A wallet that answers with another transaction than the lock is not
@@ -1909,4 +1966,53 @@ fn a_redeem_never_seen_is_abandoned_when_the_window_closes() {
     let (seller, actions) = seller.step(btc(19, None, None));
     assert!(broadcasts(&actions).is_empty());
     assert!(matches!(seller, Seller::Cancelling { .. }));
+}
+
+/// A source is an IPv4 address or an IPv6 /64, an IPv4 address mapped
+/// into IPv6 being its IPv4 one.
+#[test]
+fn a_handshake_source_is_an_address_or_a_64() {
+    use crate::transport::source;
+    let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+    assert_eq!(source(ip("192.0.2.1")), ip("192.0.2.1"));
+    assert_ne!(source(ip("192.0.2.1")), source(ip("192.0.2.2")));
+    assert_eq!(source(ip("::ffff:192.0.2.1")), ip("192.0.2.1"));
+    assert_eq!(source(ip("2001:db8:1:2:aaaa::1")), ip("2001:db8:1:2::"));
+    assert_eq!(
+        source(ip("2001:db8:1:2::1")),
+        source(ip("2001:db8:1:2:ffff:ffff:ffff:ffff"))
+    );
+    assert_ne!(source(ip("2001:db8:1:2::1")), source(ip("2001:db8:1:3::1")));
+}
+
+/// A flood from one source evicts only its own handshakes; past the cap
+/// in all, the oldest of any goes.
+#[test]
+fn a_flood_from_one_source_evicts_only_its_own() {
+    use crate::transport::{evicted, HANDSHAKES, PER_SOURCE};
+    let (buyer, flood) = ([192, 0, 2, 1].into(), [198, 51, 100, 7].into());
+    let mut sources = vec![buyer];
+    for _ in 0..10 * PER_SOURCE {
+        if let Some(i) = evicted(&sources, flood) {
+            assert_eq!(sources[i], flood, "only the flood's own");
+            sources.remove(i);
+        }
+        sources.push(flood);
+    }
+    assert_eq!(sources[0], buyer, "the buyer's handshake stays");
+    assert_eq!(sources.len(), 1 + PER_SOURCE);
+
+    // Its own oldest, not the oldest of all.
+    let mut sources = vec![buyer];
+    sources.extend([flood; PER_SOURCE]);
+    assert_eq!(evicted(&sources, flood), Some(1));
+    assert_eq!(evicted(&sources[..PER_SOURCE], flood), None);
+    assert_eq!(evicted(&sources, buyer), None);
+
+    // Past the cap in all, from sources each under their own.
+    let many: Vec<std::net::IpAddr> = (0..HANDSHAKES)
+        .map(|i| [10, 0, (i / 256) as u8, i as u8].into())
+        .collect();
+    assert_eq!(evicted(&many[..HANDSHAKES - 1], buyer), None);
+    assert_eq!(evicted(&many, buyer), Some(0));
 }

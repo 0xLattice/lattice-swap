@@ -94,6 +94,41 @@ impl Seller {
     }
 }
 
+impl Seller {
+    /// The Nexus address the NEX is sold from, until the swap ends. The
+    /// driver needs its key while [`Seller::signs_nex`].
+    pub fn nex_address(&self) -> Option<&str> {
+        use Seller::*;
+        match self {
+            AwaitBuyerHello(start) => Some(&start.nex_address),
+            AwaitLockProposal(setup) | AwaitBuyerSignatures { setup, .. } => {
+                Some(&setup.nex_address)
+            }
+            AwaitFunding { locked, .. }
+            | LockingNex { locked, .. }
+            | AwaitRedeemSignature { locked, .. }
+            | Redeeming { locked, .. }
+            | Cancelling { locked, .. } => Some(&locked.setup.nex_address),
+            ClaimingNex(claim) => Some(&claim.setup.nex_address),
+            Done(_) => None,
+        }
+    }
+
+    /// Whether the swap may still ask the driver to sign the NEX lock:
+    /// only until it is signed.
+    pub fn signs_nex(&self) -> bool {
+        use Seller::*;
+        matches!(
+            self,
+            AwaitBuyerHello(_)
+                | AwaitLockProposal(_)
+                | AwaitBuyerSignatures { .. }
+                | AwaitFunding { .. }
+                | LockingNex { nex_lock: None, .. }
+        )
+    }
+}
+
 fn abort(refusal: Refusal) -> (Seller, Vec<Action>) {
     (Seller::Done(Outcome::Aborted(refusal)), vec![])
 }

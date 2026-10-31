@@ -63,10 +63,15 @@ pub trait Bitcoin {
     fn bump(&self, parent: &Transaction, fee: Amount, rate: FeeRate, max: Amount) -> Result<Txid>;
 }
 
-/// bitcoind's JSON-RPC. `transaction` reads any transaction, so the node
-/// needs `-txindex`; `spender` calls `gettxspendingprevout`, so it needs
-/// Bitcoin Core 24 or later; `fund_lock` and `bump` need a wallet, so `url`
-/// names one (`http://host:port/wallet/<name>`).
+/// The least Bitcoin Core version a swap runs against, as `getnetworkinfo`
+/// reports it: 28.0, the first to relay version 3 (TRUC) transactions,
+/// which every swap transaction is.
+pub const MIN_VERSION: u64 = 280_000;
+
+/// bitcoind's JSON-RPC, against Bitcoin Core 28 or later with `-txindex`,
+/// as [`Bitcoind::check_node`] checks: `transaction` reads any transaction,
+/// and the swap transactions are version 3. `fund_lock` and `bump` need a
+/// wallet, so `url` names one (`http://host:port/wallet/<name>`).
 pub struct Bitcoind {
     agent: ureq::Agent,
     url: String,
@@ -91,6 +96,61 @@ impl Bitcoind {
             network,
             sized: Mutex::new(None),
         }
+    }
+
+    /// Refuses a node a swap cannot rely on. Without a synced `-txindex`, a
+    /// confirmed transaction outside the wallet looks unseen, so a buyer
+    /// never cancels or refunds; before Bitcoin Core 28, version 3
+    /// transactions are nonstandard, so its cancel and refund are refused.
+    /// On another chain than this client's network, or still in initial
+    /// block download, the node never shows the swap's transactions; and a
+    /// wallet that cannot sign makes every fee bump fail.
+    pub fn check_node(&self) -> Result<()> {
+        let index = self.call("getindexinfo", json!(["txindex"]))?;
+        match index["txindex"]["synced"].as_bool() {
+            Some(true) => {}
+            Some(false) => return Err(Error("the txindex is still syncing: try again".into())),
+            None => return Err(Error("the node needs -txindex: restart it with it".into())),
+        }
+        let info = self.call("getnetworkinfo", json!([]))?;
+        match info["version"].as_u64() {
+            Some(version) if version >= MIN_VERSION => {}
+            _ => {
+                return Err(Error(format!(
+                    "the node is version {}: the swap needs Bitcoin Core 28 or later, which \
+                     relays version 3 transactions",
+                    info["version"]
+                )))
+            }
+        }
+        let chain = self.call("getblockchaininfo", json!([]))?;
+        let expected = self.network.to_core_arg();
+        if chain["chain"] != expected {
+            return Err(Error(format!(
+                "the node is on chain {}, not {expected}",
+                chain["chain"]
+            )));
+        }
+        if chain["initialblockdownload"] != false {
+            return Err(Error(
+                "the node is in initial block download: try again once it is synced".into(),
+            ));
+        }
+        let wallet = self
+            .call("getwalletinfo", json!([]))
+            .map_err(|e| Error(format!("the node has no such wallet loaded: {}", e.0)))?;
+        if wallet["private_keys_enabled"] != true {
+            return Err(Error(
+                "the wallet cannot sign: the swap needs one with private keys".into(),
+            ));
+        }
+        // Only an encrypted wallet has it; 0 is locked.
+        if wallet["unlocked_until"] == 0 {
+            return Err(Error(
+                "the wallet is locked: unlock it for longer than the swap may take".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn call(&self, method: &str, params: Value) -> Result<Value> {
