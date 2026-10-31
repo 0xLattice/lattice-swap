@@ -1538,10 +1538,13 @@ fn offer_and_take_refuse_a_nex_fee_below_the_floor() {
 
     let address = swap_nexus_tx::address(&[9; 32]);
     let url = bitcoind(estimate());
-    let taken = |nex_fee: u64, extra: &[&str], relay: u64| {
+    let taken_with = |nex_fee: u64, extra: &[&str], node: &str| {
         let mut offer = takeable();
         offer.terms.nex_fee = nex_fee;
-        take_refusal_on(&offer, &address, extra, &url, &nexus_node_relaying(relay))
+        take_refusal_on(&offer, &address, extra, &url, node)
+    };
+    let taken = |nex_fee: u64, extra: &[&str], relay: u64| {
+        taken_with(nex_fee, extra, &nexus_node_relaying(relay))
     };
     assert_eq!(policy(&[]).0.min_nex_fee, 1);
     let refused = taken(0, &[], 0);
@@ -1553,4 +1556,13 @@ fn offer_and_take_refuse_a_nex_fee_below_the_floor() {
     assert_eq!(taken(5, &[], 5), PAST_THE_CHECKS);
     let refused = taken(5, &["--min-nex-fee", "6"], 5);
     assert!(refused.contains("below 6, --min-nex-fee"), "{refused}");
+
+    // A node on another Nexus is refused as that, before the floor it
+    // reports is held against the offer.
+    let elsewhere = nexus_node_with(&swap_nexus_tx::cid(b"dev"), 10, true, 5);
+    let refused = taken_with(1, &[], &elsewhere);
+    assert!(
+        refused.contains("follows the chain of genesis"),
+        "{refused}"
+    );
 }

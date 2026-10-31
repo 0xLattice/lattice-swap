@@ -171,9 +171,10 @@ for at most `--max-fee-rate` sat/vB, 1000 by default, and at most
 `--max-fee-fraction` of the payout, from 0 to 1, 1 by default: all of it
 but dust. Where bitcoind has no estimate it aims at `--fallback-fee-rate`,
 10 sat/vB by default. Cancel is never bumped. The buyer's wallet funds the
-lock at its own estimate, or, where bitcoind has none, as on a freshly
-synced node, at `--fallback-fee-rate` too: such a wallet funds nothing at
-its own estimate unless bitcoind runs with `-fallbackfee`.
+lock at the rate a bump aims at, bitcoind's estimate or else
+`--fallback-fee-rate`, or the mempool's minimum if higher; never at the
+wallet's own estimate, which a freshly synced node lacks, and without
+`-fallbackfee` funds nothing.
 
 `offer`, `take` and `resume` exit 0 only when the swap swapped: 3 when it
 refunded, 4 punished, 5 drained, 6 aborted. 1 means an error stopped the

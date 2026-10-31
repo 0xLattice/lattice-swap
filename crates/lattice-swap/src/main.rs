@@ -291,7 +291,7 @@ struct BumpArgs {
     max_fee_rate: FeeRate,
     /// The feerate, in sat/vB, a bump, and the buyer's lock funding, pays
     /// for when bitcoind has no fee estimate, as on regtest or a freshly
-    /// synced node.
+    /// synced node; the lock funding pays the mempool's minimum if higher.
     #[arg(long, value_parser = sat_per_vb, default_value = "10")]
     fallback_fee_rate: FeeRate,
     /// The share of a payout, from 0 to 1, its bump may pay in fees; 1 is
@@ -870,10 +870,10 @@ fn take(args: TakeArgs) -> Result<Outcome> {
     let bitcoin = args.nodes.bitcoin()?;
     let floor = btc_fee_floor(&bitcoin, args.policy.min_btc_fee_rate)?;
     let nexus = args.nodes.nexus()?;
+    args.nodes.check_nexus(&nexus)?;
     let nex_floor = nex_fee_floor(&nexus, args.policy.min_nex_fee)?;
     let (network, genesis) = (args.nodes.btc_network, &args.nodes.nexus_genesis);
     check_offer(&offer, &args.policy, network, genesis, floor, nex_floor)?;
-    args.nodes.check_nexus(&nexus)?;
     let refund = args.nodes.payout(&bitcoin)?;
     let (buyer, actions) = Buyer::start(offer.terms.clone(), refund, args.nex_address)
         .map_err(|refusal| format!("refused: {refusal:?}"))?;

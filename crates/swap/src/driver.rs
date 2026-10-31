@@ -606,13 +606,13 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
                 amount,
             } => {
                 // Before anything is at stake: a wallet that cannot fund
-                // ends the swap. Without an estimate, as on a fresh node,
-                // the wallet funds nothing unless given a rate: the one a
-                // bump pays then.
+                // ends the swap. Funded at the rate a bump aims at, never
+                // the wallet's own estimate: a fresh node has none, and
+                // without `-fallbackfee` its wallet then funds nothing.
                 let funding = self
                     .bitcoin
                     .fee_rate(false)
-                    .map(|estimate| estimate.is_none().then_some(self.fallback_fee_rate))
+                    .map(|estimate| estimate.unwrap_or(self.fallback_fee_rate))
                     .and_then(|rate| self.bitcoin.fund_lock(&script_pubkey, amount, rate))
                     .map_err(io::Error::other)?;
                 self.apply(Event::Funded(funding))?;

@@ -173,8 +173,9 @@ only one small child, so nobody else can pin them.
   so the seller can spend the cancel output in a shape no refund can
   replace at any fee, and contesting a punish is best effort.
 
-The buyer funds the lock from its wallet, at its node's estimate, or at the
-rate a bump aims at where the node has none.
+The buyer funds the lock from its wallet at the rate a bump aims at, its
+node's estimate or else a fallback rate, or the mempool's minimum if
+higher, so the lock relays.
 
 The NEX lock and the claim from it each pay `nex_fee`, below `nex_amount`;
 the claim pays the claimant's node's relay floor if higher, out of

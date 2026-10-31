@@ -650,7 +650,7 @@ impl Bitcoin for Flaky {
         &self,
         script: &bitcoin::Script,
         amount: Amount,
-        fee_rate: Option<FeeRate>,
+        fee_rate: FeeRate,
     ) -> swap::bitcoind::Result<Transaction> {
         self.inner.fund_lock(script, amount, fee_rate)
     }
@@ -903,7 +903,9 @@ fn contest_a_refund(punish: impl FnOnce(&Bitcoind, &Transaction)) {
     else {
         panic!("fund the lock: {actions:?}");
     };
-    let funding = buyer_rpc.fund_lock(script_pubkey, *amount, None).unwrap();
+    let funding = buyer_rpc
+        .fund_lock(script_pubkey, *amount, FeeRate::from_sat_per_vb_u32(10))
+        .unwrap();
     let (buyer, actions) = buyer.step(Event::Funded(funding));
     let (seller, actions) = step(seller, &actions);
     let (buyer, actions) = buyer.step(Event::Message(sent(&actions)));
@@ -976,13 +978,15 @@ fn contest_a_refund(punish: impl FnOnce(&Bitcoind, &Transaction)) {
     assert!(default.transaction(refund).unwrap().unwrap().1 > 0);
 }
 
-/// A fresh node has no fee estimate, and without `-fallbackfee`, as on
-/// mainnet, its wallet funds nothing at its own estimate. The buyer's
-/// driver funds the lock at its fallback rate, which the wallet pays.
-#[test]
-fn the_buyers_driver_funds_the_lock_without_an_estimate_or_fallbackfee() {
+/// The buyer's driver, on a regtest node started with `args` and none
+/// of corepc's `-fallbackfee`, funds a lock; returns the funding's feerate
+/// in sat/vB once the mempool accepts it. A fresh node has no estimate,
+/// and without `-fallbackfee`, as on mainnet, its wallet funds nothing at
+/// its own estimate.
+fn lock_funded_by_the_driver(args: &[&'static str]) -> f64 {
     let mut conf = Conf::default();
     conf.args.retain(|arg| !arg.starts_with("-fallbackfee"));
+    conf.args.extend(args);
     let node = start_with(conf);
     let miner = node.client.new_address().unwrap();
     node.client.generate_to_address(101, &miner).unwrap();
@@ -1015,27 +1019,46 @@ fn the_buyers_driver_funds_the_lock_without_an_estimate_or_fallbackfee() {
     else {
         panic!("fund the lock: {actions:?}");
     };
-    let refused = wallet.fund_lock(script_pubkey, *amount, None).unwrap_err();
+    let address = Address::from_script(script_pubkey, Network::Regtest).unwrap();
+    let outputs = json!([{address.to_string(): amount.to_btc()}]);
+    let refused = wallet
+        .call("walletcreatefundedpsbt", json!([[], outputs]))
+        .unwrap_err();
     assert!(refused.to_string().contains("Fallbackfee"), "{refused}");
 
     let directory = tempfile::tempdir().unwrap();
     let store = Store::new(directory.path(), terms.swap_id);
     let client = Client::new("http://127.0.0.1:9", "", Duration::from_secs(1));
-    let mut driver = Driver::<_, _, Ivy>::start(buyer, actions, wallet, client, None, store);
-    let driver = driver.as_mut().unwrap();
+    let driver = Driver::<_, _, Ivy>::start(buyer, actions, wallet, client, None, store).unwrap();
     let Buyer::AwaitSellerSignatures { funding, .. } = driver.state() else {
         panic!("funded: {:?}", serde_json::to_value(driver.state()));
     };
-    let rpc = rpc(&node, "default");
-    let accepted = rpc
+    let accepted = rpc(&node, "default")
         .call("testmempoolaccept", json!([[serialize_hex(funding)]]))
         .unwrap();
     assert_eq!(accepted[0]["allowed"], true, "{accepted}");
     let fee = Amount::from_btc(accepted[0]["fees"]["base"].as_f64().unwrap()).unwrap();
     let vsize = accepted[0]["vsize"].as_u64().unwrap();
-    let rate = fee.to_sat() as f64 / vsize as f64;
+    fee.to_sat() as f64 / vsize as f64
+}
+
+/// With no estimate, the driver funds the lock at its fallback rate.
+#[test]
+fn the_buyers_driver_funds_the_lock_without_an_estimate_or_fallbackfee() {
+    let rate = lock_funded_by_the_driver(&[]);
     assert!(
-        (9.9..11.0).contains(&rate),
+        (10.0..10.5).contains(&rate),
         "{rate} sat/vB, not the fallback 10"
+    );
+}
+
+/// A wallet given a rate holds it to no relay floor: the lock pays the
+/// mempool's minimum, 20 sat/vB here, above the fallback, so it relays.
+#[test]
+fn the_buyers_driver_funds_the_lock_at_least_at_the_mempool_minimum() {
+    let rate = lock_funded_by_the_driver(&["-minrelaytxfee=0.0002"]);
+    assert!(
+        (20.0..20.5).contains(&rate),
+        "{rate} sat/vB, not the minimum 20"
     );
 }

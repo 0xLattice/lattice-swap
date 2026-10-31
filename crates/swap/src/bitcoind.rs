@@ -52,14 +52,9 @@ pub trait Bitcoin {
     /// show `outpoint` unspent, or no such spend is found.
     fn spender(&self, outpoint: OutPoint, from: u32) -> Result<Option<(Transaction, u32)>>;
     /// A transaction from the wallet paying `amount` to `script`, signed but
-    /// not broadcast: at `fee_rate` if given, else at the wallet's own
-    /// estimate.
-    fn fund_lock(
-        &self,
-        script: &Script,
-        amount: Amount,
-        fee_rate: Option<FeeRate>,
-    ) -> Result<Transaction>;
+    /// not broadcast, at `fee_rate`, or the mempool's minimum if higher: a
+    /// wallet given a rate holds it to no relay floor.
+    fn fund_lock(&self, script: &Script, amount: Amount, fee_rate: FeeRate) -> Result<Transaction>;
     /// A feerate to confirm within a couple of blocks, if the node has an
     /// estimate; a conservative one for the next block if `urgent`.
     fn fee_rate(&self, urgent: bool) -> Result<Option<FeeRate>>;
@@ -356,23 +351,22 @@ impl Bitcoin for Bitcoind {
         Ok(None)
     }
 
-    fn fund_lock(
-        &self,
-        script: &Script,
-        amount: Amount,
-        fee_rate: Option<FeeRate>,
-    ) -> Result<Transaction> {
+    fn fund_lock(&self, script: &Script, amount: Amount, fee_rate: FeeRate) -> Result<Transaction> {
         let address = Address::from_script(script, self.network)
             .map_err(|e| Error(e.to_string()))?
             .to_string();
         let amount = amount.to_string_in(Denomination::Bitcoin);
+        // The mempool's minimum: at least `-minrelaytxfee`, and higher while
+        // it is full.
+        let mempool = self.call("getmempoolinfo", json!([]))?;
+        let rate = fee_rate.max(per_kvb(&mempool["mempoolminfee"])?);
         // Reserve the inputs, so the wallet does not spend them elsewhere
-        // before the funding transaction is broadcast.
-        let mut options = json!({"lockUnspents": true});
-        if let Some(rate) = fee_rate {
-            // sat/vB, exact: 250 sat/kwu is 1 sat/vB.
-            options["fee_rate"] = json!(rate.to_sat_per_kwu() as f64 / 250.0);
-        }
+        // before the funding transaction is broadcast. The rate is in
+        // sat/vB, exact: 250 sat/kwu is 1 sat/vB.
+        let options = json!({
+            "lockUnspents": true,
+            "fee_rate": rate.to_sat_per_kwu() as f64 / 250.0,
+        });
         let funded = self.call(
             "walletcreatefundedpsbt",
             json!([[], [{address: amount}], 0, options]),
