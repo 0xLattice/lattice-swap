@@ -695,12 +695,12 @@ fn a_lock_whose_answer_was_lost_is_still_claimed_back() {
     let (seller, buyer, lock) = locked.nex_signed();
     assert_eq!(lock.body.nonce, 3, "the nonce the synced node showed");
 
-    // Restarted, and on a node that has moved on: the same bytes again,
-    // never a lock at a new nonce.
+    // Restarted, and on a node that has moved on: never a lock at a new
+    // nonce, and the old one, which can no longer land, is not submitted.
     let seller = restart(&seller);
     let moved_on = nexus_at(healthy(), account(9_000_000, 4), account(0, 0), None);
     let (seller, actions) = seller.step(moved_on);
-    assert_eq!(submitted(&actions), lock);
+    assert!(actions.is_empty());
     assert_eq!(seller.watch().nexus.unwrap().cid, Some(lock.cid()));
 
     let (seller, _) = seller.step(btc(18, None, None));
@@ -1174,6 +1174,31 @@ fn the_seller_names_its_lock_only_once_mined() {
     assert!(matches!(seller, Seller::LockingNex { .. }));
     let (_, actions) = seller.step(nexus(account(500_000, 0), mined(lock.body.clone(), 1)));
     assert!(matches!(sent(&actions), Message::NexLocked { .. }));
+}
+
+/// A signed lock whose nonce another transaction took is no longer
+/// submitted, as in a live run that resubmitted one for hours: no submit
+/// can land it. A reorg that takes that transaction back submits it again.
+#[test]
+fn a_lock_whose_nonce_went_elsewhere_is_not_submitted() {
+    let (seller, _, lock) = locked().nex_signed();
+    assert_eq!(lock.body.nonce, 3);
+    let at = |nonce, lock: u64| {
+        nexus_at(
+            healthy(),
+            account(10_000_000, nonce),
+            account(lock, 0),
+            None,
+        )
+    };
+    let (seller, actions) = seller.step(at(4, 0));
+    assert!(actions.is_empty());
+    assert!(matches!(seller, Seller::LockingNex { .. }));
+    let (seller, actions) = seller.step(at(3, 0));
+    assert_eq!(submitted(&actions), lock);
+    // The lock address holds `nex_amount`: it is not ruled out.
+    let (_, actions) = seller.step(at(4, 500_000));
+    assert_eq!(submitted(&actions), lock);
 }
 
 /// A funding the buyer's node never shows is broadcast again, and waited
@@ -2446,6 +2471,66 @@ fn a_failing_view_is_logged_when_it_starts_and_while_it_lasts() {
         poll < 3
     };
     assert_eq!(logged(&back), 2);
+}
+
+/// Submits `transaction` at every Bitcoin view of a locked swap.
+#[cfg(feature = "native")]
+#[derive(Clone, Serialize, Deserialize)]
+struct Submitting {
+    watching: Watching<Seller>,
+    transaction: swap_nexus_tx::Transaction,
+}
+
+#[cfg(feature = "native")]
+impl Machine for Submitting {
+    fn step(self, event: Event) -> (Self, Vec<Action>) {
+        let actions = match event {
+            Event::Bitcoin(_) => vec![Action::Submit(self.transaction.clone())],
+            _ => vec![],
+        };
+        (self, actions)
+    }
+    fn outcome(&self) -> Option<Outcome> {
+        None
+    }
+    fn awaits_message(&self) -> bool {
+        false
+    }
+    fn watch(&self) -> Watch {
+        self.watching.watch()
+    }
+    fn own_spends(&self) -> &'static [Spend] {
+        self.watching.own_spends()
+    }
+}
+
+/// A submit that keeps failing alike is logged when it starts and again
+/// only every `WARN_AGAIN` while it lasts, not at every poll.
+#[cfg(feature = "native")]
+#[test]
+fn a_failing_submit_is_logged_when_it_starts_and_while_it_lasts() {
+    let locked = locked();
+    let watching = seller_watching(&locked, None);
+    let node = pooled(&locked, &[], 50);
+    node.0.borrow_mut().height = 105;
+    let (_, _, transaction) = locked.nex_signed();
+    clear_warnings();
+    let submitting = Submitting {
+        watching,
+        transaction,
+    };
+    bumps_with(
+        submitting,
+        &node,
+        |_| {},
+        |poll, _| {
+            if poll == 3 {
+                advance(WARN_AGAIN);
+            }
+            poll < 5
+        },
+    );
+    assert_eq!(warnings("nexus submit"), 2, "five submits, logged twice");
 }
 
 /// A redeem the seller saw outlives a cancel that a reorg put back in the
