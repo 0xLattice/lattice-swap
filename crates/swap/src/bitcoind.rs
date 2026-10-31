@@ -49,12 +49,17 @@ pub trait Bitcoin {
     /// mempool's minimum, and if another transaction spends `parent`'s input
     /// there, enough to replace it and its descendants.
     fn floor(&self, parent: &Transaction) -> Result<FeeRate>;
+    /// The feerate of `parent` and its descendants in the mempool, as a
+    /// child that bumped it made it; `None` if `parent` is not there.
+    fn package_rate(&self, parent: &Transaction) -> Result<Option<FeeRate>>;
     /// Raises unconfirmed `parent`, which pays `fee`, to `rate`, above its
     /// own feerate, with a CPFP child spending its payout, output 0, into
     /// the wallet, and submits both as a package; returns the child's txid.
     /// The child pays at most `max`, and less if its change would be dust
-    /// otherwise. A child at a higher rate replaces the last. Fails if the
-    /// wallet cannot sign for the payout.
+    /// otherwise. A child replacing the last pays at least what Bitcoin
+    /// Core asks of a replacement: the last's fee and the incremental
+    /// feerate on its own size. Fails if the wallet cannot sign for the
+    /// payout.
     fn bump(&self, parent: &Transaction, fee: Amount, rate: FeeRate, max: Amount) -> Result<Txid>;
 }
 
@@ -330,14 +335,44 @@ impl Bitcoin for Bitcoind {
         Ok(minimum.max(FeeRate::from_sat_per_kwu(above)))
     }
 
+    fn package_rate(&self, parent: &Transaction) -> Result<Option<FeeRate>> {
+        let entry = match self.call("getmempoolentry", json!([parent.compute_txid()])) {
+            Ok(entry) => entry,
+            // RPC_INVALID_ADDRESS_OR_KEY: not in the mempool.
+            Err(Error(e)) if e.contains("\"code\":-5") => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let size = entry["descendantsize"]
+            .as_u64()
+            .ok_or_else(|| Error(format!("mempool entry descendantsize: {entry}")))?;
+        let fees = btc(&entry["fees"]["descendant"])?.to_sat();
+        // Rounded down: it is compared with a target the package must meet.
+        Ok(Some(FeeRate::from_sat_per_kwu(fees * 250 / size.max(1))))
+    }
+
     fn bump(&self, parent: &Transaction, fee: Amount, rate: FeeRate, max: Amount) -> Result<Txid> {
-        // The child pays all the package needs but `fee`, short of `max` and
-        // of leaving dust.
+        // The child pays all the package needs but `fee`, and what replacing
+        // the last child takes, short of `max` and of leaving dust.
         let (change, size) = self.sized(parent)?;
-        let fee = rate
+        let mut fee = rate
             .fee_vb(size)
             .and_then(|package| package.checked_sub(fee))
             .ok_or_else(|| Error(format!("feerate {rate}")))?;
+        let txid = parent.compute_txid();
+        let spending = self.call("gettxspendingprevout", json!([[{"txid": txid, "vout": 0}]]))?;
+        if let Some(last) = spending[0]["spendingtxid"].as_str() {
+            let entry = self.call("getmempoolentry", json!([last]))?;
+            let mempool = self.call("getmempoolinfo", json!([]))?;
+            let incremental = per_kvb(&mempool["incrementalrelayfee"])?;
+            // A vbyte over the sized child's, whose signature may be a byte
+            // shorter than this one's.
+            let own = size - parent.vsize() as u64 + 1;
+            let replace = incremental
+                .fee_vb(own)
+                .and_then(|more| btc(&entry["fees"]["base"]).ok()?.checked_add(more))
+                .ok_or_else(|| Error(format!("mempool entry {last}: {entry}")))?;
+            fee = fee.max(replace);
+        }
         let spendable = parent.output[0]
             .value
             .checked_sub(change.minimal_non_dust())

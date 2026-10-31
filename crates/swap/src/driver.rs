@@ -134,10 +134,11 @@ impl Store {
 /// whose child the new one replaces; a refused one, which needs a package
 /// whatever its own feerate, whenever the target is above the last bump's.
 /// A bump that fails, as for a payout the wallet cannot sign for, is
-/// logged and tried again at the next poll. Cancel pays both parties'
+/// logged and tried again at the next block. Cancel pays both parties'
 /// 2-of-2 and is never bumped: a stuck cancel only delays the swap. The
 /// last bumps are kept in memory, so after a restart a waiting transaction
-/// is bumped at once.
+/// is bumped at once, unless the package a child already made with it in
+/// the mempool, as one bumped before the restart, pays the target.
 ///
 /// The buyer is safe only while its refund confirms before `t2`; after it,
 /// contesting the seller's punish is best effort. The punish leaf takes
@@ -356,22 +357,25 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
                 continue;
             }
             let last = self.waiting.get(&txid).copied();
-            let due = last
-                .is_none_or(|last| last.failed || height > last.height || refused && !last.refused);
+            let due = last.is_none_or(|last| height > last.height || refused && !last.refused);
             let mut now = last.unwrap_or(Waiting {
                 height,
                 refused,
                 rate: FeeRate::ZERO,
                 failed: false,
+                clamped: None,
             });
             now.refused = refused;
             if due {
                 now.height = height;
                 let fee = swap.fee(spend);
-                let result = match self.target(&tx, fee, refused, urgent.contains(&spend)) {
-                    Ok(Some(rate)) if rate > now.rate => {
-                        self.bump_one(&tx, fee, rate).map(|()| rate)
-                    }
+                let urgent = urgent.contains(&spend);
+                let result = match self.target(&tx, fee, refused, urgent, &mut now.clamped) {
+                    Ok(Some(rate)) if rate > now.rate => match self.bitcoin.package_rate(&tx) {
+                        Ok(Some(pooled)) if pooled >= rate => Ok(pooled),
+                        Ok(_) => self.bump_one(&tx, fee, rate).map(|()| rate),
+                        Err(e) => Err(e),
+                    },
                     Ok(_) => Ok(now.rate),
                     Err(e) => Err(e),
                 };
@@ -380,7 +384,7 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
                         now.rate = rate;
                         now.failed = false;
                     }
-                    // Logged once, then tried again quietly at every poll.
+                    // Logged once, then tried again quietly at every block.
                     Err(e) => {
                         if !now.failed {
                             warn(&format!("bump {txid}: {e}"));
@@ -396,13 +400,15 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
 
     /// The feerate to raise `tx`, which pays `fee`, to, clamped to
     /// `max_fee_rate`; `None` if `tx` is in the mempool and already pays it
-    /// alone. A refused `tx` needs a package whatever it pays.
+    /// alone. A refused `tx` needs a package whatever it pays. A clamp is
+    /// logged once per target, the last kept in `clamped`.
     fn target(
         &self,
         tx: &Transaction,
         fee: Amount,
         refused: bool,
         urgent: bool,
+        clamped: &mut Option<FeeRate>,
     ) -> bitcoind::Result<Option<FeeRate>> {
         let mut rate = self
             .bitcoin
@@ -412,11 +418,14 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
             rate = rate.max(self.bitcoin.floor(tx)?);
         }
         if rate > self.max_fee_rate {
-            warn(&format!(
-                "bump {}: target {rate} clamped to max_fee_rate {}",
-                tx.compute_txid(),
-                self.max_fee_rate
-            ));
+            if *clamped != Some(rate) {
+                warn(&format!(
+                    "bump {}: target {rate} clamped to max_fee_rate {}",
+                    tx.compute_txid(),
+                    self.max_fee_rate
+                ));
+            }
+            *clamped = Some(rate);
             rate = self.max_fee_rate;
         }
         let alone = rate.fee_vb(tx.vsize() as u64);
@@ -524,6 +533,8 @@ struct Waiting {
     rate: FeeRate,
     /// Whether the last attempt to bump it failed: it is tried again.
     failed: bool,
+    /// The last target clamped to `max_fee_rate`, already logged.
+    clamped: Option<FeeRate>,
 }
 
 /// Our spends within `margin` blocks of their deadline: redeem once the

@@ -1,6 +1,8 @@
 //! The bitcoind client, and the driver's fee bumping, against a real
 //! regtest bitcoind.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
@@ -391,6 +393,13 @@ fn a_rebump_replaces_the_child_from_a_wallet_with_no_coins() {
     assert!(pooled(&seller, second));
     assert!(!pooled(&seller, first), "replaced");
     assert!(pooled(&seller, redeem.compute_txid()));
+    // A sat more over the package is less than the incremental feerate on
+    // the child: the child pays that instead.
+    let third = seller
+        .bump(&redeem, fee, FeeRate::from_sat_per_kwu(50 * 250 + 1), all)
+        .unwrap();
+    assert!(pooled(&seller, third));
+    assert!(!pooled(&seller, second), "replaced");
 }
 
 /// Cancel pays what redeem pays and has no output either party can spend
@@ -461,11 +470,13 @@ fn the_node_takes_both_estimate_targets() {
     assert!(rpc.fee_rate(true).unwrap().is_none(), "regtest has no data");
 }
 
-/// Fails its first bump, as a wallet still locked would, and passes the
-/// rest to bitcoind.
+/// Fails its first bump, as a wallet still locked would, unless `failed`
+/// says it has, and passes the rest to bitcoind, counting in `failures`
+/// the bumps bitcoind fails.
 struct Flaky {
     inner: Bitcoind,
     failed: std::cell::Cell<bool>,
+    failures: Arc<AtomicUsize>,
 }
 
 impl Bitcoin for Flaky {
@@ -498,6 +509,9 @@ impl Bitcoin for Flaky {
     fn floor(&self, parent: &Transaction) -> swap::bitcoind::Result<FeeRate> {
         self.inner.floor(parent)
     }
+    fn package_rate(&self, parent: &Transaction) -> swap::bitcoind::Result<Option<FeeRate>> {
+        self.inner.package_rate(parent)
+    }
     fn bump(
         &self,
         parent: &Transaction,
@@ -508,7 +522,11 @@ impl Bitcoin for Flaky {
         if !self.failed.replace(true) {
             return Err(swap::bitcoind::Error("wallet locked".into()));
         }
-        self.inner.bump(parent, fee, rate, max)
+        let bumped = self.inner.bump(parent, fee, rate, max);
+        if bumped.is_err() {
+            self.failures.fetch_add(1, Ordering::Relaxed);
+        }
+        bumped
     }
 }
 
@@ -526,6 +544,7 @@ fn a_transient_bump_failure_is_retried() {
     let flaky = Flaky {
         inner: seller,
         failed: std::cell::Cell::new(false),
+        failures: Arc::default(),
     };
     let mut driver =
         Driver::<_, _, Ivy>::start(machine, vec![], flaky, nexus, None, store).unwrap();
@@ -539,6 +558,69 @@ fn a_transient_bump_failure_is_retried() {
         node.client.generate_to_address(1, &miner).unwrap();
     }
     assert_eq!(party.join().unwrap(), Outcome::Swapped);
+}
+
+/// A driver restarted while the redeem it bumped waits knows nothing of
+/// that bump. It finds the package the child made in the mempool, at the
+/// target already, and leaves it, at that block and the next: a child at
+/// the same rate could not replace it.
+#[test]
+fn a_restarted_driver_leaves_a_package_at_its_target() {
+    let node = start(&[]);
+    let (seller, payout) = empty_wallet(&node, "seller");
+    let (machine, _) = Redeems::funded(&node, payout);
+    let payout = json!([[{"txid": machine.redeem.compute_txid(), "vout": 0}]]);
+    let child = || {
+        let spending = seller.call("gettxspendingprevout", payout.clone()).unwrap();
+        spending[0]["spendingtxid"].as_str().map(String::from)
+    };
+    let nexus = || Client::new("http://127.0.0.1:9", "", Duration::from_secs(1));
+    let directory = tempfile::tempdir().unwrap();
+    let store = || Store::new(directory.path(), [7; 32]);
+    let fallback = FeeRate::from_sat_per_vb_u32(25);
+
+    let mut driver = Driver::<_, _, Ivy>::start(
+        machine,
+        vec![],
+        rpc(&node, "seller"),
+        nexus(),
+        None,
+        store(),
+    )
+    .unwrap();
+    driver.poll = Duration::from_millis(10);
+    driver.fallback_fee_rate = fallback;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    driver
+        .run_until(|_| {
+            assert!(Instant::now() < deadline, "never bumped");
+            child().is_some()
+        })
+        .unwrap();
+    let bumped = child();
+    drop(driver);
+
+    let failures = Arc::<AtomicUsize>::default();
+    let flaky = Flaky {
+        inner: rpc(&node, "seller"),
+        failed: std::cell::Cell::new(true),
+        failures: failures.clone(),
+    };
+    let mut driver = Driver::<Redeems, _, Ivy>::resume(flaky, nexus(), None, store()).unwrap();
+    driver.poll = Duration::from_millis(10);
+    driver.fallback_fee_rate = fallback;
+    let polls = std::cell::Cell::new(0);
+    driver
+        .run_until(|_| {
+            polls.set(polls.get() + 1);
+            if polls.get() == 20 {
+                mine_empty(&node);
+            }
+            polls.get() > 40
+        })
+        .unwrap();
+    assert_eq!(failures.load(Ordering::Relaxed), 0);
+    assert_eq!(child(), bumped, "the child is the first driver's");
 }
 
 fn sent(actions: &[Action]) -> swap::Message {
@@ -693,6 +775,7 @@ fn contest_a_refund(punish: impl FnOnce(&Bitcoind, &Transaction)) {
     let wait = |what: &str, done: &dyn Fn() -> bool| {
         let deadline = Instant::now() + Duration::from_secs(60);
         while !done() {
+            assert!(!party.is_finished(), "{what}: the driver stopped");
             assert!(Instant::now() < deadline, "{what}");
             std::thread::sleep(Duration::from_millis(250));
         }

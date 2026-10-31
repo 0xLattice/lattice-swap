@@ -1296,6 +1296,9 @@ impl Bitcoin for Fake {
     fn floor(&self, _: &Transaction) -> crate::bitcoind::Result<FeeRate> {
         Ok(FeeRate::from_sat_per_vb_u32(self.0.borrow().floor))
     }
+    fn package_rate(&self, _: &Transaction) -> crate::bitcoind::Result<Option<FeeRate>> {
+        Ok(None)
+    }
     fn bump(
         &self,
         parent: &Transaction,
@@ -1336,6 +1339,9 @@ impl Bitcoin for Offline {
         unreachable!()
     }
     fn floor(&self, _: &Transaction) -> crate::bitcoind::Result<FeeRate> {
+        unreachable!()
+    }
+    fn package_rate(&self, _: &Transaction) -> crate::bitcoind::Result<Option<FeeRate>> {
         unreachable!()
     }
     fn bump(
@@ -1683,24 +1689,43 @@ fn a_state_file_of_another_version_is_refused() {
     assert!(store.load_value().is_err());
 }
 
-/// A bump that fails records nothing: the spend stays due and is bumped
-/// again at the next poll, without waiting for a block.
+/// A bump that fails records nothing: the spend is bumped again at the
+/// next block, not at every poll.
 #[test]
-fn a_failed_bump_is_tried_again_at_the_next_poll() {
+fn a_failed_bump_is_tried_again_at_the_next_block() {
     let locked = locked();
     let node = pooled(&locked, &[Spend::Redeem], 50);
     node.0.borrow_mut().failing = 1;
     let bumps = bumps(
         seller_watching(&locked, None),
         &node,
-        &[105, 105, 105],
+        &[105, 105, 106, 106],
         |_| {},
     );
     let bumps: Vec<_> = bumps
         .into_iter()
         .map(|(_, height, rate, _)| (height, rate.to_sat_per_vb_ceil()))
         .collect();
-    assert_eq!(bumps, [(105, 50), (105, 50)]);
+    assert_eq!(bumps, [(105, 50), (106, 50)]);
+}
+
+/// Redeem pays two fees: a target its feerate meets with both, though not
+/// with one, needs no bump.
+#[test]
+fn a_redeem_is_bumped_only_past_what_its_two_fees_pay() {
+    let locked = locked();
+    let (swap, lock) = locked.swap();
+    let size = swap.unsigned_tx(lock, Spend::Redeem).vsize() as u64;
+    let one = swap.params().fee;
+    let rate = FeeRate::from_sat_per_kwu(one.to_sat() * 3 * 250 / (2 * size));
+    let alone = rate.fee_vb(size).unwrap();
+    assert!(one < alone && alone <= one * 2, "{alone}");
+    let node = pooled(&locked, &[Spend::Redeem], 0);
+    node.0.borrow_mut().estimate = Some(rate);
+    assert_eq!(
+        bumps(seller_watching(&locked, None), &node, &[105], |_| {}),
+        []
+    );
 }
 
 /// Within `margin` blocks of its deadline a spend is bumped to the
