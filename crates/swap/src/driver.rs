@@ -222,7 +222,9 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
             return Ok(());
         };
         match nexus_view(&self.nexus, &watch) {
-            Ok(view) => self.apply(Event::Nexus(view)),
+            Ok(Some(view)) => self.apply(Event::Nexus(view)),
+            // The tip moved while the view was read: read again next time.
+            Ok(None) => Ok(()),
             Err(e) => {
                 warn(&format!("nexus: {e}"));
                 Ok(())
@@ -342,12 +344,15 @@ pub fn bitcoin_view(
 
 /// The lock account is read before the watched transaction: a lock that
 /// has signed something, read first, shows that transaction mined in the
-/// later read if it is ours. The tip is read after both accounts, so a
-/// block that moved them is at or below the tip the view reports.
-fn nexus_view(client: &Client, watch: &NexusWatch) -> swap_nexus_tx::rpc::Result<NexusView> {
+/// later read if it is ours. The view is one tip's: `None` if the tip
+/// moved while it was read, so no read in it comes from another block.
+fn nexus_view(
+    client: &Client,
+    watch: &NexusWatch,
+) -> swap_nexus_tx::rpc::Result<Option<NexusView>> {
+    let health = client.health()?;
     let own = client.account(&watch.own_address)?;
     let lock = client.account(&watch.lock_address)?;
-    let health = client.health()?;
     let min_relay_fee = client.min_relay_fee()?;
     let watched = match &watch.cid {
         Some(cid) => match client.transaction(cid)? {
@@ -360,12 +365,16 @@ fn nexus_view(client: &Client, watch: &NexusWatch) -> swap_nexus_tx::rpc::Result
         Some(height) => client.block_hash(height)?,
         None => None,
     };
-    Ok(NexusView {
+    let after = client.health()?;
+    if (after.height, &after.tip) != (health.height, &health.tip) {
+        return Ok(None);
+    }
+    Ok(Some(NexusView {
         health,
         own,
         lock,
         min_relay_fee,
         watched,
         block_at,
-    })
+    }))
 }
