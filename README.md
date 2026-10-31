@@ -36,6 +36,49 @@ no Nexus consensus change is required.
   Its end-to-end tests run whole swaps on regtest and a Nexus node; like the
   node test, they are ignored by default and need `NEXUS_NODE_IMAGE` and
   `-- --ignored`.
+- `lattice-swap`: the command line tool that runs one side of a swap.
+
+## Usage
+
+Each party runs its own bitcoind (with `-txindex`, and a wallet) and its own
+lattice-node. The two agree on the terms off-tool. The seller, who has NEX,
+makes an offer and waits for the buyer to dial:
+
+```sh
+LATTICE_SWAP_NEX_KEY=<seed hex> lattice-swap offer \
+  --btc-amount 50000000 --btc-fee 2000 --nex-amount 1000000 --nex-fee 10 \
+  --listen 0.0.0.0:7400 --advertise 203.0.113.5:7400 \
+  --btc-wallet sell --btc-cookie ~/.bitcoin/.cookie \
+  --nexus-url http://127.0.0.1:8080 --nexus-cookie ~/lattice/.cookie > offer
+```
+
+The first line it prints is the offer: the terms, where the seller listens
+and its key, and a session key for the buyer. Whoever holds the offer can
+take it, so hand it over privately. The buyer, who has BTC, takes it:
+
+```sh
+lattice-swap take offer --nex-address <your Nexus address> \
+  --btc-wallet buy --btc-cookie ~/.bitcoin/.cookie \
+  --nexus-url http://127.0.0.1:8080 --nexus-cookie ~/lattice/.cookie
+```
+
+Both then run until the swap ends and print its outcome. Each keeps its
+state in `<swap id>.json` in `--dir`, which holds its secrets for the swap
+but never the seller's Nexus wallet key: that comes from `--nex-key-file`
+or `LATTICE_SWAP_NEX_KEY`, never from an argument.
+
+- `lattice-swap resume <swap file>` carries on after a restart, from the
+  chains alone. `refund` does the same: a swap cancels and refunds by
+  itself once its timelocks allow.
+- `lattice-swap status <swap file>` prints the state and outcome, and asks
+  no node.
+
+The defaults are `t1` 288 and `t2` 144 Bitcoin blocks, 6 Bitcoin and 24
+Nexus confirmations, and a margin of 12. A Nexus block is about 6 Bitcoin
+blocks, so the tool refuses any `t1` below `btc-confirmations + 6 ×
+(nex-confirmations + 1) + margin`. A buyer refuses an offer with fewer
+Nexus confirmations than `--min-nex-confirmations`, 24 by default.
+`docs/protocol.md` describes the protocol.
 
 ## License
 

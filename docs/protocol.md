@@ -1,0 +1,93 @@
+# The swap protocol
+
+A seller has NEX and wants BTC; a buyer has BTC and wants NEX. They agree
+on the terms off-band: the amounts, the fees, the timelocks `t1` and `t2`,
+how many confirmations each chain needs, and a `margin` of Bitcoin blocks of
+slack before a timelock.
+
+## Keys
+
+Each party makes fresh secrets for every swap: a Bitcoin key, and a key
+share that exists on both curves, ed25519 for Nexus and secp256k1 for
+Bitcoin, with a proof that the two halves are the same scalar. The NEX is
+locked at the Nexus address of the joint key `(s + b)·G`, where `s` is the
+seller's share and `b` the buyer's. Whoever learns both shares can spend
+from it. Nexus needs nothing new: the lock is an ordinary transfer, and so
+is the claim from it.
+
+Bitcoin carries every timelock. The buyer funds a Taproot output that only
+the seller's and the buyer's Bitcoin keys can spend together. Four
+transactions can move it, each with its txid fixed before any is signed:
+
+- redeem pays the seller;
+- cancel moves the BTC to the cancel output, once the lock is `t1` deep;
+- refund pays the cancel output back to the buyer;
+- punish pays the cancel output to the seller alone, once cancel is `t2`
+  deep.
+
+The buyer's signature on the redeem is an adaptor signature encrypted to
+the seller's share. To publish the redeem, the seller decrypts it, which
+reveals `s`. The seller's signature on the refund is encrypted to the
+buyer's share, so publishing the refund reveals `b`. Either is revealed as
+soon as its transaction is in the mempool.
+
+## Messages
+
+All messages travel on the ivy topic `lattice-swap/v1`. Each carries the
+swap id.
+
+1. B → S `BuyerHello`, then S → B `SellerHello`. Each sends its Bitcoin key,
+   its public share with the cross-curve proof, and its payout scripts.
+2. B → S `LockProposal`: the funding transaction without witnesses. Its txid
+   is final, but the seller cannot broadcast it.
+3. S → B `SellerSignatures`: the seller's cancel signature and its refund
+   adaptor signature. B → S `BuyerSignatures`: the buyer's cancel
+   signature. The buyer then broadcasts the funding transaction.
+4. Once the lock is `btc_confirmations` deep, S transfers `nex_amount` to
+   the lock address. Once that is mined, S sends `NexLocked` with its CID.
+5. B checks the NEX lock on its own node and sends `RedeemSignature`, its
+   redeem adaptor signature. The buyer checks that the transaction is on
+   Nexus, credits the lock address at least `nex_amount`, and is
+   `nex_confirmations` deep. It also checks that the lock address holds at
+   least `nex_amount` and has never signed, and that its node is synced.
+6. S redeems the BTC, which reveals `s`. B claims the NEX.
+
+## When something goes wrong
+
+- If S never redeems, B cancels after `t1` and refunds, which reveals `b`.
+  S then claims its NEX back.
+- If B never refunds, S punishes after `t2` and keeps the BTC.
+- S stops broadcasting the redeem once the lock is `t1 - margin + 1` deep,
+  so a redeem it sends has `margin - 1` blocks to confirm before cancel can
+  be broadcast.
+- Before anything is at stake, a party whose counterparty goes quiet
+  aborts.
+- A seller that signed a NEX lock and then learned `b` keeps waiting while
+  the lock address holds less than `nex_amount`, because the lock can still
+  land until the seller's nonce passes it. The operator ends the wait by
+  spending once from the seller's Nexus wallet at that nonce. Once that is
+  mined, the lock can never land.
+- A buyer whose node never shows its funding transaction rebroadcasts it and
+  keeps its secrets, because only they can refund it if it confirms. The
+  operator ends the wait by spending one of the funding's inputs elsewhere.
+
+Every timelock counts blocks after a confirmation, so every deadline is a
+number of confirmations.
+
+## State
+
+Each party is a state machine that does no I/O. A driver feeds it what the
+chains and the counterparty show. Before any action, the driver writes the
+party's state to its swap file. The state holds the party's secrets for the
+swap but never the seller's Nexus wallet key, so a party that restarts picks
+up where it stopped.
+
+## Outcomes
+
+- `Swapped`: the buyer has the NEX, the seller the BTC.
+- `Refunded`: the buyer has its BTC back, and the seller has its NEX if it
+  locked any.
+- `Punished`: the seller took the BTC through punish.
+- `Drained`: this party learned the joint key, but the lock was already
+  spent.
+- `Aborted`: stopped before anything was at stake.
