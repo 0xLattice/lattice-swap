@@ -102,6 +102,9 @@ pub struct Terms {
     /// At least 2: a block can land between the view the seller judges the
     /// window on and its broadcast.
     pub margin: u16,
+    /// The CID of the genesis block of the Nexus the NEX is on. The machines
+    /// never read it: the driver's caller checks its node follows that chain.
+    pub nexus_genesis: String,
 }
 
 impl Terms {

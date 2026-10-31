@@ -214,6 +214,9 @@ pub struct Driver<M, B, T> {
     /// [`WARN_AGAIN`], until the node catches up. Every other spend, and
     /// every bump, goes on: a stale view at worst delays them.
     pub max_tip_age: Duration,
+    /// The time now: the clock a tip is aged by, and stale or failing views
+    /// are timed by. The system's; tests set their own.
+    pub clock: fn() -> SystemTime,
     /// Our swap transactions waiting unconfirmed, by txid.
     waiting: HashMap<Txid, Waiting>,
     /// Transactions broadcast since the last Bitcoin view, and whether the
@@ -221,9 +224,9 @@ pub struct Driver<M, B, T> {
     broadcast: Vec<(Transaction, bool)>,
     /// The last failure to read a Bitcoin view, or why the views are
     /// stale, and when it was logged.
-    view_failed: Option<(String, Instant)>,
+    view_failed: Option<(String, SystemTime)>,
     /// Since when the Bitcoin views have been stale.
-    stale_since: Option<Instant>,
+    stale_since: Option<SystemTime>,
     /// The tip, and when this driver first saw it, in seconds since the
     /// Unix epoch. Kept in memory only: after a restart, the tip is first
     /// seen then.
@@ -287,6 +290,7 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
             max_fee_rate: FeeRate::from_sat_per_vb_u32(1_000),
             max_fee_fraction: 1.0,
             max_tip_age: Duration::from_secs(90 * 60),
+            clock: SystemTime::now,
             waiting: HashMap::new(),
             broadcast: vec![],
             view_failed: None,
@@ -369,11 +373,13 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
         let Some((swap, lock)) = watch.bitcoin else {
             return Ok(());
         };
+        let now = (self.clock)();
         let view = bitcoin_view(
             &self.bitcoin,
             &swap,
             lock,
             self.max_tip_age,
+            now,
             &mut self.first_seen,
         );
         match view {
@@ -382,9 +388,9 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
                     // A node lags its headers for a moment at every block:
                     // logged only once it lasts.
                     Some(why) => {
-                        let since = *self.stale_since.get_or_insert_with(Instant::now);
-                        if since.elapsed() >= WARN_AGAIN {
-                            self.view_failed(why.clone());
+                        let since = *self.stale_since.get_or_insert(now);
+                        if elapsed(since, now) >= WARN_AGAIN {
+                            self.view_failed(why.clone(), now);
                         }
                     }
                     None => {
@@ -407,21 +413,21 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
                 Ok(())
             }
             Err(e) => {
-                self.view_failed(e.to_string());
+                self.view_failed(e.to_string(), now);
                 Ok(())
             }
         }
     }
 
     /// Logs `e` when it changes, and again while it lasts.
-    fn view_failed(&mut self, e: String) {
+    fn view_failed(&mut self, e: String, now: SystemTime) {
         let again = self
             .view_failed
             .as_ref()
-            .is_none_or(|(last, at)| *last != e || at.elapsed() >= WARN_AGAIN);
+            .is_none_or(|(last, at)| *last != e || elapsed(*at, now) >= WARN_AGAIN);
         if again {
             warn(&e);
-            self.view_failed = Some((e, Instant::now()));
+            self.view_failed = Some((e, now));
         }
     }
 
@@ -641,8 +647,13 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
 pub(crate) const URGENT_RETRIES: u8 = 8;
 
 /// How often a failure to read a Bitcoin view that lasts is logged again,
-/// and how long stale views last before they are logged. Short under test.
-pub(crate) const WARN_AGAIN: Duration = Duration::from_millis(if cfg!(test) { 20 } else { 60_000 });
+/// and how long stale views last before they are logged.
+pub(crate) const WARN_AGAIN: Duration = Duration::from_secs(60);
+
+/// The time from `since` to `now`; none if the clock went back.
+fn elapsed(since: SystemTime, now: SystemTime) -> Duration {
+    now.duration_since(since).unwrap_or_default()
+}
 
 /// A swap transaction of ours waiting unconfirmed.
 #[derive(Clone, Copy)]
@@ -706,9 +717,9 @@ thread_local! {
 /// for.
 ///
 /// The view is [`BitcoinView::stale`] if the node lags the best header
-/// chain it knows, or if its tip is more than `max_tip_age` old: by this
-/// machine's clock, since its block time or since `first_seen`, when this
-/// machine first saw it, whichever is earlier. A block time alone is the
+/// chain it knows, or if its tip is more than `max_tip_age` old at `now`:
+/// since its block time or since `first_seen`, when this machine first saw
+/// it, whichever is earlier. A block time alone is the
 /// miner's to set, up to two hours ahead; `first_seen` is updated to the
 /// tip. A node that stalled, or is fed by someone who cut it off, would
 /// show the redeem window still open after it closed.
@@ -717,10 +728,11 @@ pub fn bitcoin_view(
     swap: &Swap,
     lock: OutPoint,
     max_tip_age: Duration,
+    now: SystemTime,
     first_seen: &mut Option<(BlockHash, u64)>,
 ) -> bitcoind::Result<BitcoinView> {
     let tip = bitcoin.tip()?;
-    let now = SystemTime::now()
+    let now = now
         .duration_since(UNIX_EPOCH)
         .map_or(0, |now| now.as_secs());
     let seen = match *first_seen {

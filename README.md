@@ -55,8 +55,10 @@ names. By default that is mainnet's,
 Bitcoin as the OP_RETURN of transaction
 `7501f77602b581f605e6bc61c310b540e17324d3cc292c18985d8a3464d23236` in block
 970053. A buyer on any other Nexus would accept a worthless NEX lock. The
-offer also names the seller's genesis, and the buyer refuses one other than
-its own, but each side's protection is its own node's check. A private chain
+offer's terms also name the seller's genesis, and the buyer refuses one
+other than its own, but each side's protection is its own node's check. The
+swap file keeps that genesis: `resume` refuses a `--nexus-genesis` naming
+another. A private chain
 forked from mainnet's genesis passes it: it shares mainnet's identity, so
 trade only through a node that follows the public network, and never use a
 mainnet key on a private or dev chain, where a transfer it signs is valid on

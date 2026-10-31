@@ -57,13 +57,13 @@ fn small(t1: u16) -> Terms {
         "--t1",
         &t1.to_string(),
     ]);
-    args.terms.terms([7; 32])
+    args.terms.terms([7; 32], MAINNET.into())
 }
 
 #[test]
 fn the_defaults_are_the_agreed_settings_and_pass() {
     let args = offer_args(&[]);
-    let terms = args.terms.terms([7; 32]);
+    let terms = args.terms.terms([7; 32], MAINNET.into());
     assert_eq!((terms.t1, terms.t2), (288, 144));
     assert_eq!((terms.btc_confirmations, terms.nex_confirmations), (6, 24));
     assert_eq!(terms.btc_amount, Amount::from_sat(50_000_000));
@@ -137,9 +137,8 @@ fn a_swap_file_is_named_by_its_swap_id() {
 #[test]
 fn an_offer_parses_back_into_the_same_terms() {
     let offer = Offer {
-        terms: offer_args(&[]).terms.terms(random32()),
+        terms: offer_args(&[]).terms.terms(random32(), MAINNET.into()),
         btc_network: Network::Signet,
-        nexus_genesis: MAINNET.into(),
         address: "192.0.2.1:7000".parse().unwrap(),
         seller: ivy::Config::new(SigningKey::from_bytes(&random32()))
             .peer_key()
@@ -156,7 +155,6 @@ fn an_offer_with_a_bad_seller_key_is_refused() {
     let offer = Offer {
         terms: small(16),
         btc_network: Network::Bitcoin,
-        nexus_genesis: MAINNET.into(),
         address: "192.0.2.1:7000".parse().unwrap(),
         seller: "00".repeat(31),
         buyer_session: [7; 32],
@@ -218,13 +216,12 @@ fn policy(extra: &[&str]) -> (PolicyArgs, Network) {
 
 /// The default terms, at the default bounds.
 fn agreed() -> Offer {
-    let mut terms = offer_args(&[]).terms.terms([7; 32]);
+    let mut terms = offer_args(&[]).terms.terms([7; 32], MAINNET.into());
     terms.btc_fee = Amount::from_sat(10_000);
     terms.nex_fee = 1_000;
     Offer {
         terms,
         btc_network: Network::Bitcoin,
-        nexus_genesis: MAINNET.into(),
         address: "192.0.2.1:7000".parse().unwrap(),
         seller: "00".repeat(32),
         buyer_session: [7; 32],
@@ -244,7 +241,9 @@ fn take_refuses_any_term_outside_its_policy() {
     type Change = (&'static str, fn(&mut Offer));
     let changes: [Change; 15] = [
         ("network", |o| o.btc_network = Network::Testnet),
-        ("nexus", |o| o.nexus_genesis = swap_nexus_tx::cid(b"dev")),
+        ("nexus", |o| {
+            o.terms.nexus_genesis = swap_nexus_tx::cid(b"dev")
+        }),
         ("more btc", |o| o.terms.btc_amount += Amount::from_sat(1)),
         ("less btc", |o| o.terms.btc_amount -= Amount::from_sat(1)),
         ("more nex", |o| o.terms.nex_amount += 1),
@@ -1431,7 +1430,7 @@ fn offer_take_and_resume_refuse_another_nexus() {
     };
     refused(take(&takeable(), &[], &elsewhere()), &dev, MAINNET);
     let mut dev_offer = takeable();
-    dev_offer.nexus_genesis = dev.clone();
+    dev_offer.terms.nexus_genesis = dev.clone();
     refused(
         take(&dev_offer, &on_dev, &nexus_node(10, true)),
         MAINNET,
@@ -1442,21 +1441,49 @@ fn offer_take_and_resume_refuse_another_nexus() {
         PAST_THE_CHECKS
     );
 
+    // A swap file keeps its Nexus: `resume` refuses a flag naming another
+    // before it asks any node, then a node on another than the flag's.
     let home = SecretBytes([7; 32]).nex_address();
-    let seller = Seller::new(small(16), home, ScriptBuf::new(), ScriptBuf::new()).unwrap();
-    let (_directory, seller) = swap_file(seller);
-    let (buyer, _) = Buyer::start(small(16), ScriptBuf::new(), "b".into()).unwrap();
-    let (_directory, buyer) = swap_file(buyer);
-    for path in [&seller, &buyer] {
+    let on = |genesis: &str| Terms {
+        nexus_genesis: genesis.into(),
+        ..small(16)
+    };
+    let mut files = vec![];
+    for genesis in [MAINNET, dev.as_str()] {
+        let seller = Seller::new(
+            on(genesis),
+            home.clone(),
+            ScriptBuf::new(),
+            ScriptBuf::new(),
+        );
+        files.push((genesis, swap_file(seller.unwrap())));
+        let (buyer, _) = Buyer::start(on(genesis), ScriptBuf::new(), "b".into()).unwrap();
+        files.push((genesis, swap_file(buyer)));
+    }
+    for (genesis, (_directory, path)) in &files {
         let resume = |extra: &[&str], nexus_url: &str| {
             let mut args = vec!["resume", path.as_str(), "--nex-key-file", key];
             args.extend(extra);
             refusal_on(&args, &url, nexus_url)
         };
-        refused(resume(&[], &elsewhere()), &dev, MAINNET);
-        refused(resume(&on_dev, &nexus_node(10, false)), MAINNET, &dev);
+        let (flag, other) = match *genesis == MAINNET {
+            true => (vec![], dev.as_str()),
+            false => (on_dev.to_vec(), MAINNET),
+        };
+        let kept = resume(&["--nexus-genesis", other], &nexus_node_on(other, 10, true));
+        assert!(
+            kept.contains(&format!(
+                "trades on the Nexus of genesis {genesis}, not {other}"
+            )),
+            "{kept}"
+        );
+        refused(
+            resume(&flag, &nexus_node_on(other, 10, true)),
+            other,
+            genesis,
+        );
         // Past the genesis, the next check is the node's past state.
-        let next = resume(&on_dev, &nexus_node_on(&dev, 10, false));
+        let next = resume(&flag, &nexus_node_on(genesis, 10, false));
         assert!(next.contains("--state all"), "{next}");
     }
 }

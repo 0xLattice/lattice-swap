@@ -3,7 +3,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime};
 
 use super::*;
 use crate::bitcoind::Bitcoin;
@@ -29,6 +29,7 @@ fn terms() -> Terms {
         btc_confirmations: 1,
         nex_confirmations: 1,
         margin: 3,
+        nexus_genesis: swap_nexus_tx::MAINNET_GENESIS.into(),
     }
 }
 
@@ -60,6 +61,13 @@ fn broadcasts(actions: &[Action]) -> Vec<Transaction> {
             Action::Broadcast(tx) => Some(tx.clone()),
             _ => None,
         })
+        .collect()
+}
+
+fn broadcast_txids(actions: &[Action]) -> Vec<Txid> {
+    broadcasts(actions)
+        .iter()
+        .map(Transaction::compute_txid)
         .collect()
 }
 
@@ -1376,9 +1384,7 @@ impl Bitcoin for Fake {
         if node.down {
             return Err(crate::bitcoind::Error("connection refused".into()));
         }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap();
+        let now = now().duration_since(std::time::UNIX_EPOCH).unwrap();
         Ok(crate::bitcoind::Tip {
             height: node.height,
             headers: node.height + node.headers_ahead,
@@ -1531,8 +1537,22 @@ fn bumps<M: Machine>(
     })
 }
 
-/// Runs `machine`'s driver, changing the node with `each` before every poll
-/// until it returns false, and returns the bumps it asked for.
+thread_local! {
+    /// This thread's time, which only [`advance`] moves: the drivers under
+    /// test and [`Fake`] tips read it.
+    static NOW: std::cell::Cell<SystemTime> = std::cell::Cell::new(SystemTime::now());
+}
+
+fn now() -> SystemTime {
+    NOW.with(std::cell::Cell::get)
+}
+
+fn advance(by: Duration) {
+    NOW.with(|now| now.set(now.get() + by));
+}
+
+/// Runs `machine`'s driver on [`now`], changing the node with `each` before
+/// every poll until it returns false, and returns the bumps it asked for.
 fn bumps_with<M: Machine>(
     machine: M,
     node: &Fake,
@@ -1544,6 +1564,7 @@ fn bumps_with<M: Machine>(
     let client = Client::new("http://127.0.0.1:9", "", Duration::from_secs(1));
     let mut driver = Driver::start(machine, vec![], node.clone(), client, None, store).unwrap();
     driver.poll = Duration::from_millis(1);
+    driver.clock = now;
     set(&mut driver);
     let polls = std::cell::Cell::new(0);
     let stopped = driver.run_until(|_| {
@@ -2030,11 +2051,6 @@ fn a_redeem_once_seen_is_never_abandoned() {
 #[test]
 fn a_redeem_never_sent_is_abandoned_when_the_window_closes() {
     let (seller, _, _) = seller_holding();
-    // As saved before `seen` existed: the field is missing, and false.
-    let mut saved = serde_json::to_value(&seller).unwrap();
-    let fields = saved["Redeeming"].as_object_mut().unwrap();
-    assert_eq!(fields.remove("seen"), Some(json!(false)));
-    let seller: Seller = serde_json::from_value(saved).unwrap();
     let (seller, actions) = seller.step(btc(19, None, None));
     assert!(broadcasts(&actions).is_empty());
     assert!(matches!(seller, Seller::Cancelling { .. }));
@@ -2152,18 +2168,21 @@ fn clear_warnings() {
 fn a_stale_or_lagging_node_starts_no_redeem() {
     let (seller, redeem, _) = seller_holding();
     let (_, lock) = seller.watch().bitcoin.unwrap();
-    let redeemed = |set: fn(&mut Node), lasting: Duration| {
+    // Views `polls` of them, `WARN_AGAIN` apart.
+    let redeemed = |set: fn(&mut Node), polls: usize| {
         // The window is open: the lock 17 deep.
         let node = funded_node(lock, 117);
         set(&mut node.0.borrow_mut());
-        let start = Instant::now();
-        let each = |poll, _: &mut Node| poll == 0 || start.elapsed() < lasting;
+        let each = |poll, _: &mut Node| {
+            advance(WARN_AGAIN);
+            poll < polls
+        };
         bumps_with(seller.clone(), &node, |_| {}, each);
         let txid = redeem.compute_txid();
         let node = node.0.borrow();
         node.mempool.iter().any(|tx| tx.compute_txid() == txid)
     };
-    let once = Duration::ZERO;
+    let once = 1;
     assert!(redeemed(|_| {}, once));
     assert!(
         redeemed(|node| node.tip_age = 60 * 60, once),
@@ -2173,9 +2192,9 @@ fn a_stale_or_lagging_node_starts_no_redeem() {
     assert!(!redeemed(|node| node.tip_age = 91 * 60, once));
     assert!(!redeemed(|node| node.headers_ahead = 1, once));
     assert_eq!(warnings("minutes old") + warnings("headers to 118"), 0);
-    assert!(!redeemed(|node| node.tip_age = 91 * 60, 3 * WARN_AGAIN));
+    assert!(!redeemed(|node| node.tip_age = 91 * 60, 2));
     assert!(warnings("91 minutes old") >= 1);
-    assert!(!redeemed(|node| node.headers_ahead = 1, 3 * WARN_AGAIN));
+    assert!(!redeemed(|node| node.headers_ahead = 1, 2));
     assert!(warnings("headers to 118") >= 1);
 }
 
@@ -2186,15 +2205,17 @@ fn a_fresh_view_restarts_the_wait_before_a_stale_one_is_logged() {
     let locked = locked();
     let node = pooled(&locked, &[], 50);
     node.0.borrow_mut().height = 105;
-    let start = Instant::now();
     let fresh_at = std::cell::Cell::new(None);
     let logged = std::cell::Cell::new(0);
+    clear_warnings();
     bumps_with(
         seller_watching(&locked, None),
         &node,
         |_| {},
         |poll, node| match fresh_at.get() {
-            None if poll == 0 || start.elapsed() < 3 * WARN_AGAIN => {
+            // Stale over `WARN_AGAIN`, then fresh, then stale again as long.
+            None if poll < 2 => {
+                advance(WARN_AGAIN);
                 node.tip_age = 91 * 60;
                 true
             }
@@ -2206,6 +2227,7 @@ fn a_fresh_view_restarts_the_wait_before_a_stale_one_is_logged() {
                 true
             }
             Some(fresh) => {
+                advance(WARN_AGAIN);
                 node.tip_age = 91 * 60;
                 poll == fresh + 1
             }
@@ -2284,24 +2306,24 @@ fn a_tip_is_as_old_as_it_was_first_seen() {
     let (swap, lock) = locked().swap();
     let node = funded_node(lock, 117);
     let tip = node.tip().unwrap().hash;
-    let now = std::time::SystemTime::now()
+    let secs = now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
     let max = Duration::from_secs(90 * 60);
     let view = |first_seen: &mut Option<(BlockHash, u64)>| {
-        crate::driver::bitcoin_view(&node, &swap, lock, max, first_seen)
+        crate::driver::bitcoin_view(&node, &swap, lock, max, now(), first_seen)
             .unwrap()
             .stale
     };
-    let stale = view(&mut Some((tip, now - 91 * 60))).unwrap();
+    let stale = view(&mut Some((tip, secs - 91 * 60))).unwrap();
     assert!(stale.contains("91 minutes old"), "{stale}");
-    assert_eq!(view(&mut Some((tip, now - 89 * 60))), None);
-    let mut first_seen = Some((BlockHash::all_zeros(), now - 91 * 60));
+    assert_eq!(view(&mut Some((tip, secs - 89 * 60))), None);
+    let mut first_seen = Some((BlockHash::all_zeros(), secs - 91 * 60));
     assert_eq!(view(&mut first_seen), None);
     let (hash, at) = first_seen.unwrap();
     assert_eq!(hash, tip);
-    assert!(at >= now);
+    assert_eq!(at, secs);
 }
 
 /// The driver keeps when it first saw the tip from view to view: a tip
@@ -2312,15 +2334,19 @@ fn the_driver_ages_a_tip_from_when_it_first_saw_it() {
     let node = pooled(&locked, &[], 50);
     node.0.borrow_mut().height = 105;
     clear_warnings();
-    let start = Instant::now();
-    let lasting = Duration::from_millis(1_100) + 2 * WARN_AGAIN;
     bumps_with(
         seller_watching(&locked, None),
         &node,
-        |driver| driver.max_tip_age = Duration::ZERO,
-        |_, _| start.elapsed() < lasting,
+        |driver| driver.max_tip_age = Duration::from_secs(30 * 60),
+        |poll, _| {
+            // The block stays stamped as fresh as the clock: first seen at
+            // the first view, it is 60 minutes old at the fourth.
+            advance(Duration::from_secs(20 * 60));
+            poll < 4
+        },
     );
-    assert!(warnings("minutes old") >= 1);
+    assert_eq!(warnings("minutes old"), 1);
+    assert_eq!(warnings("60 minutes old"), 1);
 }
 
 /// A failure to read a view is logged when it starts, again every
@@ -2336,12 +2362,12 @@ fn a_failing_view_is_logged_when_it_starts_and_while_it_lasts() {
         bumps_with(seller_watching(&locked, None), &node, |_| {}, each);
         warnings("connection refused")
     };
-    let start = Instant::now();
     let lasting = |poll, node: &mut Node| {
+        advance(WARN_AGAIN);
         node.down = true;
-        poll == 0 || start.elapsed() < 3 * WARN_AGAIN
+        poll < 2
     };
-    assert!(logged(&lasting) >= 2);
+    assert_eq!(logged(&lasting), 2);
     let back = |poll, node: &mut Node| {
         node.down = poll != 1;
         poll < 3
@@ -2362,9 +2388,10 @@ fn a_seen_redeem_is_sent_again_when_cancel_leaves_its_block() {
     let seller = restart(&seller);
     let (seller, actions) = seller.step(btc(20, Some((&cancel, 0)), None));
     assert_eq!(broadcasts(&actions), std::slice::from_ref(&redeem));
-    // Gone from the node altogether: the redeem, never cancel.
+    // Gone from the node altogether: the redeem, and cancel beside it.
     let (seller, actions) = seller.step(btc(20, None, None));
-    assert_eq!(broadcasts(&actions), std::slice::from_ref(&redeem));
+    let both = [redeem.compute_txid(), cancel.compute_txid()];
+    assert_eq!(broadcast_txids(&actions), both);
     let (seller, actions) = seller.step(btc(21, Some((&cancel, 1)), None));
     assert!(actions.is_empty(), "cancel in a block again");
     let (seller, _) = seller.step(btc(21, Some((&redeem, 1)), None));
@@ -2654,7 +2681,7 @@ fn an_urgent_bump_in_trouble_is_logged_at_every_block() {
 /// A refund pooled on a cancel that displaced a seen redeem comes only
 /// from a buyer racing it, who holds `s` and may have taken the NEX: the
 /// seller keeps sending its redeem, from `Redeeming` or `Cancelling`, and
-/// once cancelling claims beside it, until the cancel is
+/// once cancelling claims beside it, until the refund is
 /// `btc_confirmations` deep. A refund with no seen redeem gives `b` at once.
 #[test]
 fn a_pooled_refund_does_not_end_a_seen_redeem() {
@@ -2681,7 +2708,13 @@ fn a_pooled_refund_does_not_end_a_seen_redeem() {
     let (cancelling, actions) = cancelling.step(pooled());
     assert_eq!(broadcasts(&actions), std::slice::from_ref(redeem));
     assert!(matches!(cancelling, Seller::Cancelling { .. }));
-    let (claiming, actions) = cancelling.step(btc(20, Some((&cancel, 1)), Some((&refund, 0))));
+    let (cancelling, actions) = cancelling.step(btc(20, Some((&cancel, 1)), Some((&refund, 0))));
+    assert!(actions.is_empty());
+    assert!(matches!(
+        cancelling,
+        Seller::Cancelling { claim: Some(_), .. }
+    ));
+    let (claiming, actions) = cancelling.step(btc(21, Some((&cancel, 2)), Some((&refund, 1))));
     assert!(actions.is_empty());
     assert!(matches!(claiming, Seller::ClaimingNex(_)));
 }
@@ -2774,7 +2807,8 @@ fn a_claim_goes_on_beside_a_redeem_a_reorg_can_still_confirm() {
     let (seller, claim, [redeem, cancel, refund]) = seller_claiming_beside_a_redeem();
     let seller = restart(&seller);
     let (seller, actions) = seller.step(btc(21, None, None));
-    assert_eq!(broadcasts(&actions), std::slice::from_ref(&redeem));
+    let both = [redeem.compute_txid(), cancel.compute_txid()];
+    assert_eq!(broadcast_txids(&actions), both, "cancel beside it");
     let (seller, actions) = seller.step(btc(21, Some((&cancel, 0)), Some((&refund, 0))));
     assert_eq!(broadcasts(&actions), std::slice::from_ref(&redeem));
     let (seller, actions) = seller.step(nexus(account(500_000, 0), None));
@@ -2784,44 +2818,76 @@ fn a_claim_goes_on_beside_a_redeem_a_reorg_can_still_confirm() {
     assert!(matches!(seller, Seller::Cancelling { .. }));
 }
 
-/// A redeem that wins ends the swap `Swapped` once deep, whether the buyer
-/// drained the NEX or the seller's claim landed.
+/// A claim that lands beside the fought redeem ends the swap `Refunded` at
+/// once: the seller has its NEX, and sends the redeem no more.
 #[test]
-fn a_redeem_that_wins_beside_a_claim_ends_swapped() {
-    let (seller, claim, [redeem, ..]) = seller_claiming_beside_a_redeem();
-    let drained = seller.clone().step(nexus(account(0, 1), None));
-    let landed = seller.step(nexus(account(0, 1), mined(claim.body, 1)));
-    for (seller, actions) in [drained, landed] {
-        assert!(actions.is_empty());
-        assert_eq!(seller.outcome(), None);
-        let (seller, actions) = seller.step(btc(21, None, None));
-        assert_eq!(broadcasts(&actions), std::slice::from_ref(&redeem));
-        let (seller, _) = seller.step(btc(22, Some((&redeem, 2)), None));
-        assert_eq!(seller.outcome(), None);
-        let (seller, _) = seller.step(btc(23, Some((&redeem, 3)), None));
-        assert_eq!(seller.outcome(), Some(Outcome::Swapped));
-    }
+fn a_claim_that_lands_beside_a_redeem_ends_the_fight() {
+    let (seller, claim, _) = seller_claiming_beside_a_redeem();
+    let (seller, actions) = seller.step(nexus(account(0, 1), mined(claim.body, 1)));
+    assert!(actions.is_empty());
+    assert_eq!(seller.outcome(), Some(Outcome::Refunded));
 }
 
-/// Once the cancel is `btc_confirmations` deep only the claim is left: a
-/// claim that landed ends `Refunded`, a lock the buyer drained `Drained`.
+/// A lock the buyer drained leaves the seller the BTC: it watches Bitcoin
+/// alone, and a redeem that wins ends the swap `Swapped` once deep.
 #[test]
-fn a_claim_beside_a_redeem_ends_once_its_cancel_is_deep() {
-    let (seller, claim, [_, cancel, refund]) = seller_claiming_beside_a_redeem();
-    let landed = || nexus(account(0, 1), mined(claim.body.clone(), 1));
-    let drained = || nexus(account(0, 1), None);
-    for (view, outcome) in [(landed(), Outcome::Refunded), (drained(), Outcome::Drained)] {
-        let (seller, _) = seller.clone().step(view);
-        let (seller, actions) = seller.step(btc(22, Some((&cancel, 2)), Some((&refund, 1))));
-        assert!(actions.is_empty());
-        assert!(matches!(seller, Seller::Cancelling { .. }));
-        let (seller, _) = seller.step(btc(23, Some((&cancel, 3)), Some((&refund, 2))));
-        assert!(matches!(seller, Seller::ClaimingNex(_)));
-        let view = match outcome {
-            Outcome::Refunded => landed(),
-            _ => drained(),
-        };
-        let (seller, _) = seller.step(view);
-        assert_eq!(seller.outcome(), Some(outcome));
-    }
+fn a_redeem_that_wins_beside_a_drained_claim_ends_swapped() {
+    let (seller, _, [redeem, cancel, _]) = seller_claiming_beside_a_redeem();
+    let (seller, actions) = seller.step(nexus(account(0, 1), None));
+    assert!(actions.is_empty());
+    assert_eq!(seller.outcome(), None);
+    let watch = seller.watch();
+    assert!(watch.bitcoin.is_some() && watch.nexus.is_none());
+    let seller = restart(&seller);
+    let (seller, actions) = seller.step(btc(21, None, None));
+    let both = [redeem.compute_txid(), cancel.compute_txid()];
+    assert_eq!(broadcast_txids(&actions), both);
+    let (seller, _) = seller.step(btc(22, Some((&redeem, 2)), None));
+    assert_eq!(seller.outcome(), None);
+    let (seller, _) = seller.step(btc(23, Some((&redeem, 3)), None));
+    assert_eq!(seller.outcome(), Some(Outcome::Swapped));
+}
+
+/// Past a deep cancel, a drained lock still leaves punish: the seller waits
+/// for the refund to be `btc_confirmations` deep before it ends `Drained`,
+/// and punishes at `t2` if the refund leaves, ending `Punished` once that is
+/// deep. A claim not drained gets the NEX back instead: no punish beside it.
+#[test]
+fn a_drained_claim_watches_for_punish_until_the_refund_is_deep() {
+    let (seller, _, [_, cancel, refund]) = seller_claiming_beside_a_redeem();
+    let (swap, lock) = seller.watch().bitcoin.unwrap();
+    let punish = swap.unsigned_tx(lock, Spend::Punish);
+    let (drained, _) = seller.clone().step(nexus(account(0, 1), None));
+    let (drained, actions) = drained.step(btc(23, Some((&cancel, 3)), Some((&refund, 2))));
+    assert!(actions.is_empty());
+    assert!(matches!(drained, Seller::Cancelling { .. }));
+    let (done, _) = drained
+        .clone()
+        .step(btc(24, Some((&cancel, 4)), Some((&refund, 3))));
+    assert_eq!(done.outcome(), Some(Outcome::Drained));
+
+    let gone = || btc(31, Some((&cancel, 10)), None);
+    let (drained, actions) = drained.step(gone());
+    assert_eq!(broadcast_txids(&actions), [punish.compute_txid()]);
+    let (drained, _) = drained.step(btc(33, Some((&cancel, 12)), Some((&punish, 2))));
+    assert_eq!(drained.outcome(), None);
+    let (drained, _) = drained.step(btc(34, Some((&cancel, 13)), Some((&punish, 3))));
+    assert_eq!(drained.outcome(), Some(Outcome::Punished));
+
+    let (claiming, actions) = seller.step(gone());
+    assert!(actions.is_empty());
+    assert!(matches!(claiming, Seller::Cancelling { .. }));
+}
+
+/// A redeem sent but gone from the view is sent again, and from `t1` cancel
+/// with it.
+#[test]
+fn a_sent_redeem_gone_from_the_view_goes_out_with_cancel_once_due() {
+    let (seller, redeem, cancel) = seller_redeeming();
+    let (seller, actions) = seller.step(btc(19, None, None));
+    assert_eq!(broadcast_txids(&actions), [redeem.compute_txid()]);
+    let (seller, actions) = seller.step(btc(20, None, None));
+    let both = [redeem.compute_txid(), cancel.compute_txid()];
+    assert_eq!(broadcast_txids(&actions), both);
+    assert!(matches!(seller, Seller::Redeeming { .. }));
 }

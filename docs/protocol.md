@@ -74,14 +74,21 @@ swap id.
   still in the mempool. Only a cancel in a block stops it; a reorg that
   puts that cancel back in the mempool starts it again, even with a refund
   pooled on that cancel: only a B racing the redeem sends one, and B holds
-  `s` and may have taken the NEX already. A refund gives S `b`, even in the
-  mempool, and S claims the NEX; but while it holds a redeem sent or seen,
-  it goes on watching Bitcoin and fighting for that redeem until the cancel
-  is `btc_confirmations` deep, as deep as B waits before it refunds. A
-  redeem that ends that deep ends the swap `Swapped`, even if the claim
-  landed too; a deep cancel leaves only the claim, which ends it `Refunded`,
-  or `Drained` if B emptied the lock first. A redeem never sent cannot
-  have revealed `s`, and is abandoned once the window closes.
+  `s` and may have taken the NEX already. Once due, S broadcasts cancel
+  beside a redeem missing from its node: a redeem in the mempool refuses
+  it, paying twice its fee, but one refused for another reason leaves S
+  its path to punish. A refund gives S `b`, even in the mempool, and S
+  claims the NEX. A claim that lands ends the swap `Refunded`, and S
+  fights for the redeem no longer. Until then, while it holds a redeem sent
+  or seen, S goes on watching Bitcoin: it fights for that redeem until the
+  cancel is in a block, and, if B emptied the lock with `s`, punishes at
+  `t2` should the refund leave the mempool, until the refund is
+  `btc_confirmations` deep. A redeem that deep ends the swap `Swapped`, a
+  punish that deep `Punished`, and a refund that deep after B emptied the
+  lock `Drained`; otherwise a deep refund leaves only the claim. A redeem
+  never sent cannot have revealed `s`, and is abandoned once the window
+  closes: no one else can empty the lock, and a refund leaves only the
+  claim at once.
 - Every deadline is read from the party's own Bitcoin node. A node that
   stalled, or that someone cut off from the network, shows fewer blocks
   than there are: every depth it reports is too low. That only delays

@@ -304,6 +304,21 @@ impl Machine for Buyer {
 }
 
 impl Buyer {
+    /// The terms, until the swap ends.
+    pub fn terms(&self) -> Option<&Terms> {
+        use Buyer::*;
+        match self {
+            AwaitSellerHello(start) => Some(&start.terms),
+            AwaitFunded(setup) | AwaitSellerSignatures { setup, .. } => Some(&setup.terms),
+            SendingSignatures(locked)
+            | AwaitNexLock { locked, .. }
+            | AwaitRedeem { locked, .. }
+            | Cancelling { locked, .. } => Some(&locked.setup.terms),
+            ClaimingNex(claim) => Some(&claim.setup.terms),
+            Done(_) => None,
+        }
+    }
+
     /// The Nexus address the NEX is locked at, once the hellos are
     /// exchanged and until the swap ends.
     pub fn lock_address(&self) -> Option<String> {
