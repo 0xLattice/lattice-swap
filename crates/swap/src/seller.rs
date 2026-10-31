@@ -19,7 +19,7 @@ pub enum Seller {
         since: Option<u32>,
     },
     /// Signs the NEX lock at the nonce a synced node shows, then submits it
-    /// until it is mined. Once signed, the lock is the same transaction
+    /// until it is mined, while it can land. Once signed, the lock is the same transaction
     /// whenever it is submitted, and can land only once.
     LockingNex {
         locked: SellerLocked,
@@ -308,6 +308,12 @@ impl Machine for Seller {
                         nex_lock: lock,
                     };
                     (state, vec![Action::Send(message)])
+                }
+                // Its nonce went to another transaction: no submit can
+                // land it, unless a reorg takes that back.
+                Some(lock) if lock_passed(&locked.setup.terms, lock.body.nonce, &view) => {
+                    let nex_lock = Some(lock);
+                    (LockingNex { locked, nex_lock }, vec![])
                 }
                 // The same bytes again: the node answers with their CID
                 // while it pools them, and takes them back if it dropped

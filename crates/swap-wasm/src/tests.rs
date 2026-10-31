@@ -142,6 +142,9 @@ fn refused_terms_are_an_error() {
         Err("refused: Terms".into())
     );
     assert!(start_buyer(&terms, &payout(), "buyer-payout").is_err());
+    let why = check_terms(&terms).unwrap().unwrap();
+    assert!(why.contains("margin"), "{why}");
+    assert_eq!(check_terms(&self::terms()), Ok(None));
 }
 
 #[test]

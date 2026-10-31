@@ -54,6 +54,13 @@ pub fn start_buyer(terms: &str, refund_payout: &str, nex_address: &str) -> Resul
     stepped(&buyer, &actions)
 }
 
+/// Why `terms` are refused, as `newSeller` and `startBuyer` refuse them,
+/// or null if they are not.
+#[wasm_bindgen(js_name = checkTerms)]
+pub fn check_terms(terms: &str) -> Result<Option<String>> {
+    Ok(parse::<swap::Terms>(terms)?.check().err())
+}
+
 /// Feeds `event` to a seller's `state`: a step.
 #[wasm_bindgen(js_name = stepSeller)]
 pub fn step_seller(state: &str, event: &str) -> Result<String> {

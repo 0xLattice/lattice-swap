@@ -658,6 +658,14 @@ fn nex_lock_holds(terms: &Terms, lock_address: &str, view: &NexusView) -> bool {
         && synced(&view.health)
 }
 
+/// Whether a NEX lock signed at `nonce` cannot land on `view`: the seller's
+/// nonce moved past it, and the lock address is short of `nex_amount`, so
+/// it did not credit it. A reorg that takes back what moved the nonce can
+/// undo this.
+fn lock_passed(terms: &Terms, nonce: u64, view: &NexusView) -> bool {
+    view.lock.balance < terms.nex_amount && view.own.nonce > nonce
+}
+
 /// The node is active and has executed the best chain it knows.
 fn synced(health: &Health) -> bool {
     health.phase == "active" && health.best_header_height == Some(health.height)
@@ -770,7 +778,7 @@ impl Claim {
             // blocks of the tip. A reorg below the tip it was first seen at,
             // even one between two views, replaces that block: the count
             // starts again.
-            Lock::Signed(nonce) if short && view.own.nonce > nonce => {
+            Lock::Signed(nonce) if lock_passed(terms, nonce, &view) => {
                 let reorged = self
                     .passed_at
                     .as_ref()

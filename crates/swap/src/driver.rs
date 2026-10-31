@@ -226,6 +226,9 @@ pub struct Driver<M, B, T> {
     view_failed: Option<(String, SystemTime)>,
     /// Since when the Bitcoin views have been stale.
     stale_since: Option<SystemTime>,
+    /// The last failure to submit a Nexus transaction, and when it was
+    /// logged.
+    submit_failed: Option<(String, SystemTime)>,
     /// The tip, and when this driver first saw it, in seconds since the
     /// Unix epoch. Kept in memory only: after a restart, the tip is first
     /// seen then.
@@ -294,6 +297,7 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
             broadcast: vec![],
             view_failed: None,
             stale_since: None,
+            submit_failed: None,
             first_seen: None,
             _lock: lock,
         }
@@ -389,7 +393,7 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
                     Some(why) => {
                         let since = *self.stale_since.get_or_insert(now);
                         if elapsed(since, now) >= WARN_AGAIN {
-                            self.view_failed(why.clone(), now);
+                            warn_again(&mut self.view_failed, why.clone(), now);
                         }
                     }
                     None => {
@@ -412,21 +416,9 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
                 Ok(())
             }
             Err(e) => {
-                self.view_failed(e.to_string(), now);
+                warn_again(&mut self.view_failed, e.to_string(), now);
                 Ok(())
             }
-        }
-    }
-
-    /// Logs `e` when it changes, and again while it lasts.
-    fn view_failed(&mut self, e: String, now: SystemTime) {
-        let again = self
-            .view_failed
-            .as_ref()
-            .is_none_or(|(last, at)| *last != e || elapsed(*at, now) >= WARN_AGAIN);
-        if again {
-            warn(&e);
-            self.view_failed = Some((e, now));
         }
     }
 
@@ -637,11 +629,13 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
             },
             // The machine watches the transaction by its CID: the answer
             // adds nothing.
-            Action::Submit(transaction) => {
-                if let Err(e) = self.nexus.submit(&transaction) {
-                    warn(&format!("nexus submit {}: {e}", transaction.cid()));
+            Action::Submit(transaction) => match self.nexus.submit(&transaction) {
+                Ok(_) => self.submit_failed = None,
+                Err(e) => {
+                    let e = format!("nexus submit {}: {e}", transaction.cid());
+                    warn_again(&mut self.submit_failed, e, (self.clock)());
                 }
-            }
+            },
         }
         Ok(())
     }
@@ -651,9 +645,22 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
 /// block, a poll apart.
 pub(crate) const URGENT_RETRIES: u8 = 8;
 
-/// How often a failure to read a Bitcoin view that lasts is logged again,
-/// and how long stale views last before they are logged.
+/// How often a failure to read a Bitcoin view, or to submit a Nexus
+/// transaction, that lasts is logged again, and how long stale views last
+/// before they are logged.
 pub(crate) const WARN_AGAIN: Duration = Duration::from_secs(60);
+
+/// Logs `e` when it differs from `last`, and again every [`WARN_AGAIN`]
+/// while it lasts.
+fn warn_again(last: &mut Option<(String, SystemTime)>, e: String, now: SystemTime) {
+    let again = last
+        .as_ref()
+        .is_none_or(|(last, at)| *last != e || elapsed(*at, now) >= WARN_AGAIN);
+    if again {
+        warn(&e);
+        *last = Some((e, now));
+    }
+}
 
 /// The time from `since` to `now`; none if the clock went back.
 fn elapsed(since: SystemTime, now: SystemTime) -> Duration {
