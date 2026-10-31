@@ -938,7 +938,7 @@ fn status_reads_a_swap_file_the_driver_saved() {
         fs::write(&path, other.to_string()).unwrap();
         let refused = cli(&path).unwrap_err();
         assert!(refused.contains(&path), "{refused}");
-        assert!(refused.contains("this build reads only 4"), "{refused}");
+        assert!(refused.contains("this build reads only 5"), "{refused}");
     }
     fs::remove_file(&path).unwrap();
     assert_eq!(cli(&path), Err(format!("{path}: no such swap file")));

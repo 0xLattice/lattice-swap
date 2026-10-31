@@ -18,7 +18,7 @@ use crate::{SecretBytes, Spent};
 
 /// The format of a state file. A file of another version is refused: its
 /// signatures may be over transactions this build no longer makes.
-pub const STATE_VERSION: u32 = 4;
+pub const STATE_VERSION: u32 = 5;
 
 /// One JSON file per swap, replaced atomically: written to a temporary
 /// file, synced, then renamed over the old one. It holds the party's
@@ -202,9 +202,10 @@ pub struct Driver<M, B, T> {
     /// of it but dust, holds for every spend this driver bumps: a redeem
     /// once broadcast may be in some mempool, so `s` may be public, and
     /// losing it then loses the BTC and the NEX; a refund lost to punish
-    /// loses the BTC; and the seller bumps punish only while no refund
-    /// shows, when the buyer is away and the NEX it locked is out of reach
-    /// anyway. Any BTC kept beats none.
+    /// loses the BTC; and the seller bumps punish only from `t2`, against
+    /// no refund or one only in the mempool, which missed `t2`: lost, that
+    /// BTC is the buyer's while the NEX may be too. Any BTC kept beats
+    /// none.
     pub max_fee_fraction: f64,
     /// The oldest a Bitcoin tip may be for a view not to be stale: see
     /// [`bitcoin_view`]. A node that stalled, or that someone cut off from

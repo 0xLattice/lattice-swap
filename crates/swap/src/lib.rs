@@ -56,7 +56,7 @@ mod seller;
 pub mod transport;
 
 pub use buyer::Buyer;
-pub use seller::Seller;
+pub use seller::{Claiming, Seller};
 
 use bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
 use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction};

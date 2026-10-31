@@ -78,17 +78,29 @@ swap id.
   beside a redeem missing from its node: a redeem in the mempool refuses
   it, paying twice its fee, but one refused for another reason leaves S
   its path to punish. A refund gives S `b`, even in the mempool, and S
-  claims the NEX. A claim that lands ends the swap `Refunded`, and S
-  fights for the redeem no longer. Until then, while it holds a redeem sent
-  or seen, S goes on watching Bitcoin: it fights for that redeem until the
-  cancel is in a block, and, if B emptied the lock with `s`, punishes at
-  `t2` should the refund leave the mempool, until the refund is
-  `btc_confirmations` deep. A redeem that deep ends the swap `Swapped`, a
-  punish that deep `Punished`, and a refund that deep after B emptied the
-  lock `Drained`; otherwise a deep refund leaves only the claim. A redeem
-  never sent cannot have revealed `s`, and is abandoned once the window
-  closes: no one else can empty the lock, and a refund leaves only the
-  claim at once.
+  claims the NEX. A claim that lands means S fights for the redeem no
+  longer. Until then, while it holds a redeem sent or seen, S goes on
+  watching Bitcoin: it fights for that redeem until the cancel is in a
+  block, and goes on until the refund is `btc_confirmations` deep. A
+  redeem never sent cannot have revealed `s`, and is abandoned once the
+  window closes: no one else can empty the lock, and before `t2` a refund
+  leaves only the claim at once.
+- From `t2`, a refund not yet in a block missed it. Whatever its claim,
+  pending, landed or drained, and whether or not it held a redeem, S
+  broadcasts punish at every Bitcoin view while the cancel is `t2` deep and
+  the cancel output is unspent or spent only by a refund in the mempool;
+  its driver bumps punish as a package priced to replace that refund. The
+  claim goes on beside it: recovering the BTC never waits on Nexus. S never
+  broadcasts punish before `t2`, which consensus would refuse anyway, and
+  never contests a refund in a block. Whichever spend gets
+  `btc_confirmations` deep decides: a redeem ends the swap `Swapped`; a
+  punish `Punished`, even with the claim landed, when S has both since the
+  refund missed `t2`; a refund `Refunded` if the claim landed or nothing
+  was locked, `Drained` if B emptied the lock with `s`, and otherwise
+  leaves only the claim. A claim that lands while no punish can win, before
+  `t2` or against a refund in a block, ends the swap `Refunded` at the
+  next Bitcoin view, and one that finds nothing was locked ends it at
+  once.
 - Every deadline is read from the party's own Bitcoin node. A node that
   stalled, or that someone cut off from the network, shows fewer blocks
   than there are: every depth it reports is too low. That only delays
@@ -170,7 +182,8 @@ up where it stopped.
 - `Swapped`: the buyer has the NEX, the seller the BTC.
 - `Refunded`: the buyer has its BTC back, and the seller has its NEX if it
   locked any.
-- `Punished`: the seller took the BTC through punish.
+- `Punished`: the seller took the BTC through punish. Its claim of the
+  NEX, if it learned `b` from a refund that missed `t2`, may land too.
 - `Drained`: this party learned the joint key, but the lock was already
   spent.
 - `Aborted`: stopped before anything was at stake.
