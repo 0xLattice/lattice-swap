@@ -3,7 +3,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
 use bitcoin::{Address, Amount, FeeRate, Network, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
@@ -106,12 +106,28 @@ fn a_stale_tip_shows_a_stale_view() {
     })
     .unwrap();
     let mut first_seen = None;
-    let view = bitcoin_view(&rpc, &swap, OutPoint::null(), AGE, &mut first_seen).unwrap();
+    let view = bitcoin_view(
+        &rpc,
+        &swap,
+        OutPoint::null(),
+        AGE,
+        SystemTime::now(),
+        &mut first_seen,
+    )
+    .unwrap();
     let stale = view.stale.unwrap();
     assert!(stale.contains("minutes old"), "{stale}");
     let miner = node.client.new_address().unwrap();
     node.client.generate_to_address(1, &miner).unwrap();
-    let view = bitcoin_view(&rpc, &swap, OutPoint::null(), AGE, &mut first_seen).unwrap();
+    let view = bitcoin_view(
+        &rpc,
+        &swap,
+        OutPoint::null(),
+        AGE,
+        SystemTime::now(),
+        &mut first_seen,
+    )
+    .unwrap();
     assert_eq!(view.height, 1);
     assert_eq!(view.stale, None);
 }
@@ -161,7 +177,7 @@ fn a_punish_of_the_sellers_own_making_shows_in_the_view() {
     let cancel = swap.finalize(lock, Spend::Cancel, &a, Some(&b)).unwrap();
     rpc.broadcast(&cancel).unwrap();
     mine(3);
-    let view = bitcoin_view(&rpc, &swap, lock, AGE, &mut None).unwrap();
+    let view = bitcoin_view(&rpc, &swap, lock, AGE, SystemTime::now(), &mut None).unwrap();
     assert_eq!(view.lock_spend.unwrap().confirmations, 3);
     assert!(view.cancel_spend.is_none(), "the cancel output is unspent");
 
@@ -175,7 +191,7 @@ fn a_punish_of_the_sellers_own_making_shows_in_the_view() {
     );
     rpc.broadcast(&punish).unwrap();
     let spent = |depth| {
-        let spent = bitcoin_view(&rpc, &swap, lock, AGE, &mut None)
+        let spent = bitcoin_view(&rpc, &swap, lock, AGE, SystemTime::now(), &mut None)
             .unwrap()
             .cancel_spend
             .unwrap();
@@ -235,40 +251,62 @@ impl Redeems {
     }
 
     fn funded_with(node: &Node, payout: ScriptBuf, amount: Amount) -> (Self, Transaction) {
-        let mut machine = Redeems {
-            keys: [(); 4].map(|_| Scalar::random(&mut OsRng).to_bytes()),
-            payout,
-            amount,
-            lock: OutPoint::null(),
-            redeem: empty(),
-            confirmed: false,
-        };
-        let swap = machine.swap();
-        let address = Address::from_script(&swap.lock_script_pubkey(), Network::Regtest).unwrap();
-        let funding = node
-            .client
-            .send_to_address(&address, swap.params().amount)
-            .unwrap()
-            .txid()
-            .unwrap();
-        let raw = node.client.get_raw_transaction(funding).unwrap();
-        let vout = raw
-            .transaction()
-            .unwrap()
-            .output
-            .iter()
-            .position(|out| out.script_pubkey == swap.lock_script_pubkey());
-        machine.lock = OutPoint::new(funding, vout.unwrap() as u32);
+        Self::funded_many(node, payout, amount, 1).remove(0)
+    }
+
+    /// `n` such swaps of `amount`, their locks mined in one block.
+    fn funded_many(
+        node: &Node,
+        payout: ScriptBuf,
+        amount: Amount,
+        n: usize,
+    ) -> Vec<(Self, Transaction)> {
+        let machines: Vec<_> = (0..n)
+            .map(|_| {
+                let mut machine = Redeems {
+                    keys: [(); 4].map(|_| Scalar::random(&mut OsRng).to_bytes()),
+                    payout: payout.clone(),
+                    amount,
+                    lock: OutPoint::null(),
+                    redeem: empty(),
+                    confirmed: false,
+                };
+                let swap = machine.swap();
+                let script = swap.lock_script_pubkey();
+                let address = Address::from_script(&script, Network::Regtest).unwrap();
+                let funding = node
+                    .client
+                    .send_to_address(&address, swap.params().amount)
+                    .unwrap()
+                    .txid()
+                    .unwrap();
+                let raw = node.client.get_raw_transaction(funding).unwrap();
+                let vout = raw
+                    .transaction()
+                    .unwrap()
+                    .output
+                    .iter()
+                    .position(|out| out.script_pubkey == script);
+                machine.lock = OutPoint::new(funding, vout.unwrap() as u32);
+                machine
+            })
+            .collect();
         let miner = node.client.new_address().unwrap();
         node.client.generate_to_address(1, &miner).unwrap();
-        let (lock, seller, buyer) = (machine.lock, machine.key(0), machine.key(1));
-        let signed = |spend| {
-            let a = swap.sign(lock, spend, &seller);
-            let b = swap.sign(lock, spend, &buyer);
-            swap.finalize(lock, spend, &a, Some(&b)).unwrap()
-        };
-        machine.redeem = signed(Spend::Redeem);
-        (machine, signed(Spend::Cancel))
+        machines
+            .into_iter()
+            .map(|mut machine| {
+                let swap = machine.swap();
+                let (lock, seller, buyer) = (machine.lock, machine.key(0), machine.key(1));
+                let signed = |spend| {
+                    let a = swap.sign(lock, spend, &seller);
+                    let b = swap.sign(lock, spend, &buyer);
+                    swap.finalize(lock, spend, &a, Some(&b)).unwrap()
+                };
+                machine.redeem = signed(Spend::Redeem);
+                (machine, signed(Spend::Cancel))
+            })
+            .collect()
     }
 }
 
@@ -477,6 +515,36 @@ fn a_rebump_replaces_the_child_from_a_wallet_with_no_coins() {
         .unwrap();
     assert!(pooled(&seller, third));
     assert!(!pooled(&seller, second), "replaced");
+}
+
+/// A child is priced a vbyte over the package it was sized with, whose
+/// signature can come out a byte shorter than its own: every package pays
+/// its target, and most, whose signature came out as long as the sized
+/// one's, a vbyte more. Priced at the sized package, about one in 70 fell a
+/// vbyte short.
+#[test]
+fn every_bumped_package_pays_its_target() {
+    let node = start(&[]);
+    let (seller, payout) = empty_wallet(&node, "seller");
+    let target = FeeRate::from_sat_per_vb_u32(25);
+    let amount = Amount::from_sat(100_000);
+    // Twenty at a time: the wallet chains no more unconfirmed sends.
+    let machines = (0..10).flat_map(|_| Redeems::funded_many(&node, payout.clone(), amount, 20));
+    let mut over = 0;
+    for (machine, _) in machines {
+        let (redeem, fee) = (&machine.redeem, machine.swap().fee(Spend::Redeem));
+        seller
+            .bump(redeem, fee, target, redeem.output[0].value)
+            .unwrap();
+        let txid = redeem.compute_txid().to_string();
+        let entry = seller.call("getmempoolentry", json!([txid])).unwrap();
+        let paid = entry["fees"]["descendant"].as_f64().unwrap();
+        let paid = Amount::from_btc(paid).unwrap();
+        let size = entry["descendantsize"].as_u64().unwrap();
+        assert!(paid >= target.fee_vb(size).unwrap(), "{paid} for {size} vB");
+        over += usize::from(paid >= target.fee_vb(size + 1).unwrap());
+    }
+    assert!(over > 100, "{over} of 200 a vbyte over");
 }
 
 /// Cancel pays what redeem pays and has no output either party can spend
@@ -809,6 +877,7 @@ fn contest_a_refund(punish: impl FnOnce(&Bitcoind, &Transaction)) {
         btc_confirmations: 1,
         nex_confirmations: 1,
         margin: 2,
+        nexus_genesis: swap_nexus_tx::MAINNET_GENESIS.into(),
     };
     let seller_nex = SecretBytes([3; 32]).nex_address();
     let seller = Seller::new(
@@ -879,15 +948,16 @@ fn contest_a_refund(punish: impl FnOnce(&Bitcoind, &Transaction)) {
     // The seller ignores it and punishes, with a child paying 30 sat/vB.
     let view = BitcoinView {
         cancel_spend: None,
-        ..bitcoin_view(&seller_rpc, &swap, lock, AGE, &mut None).unwrap()
+        ..bitcoin_view(&seller_rpc, &swap, lock, AGE, SystemTime::now(), &mut None).unwrap()
     };
     let (_, actions) = seller.step(Event::Bitcoin(view));
     let [Action::Broadcast(tx)] = &actions[..] else {
         panic!("punish: {actions:?}");
     };
     assert_eq!(tx.compute_txid(), punish_txid);
+    // Taken, it replaced the refund; the buyer's driver may already have
+    // outbid it again.
     punish(&seller_rpc, tx);
-    assert!(pooled(&default, punish_txid) && !pooled(&default, refund));
 
     // Without a block, the buyer's driver takes the cancel output back.
     wait("refund back", &|| pooled(&default, refund));

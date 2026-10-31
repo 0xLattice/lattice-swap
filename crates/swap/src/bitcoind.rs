@@ -441,10 +441,12 @@ impl Bitcoin for Bitcoind {
 
     fn bump(&self, parent: &Transaction, fee: Amount, rate: FeeRate, max: Amount) -> Result<Txid> {
         // The child pays all the package needs but `fee`, and what replacing
-        // the last child takes, short of `max` and of leaving dust.
+        // the last child takes, short of `max` and of leaving dust. Priced
+        // a vbyte over the sized package: a signature can come out a byte
+        // longer than the one it was sized with.
         let (change, size) = self.sized(parent)?;
         let mut fee = rate
-            .fee_vb(size)
+            .fee_vb(size + 1)
             .and_then(|package| package.checked_sub(fee))
             .ok_or_else(|| Error(format!("feerate {rate}")))?;
         let txid = parent.compute_txid();

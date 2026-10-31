@@ -254,6 +254,7 @@ impl World {
                 btc_confirmations: 1,
                 nex_confirmations: 1,
                 margin: 3,
+                nexus_genesis: swap_nexus_tx::MAINNET_GENESIS.into(),
             },
             seller_nex,
             buyer_nex,

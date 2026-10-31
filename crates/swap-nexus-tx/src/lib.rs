@@ -17,6 +17,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use swap_nexus::JointKey;
 
+/// The CID of the mainnet Nexus genesis block, the one root chain every
+/// lattice-node build pins (lattice-node's `NexusGenesis.expectedBlockHash`).
+/// It is anchored in Bitcoin as the OP_RETURN of transaction
+/// 7501f77602b581f605e6bc61c310b540e17324d3cc292c18985d8a3464d23236, in block
+/// 970053.
+pub const MAINNET_GENESIS: &str = "bafyreiggtg4ezifboyekbf4gxst2jr3mpjqcxsbmopy7w6fp46g4ngpgxa";
+
 /// Every signed message is this prefix followed by the message text.
 pub const SIGNATURE_DOMAIN: &str = "lattice-tx-v1:";
 const TRANSACTION_DOMAIN: &str = "lattice-tx-v1";

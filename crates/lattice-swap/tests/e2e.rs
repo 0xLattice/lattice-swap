@@ -247,6 +247,9 @@ struct World {
     bitcoind: Node,
     miner: bitcoin::Address,
     nexus: Nexus,
+    /// The genesis of the node's Nexus, which a dev build may pin other than
+    /// mainnet's: both parties are told it, and the default stays mainnet's.
+    nexus_genesis: String,
     seller_nex: SecretBytes,
     buyer_nex: String,
     nex_fee: u64,
@@ -288,6 +291,8 @@ impl World {
                 .to_bytes(),
         );
         let nex_fee = nexus.client().min_relay_fee().unwrap();
+        let nexus_genesis = nexus.client().genesis().unwrap();
+        eprintln!("node genesis {nexus_genesis}");
 
         let directory = tempfile::tempdir().unwrap();
         let nexus_cookie = directory.path().join("nexus.cookie");
@@ -303,6 +308,7 @@ impl World {
             bitcoind,
             miner,
             nexus,
+            nexus_genesis,
             seller_nex,
             buyer_nex,
             nex_fee,
@@ -328,6 +334,8 @@ impl World {
             &self.nexus.url,
             "--nexus-cookie",
             self.nexus_cookie.to_str().unwrap(),
+            "--nexus-genesis",
+            &self.nexus_genesis,
         ];
         args.map(String::from).to_vec()
     }

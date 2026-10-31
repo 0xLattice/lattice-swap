@@ -1,5 +1,6 @@
 use super::*;
 use clap::CommandFactory;
+use swap_nexus_tx::MAINNET_GENESIS as MAINNET;
 
 const NODES: [&str; 6] = [
     "--btc-wallet",
@@ -56,13 +57,13 @@ fn small(t1: u16) -> Terms {
         "--t1",
         &t1.to_string(),
     ]);
-    args.terms.terms([7; 32])
+    args.terms.terms([7; 32], MAINNET.into())
 }
 
 #[test]
 fn the_defaults_are_the_agreed_settings_and_pass() {
     let args = offer_args(&[]);
-    let terms = args.terms.terms([7; 32]);
+    let terms = args.terms.terms([7; 32], MAINNET.into());
     assert_eq!((terms.t1, terms.t2), (288, 144));
     assert_eq!((terms.btc_confirmations, terms.nex_confirmations), (6, 24));
     assert_eq!(terms.btc_amount, Amount::from_sat(50_000_000));
@@ -136,7 +137,7 @@ fn a_swap_file_is_named_by_its_swap_id() {
 #[test]
 fn an_offer_parses_back_into_the_same_terms() {
     let offer = Offer {
-        terms: offer_args(&[]).terms.terms(random32()),
+        terms: offer_args(&[]).terms.terms(random32(), MAINNET.into()),
         btc_network: Network::Signet,
         address: "192.0.2.1:7000".parse().unwrap(),
         seller: ivy::Config::new(SigningKey::from_bytes(&random32()))
@@ -215,7 +216,7 @@ fn policy(extra: &[&str]) -> (PolicyArgs, Network) {
 
 /// The default terms, at the default bounds.
 fn agreed() -> Offer {
-    let mut terms = offer_args(&[]).terms.terms([7; 32]);
+    let mut terms = offer_args(&[]).terms.terms([7; 32], MAINNET.into());
     terms.btc_fee = Amount::from_sat(10_000);
     terms.nex_fee = 1_000;
     Offer {
@@ -233,10 +234,16 @@ const FLOOR: u64 = 10_000;
 #[test]
 fn take_refuses_any_term_outside_its_policy() {
     let (policy, network) = policy(&[]);
-    assert_eq!(check_offer(&agreed(), &policy, network, FLOOR), Ok(()));
+    assert_eq!(
+        check_offer(&agreed(), &policy, network, MAINNET, FLOOR),
+        Ok(())
+    );
     type Change = (&'static str, fn(&mut Offer));
-    let changes: [Change; 14] = [
+    let changes: [Change; 15] = [
         ("network", |o| o.btc_network = Network::Testnet),
+        ("nexus", |o| {
+            o.terms.nexus_genesis = swap_nexus_tx::cid(b"dev")
+        }),
         ("more btc", |o| o.terms.btc_amount += Amount::from_sat(1)),
         ("less btc", |o| o.terms.btc_amount -= Amount::from_sat(1)),
         ("more nex", |o| o.terms.nex_amount += 1),
@@ -255,7 +262,7 @@ fn take_refuses_any_term_outside_its_policy() {
         let mut offer = agreed();
         change(&mut offer);
         assert_eq!(check_terms(&offer.terms), Ok(()), "{what}");
-        let refused = check_offer(&offer, &policy, network, FLOOR).unwrap_err();
+        let refused = check_offer(&offer, &policy, network, MAINNET, FLOOR).unwrap_err();
         assert!(
             refused.starts_with("refused: the offer"),
             "{what}: {refused}"
@@ -263,10 +270,13 @@ fn take_refuses_any_term_outside_its_policy() {
     }
     // The defaults leave t2 - btc_confirmations = 144 - 6.
     let (policy, network) = self::policy(&["--min-refund-window", "138"]);
-    assert_eq!(check_offer(&agreed(), &policy, network, FLOOR), Ok(()));
+    assert_eq!(
+        check_offer(&agreed(), &policy, network, MAINNET, FLOOR),
+        Ok(())
+    );
     let mut offer = agreed();
     offer.terms.btc_confirmations += 1;
-    let refused = check_offer(&offer, &policy, network, FLOOR).unwrap_err();
+    let refused = check_offer(&offer, &policy, network, MAINNET, FLOOR).unwrap_err();
     assert!(refused.contains("blocks to refund in"), "{refused}");
 }
 
@@ -285,7 +295,7 @@ fn take_refuses_terms_that_cannot_work() {
     let mut offer = agreed();
     offer.terms.t1 = 100;
     assert!(
-        check_offer(&offer, &policy, network, 0).is_err(),
+        check_offer(&offer, &policy, network, MAINNET, 0).is_err(),
         "below the floor"
     );
 }
@@ -798,7 +808,7 @@ fn an_amount_that_cannot_pay_redeem_is_refused() {
     let (policy, network) = policy(&[]);
     let mut offer = agreed();
     offer.terms.btc_amount = Amount::from_sat(2 * 10_000 + 545);
-    let refused = check_offer(&offer, &policy, network, FLOOR).unwrap_err();
+    let refused = check_offer(&offer, &policy, network, MAINNET, FLOOR).unwrap_err();
     assert!(refused.contains("redeem pays two btc_fee"), "{refused}");
 }
 
@@ -928,7 +938,7 @@ fn status_reads_a_swap_file_the_driver_saved() {
         fs::write(&path, other.to_string()).unwrap();
         let refused = cli(&path).unwrap_err();
         assert!(refused.contains(&path), "{refused}");
-        assert!(refused.contains("this build reads only 3"), "{refused}");
+        assert!(refused.contains("this build reads only 4"), "{refused}");
     }
     fs::remove_file(&path).unwrap();
     assert_eq!(cli(&path), Err(format!("{path}: no such swap file")));
@@ -1184,11 +1194,17 @@ fn offer_refuses_a_fee_below_its_nodes_estimate() {
     assert!(refused.contains("below the"), "{refused}");
 }
 
-/// A lattice-node at `height` whose operator reads answer, but whose read
-/// of an account after the block halfway up answers only if it
-/// `keeps_state`.
+/// A lattice-node on mainnet's Nexus at `height` whose operator reads
+/// answer, but whose read of an account after the block halfway up answers
+/// only if it `keeps_state`.
 fn nexus_node(height: u64, keeps_state: bool) -> String {
+    nexus_node_on(MAINNET, height, keeps_state)
+}
+
+/// [`nexus_node`], on the Nexus of `genesis`.
+fn nexus_node_on(genesis: &str, height: u64, keeps_state: bool) -> String {
     use std::io::BufRead;
+    let genesis = genesis.to_string();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     std::thread::spawn(move || {
@@ -1207,7 +1223,9 @@ fn nexus_node(height: u64, keeps_state: bool) -> String {
             let path = request.split(' ').nth(1).unwrap_or_default();
             let half = format!("/api/block/{}", height.div_ceil(2));
             let block = swap_nexus_tx::cid(b"half");
-            let answer = if path == "/health" {
+            let answer = if path == "/api/chain/info" {
+                Some(json!({"chain": ["Nexus"], "genesisHash": genesis}))
+            } else if path == "/health" {
                 let height = height.to_string();
                 Some(json!({"phase": "active", "height": height, "bestHeaderHeight": height}))
             } else if path == half {
@@ -1305,4 +1323,167 @@ fn offer_take_and_resume_check_the_nexus_node() {
     let (buyer, _) = Buyer::start(small(16), ScriptBuf::new(), "b".into()).unwrap();
     let (_directory, path) = swap_file(buyer);
     refused(refusal_on(&["resume", &path], &url, &forgetful()));
+}
+
+/// The Nexus genesis defaults to mainnet's, as anchored in Bitcoin, for
+/// `offer`, `take` and `resume` alike.
+#[test]
+fn the_nexus_genesis_defaults_to_mainnets() {
+    assert_eq!(
+        MAINNET,
+        "bafyreiggtg4ezifboyekbf4gxst2jr3mpjqcxsbmopy7w6fp46g4ngpgxa"
+    );
+    let take = [
+        "take",
+        "o",
+        "--nex-address",
+        "b",
+        "--btc-amount",
+        "1",
+        "--nex-amount",
+        "1",
+    ];
+    for args in [
+        &[
+            "offer",
+            "--btc-amount",
+            "1",
+            "--btc-fee",
+            "1",
+            "--nex-amount",
+            "1",
+            "--nex-fee",
+            "1",
+            "--listen",
+            "127.0.0.1:0",
+        ][..],
+        &take,
+        &["resume", "f.json"],
+    ] {
+        let nodes = match parse(args).unwrap().command {
+            Command::Offer(args) => args.nodes,
+            Command::Take(args) => args.nodes,
+            Command::Resume(args) => args.nodes,
+            Command::Status { .. } => unreachable!(),
+        };
+        assert_eq!(nodes.nexus_genesis, MAINNET, "{args:?}");
+    }
+}
+
+/// `offer`, `take` and `resume` refuse a lattice-node on another Nexus than
+/// `--nexus-genesis` names, before they ask it anything else, and run on
+/// the one it names.
+#[cfg(unix)]
+#[test]
+fn offer_take_and_resume_refuse_another_nexus() {
+    let dev = swap_nexus_tx::cid(b"dev");
+    let refused = |refusal: String, genesis: &str, expected: &str| {
+        assert!(
+            refusal.contains(&format!("genesis {genesis}, not {expected}")),
+            "{refusal}"
+        );
+    };
+    // It also keeps no past state: refused for its genesis first.
+    let elsewhere = || nexus_node_on(&dev, 10, false);
+    let url = bitcoind(estimate());
+    let key = key_file(7);
+    let key = key.path().to_str().unwrap();
+    let fee = btc_fee_at(10_000).to_string();
+    let offer = |extra: &[&str], nexus_url: &str| {
+        let mut args = vec![
+            "offer",
+            "--btc-amount",
+            "50000000",
+            "--btc-fee",
+            &fee,
+            "--nex-amount",
+            "1000000",
+            "--nex-fee",
+            "10",
+            "--listen",
+            "127.0.0.1:0",
+            "--nex-key-file",
+            key,
+        ];
+        args.extend(extra);
+        refusal_on(&args, &url, nexus_url)
+    };
+    refused(offer(&[], &elsewhere()), &dev, MAINNET);
+    refused(
+        offer(
+            &["--nexus-genesis", MAINNET],
+            &nexus_node_on(&dev, 10, true),
+        ),
+        &dev,
+        MAINNET,
+    );
+    let on_dev = ["--nexus-genesis", dev.as_str()];
+    refused(offer(&on_dev, &nexus_node(10, true)), MAINNET, &dev);
+    assert_eq!(
+        offer(&on_dev, &nexus_node_on(&dev, 10, true)),
+        PAST_THE_CHECKS
+    );
+
+    let address = swap_nexus_tx::address(&[9; 32]);
+    let take = |offer: &Offer, extra: &[&str], nexus_url: &str| {
+        take_refusal_on(offer, &address, extra, &url, nexus_url)
+    };
+    refused(take(&takeable(), &[], &elsewhere()), &dev, MAINNET);
+    let mut dev_offer = takeable();
+    dev_offer.terms.nexus_genesis = dev.clone();
+    refused(
+        take(&dev_offer, &on_dev, &nexus_node(10, true)),
+        MAINNET,
+        &dev,
+    );
+    assert_eq!(
+        take(&dev_offer, &on_dev, &nexus_node_on(&dev, 10, true)),
+        PAST_THE_CHECKS
+    );
+
+    // A swap file keeps its Nexus: `resume` refuses a flag naming another
+    // before it asks any node, then a node on another than the flag's.
+    let home = SecretBytes([7; 32]).nex_address();
+    let on = |genesis: &str| Terms {
+        nexus_genesis: genesis.into(),
+        ..small(16)
+    };
+    let mut files = vec![];
+    for genesis in [MAINNET, dev.as_str()] {
+        let seller = Seller::new(
+            on(genesis),
+            home.clone(),
+            ScriptBuf::new(),
+            ScriptBuf::new(),
+        );
+        files.push((genesis, swap_file(seller.unwrap())));
+        let (buyer, _) = Buyer::start(on(genesis), ScriptBuf::new(), "b".into()).unwrap();
+        files.push((genesis, swap_file(buyer)));
+    }
+    for (genesis, (_directory, path)) in &files {
+        let resume = |extra: &[&str], nexus_url: &str| {
+            let mut args = vec!["resume", path.as_str(), "--nex-key-file", key];
+            args.extend(extra);
+            refusal_on(&args, &url, nexus_url)
+        };
+        let (flag, other) = match *genesis == MAINNET {
+            true => (vec![], dev.as_str()),
+            false => (on_dev.to_vec(), MAINNET),
+        };
+        let kept = resume(&["--nexus-genesis", other], &nexus_node_on(other, 10, true));
+        assert!(
+            kept.contains(&format!(
+                "trades on the Nexus of genesis {genesis}, not {other}"
+            )),
+            "{kept}"
+        );
+        refused(
+            resume(&flag, &nexus_node_on(other, 10, true)),
+            other,
+            genesis,
+        );
+        // Past the genesis, the next check is the node's past state.
+        let next = resume(&flag, &nexus_node_on(genesis, 10, false));
+        assert!(next.contains("--state all"), "{next}");
+    }
 }

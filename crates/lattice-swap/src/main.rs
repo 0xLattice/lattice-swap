@@ -115,7 +115,7 @@ struct TermsArgs {
 }
 
 impl TermsArgs {
-    fn terms(&self, swap_id: [u8; 32]) -> Terms {
+    fn terms(&self, swap_id: [u8; 32], nexus_genesis: String) -> Terms {
         Terms {
             swap_id,
             btc_amount: Amount::from_sat(self.btc_amount),
@@ -127,6 +127,7 @@ impl TermsArgs {
             btc_confirmations: self.btc_confirmations,
             nex_confirmations: self.nex_confirmations,
             margin: self.margin,
+            nexus_genesis,
         }
     }
 }
@@ -155,6 +156,10 @@ struct NodeArgs {
     /// The lattice-node's RPC cookie file.
     #[arg(long)]
     nexus_cookie: PathBuf,
+    /// The CID of the genesis block of the Nexus to trade on: the
+    /// lattice-node must follow that chain. Mainnet's by default.
+    #[arg(long, default_value = swap_nexus_tx::MAINNET_GENESIS)]
+    nexus_genesis: String,
 }
 
 impl NodeArgs {
@@ -197,14 +202,24 @@ impl NodeArgs {
         ))
     }
 
-    /// Refuses a lattice-node that cannot say how deep a transaction is. It
-    /// works that out from past blocks and the state after them, which a
-    /// node run with `--state tip` or `none`, or `--block-bodies none`,
-    /// does not keep: every NEX lock would look unmined, and every claim
-    /// drained. Its read of an account after the block halfway up the
-    /// chain shows whether it keeps that state; a chain too short to tell
-    /// passes.
+    /// Refuses a lattice-node on another Nexus than `--nexus-genesis`
+    /// names, where a NEX lock is worthless; then one that cannot say how
+    /// deep a transaction is. It works that out from past blocks and the
+    /// state after them, which a node run with `--state tip` or `none`, or
+    /// `--block-bodies none`, does not keep: every NEX lock would look
+    /// unmined, and every claim drained. Its read of an account after the
+    /// block halfway up the chain shows whether it keeps that state; a chain
+    /// too short to tell passes.
     fn check_nexus(&self, client: &Client) -> Result<()> {
+        let genesis = client.genesis()?;
+        if genesis != self.nexus_genesis {
+            return Err(format!(
+                "refused: the Nexus node follows the chain of genesis {genesis}, not {}, the \
+                 one --nexus-genesis names",
+                self.nexus_genesis
+            )
+            .into());
+        }
         let height = client.health()?.height;
         if height < 2 {
             return Ok(());
@@ -548,13 +563,14 @@ fn btc_fee_floor(bitcoin: &Bitcoind, fallback: Option<u64>) -> Result<u64> {
     Ok(btc_fee_at(per_kvb))
 }
 
-/// An offer the buyer takes: terms that work, the amounts it agreed to on
-/// its network, a Bitcoin fee of at least `btc_fee_floor`, and every other
-/// term within its bounds.
+/// An offer the buyer takes: terms that work, on its Bitcoin network and
+/// its Nexus, the amounts it agreed to, a Bitcoin fee of at least
+/// `btc_fee_floor`, and every other term within its bounds.
 fn check_offer(
     offer: &Offer,
     policy: &PolicyArgs,
     network: Network,
+    nexus_genesis: &str,
     btc_fee_floor: u64,
 ) -> std::result::Result<(), String> {
     let terms = &offer.terms;
@@ -562,6 +578,12 @@ fn check_offer(
     let refused = |why: String| Err(format!("refused: the offer {why}"));
     if offer.btc_network != network {
         return refused(format!("is on {}, not {network}", offer.btc_network));
+    }
+    if terms.nexus_genesis != nexus_genesis {
+        return refused(format!(
+            "is on the Nexus of genesis {}, not {nexus_genesis}",
+            terms.nexus_genesis
+        ));
     }
     if terms.btc_amount.to_sat() != policy.btc_amount {
         return refused(format!(
@@ -636,9 +658,12 @@ fn check_offer(
     Ok(())
 }
 
-/// What the buyer needs to take the swap: the terms, where the seller
-/// listens and its key, and the session key the seller made for the buyer,
-/// the only one it accepts. Whoever holds an offer can take it.
+/// What the buyer needs to take the swap: the terms, among them the Nexus
+/// the seller trades on, where the seller listens and its key, and the
+/// session key the seller made for the buyer, the only one it accepts.
+/// Whoever holds an offer can take it. The Nexus in the terms is only a
+/// courtesy: a buyer on another refuses before it locks anything, but the
+/// buyer's safety is its own node's check against its own `--nexus-genesis`.
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 struct Offer {
     terms: Terms,
@@ -730,7 +755,9 @@ fn seller_key(
 
 fn offer(args: OfferArgs) -> Result<Outcome> {
     check_listen(args.listen, args.advertise)?;
-    let terms = args.terms.terms(random32());
+    let terms = args
+        .terms
+        .terms(random32(), args.nodes.nexus_genesis.clone());
     check_terms(&terms)?;
     let key = args.key.load()?;
     let bitcoin = args.nodes.bitcoin()?;
@@ -805,7 +832,8 @@ fn take(args: TakeArgs) -> Result<Outcome> {
     }
     let bitcoin = args.nodes.bitcoin()?;
     let floor = btc_fee_floor(&bitcoin, args.policy.min_btc_fee_rate)?;
-    check_offer(&offer, &args.policy, args.nodes.btc_network, floor)?;
+    let (network, genesis) = (args.nodes.btc_network, &args.nodes.nexus_genesis);
+    check_offer(&offer, &args.policy, network, genesis, floor)?;
     let nexus = args.nodes.nexus()?;
     args.nodes.check_nexus(&nexus)?;
     let refund = args.nodes.payout(&bitcoin)?;
@@ -825,7 +853,17 @@ fn take(args: TakeArgs) -> Result<Outcome> {
 fn resume(args: SwapFileArgs) -> Result<Outcome> {
     let store = swap_store(&args.swap_file)?;
     let swap_file = store.path().to_path_buf();
-    match Saved::load(&store)? {
+    let saved = Saved::load(&store)?;
+    let flag = &args.nodes.nexus_genesis;
+    if let Some(genesis) = saved.nexus_genesis().filter(|genesis| genesis != flag) {
+        return Err(format!(
+            "refused: {} trades on the Nexus of genesis {genesis}, not {flag}, the one \
+             --nexus-genesis names: resume it with --nexus-genesis {genesis}",
+            swap_file.display()
+        )
+        .into());
+    }
+    match saved {
         Saved::Seller(seller) => {
             let given = args.key.given()?;
             let key = seller_key(seller.nex_address(), seller.signs_nex(), given)?;
@@ -950,6 +988,15 @@ impl Saved {
         let buyer = serde_json::from_value(value)
             .map_err(|e| format!("{} is not a swap file: {e}", path.display()))?;
         Ok(Saved::Buyer(buyer))
+    }
+
+    /// The Nexus the swap trades on, until it ends.
+    fn nexus_genesis(&self) -> Option<&str> {
+        let terms = match self {
+            Saved::Seller(seller) => seller.terms(),
+            Saved::Buyer(buyer) => buyer.terms(),
+        };
+        terms.map(|terms| terms.nexus_genesis.as_str())
     }
 }
 

@@ -47,13 +47,24 @@ download, on the chain `--btc-network` names, and `--btc-wallet` loaded with
 private keys and, if encrypted, unlocked; an unlock that times out mid-swap
 stops its bumps. They also check that the lattice-node keeps past blocks and
 the state after them (`--state all` and `--block-bodies all`, its defaults),
-without which it cannot say how deep a transaction is. Nothing checks which Nexus the lattice-node follows: point it
-at the one you mean to trade on, and never use one Nexus wallet seed on two
-networks: a Lattice signature does not commit to the genesis block, so a NEX
-lock signed on a testnet can be replayed on mainnet, paying a lock whose key
-the testnet counterparty holds. While a swap runs, a bitcoind that falls
-behind its headers, or whose tip is over `--max-tip-age` minutes old, 90 by
-default, since its block time or since the tool first saw it, may hide that
+without which it cannot say how deep a transaction is. Before that, they
+check which Nexus the lattice-node follows: the genesis block of its root
+chain, as `GET /api/chain/info` names it, must be the one `--nexus-genesis`
+names. By default that is mainnet's,
+`bafyreiggtg4ezifboyekbf4gxst2jr3mpjqcxsbmopy7w6fp46g4ngpgxa`, anchored in
+Bitcoin as the OP_RETURN of transaction
+`7501f77602b581f605e6bc61c310b540e17324d3cc292c18985d8a3464d23236` in block
+970053. A buyer on any other Nexus would accept a worthless NEX lock. The
+offer's terms also name the seller's genesis, and the buyer refuses one
+other than its own, but each side's protection is its own node's check. The
+swap file keeps that genesis: `resume` refuses a `--nexus-genesis` naming
+another. A private chain
+forked from mainnet's genesis passes it: it shares mainnet's identity, so
+trade only through a node that follows the public network, and never use a
+mainnet key on a private or dev chain, where a transfer it signs is valid on
+mainnet too. While a swap runs, a bitcoind that falls behind its headers,
+or whose tip is over `--max-tip-age` minutes old, 90 by default, since its
+block time or since the tool first saw it, may hide that
 the redeem window closed: the seller starts no redeem and locks no NEX on it,
 and the tool warns until it catches up. Every other spend and bump goes on.
 The seller's protection against a node someone cut off is that node's own

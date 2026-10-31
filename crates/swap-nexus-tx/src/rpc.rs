@@ -1,7 +1,7 @@
 //! A blocking client for the few routes of a Lattice node's operator RPC
-//! (lattice-node 3.2.0) the swap needs: check the node is synced, read an
-//! account, submit a transaction, and read back a transaction and whether
-//! it is mined.
+//! (lattice-node 3.2.0) the swap needs: check which Nexus the node follows
+//! and that it is synced, read an account, submit a transaction, and read
+//! back a transaction and whether it is mined.
 //!
 //! The operator port listens on loopback only and takes the node's cookie
 //! (`<data-directory>/.cookie`, `__cookie__:<token>`) as HTTP basic auth. It
@@ -155,6 +155,20 @@ impl Client {
     /// less credits), not a rate. Node policy, not consensus.
     pub fn min_relay_fee(&self) -> Result<u64> {
         decimal(&self.get("/api/chain/info")?, "minRelayFee")
+    }
+
+    /// The CID of the genesis block of the Nexus the node follows: the block
+    /// at height 0 of its canonical root chain, which `/api/chain/info`
+    /// names when asked for no other chain.
+    pub fn genesis(&self) -> Result<String> {
+        let json = self.get("/api/chain/info")?;
+        if json["chain"] != serde_json::json!(["Nexus"]) {
+            return Err(Error::Malformed(format!("not the Nexus chain: {json}")));
+        }
+        let genesis = json["genesisHash"]
+            .as_str()
+            .ok_or_else(|| Error::Malformed(format!("no genesisHash in {json}")))?;
+        Ok(cid_path(genesis)?.into())
     }
 
     /// The account at the tip. The node answers balance 0, nonce 0 for an
@@ -366,6 +380,24 @@ mod tests {
             answering(block).block_hash(7).unwrap(),
             Some("bafytip".into())
         );
+    }
+
+    #[test]
+    fn the_genesis_is_the_root_chains_and_a_cid() {
+        let info = |chain: serde_json::Value, genesis: serde_json::Value| {
+            let json = serde_json::json!({"chain": chain, "genesisHash": genesis});
+            answering(json).genesis()
+        };
+        let nexus = || serde_json::json!(["Nexus"]);
+        let genesis = crate::MAINNET_GENESIS;
+        assert!(crate::is_cid(genesis));
+        assert_eq!(info(nexus(), genesis.into()).unwrap(), genesis);
+        let child = info(serde_json::json!(["Nexus", "Child"]), genesis.into());
+        assert!(matches!(child, Err(Error::Malformed(_))), "{child:?}");
+        let none = info(nexus(), serde_json::Value::Null);
+        assert!(matches!(none, Err(Error::Malformed(_))), "{none:?}");
+        let upper = info(nexus(), genesis.to_ascii_uppercase().into());
+        assert!(matches!(upper, Err(Error::NotCid(_))), "{upper:?}");
     }
 
     #[test]
