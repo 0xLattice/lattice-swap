@@ -265,6 +265,10 @@ impl Machine for Buyer {
         )
     }
 
+    fn own_spends(&self) -> &'static [Spend] {
+        &[Spend::Refund]
+    }
+
     fn watch(&self) -> Watch {
         use Buyer::*;
         let bitcoin = |locked: &BuyerLocked| Some((locked.setup.swap(), locked.lock));

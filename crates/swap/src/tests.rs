@@ -1,10 +1,18 @@
 //! Both machines against each other, with the chains made up: every path,
 //! and a counterparty that cheats at each step.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::time::Duration;
+
 use super::*;
+use crate::bitcoind::Bitcoin;
+use crate::driver::{Driver, Store};
+use crate::transport::Transport;
 use bitcoin::hashes::Hash;
-use bitcoin::{Script, TxIn, TxOut, Txid, WPubkeyHash, Witness};
-use swap_nexus_tx::rpc::Inclusion;
+use bitcoin::{FeeRate, Script, TxIn, TxOut, Txid, WPubkeyHash, Witness};
+use serde_json::json;
+use swap_nexus_tx::rpc::{Client, Inclusion};
 
 const SELLER_NEX: SecretBytes = SecretBytes([7; 32]);
 const BUYER_NEX: &str = "buyer-payout";
@@ -953,41 +961,6 @@ fn a_funding_transaction_with_two_lock_outputs_is_refused() {
 
 #[test]
 fn a_swap_cannot_be_started_twice() {
-    use crate::driver::{Driver, Store};
-    use crate::transport::Transport;
-    use std::time::Duration;
-    use swap_nexus_tx::rpc::Client;
-
-    struct Offline;
-    impl crate::bitcoind::Bitcoin for Offline {
-        fn broadcast(&self, _: &Transaction) -> crate::bitcoind::Result<()> {
-            unreachable!()
-        }
-        fn height(&self) -> crate::bitcoind::Result<u32> {
-            unreachable!()
-        }
-        fn transaction(&self, _: Txid) -> crate::bitcoind::Result<Option<(Transaction, u32)>> {
-            unreachable!()
-        }
-        fn spender(
-            &self,
-            _: OutPoint,
-            _: u32,
-        ) -> crate::bitcoind::Result<Option<(Transaction, u32)>> {
-            unreachable!()
-        }
-        fn fund_lock(&self, _: &Script, _: Amount) -> crate::bitcoind::Result<Transaction> {
-            unreachable!()
-        }
-    }
-    impl Transport for Offline {
-        fn send(&mut self, _: &[u8]) -> std::io::Result<()> {
-            unreachable!()
-        }
-        fn recv(&mut self, _: Duration) -> std::io::Result<Option<Vec<u8>>> {
-            unreachable!()
-        }
-    }
     let start = |seller: Seller, directory: &std::path::Path| {
         let client = Client::new("http://127.0.0.1:9", "", Duration::from_secs(1));
         let store = Store::new(directory, terms().swap_id);
@@ -1256,4 +1229,313 @@ fn a_passed_nonce_must_hold_nex_confirmations_blocks() {
     assert_eq!(seller.outcome(), None, "counted from 16, not 13");
     let (done, _) = seller.step(at(19, 4));
     assert_eq!(done.outcome(), Some(Outcome::Refunded));
+}
+
+// Fee bumping, against a made-up node.
+
+/// A Bitcoin node the test moves by hand. The lock is mined at height 101,
+/// as in [`btc`]; whatever is in `mempool` waits unconfirmed.
+#[derive(Default)]
+struct Node {
+    height: u32,
+    lock: Option<Txid>,
+    mempool: Vec<Transaction>,
+    estimate: Option<FeeRate>,
+    /// Each bump asked of the node: the parent, the height, the feerate.
+    bumps: Vec<(Txid, u32, FeeRate)>,
+}
+
+#[derive(Clone, Default)]
+struct Fake(Rc<RefCell<Node>>);
+
+impl Bitcoin for Fake {
+    fn broadcast(&self, tx: &Transaction) -> crate::bitcoind::Result<()> {
+        self.0.borrow_mut().mempool.push(tx.clone());
+        Ok(())
+    }
+    fn height(&self) -> crate::bitcoind::Result<u32> {
+        Ok(self.0.borrow().height)
+    }
+    fn transaction(&self, txid: Txid) -> crate::bitcoind::Result<Option<(Transaction, u32)>> {
+        let node = self.0.borrow();
+        if node.lock == Some(txid) {
+            return Ok(Some((node.mempool[0].clone(), node.height - 100)));
+        }
+        let pooled = node.mempool.iter().find(|tx| tx.compute_txid() == txid);
+        Ok(pooled.map(|tx| (tx.clone(), 0)))
+    }
+    fn spender(&self, _: OutPoint, _: u32) -> crate::bitcoind::Result<Option<(Transaction, u32)>> {
+        Ok(None)
+    }
+    fn fund_lock(&self, _: &Script, _: Amount) -> crate::bitcoind::Result<Transaction> {
+        unreachable!()
+    }
+    fn fee_rate(&self) -> crate::bitcoind::Result<Option<FeeRate>> {
+        Ok(self.0.borrow().estimate)
+    }
+    fn bump(
+        &self,
+        parent: &Transaction,
+        _: Amount,
+        rate: FeeRate,
+    ) -> crate::bitcoind::Result<Txid> {
+        let mut node = self.0.borrow_mut();
+        let height = node.height;
+        node.bumps.push((parent.compute_txid(), height, rate));
+        Ok(Txid::all_zeros())
+    }
+}
+
+struct Offline;
+
+impl Bitcoin for Offline {
+    fn broadcast(&self, _: &Transaction) -> crate::bitcoind::Result<()> {
+        unreachable!()
+    }
+    fn height(&self) -> crate::bitcoind::Result<u32> {
+        unreachable!()
+    }
+    fn transaction(&self, _: Txid) -> crate::bitcoind::Result<Option<(Transaction, u32)>> {
+        unreachable!()
+    }
+    fn spender(&self, _: OutPoint, _: u32) -> crate::bitcoind::Result<Option<(Transaction, u32)>> {
+        unreachable!()
+    }
+    fn fund_lock(&self, _: &Script, _: Amount) -> crate::bitcoind::Result<Transaction> {
+        unreachable!()
+    }
+    fn fee_rate(&self) -> crate::bitcoind::Result<Option<FeeRate>> {
+        unreachable!()
+    }
+    fn bump(&self, _: &Transaction, _: Amount, _: FeeRate) -> crate::bitcoind::Result<Txid> {
+        unreachable!()
+    }
+}
+
+impl Transport for Offline {
+    fn send(&mut self, _: &[u8]) -> std::io::Result<()> {
+        unreachable!()
+    }
+    fn recv(&mut self, _: Duration) -> std::io::Result<Option<Vec<u8>>> {
+        unreachable!()
+    }
+}
+
+/// Watches a locked swap and does nothing, with `role`'s view of which
+/// spends are its own.
+#[derive(Clone, Serialize, Deserialize)]
+struct Watching<R> {
+    watcher: Buyer,
+    role: R,
+}
+
+impl<R: Machine> Machine for Watching<R> {
+    fn step(self, _: Event) -> (Self, Vec<Action>) {
+        (self, vec![])
+    }
+    fn outcome(&self) -> Option<Outcome> {
+        None
+    }
+    fn awaits_message(&self) -> bool {
+        false
+    }
+    fn watch(&self) -> Watch {
+        Watch {
+            bitcoin: self.watcher.watch().bitcoin,
+            nexus: None,
+        }
+    }
+    fn own_spends(&self) -> &'static [Spend] {
+        self.role.own_spends()
+    }
+}
+
+/// Runs `machine`'s driver for one poll at each of `heights`, and returns
+/// the bumps it asked for.
+fn bumps<M: Machine>(
+    machine: M,
+    node: &Fake,
+    heights: &[u32],
+    set: impl FnOnce(&mut Driver<M, Fake, Offline>),
+) -> Vec<(Txid, u32, FeeRate)> {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::new(directory.path(), terms().swap_id);
+    let client = Client::new("http://127.0.0.1:9", "", Duration::from_secs(1));
+    let mut driver = Driver::start(machine, vec![], node.clone(), client, None, store).unwrap();
+    driver.poll = Duration::from_millis(1);
+    set(&mut driver);
+    let polls = std::cell::Cell::new(0);
+    let stopped = driver.run_until(|_| {
+        let Some(&height) = heights.get(polls.get()) else {
+            return true;
+        };
+        polls.set(polls.get() + 1);
+        node.0.borrow_mut().height = height;
+        false
+    });
+    assert!(stopped.unwrap().is_none());
+    node.0.borrow().bumps.clone()
+}
+
+/// A node whose mempool holds `spends` of a locked swap, and estimates
+/// `estimate` sat/vB.
+fn pooled(locked: &Locked, spends: &[Spend], estimate: u32) -> Fake {
+    let (swap, lock) = locked.swap();
+    let funding = Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![],
+        output: vec![],
+    };
+    let mut mempool = vec![funding];
+    mempool.extend(spends.iter().map(|&spend| swap.unsigned_tx(lock, spend)));
+    Fake(Rc::new(RefCell::new(Node {
+        lock: Some(lock.txid),
+        mempool,
+        estimate: Some(FeeRate::from_sat_per_vb_u32(estimate)),
+        ..Node::default()
+    })))
+}
+
+fn txids(locked: &Locked, spends: &[Spend]) -> Vec<Txid> {
+    let (swap, lock) = locked.swap();
+    spends
+        .iter()
+        .map(|&spend| swap.unsigned_tx(lock, spend).compute_txid())
+        .collect()
+}
+
+/// Each party bumps only what pays it: the seller its redeem and punish,
+/// the buyer its refund, and neither ever bumps cancel.
+#[test]
+fn each_party_bumps_only_what_pays_it() {
+    fn bumped<R: Machine>(locked: &Locked, role: R, spends: &[Spend]) -> Vec<Txid> {
+        let node = pooled(locked, spends, 50);
+        let watcher = locked.buyer.clone();
+        let bumps = bumps(Watching { watcher, role }, &node, &[105], |_| {});
+        bumps.into_iter().map(|(txid, ..)| txid).collect()
+    }
+    let locked = locked();
+    let (seller, buyer) = (locked.seller.clone(), locked.buyer.clone());
+    use Spend::*;
+    assert_eq!(
+        bumped(&locked, seller.clone(), &[Redeem, Refund]),
+        txids(&locked, &[Redeem])
+    );
+    assert_eq!(
+        bumped(&locked, buyer.clone(), &[Redeem, Refund]),
+        txids(&locked, &[Refund])
+    );
+    assert_eq!(
+        bumped(&locked, seller, &[Cancel, Punish]),
+        txids(&locked, &[Punish])
+    );
+    assert_eq!(bumped(&locked, buyer, &[Cancel, Punish]), []);
+}
+
+/// Bumped when first seen, then every `bump_after` blocks however often
+/// the driver polls; 0 is every new block.
+#[test]
+fn a_waiting_spend_is_bumped_once_every_bump_after_blocks() {
+    let locked = locked();
+    let heights = |bump_after, polls: &[u32]| {
+        let node = pooled(&locked, &[Spend::Redeem], 50);
+        let watcher = locked.buyer.clone();
+        let role = locked.seller.clone();
+        let bumps = bumps(Watching { watcher, role }, &node, polls, |driver| {
+            driver.bump_after = bump_after;
+        });
+        bumps
+            .into_iter()
+            .map(|(_, height, _)| height)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        heights(2, &[105, 105, 106, 107, 107, 108, 109]),
+        [105, 107, 109]
+    );
+    assert_eq!(heights(0, &[105, 105, 106, 106, 107]), [105, 106, 107]);
+}
+
+/// A bump pays at most `max_fee_rate`, and nothing when the estimate is
+/// not above what the spend already pays.
+#[test]
+fn a_bump_pays_the_estimate_up_to_the_cap() {
+    let locked = locked();
+    let rates = |estimate, max: Option<u32>| {
+        let node = pooled(&locked, &[Spend::Redeem], estimate);
+        let watcher = locked.buyer.clone();
+        let role = locked.seller.clone();
+        let bumps = bumps(Watching { watcher, role }, &node, &[105], |driver| {
+            if let Some(max) = max {
+                driver.max_fee_rate = FeeRate::from_sat_per_vb_u32(max);
+            }
+        });
+        bumps
+            .into_iter()
+            .map(|(.., rate)| rate.to_sat_per_vb_ceil())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(rates(50, None), [50]);
+    assert_eq!(rates(5_000, None), [1_000], "the default cap");
+    assert_eq!(rates(50, Some(20)), [20]);
+    // The redeem alone pays more than 1 sat/vB.
+    assert_eq!(rates(1, None), [0u64; 0]);
+}
+
+/// A redeem sent at the last block the window is open is bumped at once,
+/// long before cancel is valid.
+#[test]
+fn a_redeem_sent_at_the_last_open_block_is_bumped_before_t1() {
+    let (seller, buyer, nex_lock) = locked().nex_locked();
+    let (_, actions) = buyer.step(nexus(account(500_000, 0), mined(nex_lock.body, 1)));
+    // t1 = 20, margin = 3: the lock 17 deep is the last chance.
+    let (seller, _) = seller.step(btc(17, None, None));
+    let (seller, _) = seller.step(message(sent(&actions)));
+    let (swap, lock) = seller.watch().bitcoin.unwrap();
+    let redeem = swap.unsigned_tx(lock, Spend::Redeem).compute_txid();
+    let funding = Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![],
+        output: vec![],
+    };
+    let node = Fake(Rc::new(RefCell::new(Node {
+        lock: Some(lock.txid),
+        mempool: vec![funding],
+        estimate: Some(FeeRate::from_sat_per_vb_u32(50)),
+        ..Node::default()
+    })));
+    // A block every poll, until the lock is t1 deep.
+    let bumps = bumps(seller, &node, &[117, 118, 119], |_| {});
+    assert_eq!(node.0.borrow().mempool[1].compute_txid(), redeem);
+    assert_eq!(
+        bumps.first().map(|&(txid, height, _)| (txid, height)),
+        Some((redeem, 117))
+    );
+}
+
+/// A state file of another format is refused, not misread.
+#[test]
+fn a_state_file_of_another_version_is_refused() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::new(directory.path(), terms().swap_id);
+    let client = Client::new("http://127.0.0.1:9", "", Duration::from_secs(1));
+    let seller = new_seller(terms());
+    Driver::<_, _, Offline>::start(seller, vec![], Offline, client, None, store).unwrap();
+    let store = Store::new(directory.path(), terms().swap_id);
+    assert!(store.load::<Seller>().unwrap().is_some());
+
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(store.path()).unwrap()).unwrap();
+    for other in [json!(crate::driver::STATE_VERSION + 1), json!(null)] {
+        let mut file = saved.clone();
+        file["version"] = other;
+        std::fs::write(store.path(), serde_json::to_vec(&file).unwrap()).unwrap();
+        let refused = store.load::<Seller>().err().expect("refused");
+        assert_eq!(refused.kind(), std::io::ErrorKind::InvalidData);
+    }
+    // A file from before versions: the state itself, at the top.
+    std::fs::write(store.path(), serde_json::to_vec(&saved["state"]).unwrap()).unwrap();
+    assert!(store.load::<Seller>().is_err());
 }

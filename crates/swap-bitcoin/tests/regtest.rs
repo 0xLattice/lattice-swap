@@ -3,13 +3,13 @@
 use corepc_node::serde_json::Value;
 use corepc_node::{Conf, Node};
 use rand_core::OsRng;
-use swap_bitcoin::bitcoin::consensus::encode::deserialize_hex;
+use swap_bitcoin::bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
 use swap_bitcoin::bitcoin::hashes::Hash;
 use swap_bitcoin::bitcoin::sighash::{Prevouts, SighashCache};
 use swap_bitcoin::bitcoin::taproot::{LeafVersion, TapLeafHash};
 use swap_bitcoin::bitcoin::{
-    Address, Amount, Network, OutPoint, Script, ScriptBuf, Sequence, TapSighashType, Transaction,
-    TxOut, Txid, WPubkeyHash,
+    Address, Amount, Denomination, Network, OutPoint, Script, ScriptBuf, Sequence, TapSighashType,
+    Transaction, TxOut, Txid, WPubkeyHash,
 };
 use swap_bitcoin::schnorr_fun;
 use swap_bitcoin::{Error, EvenY, KeyPair, Params, Party, Point, Scalar, Spend, Swap};
@@ -24,8 +24,14 @@ struct Chain {
 
 impl Chain {
     fn start() -> Self {
+        Self::start_with(&[])
+    }
+
+    /// A node started with extra `args`, such as a fee policy.
+    fn start_with(args: &[&'static str]) -> Self {
         let mut conf = Conf::default();
         conf.args.push("-txindex");
+        conf.args.extend(args);
         let node = Node::from_downloaded_with_conf(&conf).expect("start bitcoind");
         let miner = node.client.new_address().unwrap();
         let chain = Self { node, miner };
@@ -78,6 +84,45 @@ impl Chain {
             .call("getrawtransaction", &[txid.to_string().into()])
             .unwrap();
         deserialize_hex(&hex).unwrap()
+    }
+
+    fn confirmations(&self, txid: Txid) -> u64 {
+        let verbose: Value = self
+            .node
+            .client
+            .call("getrawtransaction", &[txid.to_string().into(), true.into()])
+            .unwrap();
+        verbose["confirmations"].as_u64().unwrap_or(0)
+    }
+
+    /// A CPFP child of `parent` paying `fee` from its payout, which the
+    /// node's wallet signs for.
+    fn child(&self, parent: &Transaction, fee: Amount) -> Transaction {
+        let child = swap_bitcoin::cpfp(parent, self.script(), fee).unwrap();
+        let payout = Value::from(vec![corepc_node::serde_json::json!({
+            "txid": parent.compute_txid().to_string(),
+            "vout": 0,
+            "scriptPubKey": parent.output[0].script_pubkey.to_hex_string(),
+            "amount": parent.output[0].value.to_string_in(Denomination::Bitcoin),
+        })]);
+        let signed: Value = self
+            .node
+            .client
+            .call(
+                "signrawtransactionwithwallet",
+                &[serialize_hex(&child).into(), payout],
+            )
+            .unwrap();
+        assert_eq!(signed["complete"], true, "{signed}");
+        deserialize_hex(signed["hex"].as_str().unwrap()).unwrap()
+    }
+
+    fn submit_package(&self, parent: &Transaction, child: &Transaction) -> Value {
+        let package = vec![serialize_hex(parent), serialize_hex(child)];
+        self.node
+            .client
+            .call("submitpackage", &[package.into()])
+            .unwrap()
     }
 
     /// Mines a block and returns the transaction as it appears on chain.
@@ -143,7 +188,10 @@ fn offline_payout() -> ScriptBuf {
 
 /// A funded swap with one confirmation on the lock.
 fn funded() -> (Chain, Parties, Swap, OutPoint) {
-    let chain = Chain::start();
+    funded_on(Chain::start())
+}
+
+fn funded_on(chain: Chain) -> (Chain, Parties, Swap, OutPoint) {
     let parties = Parties::random();
     let swap = Swap::new(parties.params(chain.script())).unwrap();
     let lock = chain.fund(&swap.lock_script_pubkey(), swap.params().amount);
@@ -178,6 +226,12 @@ fn one_block_short(tx: &Transaction, prevout: TxOut, signers: &[&KeyPair<EvenY>]
     tx
 }
 
+/// Version 3 with its one output, broadcast alone at the agreed fee.
+fn assert_truc(tx: &Transaction) {
+    assert_eq!(tx.version.0, 3);
+    assert_eq!(tx.output.len(), 1);
+}
+
 fn assert_csv_rejects(chain: &Chain, tx: &Transaction) {
     let err = chain.broadcast(tx).unwrap_err();
     assert!(err.contains("Locktime requirement not satisfied"), "{err}");
@@ -194,6 +248,7 @@ fn cancel(chain: &Chain, parties: &Parties, swap: &Swap, lock: OutPoint) -> Tran
     let tx = swap
         .finalize(lock, Spend::Cancel, &seller_sig, Some(&buyer_sig))
         .unwrap();
+    assert_truc(&tx);
 
     // The lock has one confirmation. Cancel can enter block `lock + t1`, so the
     // mempool accepts it once the tip is one below that.
@@ -231,6 +286,7 @@ fn redeem_pays_seller_and_reveals_s() {
     let tx = swap
         .finalize(lock, Spend::Redeem, &seller_sig, Some(&buyer_sig))
         .unwrap();
+    assert_truc(&tx);
     let txid = chain.broadcast(&tx).unwrap();
     let on_chain = chain.mine_and_fetch(txid);
 
@@ -265,6 +321,7 @@ fn cancel_then_refund_reveals_b() {
     let tx = swap
         .finalize(lock, Spend::Refund, &seller_sig, Some(&buyer_sig))
         .unwrap();
+    assert_truc(&tx);
     let txid = chain.broadcast(&tx).unwrap();
     let on_chain = chain.mine_and_fetch(txid);
 
@@ -284,6 +341,7 @@ fn cancel_then_punish_after_t2() {
     let tx = swap
         .finalize(lock, Spend::Punish, &seller_sig, None)
         .unwrap();
+    assert_truc(&tx);
 
     // Cancel has one confirmation; same boundary as cancel itself.
     chain.mine(T2 as usize - 2);
@@ -297,6 +355,29 @@ fn cancel_then_punish_after_t2() {
     chain.mine(1);
     let txid = chain.broadcast(&tx).unwrap();
     chain.mine_and_fetch(txid);
+}
+
+/// Below the node's relay feerate a spend is refused alone, but relays and
+/// confirms in a package with a child that pays for both.
+#[test]
+fn a_spend_below_the_relay_feerate_relays_as_a_package() {
+    let (chain, parties, swap, lock) = funded_on(Chain::start_with(&["-minrelaytxfee=0.0001"]));
+    let encrypted = swap
+        .encrypted_sign(lock, Spend::Redeem, &parties.buyer)
+        .unwrap();
+    let buyer_sig = swap.decrypt(&parties.s, &encrypted);
+    let seller_sig = swap.sign(lock, Spend::Redeem, &parties.seller);
+    let redeem = swap
+        .finalize(lock, Spend::Redeem, &seller_sig, Some(&buyer_sig))
+        .unwrap();
+    let alone = chain.broadcast(&redeem).unwrap_err();
+    assert!(alone.contains("min relay fee not met"), "{alone}");
+
+    let child = chain.child(&redeem, Amount::from_sat(10_000));
+    let result = chain.submit_package(&redeem, &child);
+    assert_eq!(result["package_msg"], "success", "{result}");
+    chain.mine(1);
+    assert_eq!(chain.confirmations(redeem.compute_txid()), 1);
 }
 
 #[test]

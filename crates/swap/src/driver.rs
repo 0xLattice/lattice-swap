@@ -1,12 +1,13 @@
 //! Runs a [`Machine`] against real nodes and a real counterparty.
 
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::mem::discriminant;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use bitcoin::OutPoint;
+use bitcoin::{Amount, FeeRate, OutPoint, Transaction, Txid};
 use swap_bitcoin::{Spend, Swap};
 use swap_nexus_tx::rpc::Client;
 
@@ -15,9 +16,13 @@ use crate::transport::Transport;
 use crate::{Action, BitcoinView, Event, Machine, Message, NexusView, NexusWatch, Outcome};
 use crate::{SecretBytes, Spent};
 
+/// The format of a state file. A file of another version is refused: its
+/// signatures may be over transactions this build no longer makes.
+pub const STATE_VERSION: u32 = 2;
+
 /// One JSON file per swap, replaced atomically: written to a temporary
 /// file, synced, then renamed over the old one. It holds the party's
-/// secrets.
+/// secrets, and [`STATE_VERSION`].
 pub struct Store {
     path: PathBuf,
     swap_id: [u8; 32],
@@ -44,14 +49,28 @@ impl Store {
         self.sync_directory()
     }
 
+    /// Fails on a file of another [`STATE_VERSION`].
     pub fn load<M: Machine>(&self) -> io::Result<Option<M>> {
-        match fs::read(&self.path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map(Some)
-                .map_err(io::Error::other),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
+        let bytes = match fs::read(&self.path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let mut file: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+        let version = &file["version"];
+        if version.as_u64() != Some(STATE_VERSION.into()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{}: state version {version}, but this build reads only {STATE_VERSION}",
+                    self.path.display()
+                ),
+            ));
         }
+        serde_json::from_value(file["state"].take())
+            .map(Some)
+            .map_err(io::Error::other)
     }
 
     fn save<M: Machine>(&self, state: &M) -> io::Result<()> {
@@ -67,7 +86,8 @@ impl Store {
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
         let mut file = options.open(&temporary)?;
-        file.write_all(&serde_json::to_vec_pretty(state).map_err(io::Error::other)?)?;
+        let file_state = serde_json::json!({"version": STATE_VERSION, "state": state});
+        file.write_all(&serde_json::to_vec_pretty(&file_state).map_err(io::Error::other)?)?;
         file.sync_all()?;
         Ok(temporary)
     }
@@ -85,6 +105,18 @@ impl Store {
 /// it asks. The state is saved after every step that changes it, before
 /// any of the step's actions, so nothing is sent, broadcast or submitted
 /// that a restart would not know about.
+///
+/// A swap transaction that pays this party (redeem and punish for the
+/// seller, refund for the buyer) is bumped by CPFP as soon as it is seen
+/// unconfirmed, in the mempool or refused by it, if the node's estimate is
+/// above its own feerate: a child spends its payout into the party's
+/// bitcoind wallet, and the two go to the node as a package. While it waits
+/// it is bumped again every `bump_after` blocks at the current estimate; a
+/// new child replaces the last only if it pays more. A payout the wallet
+/// cannot sign for is not bumped, and a failed bump is only logged. Cancel
+/// pays both parties' 2-of-2 and is never bumped: a stuck cancel only
+/// delays the swap. The wait is counted in memory, so after a restart a
+/// waiting transaction is bumped at once.
 pub struct Driver<M, B, T> {
     state: M,
     bitcoin: B,
@@ -99,6 +131,19 @@ pub struct Driver<M, B, T> {
     /// The seller's Nexus wallet key, which signs the NEX lock: set it
     /// before running a seller. Kept here and never in the state file.
     pub nex_key: Option<SecretBytes>,
+    /// Blocks between bumps of a swap transaction still waiting; 0 bumps it
+    /// at every new block.
+    pub bump_after: u32,
+    /// The feerate a bump pays for when the node has no estimate, as on
+    /// regtest.
+    pub fallback_fee_rate: FeeRate,
+    /// The most a bump pays for: a higher estimate is clamped to it.
+    pub max_fee_rate: FeeRate,
+    /// Our swap transactions waiting unconfirmed, by txid, with the height
+    /// at which this driver last bumped each, or first saw it wait.
+    waiting: HashMap<Txid, u32>,
+    /// Transactions broadcast since the last Bitcoin view.
+    broadcast: Vec<Transaction>,
 }
 
 impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
@@ -143,6 +188,11 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
             poll: Duration::from_millis(250),
             message_timeout: Duration::from_secs(60),
             nex_key: None,
+            bump_after: 3,
+            fallback_fee_rate: FeeRate::from_sat_per_vb_u32(10),
+            max_fee_rate: FeeRate::from_sat_per_vb_u32(1_000),
+            waiting: HashMap::new(),
+            broadcast: vec![],
         }
     }
 
@@ -209,11 +259,80 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
             return Ok(());
         };
         match bitcoin_view(&self.bitcoin, &swap, lock) {
-            Ok(view) => self.apply(Event::Bitcoin(view)),
+            Ok(view) => {
+                let height = view.height;
+                let mut waiting: Vec<Transaction> = [&view.lock_spend, &view.cancel_spend]
+                    .into_iter()
+                    .flatten()
+                    .filter(|spent| spent.confirmations == 0)
+                    .map(|spent| spent.tx.clone())
+                    .collect();
+                self.apply(Event::Bitcoin(view))?;
+                // What the machine broadcast was not in the view at all.
+                waiting.append(&mut self.broadcast);
+                self.bump(&swap, lock, height, waiting);
+                Ok(())
+            }
             Err(e) => {
                 warn(&e.to_string());
                 Ok(())
             }
+        }
+    }
+
+    /// Bumps each of our swap transactions in `waiting` the first time it is
+    /// seen, then once every `bump_after` blocks, never twice in a block,
+    /// and forgets those no longer waiting.
+    fn bump(&mut self, swap: &Swap, lock: OutPoint, height: u32, waiting: Vec<Transaction>) {
+        let own: Vec<Txid> = self
+            .state
+            .own_spends()
+            .iter()
+            .map(|&spend| swap.unsigned_tx(lock, spend).compute_txid())
+            .collect();
+        let mut still = HashMap::new();
+        for tx in waiting {
+            let txid = tx.compute_txid();
+            if !own.contains(&txid) || still.contains_key(&txid) {
+                continue;
+            }
+            let since = match self.waiting.get(&txid) {
+                Some(&since) if height < since + self.bump_after.max(1) => since,
+                _ => {
+                    self.bump_one(&tx, swap.params().fee);
+                    height
+                }
+            };
+            still.insert(txid, since);
+        }
+        self.waiting = still;
+    }
+
+    /// Bumps `tx`, which pays `fee`, to the node's estimate if that is above
+    /// its own feerate.
+    fn bump_one(&self, tx: &Transaction, fee: Amount) {
+        let txid = tx.compute_txid();
+        let rate = match self.bitcoin.fee_rate() {
+            Ok(rate) => rate.unwrap_or(self.fallback_fee_rate),
+            Err(e) => return warn(&format!("bump {txid}: {e}")),
+        };
+        let rate = if rate > self.max_fee_rate {
+            warn(&format!(
+                "bump {txid}: estimate {rate} clamped to max_fee_rate {}",
+                self.max_fee_rate
+            ));
+            self.max_fee_rate
+        } else {
+            rate
+        };
+        if rate
+            .fee_vb(tx.vsize() as u64)
+            .is_none_or(|alone| alone <= fee)
+        {
+            return;
+        }
+        if let Err(e) = self.bitcoin.bump(tx, fee, rate) {
+            warn(&format!("bump {txid}: {e}"));
         }
     }
 
@@ -273,6 +392,7 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
                 if let Err(e) = self.bitcoin.broadcast(&tx) {
                     warn(&format!("broadcast {}: {e}", tx.compute_txid()));
                 }
+                self.broadcast.push(tx);
             }
             Action::SignNex(body) => match &self.nex_key {
                 Some(key) => {

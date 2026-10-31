@@ -18,6 +18,28 @@
 //! Every output uses the BIP341 NUMS point as its internal key, so every spend
 //! is a script-path spend. Each transaction pays one fixed absolute fee.
 //!
+//! The fee is fixed when the swap is set up. Each spend has exactly one
+//! output, so the party it pays raises its feerate by CPFP: a child that
+//! spends the payout itself (see [`cpfp`]), sent with it as a package and
+//! replaced by a higher-paying child to bump again. Redeem and punish pay the
+//! seller, refund pays the buyer, and nobody else can spend those outputs.
+//! The spends are version 3 (TRUC) transactions, which Bitcoin Core relays as
+//! 1-parent-1-child packages:
+//!
+//! - An unconfirmed TRUC transaction has at most one unconfirmed child, of at
+//!   most 1000 vB, and only its payee can make one, so nobody else can pin it
+//!   with a large child. Only a TRUC transaction may pay less than the
+//!   minimum relay feerate, and only in a package that pays for it.
+//! - Cancel cannot be bumped: its only output is the cancel output, which
+//!   only both parties together, or the seller after `t2` blocks, can spend.
+//!   A cancel that sits unconfirmed only delays the swap, since `t2` counts
+//!   from cancel's confirmation. It also means cancel, paying the same fee as
+//!   redeem, can never outbid a redeem that is already in the mempool.
+//! - After `t2`, refund and punish both spend the cancel output, and each
+//!   party bumps its own: a fee race between the two owners.
+//! - A TRUC transaction spends no unconfirmed non-TRUC output. Redeem and
+//!   cancel spend the lock, which is confirmed before either is sent.
+//!
 //! Rules for whoever drives these transactions:
 //!
 //! - The buyer funds the lock with exactly `amount` to `lock_script_pubkey`,
@@ -30,10 +52,6 @@
 //! - The buyer refunds a safe margin before `t2`, or the seller can punish.
 //! - Both parties watch the mempool, not only blocks. A redeem in the mempool
 //!   already reveals `s`, and a refund in the mempool already reveals `b`.
-//!
-//! TODO: fee bumping. The fee is fixed when the swap is set up; there is no
-//! CPFP anchor or RBF path, so a fee that is too low for the mempool at
-//! broadcast time cannot be raised.
 
 use bitcoin::absolute::LockTime;
 use bitcoin::hashes::Hash;
@@ -245,6 +263,7 @@ impl Swap {
     }
 
     /// The spend without its witness. `lock` is the funded lock output.
+    /// Its one output is the payout, or for cancel the cancel output.
     pub fn unsigned_tx(&self, lock: OutPoint, spend: Spend) -> Transaction {
         let p = &self.params;
         let (input, sequence, payout) = match spend {
@@ -262,7 +281,7 @@ impl Swap {
             ),
         };
         Transaction {
-            version: Version::TWO,
+            version: Version::non_standard(3),
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
                 previous_output: input,
@@ -495,6 +514,32 @@ impl Swap {
     }
 }
 
+/// A CPFP child of `parent`, unsigned: it spends the parent's payout,
+/// output 0, and pays all of it but `fee` to `change`. Only the payee can
+/// sign it. `None` if the change would be dust. Version 3, like its parent;
+/// with one input and one output it stays far below the 1000 vB a TRUC
+/// child may weigh. A child paying more replaces it.
+pub fn cpfp(parent: &Transaction, change: ScriptBuf, fee: Amount) -> Option<Transaction> {
+    let value = parent.output[0]
+        .value
+        .checked_sub(fee)
+        .filter(|value| *value >= change.minimal_non_dust())?;
+    Some(Transaction {
+        version: Version::non_standard(3),
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::new(parent.compute_txid(), 0),
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value,
+            script_pubkey: change,
+        }],
+    })
+}
+
 fn xonly(point: &Point<EvenY>) -> XOnlyPublicKey {
     XOnlyPublicKey::from_slice(&point.to_xonly_bytes()).expect("a valid point")
 }
@@ -576,6 +621,70 @@ mod tests {
         assert_eq!(rejects(with(2 * fee - 1)), Error::Amount);
         assert_eq!(rejects(with(2 * fee + dust - 1)), Error::Amount);
         assert!(Swap::new(with(2 * fee + dust)).is_ok());
+    }
+
+    /// Nothing a third party can spend: each spend's one output pays its
+    /// owner, and cancel's only output needs both parties, or the seller
+    /// once cancel is `t2` deep.
+    #[test]
+    fn every_spend_is_truc_with_one_output_its_owner_spends() {
+        let script = |n| ScriptBuf::new_p2wpkh(&WPubkeyHash::from_byte_array([n; 20]));
+        let swap = Swap::new(Params {
+            redeem_payout: script(1),
+            refund_payout: script(2),
+            punish_payout: script(3),
+            ..params()
+        })
+        .unwrap();
+        for (spend, payout) in [
+            (Spend::Redeem, script(1)),
+            (Spend::Cancel, swap.cancel_output()),
+            (Spend::Refund, script(2)),
+            (Spend::Punish, script(3)),
+        ] {
+            let tx = swap.unsigned_tx(lock(), spend);
+            assert_eq!(tx.version, Version::non_standard(3));
+            assert_eq!(tx.output.len(), 1, "{spend:?}");
+            assert_eq!(tx.output[0].script_pubkey, payout, "{spend:?}");
+            assert_eq!(swap.spent_value(spend) - tx.output[0].value, params().fee);
+        }
+        // The cancel output has no key path, and its leaves are the 2-of-2
+        // and punish, which waits `t2` blocks: no unconfirmed cancel has a
+        // child either party makes alone.
+        assert_eq!(swap.cancel.internal_key().serialize(), NUMS);
+        let leaves: Vec<&ScriptBuf> = swap.cancel.script_map().keys().map(|(s, _)| s).collect();
+        assert_eq!(leaves.len(), 2);
+        assert!(leaves.contains(&&swap.two_of_two));
+        assert!(leaves.contains(&&swap.punish_leaf));
+        assert!(swap.params().t2 > 0);
+        let punish = swap.unsigned_tx(lock(), Spend::Punish);
+        assert_eq!(
+            punish.input[0].sequence,
+            Sequence::from_height(swap.params().t2)
+        );
+        let refund = swap.unsigned_tx(lock(), Spend::Refund);
+        let cancel = swap.unsigned_tx(lock(), Spend::Cancel);
+        assert_eq!(
+            refund.input[0].previous_output,
+            OutPoint::new(cancel.compute_txid(), 0)
+        );
+    }
+
+    #[test]
+    fn a_child_spends_the_payout_and_keeps_above_dust() {
+        let swap = Swap::new(params()).unwrap();
+        let redeem = swap.unsigned_tx(lock(), Spend::Redeem);
+        let value = redeem.output[0].value;
+        let dust = payout().minimal_non_dust();
+        let child = cpfp(&redeem, payout(), Amount::from_sat(500)).unwrap();
+        assert_eq!(child.version, Version::non_standard(3));
+        assert_eq!(
+            child.input[0].previous_output,
+            OutPoint::new(redeem.compute_txid(), 0)
+        );
+        assert_eq!(child.output[0].value, value - Amount::from_sat(500));
+        assert!(cpfp(&redeem, payout(), value - dust).is_some());
+        assert!(cpfp(&redeem, payout(), value - dust + Amount::ONE_SAT).is_none());
     }
 
     #[test]

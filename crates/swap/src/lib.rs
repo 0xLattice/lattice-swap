@@ -712,6 +712,10 @@ pub trait Machine: Clone + Serialize + serde::de::DeserializeOwned {
     /// if it stays quiet, the driver sends [`Event::Timeout`].
     fn awaits_message(&self) -> bool;
     fn watch(&self) -> Watch;
+    /// The swap transactions that pay this side, which the driver bumps by
+    /// CPFP from their payout while they wait unconfirmed. Never cancel,
+    /// whose output only both parties together can spend.
+    fn own_spends(&self) -> &'static [Spend];
 }
 
 /// What a driver should watch for a machine in its current state.
