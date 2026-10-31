@@ -2843,16 +2843,107 @@ fn a_claim_that_lands_beside_a_redeem_ends_the_fight() {
 }
 
 /// Nothing locked, and nothing can be any more, while the redeem is fought
-/// for: the seller never parted with its NEX, and ends `Refunded`.
+/// for: the seller never parted with its NEX, and ends `Refunded` at the
+/// next Bitcoin view, which is what tells whether a punish can still win.
 #[test]
 fn an_empty_lock_during_the_fight_ends_refunded() {
-    let (seller, _) = seller_beside_a_redeem();
+    let (seller, [_, cancel, refund]) = seller_beside_a_redeem();
     let passed = |height| nexus_at(synced_at(height), account(0, 4), account(0, 0), None);
     let (seller, actions) = seller.step(passed(10));
     assert!(actions.is_empty());
     assert_eq!(seller.outcome(), None, "not yet a block deep");
     let (seller, _) = seller.step(passed(11));
+    assert!(seller.watch().nexus.is_none());
+    let (seller, actions) = seller.step(btc(22, Some((&cancel, 1)), Some((&refund, 0))));
+    assert!(actions.is_empty(), "no redeem");
     assert_eq!(seller.outcome(), Some(Outcome::Refunded));
+}
+
+/// An empty lock while a refund pooled after `t2` is contested ends
+/// nothing: the punish may still win.
+#[test]
+fn an_empty_lock_after_t2_leaves_punish_to_decide() {
+    let (seller, [_, cancel, refund]) = seller_beside_a_redeem();
+    let (swap, lock) = seller.watch().bitcoin.unwrap();
+    let punish = swap.unsigned_tx(lock, Spend::Punish);
+    let late = || btc(31, Some((&cancel, 10)), Some((&refund, 0)));
+    let (seller, _) = seller.step(late());
+    let passed = |height| nexus_at(synced_at(height), account(0, 4), account(0, 0), None);
+    let (seller, _) = seller.step(passed(10));
+    let (seller, _) = seller.step(passed(11));
+    assert_eq!(seller.outcome(), None);
+    let seller = restart(&seller);
+    let (seller, actions) = seller.step(late());
+    assert_eq!(broadcast_txids(&actions), [punish.compute_txid()]);
+    let (punished, _) = seller
+        .clone()
+        .step(btc(34, Some((&cancel, 13)), Some((&punish, 3))));
+    assert_eq!(punished.outcome(), Some(Outcome::Punished));
+    let (refunded, _) = seller.step(btc(34, Some((&cancel, 13)), Some((&refund, 3))));
+    assert_eq!(refunded.outcome(), Some(Outcome::Refunded));
+}
+
+/// A punish that gets deep while the claim is still pending, its Nexus
+/// node down or the NEX lock not yet landed, keeps the claim: the seller
+/// goes on submitting it, and ends `Punished` once it lands, holding both.
+#[test]
+fn a_deep_punish_leaves_a_pending_claim_to_finish() {
+    let (seller, claim, [_, cancel, refund]) = seller_claiming_beside_a_redeem();
+    let (swap, lock) = seller.watch().bitcoin.unwrap();
+    let punish = swap.unsigned_tx(lock, Spend::Punish);
+    let (seller, _) = seller.step(btc(31, Some((&cancel, 10)), Some((&refund, 0))));
+    let (seller, actions) = seller.step(btc(34, Some((&cancel, 13)), Some((&punish, 3))));
+    assert!(actions.is_empty());
+    assert!(matches!(seller, Seller::ClaimingNex(_)));
+    assert_eq!(seller.outcome(), None);
+    assert!(seller.watch().nexus.is_some());
+    let seller = restart(&seller);
+    let (seller, actions) = seller.step(nexus(account(500_000, 0), None));
+    assert_eq!(submitted(&actions), claim, "the same claim");
+    let (seller, actions) = seller.step(nexus(account(0, 1), mined(claim.body, 1)));
+    assert!(actions.is_empty());
+    assert_eq!(seller.outcome(), Some(Outcome::Punished));
+}
+
+/// After a deep punish, a lock drained or found empty ends the swap
+/// `Punished` too: the BTC is the seller's.
+#[test]
+fn a_claim_after_a_deep_punish_ends_punished_however_it_ends() {
+    let deep_punish = |seller: Seller, cancel: &Transaction, refund: &Transaction| {
+        let (swap, lock) = seller.watch().bitcoin.unwrap();
+        let punish = swap.unsigned_tx(lock, Spend::Punish);
+        let (seller, _) = seller.step(btc(31, Some((cancel, 10)), Some((refund, 0))));
+        let (seller, _) = seller.step(btc(34, Some((cancel, 13)), Some((&punish, 3))));
+        assert!(matches!(seller, Seller::ClaimingNex(_)));
+        seller
+    };
+    let (seller, _, [_, cancel, refund]) = seller_claiming_beside_a_redeem();
+    let seller = deep_punish(seller, &cancel, &refund);
+    let (drained, _) = seller.step(nexus(account(0, 1), None));
+    assert_eq!(drained.outcome(), Some(Outcome::Punished));
+
+    let (seller, [_, cancel, refund]) = seller_beside_a_redeem();
+    let seller = deep_punish(seller, &cancel, &refund);
+    let passed = |height| nexus_at(synced_at(height), account(0, 4), account(0, 0), None);
+    let (seller, _) = seller.step(passed(10));
+    assert_eq!(seller.outcome(), None, "not yet a block deep");
+    let (empty, _) = seller.step(passed(11));
+    assert_eq!(empty.outcome(), Some(Outcome::Punished));
+}
+
+/// A refund confirmed before `t2` and reorged back into the mempool after
+/// it is contested: the buyer is safe only while its refund stays
+/// confirmed.
+#[test]
+fn a_refund_reorged_out_after_t2_is_contested() {
+    let (seller, _, [_, cancel, refund]) = seller_claiming_beside_a_redeem();
+    let (swap, lock) = seller.watch().bitcoin.unwrap();
+    let punish = swap.unsigned_tx(lock, Spend::Punish).compute_txid();
+    let (seller, actions) = seller.step(btc(26, Some((&cancel, 5)), Some((&refund, 1))));
+    assert!(actions.is_empty());
+    let (seller, actions) = seller.step(btc(31, Some((&cancel, 10)), Some((&refund, 0))));
+    assert_eq!(broadcast_txids(&actions), [punish]);
+    assert!(matches!(seller, Seller::Cancelling { .. }));
 }
 
 /// A lock the buyer drained leaves the seller the BTC: it watches Bitcoin

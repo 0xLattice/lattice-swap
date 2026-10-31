@@ -47,13 +47,14 @@
 //! - A pending refund can be displaced only by a spend through the punish
 //!   leaf, once cancel is `t2` deep: nothing else spends the cancel output
 //!   but the 2-of-2.
-//! - So the buyer is safe only while its refund confirms before `t2`. The
-//!   punish leaf takes the seller's signature alone, so after `t2` the
-//!   seller can spend the cancel output with a transaction of any shape: a
-//!   version 2 one with two children pins the refund outright, since Bitcoin
-//!   Core replaces by package only a conflict with no more than one
-//!   descendant, so no refund fee wins. Contesting a punish after `t2` is
-//!   best effort.
+//! - So the buyer is safe only while its refund confirms before `t2` and
+//!   stays confirmed: a reorg reaching below the refund's block after `t2`
+//!   puts it back in contest. The punish leaf takes the seller's signature
+//!   alone, so after `t2` the seller can spend the cancel output with a
+//!   transaction of any shape: a version 2 one with two children pins the
+//!   refund outright, since Bitcoin Core replaces by package only a
+//!   conflict with no more than one descendant, so no refund fee wins.
+//!   Contesting a punish after `t2` is best effort.
 //! - A TRUC transaction spends no unconfirmed non-TRUC output. Redeem and
 //!   cancel spend the lock, which is confirmed before either is sent.
 //!

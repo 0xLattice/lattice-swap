@@ -593,6 +593,10 @@ pub struct Claim {
     /// is mined. The joint key signs with fresh randomness: signed again,
     /// it would be another transaction under another CID.
     claim: Option<swap_nexus_tx::Transaction>,
+    /// The seller's punish is `btc_confirmations` deep: the BTC is its own,
+    /// and however the claim ends, the swap ends `Punished`.
+    #[serde(default)]
+    punished: bool,
 }
 
 #[allow(clippy::large_enum_variant)] // Short-lived: matched on as soon as made.
@@ -614,6 +618,7 @@ impl Claim {
             lock,
             passed_at: None,
             claim: None,
+            punished: false,
         }
     }
 

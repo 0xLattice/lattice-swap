@@ -57,7 +57,9 @@ pub enum Seller {
     /// A lock the buyer drained with `s` leaves the BTC: the redeem, or
     /// punish at `t2`. From `t2`, whatever the claim, the seller punishes
     /// while the cancel output is unspent or holds only a refund in the
-    /// mempool.
+    /// mempool. A punish `btc_confirmations` deep beside a claim still
+    /// pending leaves the claim to finish, in `ClaimingNex`: however it
+    /// ends, the swap ends `Punished`.
     Cancelling {
         locked: SellerLocked,
         nex_lock: Option<swap_nexus_tx::Transaction>,
@@ -76,7 +78,8 @@ pub enum Claiming {
     /// No refund has given `b` yet.
     None,
     Pending(Box<Claim>),
-    /// The claim is `nex_confirmations` deep: the NEX is back.
+    /// The claim is `nex_confirmations` deep, or nothing was locked and
+    /// nothing can be any more: the NEX is the seller's.
     Landed,
     /// The buyer spent the lock with `s`: the NEX is gone.
     Drained,
@@ -463,8 +466,9 @@ impl Machine for Seller {
                     Claimed::Pending(claim, actions) => {
                         (Claiming::Pending(Box::new(claim)), actions)
                     }
-                    Claimed::Done => (Claiming::Landed, vec![]),
-                    Claimed::Empty => return (Done(Outcome::Refunded), vec![]),
+                    // Empty, as landed, is left to the next Bitcoin view: a
+                    // punish may still win.
+                    Claimed::Done | Claimed::Empty => (Claiming::Landed, vec![]),
                     Claimed::Drained => (Claiming::Drained, vec![]),
                 };
                 let state = Cancelling {
@@ -476,11 +480,15 @@ impl Machine for Seller {
                 };
                 (state, actions)
             }
-            (ClaimingNex(claim), event) => match claim.step(event) {
-                Claimed::Pending(claim, actions) => (ClaimingNex(claim), actions),
-                Claimed::Done | Claimed::Empty => (Done(Outcome::Refunded), vec![]),
-                Claimed::Drained => (Done(Outcome::Drained), vec![]),
-            },
+            (ClaimingNex(claim), event) => {
+                let punished = claim.punished;
+                match claim.step(event) {
+                    Claimed::Pending(claim, actions) => (ClaimingNex(claim), actions),
+                    _ if punished => (Done(Outcome::Punished), vec![]),
+                    Claimed::Done | Claimed::Empty => (Done(Outcome::Refunded), vec![]),
+                    Claimed::Drained => (Done(Outcome::Drained), vec![]),
+                }
+            }
             (
                 AwaitBuyerHello(_) | AwaitLockProposal(_) | AwaitBuyerSignatures { .. },
                 Event::Timeout,
@@ -678,11 +686,17 @@ impl SellerLocked {
                 // Anything but the refund is our punish: its leaf takes our
                 // signature alone, on any transaction. Unconfirmed, it is
                 // waited for; another punish would only conflict with it.
+                // Deep, it leaves a claim still pending to finish: its secrets
+                // and its signed claim are kept until the NEX is back or gone.
                 _ if view
                     .cancel_spend
                     .as_ref()
                     .is_some_and(|spent| spent.confirmations >= terms.btc_confirmations) =>
                 {
+                    if let Claiming::Pending(mut claim) = claim {
+                        claim.punished = true;
+                        return (Seller::ClaimingNex(*claim), vec![]);
+                    }
                     return (Seller::Done(Outcome::Punished), vec![]);
                 }
                 // Whatever the claim: recovering the BTC must not wait on

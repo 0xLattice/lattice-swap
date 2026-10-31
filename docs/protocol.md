@@ -95,12 +95,13 @@ swap id.
   never contests a refund in a block. Whichever spend gets
   `btc_confirmations` deep decides: a redeem ends the swap `Swapped`; a
   punish `Punished`, even with the claim landed, when S has both since the
-  refund missed `t2`; a refund `Refunded` if the claim landed or nothing
-  was locked, `Drained` if B emptied the lock with `s`, and otherwise
-  leaves only the claim. A claim that lands while no punish can win, before
-  `t2` or against a refund in a block, ends the swap `Refunded` at the
-  next Bitcoin view, and one that finds nothing was locked ends it at
-  once.
+  refund missed `t2`, and with the claim still pending S keeps its secrets
+  and goes on claiming, ending `Punished` once the claim lands or the lock
+  turns out drained or empty; a refund `Refunded` if the claim landed or
+  nothing was locked, `Drained` if B emptied the lock with `s`, and
+  otherwise leaves only the claim. A claim that lands, or finds nothing was
+  locked, ends the swap `Refunded` at the next Bitcoin view that shows no
+  punish can win: before `t2`, or against a refund in a block.
 - Every deadline is read from the party's own Bitcoin node. A node that
   stalled, or that someone cut off from the network, shows fewer blocks
   than there are: every depth it reports is too low. That only delays
@@ -163,10 +164,14 @@ only one small child, so nobody else can pin them.
 - Refund has no timelock, so after `t1` the buyer could send cancel and
   refund as one package, paying two fees, against a redeem still pending.
   Redeem paying two fees keeps that package from replacing it.
-- The buyer is safe as long as its refund confirms before `t2`. After
-  that, the punish leaf takes the seller's signature alone, so the seller
-  can spend the cancel output in a shape no refund can replace at any fee,
-  and contesting a punish is best effort.
+- The buyer is safe as long as its refund confirms before `t2` and stays
+  confirmed: a reorg reaching below the refund's block after `t2` puts it
+  back in the mempool, where the seller contests it. The buyer refunds once
+  cancel is in a block, or `btc_confirmations` deep once it has sent its
+  redeem signature, leaving at least `t2 - btc_confirmations` blocks of
+  margin. After `t2`, the punish leaf takes the seller's signature alone,
+  so the seller can spend the cancel output in a shape no refund can
+  replace at any fee, and contesting a punish is best effort.
 
 ## State
 
@@ -183,7 +188,8 @@ up where it stopped.
 - `Refunded`: the buyer has its BTC back, and the seller has its NEX if it
   locked any.
 - `Punished`: the seller took the BTC through punish. Its claim of the
-  NEX, if it learned `b` from a refund that missed `t2`, may land too.
+  NEX, if it learned `b` from a refund that missed `t2`, may land too: a
+  claim still pending is seen through before the swap ends.
 - `Drained`: this party learned the joint key, but the lock was already
   spent.
 - `Aborted`: stopped before anything was at stake.
