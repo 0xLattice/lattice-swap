@@ -53,19 +53,36 @@ pub enum Seller {
     /// redeem until the refund is `btc_confirmations` deep: a shallower
     /// reorg can drop the cancel and let the redeem confirm, and a refund
     /// that never confirms leaves punish. A claim that lands ends the swap
-    /// `Refunded`. A lock the buyer drained with `s`, `drained`, leaves the
-    /// BTC: the redeem, or punish at `t2`.
+    /// `Refunded` at the next Bitcoin view, unless a punish can still win.
+    /// A lock the buyer drained with `s` leaves the BTC: the redeem, or
+    /// punish at `t2`. From `t2`, whatever the claim, the seller punishes
+    /// while the cancel output is unspent or holds only a refund in the
+    /// mempool. A punish `btc_confirmations` deep beside a claim still
+    /// pending leaves the claim to finish, in `ClaimingNex`: however it
+    /// ends, the swap ends `Punished`.
     Cancelling {
         locked: SellerLocked,
         nex_lock: Option<swap_nexus_tx::Transaction>,
         #[serde(with = "hex_tx::option")]
         redeem: Option<Transaction>,
         seen: bool,
-        claim: Option<Box<Claim>>,
-        drained: bool,
+        claim: Claiming,
     },
     ClaimingNex(Claim),
     Done(Outcome),
+}
+
+/// The claim of the NEX back, in `Cancelling`.
+#[derive(Clone, Serialize, Deserialize)]
+pub enum Claiming {
+    /// No refund has given `b` yet.
+    None,
+    Pending(Box<Claim>),
+    /// The claim is `nex_confirmations` deep, or nothing was locked and
+    /// nothing can be any more: the NEX is the seller's.
+    Landed,
+    /// The buyer spent the lock with `s`: the NEX is gone.
+    Drained,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -261,7 +278,7 @@ impl Machine for Seller {
                     let since = Some(since);
                     (AwaitFunding { locked, since }, vec![])
                 } else if terms.redeem_closed(&view) {
-                    locked.cancelling(None, None, false, None, false, view)
+                    locked.cancelling(None, None, false, Claiming::None, view)
                 } else if view.stale.is_some() {
                     // The window may have closed already: no NEX is locked
                     // on a view that cannot tell.
@@ -319,14 +336,14 @@ impl Machine for Seller {
             }
             (LockingNex { locked, nex_lock }, Event::Bitcoin(view)) => {
                 if locked.gives_up(&view) {
-                    locked.cancelling(nex_lock, None, false, None, false, view)
+                    locked.cancelling(nex_lock, None, false, Claiming::None, view)
                 } else {
                     (LockingNex { locked, nex_lock }, vec![])
                 }
             }
             (AwaitRedeemSignature { locked, nex_lock }, Event::Bitcoin(view)) => {
                 if locked.gives_up(&view) {
-                    locked.cancelling(Some(nex_lock), None, false, None, false, view)
+                    locked.cancelling(Some(nex_lock), None, false, Claiming::None, view)
                 } else {
                     (AwaitRedeemSignature { locked, nex_lock }, vec![])
                 }
@@ -416,7 +433,7 @@ impl Machine for Seller {
                     }
                     _ => {
                         let redeem = Some(redeem);
-                        locked.cancelling(Some(nex_lock), redeem, seen, None, false, view)
+                        locked.cancelling(Some(nex_lock), redeem, seen, Claiming::None, view)
                     }
                 }
             }
@@ -427,45 +444,51 @@ impl Machine for Seller {
                     redeem,
                     seen,
                     claim,
-                    drained,
                 },
                 Event::Bitcoin(view),
-            ) => locked.cancelling(nex_lock, redeem, seen, claim, drained, view),
+            ) => locked.cancelling(nex_lock, redeem, seen, claim, view),
             // The claim goes on beside the redeem. Once it lands the NEX is
             // back: the redeem is fought for no longer, or the seller could
-            // end with both. Drained, the buyer has the NEX: the claim is kept
-            // only to say so, and the BTC is fought for.
+            // end with both. Only a punish from `t2` is, against a refund
+            // that missed it. Drained, the buyer has the NEX, and the BTC is
+            // fought for.
             (
                 Cancelling {
                     locked,
                     nex_lock,
                     redeem,
                     seen,
-                    claim: Some(claim),
-                    drained: false,
+                    claim: Claiming::Pending(claim),
                 },
                 event @ Event::Nexus(_),
             ) => {
-                let (claim, drained, actions) = match (*claim).clone().step(event) {
-                    Claimed::Pending(claim, actions) => (Box::new(claim), false, actions),
-                    Claimed::Done | Claimed::Empty => return (Done(Outcome::Refunded), vec![]),
-                    Claimed::Drained => (claim, true, vec![]),
+                let (claim, actions) = match (*claim).step(event) {
+                    Claimed::Pending(claim, actions) => {
+                        (Claiming::Pending(Box::new(claim)), actions)
+                    }
+                    // Empty, as landed, is left to the next Bitcoin view: a
+                    // punish may still win.
+                    Claimed::Done | Claimed::Empty => (Claiming::Landed, vec![]),
+                    Claimed::Drained => (Claiming::Drained, vec![]),
                 };
                 let state = Cancelling {
                     locked,
                     nex_lock,
                     redeem,
                     seen,
-                    claim: Some(claim),
-                    drained,
+                    claim,
                 };
                 (state, actions)
             }
-            (ClaimingNex(claim), event) => match claim.step(event) {
-                Claimed::Pending(claim, actions) => (ClaimingNex(claim), actions),
-                Claimed::Done | Claimed::Empty => (Done(Outcome::Refunded), vec![]),
-                Claimed::Drained => (Done(Outcome::Drained), vec![]),
-            },
+            (ClaimingNex(claim), event) => {
+                let punished = claim.punished;
+                match claim.step(event) {
+                    Claimed::Pending(claim, actions) => (ClaimingNex(claim), actions),
+                    _ if punished => (Done(Outcome::Punished), vec![]),
+                    Claimed::Done | Claimed::Empty => (Done(Outcome::Refunded), vec![]),
+                    Claimed::Drained => (Done(Outcome::Drained), vec![]),
+                }
+            }
             (
                 AwaitBuyerHello(_) | AwaitLockProposal(_) | AwaitBuyerSignatures { .. },
                 Event::Timeout,
@@ -505,17 +528,12 @@ impl Machine for Seller {
                 nexus: None,
                 margin: locked.setup.terms.margin,
             },
-            Cancelling {
-                locked,
-                claim,
-                drained,
-                ..
-            } => Watch {
+            Cancelling { locked, claim, .. } => Watch {
                 bitcoin: bitcoin(locked),
-                nexus: claim
-                    .as_ref()
-                    .filter(|_| !drained)
-                    .and_then(|claim| claim.watch().nexus),
+                nexus: match claim {
+                    Claiming::Pending(claim) => claim.watch().nexus,
+                    _ => None,
+                },
                 margin: locked.setup.terms.margin,
             },
             LockingNex { locked, nex_lock } => Watch {
@@ -575,13 +593,23 @@ impl SellerLocked {
             .then(|| Action::Broadcast(self.setup.cancel(self.lock, &self.buyer_cancel)))
     }
 
+    /// Punish, signed by us alone: valid once cancel is `t2` deep.
+    fn punish(&self) -> Action {
+        let swap = self.setup.swap();
+        let key = self.setup.secrets.key();
+        let signature = swap.sign(self.lock, Spend::Punish, &key);
+        let punish = swap
+            .finalize(self.lock, Spend::Punish, &signature, None)
+            .expect("our own signature");
+        Action::Broadcast(punish)
+    }
+
     fn cancelling(
         self,
         nex_lock: Option<swap_nexus_tx::Transaction>,
         redeem: Option<Transaction>,
         mut seen: bool,
-        mut claim: Option<Box<Claim>>,
-        drained: bool,
+        mut claim: Claiming,
         view: BitcoinView,
     ) -> (Seller, Vec<Action>) {
         let setup = &self.setup;
@@ -590,36 +618,44 @@ impl SellerLocked {
         // A redeem once sent or seen may have revealed `s`, and the buyer may
         // have taken the NEX with it already: while its cancel is not in a
         // block, the redeem is fought for, even against a refund in the
-        // mempool, which only a buyer racing it sends.
-        let held = seen && redeem.is_some();
+        // mempool, which only a buyer racing it sends. Once the claim has
+        // landed, the NEX is back: the redeem is fought for no longer.
+        let held = seen && redeem.is_some() && !matches!(claim, Claiming::Landed);
         let lock_spend = setup.spend(self.lock, &view.lock_spend);
+        let cancel_spend = setup.spend(self.lock, &view.cancel_spend);
         let fighting = held && matches!(lock_spend, None | Some((Spend::Cancel, 0)));
         // A refund gives `b`, even with its cancel still in the mempool.
-        if let (None, Some((Spend::Refund, _))) =
-            (&claim, setup.spend(self.lock, &view.cancel_spend))
-        {
+        if let (Claiming::None, Some((Spend::Refund, _))) = (&claim, cancel_spend) {
             let refund = &view.cancel_spend.as_ref().expect("matched").tx;
             if let Some(b) = setup.recover(self.lock, Spend::Refund, &self.refund, refund) {
                 let lock = match &nex_lock {
                     Some(lock) => Lock::Signed(lock.body.nonce),
                     None => Lock::Unsigned,
                 };
-                claim = Some(Box::new(Claim::new(setup.clone(), b, lock)));
+                claim = Claiming::Pending(Box::new(Claim::new(setup.clone(), b, lock)));
             }
         }
+        // From `t2` the buyer's refund came too late: while the cancel
+        // output is unspent or holds only a refund in the mempool, punish
+        // can still win, whatever the claim.
+        let late = matches!(lock_spend, Some((Spend::Cancel, depth)) if depth >= u32::from(terms.t2))
+            && !matches!(cancel_spend, Some((Spend::Refund, depth)) if depth > 0);
         // With `b`, the NEX is claimed. With no redeem held `s` never left,
-        // so no one else can spend the lock: only the claim is left. With
-        // one, the buyer may drain the lock, and the claim goes on beside
-        // the fight for the BTC until the refund is `btc_confirmations` deep.
+        // so no one else can spend the lock: only the claim is left, unless
+        // punish can still win. With one, the buyer may drain the lock, and
+        // the claim goes on beside the fight for the BTC until the refund
+        // is `btc_confirmations` deep.
         let refunded = matches!(
-            setup.spend(self.lock, &view.cancel_spend),
+            cancel_spend,
             Some((Spend::Refund, depth)) if depth >= terms.btc_confirmations
         );
-        if let Some(claim) = claim.take_if(|_| !held || refunded) {
-            if drained {
-                return (Seller::Done(Outcome::Drained), vec![]);
-            }
-            return (Seller::ClaimingNex(*claim), vec![]);
+        if (!held && !late) || refunded {
+            claim = match claim {
+                Claiming::None => Claiming::None,
+                Claiming::Pending(claim) => return (Seller::ClaimingNex(*claim), vec![]),
+                Claiming::Landed => return (Seller::Done(Outcome::Refunded), vec![]),
+                Claiming::Drained => return (Seller::Done(Outcome::Drained), vec![]),
+            };
         }
         match lock_spend {
             // A bump of it can replace a cancel not yet in a block.
@@ -638,31 +674,35 @@ impl SellerLocked {
                 }
                 seen = true;
             }
-            Some((_, cancel_depth)) => match setup.spend(self.lock, &view.cancel_spend) {
+            Some((_, cancel_depth)) => match cancel_spend {
+                // From `t2`, a refund only in the mempool is contested: the
+                // driver bumps punish against it as a package. Never one in
+                // a block.
+                Some((Spend::Refund, 0)) if cancel_depth >= u32::from(terms.t2) => {
+                    actions.push(self.punish());
+                }
                 // One that does not give `b`: never our punish.
                 Some((Spend::Refund, _)) => {}
                 // Anything but the refund is our punish: its leaf takes our
                 // signature alone, on any transaction. Unconfirmed, it is
-                // waited for; another punish would only conflict with it. A
-                // claim not drained gets the NEX back: no punish beside it.
+                // waited for; another punish would only conflict with it.
+                // Deep, it leaves a claim still pending to finish: its secrets
+                // and its signed claim are kept until the NEX is back or gone.
                 _ if view
                     .cancel_spend
                     .as_ref()
                     .is_some_and(|spent| spent.confirmations >= terms.btc_confirmations) =>
                 {
+                    if let Claiming::Pending(mut claim) = claim {
+                        claim.punished = true;
+                        return (Seller::ClaimingNex(*claim), vec![]);
+                    }
                     return (Seller::Done(Outcome::Punished), vec![]);
                 }
-                None if view.cancel_spend.is_none()
-                    && cancel_depth >= u32::from(terms.t2)
-                    && (claim.is_none() || drained) =>
-                {
-                    let swap = setup.swap();
-                    let key = setup.secrets.key();
-                    let signature = swap.sign(self.lock, Spend::Punish, &key);
-                    let punish = swap
-                        .finalize(self.lock, Spend::Punish, &signature, None)
-                        .expect("our own signature");
-                    actions.push(Action::Broadcast(punish));
+                // Whatever the claim: recovering the BTC must not wait on
+                // Nexus.
+                None if view.cancel_spend.is_none() && cancel_depth >= u32::from(terms.t2) => {
+                    actions.push(self.punish());
                 }
                 _ => {}
             },
@@ -674,7 +714,6 @@ impl SellerLocked {
             redeem,
             seen,
             claim,
-            drained,
         };
         (state, actions)
     }
