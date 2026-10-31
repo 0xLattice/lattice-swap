@@ -346,6 +346,8 @@ pub fn bitcoin_view(
 /// has signed something, read first, shows that transaction mined in the
 /// later read if it is ours. The view is one tip's: `None` if the tip
 /// moved while it was read, so no read in it comes from another block.
+/// That needs the operator port, whose `/health` is never cached; a public
+/// read port caches it, and would let the reads straddle two tips.
 fn nexus_view(
     client: &Client,
     watch: &NexusWatch,
