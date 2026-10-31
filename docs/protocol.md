@@ -69,15 +69,31 @@ swap id.
   block, may have made `s` public, so S keeps broadcasting it until it is
   `btc_confirmations` deep, in place of cancel, and against a cancel still
   in the mempool. Only a cancel in a block stops it; a reorg that puts that
-  cancel back in the mempool starts it again.
-- Every deadline is read from the party's own Bitcoin node, so a node that
-  stalled, or that the counterparty cut off from the network, would show
-  the redeem window still open after cancel, and the buyer's deadlines
-  still far. A party acts on a view only while its node has every block of
-  the best header chain it knows and the tip's block time is at most
-  `max_tip_age`, 90 minutes by default, behind the party's clock. Until
-  then it does nothing and warns, again every minute. Feeding a node fresh
-  blocks of a fork takes real proof of work.
+  cancel back in the mempool starts it again. A refund stops it too, even
+  one still in the mempool: it gives S `b`, and B, who may hold `s`, races
+  for the NEX, so S claims it at once.
+- Every deadline is read from the party's own Bitcoin node. A node that
+  stalled, or that someone cut off from the network, shows fewer blocks
+  than there are: every depth it reports is too low. That only delays
+  cancel and punish, which consensus holds to their timelocks, and the
+  refund, which waits on depth, so they and their bumps go on whatever the
+  node shows. The one thing it
+  makes unsafe is the redeem window, which such a node shows open after it
+  closed: S starts a redeem, and locks the NEX, only on a view whose node
+  has every block of the best header chain it knows and whose tip is at
+  most `max_tip_age` old, 90 minutes by default. The tip's age counts from
+  the earlier of its block time and when S's driver first saw it: a block
+  time is the miner's to set, up to two hours ahead, but first sight is
+  S's own. A redeem S has seen is sent again on any view. Once its views
+  have been stale for a minute, the driver warns, and again every minute.
+- So to keep S's node showing the window open, whoever cut it off must feed
+  it a fork block of full difficulty at least every `max_tip_age`: about
+  11% of the network's hashrate at 90 minutes, sustained over the redeem
+  window. The protection is the connectivity of S's own node; for a large
+  swap, run a well-connected one. S's driver does not also bound the
+  window by its clock: the window is set in blocks, which come at no fixed
+  rate, and a clock bound tight enough to matter would close it before the
+  NEX lock could be deep enough for B, so most swaps would cancel.
 - Before anything is at stake, a party whose counterparty goes quiet
   aborts.
 - A seller that signed a NEX lock and then learned `b` keeps waiting while

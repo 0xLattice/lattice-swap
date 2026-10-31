@@ -7,7 +7,7 @@ use std::mem::discriminant;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use bitcoin::{Amount, FeeRate, OutPoint, Transaction, Txid};
+use bitcoin::{Amount, BlockHash, FeeRate, OutPoint, Transaction, Txid};
 use swap_bitcoin::{Spend, Swap};
 use swap_nexus_tx::rpc::Client;
 
@@ -206,19 +206,28 @@ pub struct Driver<M, B, T> {
     /// shows, when the buyer is away and the NEX it locked is out of reach
     /// anyway. Any BTC kept beats none.
     pub max_fee_fraction: f64,
-    /// The oldest a Bitcoin tip may be, by its block time against this
-    /// machine's clock, for a view to be acted on. A node that stalled, or
-    /// that someone cut off from the network, shows a window still open
-    /// and a deadline still far: no machine sees its views, and the driver
-    /// warns, again every [`WARN_AGAIN`], until the node catches up.
+    /// The oldest a Bitcoin tip may be for a view not to be stale: see
+    /// [`bitcoin_view`]. A node that stalled, or that someone cut off from
+    /// the network, shows the redeem window still open after it closed: on
+    /// a stale view the seller starts no redeem and locks no NEX, and the
+    /// driver warns, once it has lasted [`WARN_AGAIN`] and again every
+    /// [`WARN_AGAIN`], until the node catches up. Every other spend, and
+    /// every bump, goes on: a stale view only under-reports depth.
     pub max_tip_age: Duration,
     /// Our swap transactions waiting unconfirmed, by txid.
     waiting: HashMap<Txid, Waiting>,
     /// Transactions broadcast since the last Bitcoin view, and whether the
     /// node refused each.
     broadcast: Vec<(Transaction, bool)>,
-    /// The last failure to read a Bitcoin view, and when it was logged.
+    /// The last failure to read a Bitcoin view, or why the views are
+    /// stale, and when it was logged.
     view_failed: Option<(String, Instant)>,
+    /// Since when the Bitcoin views have been stale.
+    stale_since: Option<Instant>,
+    /// The tip, and when this driver first saw it, in seconds since the
+    /// Unix epoch. Kept in memory only: after a restart, the tip is first
+    /// seen then.
+    first_seen: Option<(BlockHash, u64)>,
     /// Held while the driver lives: see [`Store`].
     _lock: File,
 }
@@ -281,6 +290,8 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
             waiting: HashMap::new(),
             broadcast: vec![],
             view_failed: None,
+            stale_since: None,
+            first_seen: None,
             _lock: lock,
         }
     }
@@ -358,9 +369,29 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
         let Some((swap, lock)) = watch.bitcoin else {
             return Ok(());
         };
-        match bitcoin_view(&self.bitcoin, &swap, lock, self.max_tip_age) {
+        let view = bitcoin_view(
+            &self.bitcoin,
+            &swap,
+            lock,
+            self.max_tip_age,
+            &mut self.first_seen,
+        );
+        match view {
             Ok(view) => {
-                self.view_failed = None;
+                match &view.stale {
+                    // A node lags its headers for a moment at every block:
+                    // logged only once it lasts.
+                    Some(why) => {
+                        let since = *self.stale_since.get_or_insert_with(Instant::now);
+                        if since.elapsed() >= WARN_AGAIN {
+                            self.view_failed(why.clone());
+                        }
+                    }
+                    None => {
+                        self.stale_since = None;
+                        self.view_failed = None;
+                    }
+                }
                 let height = view.height;
                 let urgent = urgent(&swap, lock, &view, watch.margin);
                 let mut waiting: Vec<(Transaction, bool)> = [&view.lock_spend, &view.cancel_spend]
@@ -375,19 +406,22 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
                 self.bump(&swap, lock, height, &urgent, waiting);
                 Ok(())
             }
-            // Logged when it changes, and again while it lasts.
             Err(e) => {
-                let e = e.to_string();
-                let again = self
-                    .view_failed
-                    .as_ref()
-                    .is_none_or(|(last, at)| *last != e || at.elapsed() >= WARN_AGAIN);
-                if again {
-                    warn(&e);
-                    self.view_failed = Some((e, Instant::now()));
-                }
+                self.view_failed(e.to_string());
                 Ok(())
             }
+        }
+    }
+
+    /// Logs `e` when it changes, and again while it lasts.
+    fn view_failed(&mut self, e: String) {
+        let again = self
+            .view_failed
+            .as_ref()
+            .is_none_or(|(last, at)| *last != e || at.elapsed() >= WARN_AGAIN);
+        if again {
+            warn(&e);
+            self.view_failed = Some((e, Instant::now()));
         }
     }
 
@@ -606,8 +640,9 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
 /// block, a poll apart.
 pub(crate) const URGENT_RETRIES: u8 = 8;
 
-/// How often a failure to read a Bitcoin view that lasts is logged again.
-const WARN_AGAIN: Duration = Duration::from_secs(60);
+/// How often a failure to read a Bitcoin view that lasts is logged again,
+/// and how long stale views last before they are logged. Short under test.
+pub(crate) const WARN_AGAIN: Duration = Duration::from_millis(if cfg!(test) { 20 } else { 60_000 });
 
 /// A swap transaction of ours waiting unconfirmed.
 #[derive(Clone, Copy)]
@@ -670,35 +705,45 @@ thread_local! {
 /// shows, and the cancel output is spent anyway, is the spender searched
 /// for.
 ///
-/// Fails unless the node has every block of the best chain it knows, and
-/// the tip's block time is at most `max_tip_age` behind this machine's
-/// clock: a node that stalled, or is fed by someone who cut it off, would
-/// show the redeem window still open and the deadlines still far.
+/// The view is [`BitcoinView::stale`] if the node lags the best header
+/// chain it knows, or if its tip is more than `max_tip_age` old: by this
+/// machine's clock, since its block time or since `first_seen`, when this
+/// machine first saw it, whichever is earlier. A block time alone is the
+/// miner's to set, up to two hours ahead; `first_seen` is updated to the
+/// tip. A node that stalled, or is fed by someone who cut it off, would
+/// show the redeem window still open after it closed.
 pub fn bitcoin_view(
     bitcoin: &impl Bitcoin,
     swap: &Swap,
     lock: OutPoint,
     max_tip_age: Duration,
+    first_seen: &mut Option<(BlockHash, u64)>,
 ) -> bitcoind::Result<BitcoinView> {
     let tip = bitcoin.tip()?;
-    if tip.headers != tip.height {
-        return Err(bitcoind::Error(format!(
-            "the node has blocks to {} of headers to {}: not acting until it catches up",
-            tip.height, tip.headers
-        )));
-    }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |now| now.as_secs());
-    let age = now.saturating_sub(tip.time);
-    if age > max_tip_age.as_secs() {
-        return Err(bitcoind::Error(format!(
-            "the node's tip, block {}, is {} minutes old: not acting until it has a fresh one, \
-             since a stalled or cut-off node hides the swap's deadlines",
+    let seen = match *first_seen {
+        Some((hash, at)) if hash == tip.hash => at,
+        _ => first_seen.insert((tip.hash, now)).1,
+    };
+    let age = now.saturating_sub(tip.time.min(seen));
+    let stale = if tip.headers > tip.height {
+        Some(format!(
+            "the node has blocks to {} of headers to {}: no redeem or NEX lock starts until it \
+             catches up",
+            tip.height, tip.headers
+        ))
+    } else if age > max_tip_age.as_secs() {
+        Some(format!(
+            "the node's tip, block {}, is {} minutes old: no redeem or NEX lock starts until it \
+             has a fresh one, since a stalled or cut-off node hides the swap's deadlines",
             tip.height,
             age / 60
-        )));
-    }
+        ))
+    } else {
+        None
+    };
     let height = tip.height;
     let funding = bitcoin.transaction(lock.txid)?.map(|(_, depth)| depth);
     let spent = |spends: [Spend; 2]| -> bitcoind::Result<Option<Spent>> {
@@ -728,6 +773,7 @@ pub fn bitcoin_view(
         funding,
         lock_spend,
         cancel_spend,
+        stale,
     })
 }
 

@@ -3,14 +3,14 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::*;
 use crate::bitcoind::Bitcoin;
-use crate::driver::{Driver, Store};
+use crate::driver::{Driver, Store, WARN_AGAIN};
 use crate::transport::Transport;
 use bitcoin::hashes::Hash;
-use bitcoin::{FeeRate, Script, TxIn, TxOut, Txid, WPubkeyHash, Witness};
+use bitcoin::{BlockHash, FeeRate, Script, TxIn, TxOut, Txid, WPubkeyHash, Witness};
 use serde_json::json;
 use swap_nexus_tx::rpc::{Client, Inclusion};
 
@@ -122,6 +122,22 @@ fn btc(
         funding: Some(funding),
         lock_spend: spent(lock_spend),
         cancel_spend: spent(cancel_spend),
+        stale: None,
+    })
+}
+
+/// [`btc`], on a stale view.
+fn stale(
+    funding: u32,
+    lock_spend: Option<(&Transaction, u32)>,
+    cancel_spend: Option<(&Transaction, u32)>,
+) -> Event {
+    let Event::Bitcoin(view) = btc(funding, lock_spend, cancel_spend) else {
+        unreachable!()
+    };
+    Event::Bitcoin(BitcoinView {
+        stale: Some("old".into()),
+        ..view
     })
 }
 
@@ -854,6 +870,7 @@ fn the_seller_waits_blocks_not_seconds_for_the_funding() {
             funding,
             lock_spend: None,
             cancel_spend: None,
+            stale: None,
         })
     };
     let unseen = |height| view(height, None);
@@ -1144,6 +1161,7 @@ fn a_buyer_whose_funding_does_not_show_keeps_its_secrets() {
             funding: None,
             lock_spend: None,
             cancel_spend: None,
+            stale: None,
         })
     };
     let (buyer, actions) = buyer.step(view(100));
@@ -1323,6 +1341,8 @@ struct Node {
     headers_ahead: u32,
     /// How old the tip's block is, in seconds.
     tip_age: u64,
+    /// Fail every read of the tip.
+    down: bool,
     /// A swap file, whose state's name is read into `saved` at every
     /// broadcast.
     store: Option<std::path::PathBuf>,
@@ -1350,6 +1370,9 @@ impl Bitcoin for Fake {
     }
     fn tip(&self) -> crate::bitcoind::Result<crate::bitcoind::Tip> {
         let node = self.0.borrow();
+        if node.down {
+            return Err(crate::bitcoind::Error("connection refused".into()));
+        }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap();
@@ -1357,6 +1380,7 @@ impl Bitcoin for Fake {
             height: node.height,
             headers: node.height + node.headers_ahead,
             time: now.as_secs() - node.tip_age,
+            hash: BlockHash::from_byte_array([node.height as u8; 32]),
         })
     }
     fn transaction(&self, txid: Txid) -> crate::bitcoind::Result<Option<(Transaction, u32)>> {
@@ -2103,28 +2127,204 @@ fn clear_warnings() {
 }
 
 /// A node that lags its own headers, or whose tip is older than
-/// `max_tip_age`, would show the redeem window open after cancel: no
-/// machine sees its views, and the driver warns, once while it lasts.
+/// `max_tip_age`, would show the redeem window open after it closed: the
+/// seller starts no redeem on it, and the driver warns only once that has
+/// lasted, not at every block a node briefly lags.
 #[test]
-fn a_stale_or_lagging_node_shows_no_view() {
+fn a_stale_or_lagging_node_starts_no_redeem() {
     let (seller, redeem, _) = seller_redeeming();
     let (_, lock) = seller.watch().bitcoin.unwrap();
-    let redeemed = |set: fn(&mut Node)| {
+    let redeemed = |set: fn(&mut Node), lasting: Duration| {
         // The window is open: the lock 17 deep.
         let node = funded_node(lock, 117);
         set(&mut node.0.borrow_mut());
-        bumps(seller.clone(), &node, &[117, 117, 117], |_| {});
+        let start = Instant::now();
+        let each = |poll, _: &mut Node| poll == 0 || start.elapsed() < lasting;
+        bumps_with(seller.clone(), &node, |_| {}, each);
         let txid = redeem.compute_txid();
         let node = node.0.borrow();
         node.mempool.iter().any(|tx| tx.compute_txid() == txid)
     };
-    assert!(redeemed(|_| {}));
-    assert!(redeemed(|node| node.tip_age = 60 * 60), "an hour is fresh");
+    let once = Duration::ZERO;
+    assert!(redeemed(|_| {}, once));
+    assert!(
+        redeemed(|node| node.tip_age = 60 * 60, once),
+        "an hour is fresh"
+    );
     clear_warnings();
-    assert!(!redeemed(|node| node.tip_age = 91 * 60));
-    assert_eq!(warnings("minutes old"), 1);
-    assert!(!redeemed(|node| node.headers_ahead = 1));
-    assert_eq!(warnings("headers to 118"), 1);
+    assert!(!redeemed(|node| node.tip_age = 91 * 60, once));
+    assert!(!redeemed(|node| node.headers_ahead = 1, once));
+    assert_eq!(warnings("minutes old") + warnings("headers to 118"), 0);
+    assert!(!redeemed(|node| node.tip_age = 91 * 60, 3 * WARN_AGAIN));
+    assert!(warnings("91 minutes old") >= 1);
+    assert!(!redeemed(|node| node.headers_ahead = 1, 3 * WARN_AGAIN));
+    assert!(warnings("headers to 118") >= 1);
+}
+
+/// A fresh view ends a stale spell: staleness that comes back is logged
+/// only once it has lasted again.
+#[test]
+fn a_fresh_view_restarts_the_wait_before_a_stale_one_is_logged() {
+    let locked = locked();
+    let node = pooled(&locked, &[], 50);
+    node.0.borrow_mut().height = 105;
+    let start = Instant::now();
+    let fresh_at = std::cell::Cell::new(None);
+    let logged = std::cell::Cell::new(0);
+    bumps_with(
+        seller_watching(&locked, None),
+        &node,
+        |_| {},
+        |poll, node| match fresh_at.get() {
+            None if poll == 0 || start.elapsed() < 3 * WARN_AGAIN => {
+                node.tip_age = 91 * 60;
+                true
+            }
+            None => {
+                logged.set(warnings("minutes old"));
+                clear_warnings();
+                node.tip_age = 0;
+                fresh_at.set(Some(poll));
+                true
+            }
+            Some(fresh) => {
+                node.tip_age = 91 * 60;
+                poll == fresh + 1
+            }
+        },
+    );
+    assert!(logged.get() >= 1);
+    assert_eq!(warnings("minutes old"), 0);
+}
+
+/// A stale view can show the window open after it closed, but a redeem
+/// once seen may have revealed `s`: the seller starts none on it, but
+/// sends a seen one again.
+#[test]
+fn a_stale_view_starts_no_redeem_but_sends_a_seen_one_again() {
+    let (seller, redeem, _) = seller_redeeming();
+    let (seller, actions) = seller.step(stale(17, None, None));
+    assert!(actions.is_empty());
+    assert!(matches!(seller, Seller::Redeeming { .. }));
+    let (seller, _) = seller.step(btc(17, Some((&redeem, 0)), None));
+    let (_, actions) = seller.step(stale(17, None, None));
+    assert_eq!(broadcasts(&actions), [redeem]);
+}
+
+/// The NEX is locked only on a view that can tell the window is open.
+#[test]
+fn a_stale_view_locks_no_nex() {
+    let (seller, actions) = locked().seller.step(stale(2, None, None));
+    assert!(actions.is_empty());
+    assert!(matches!(seller, Seller::AwaitFunding { .. }));
+    let (seller, _) = seller.step(btc(2, None, None));
+    assert!(matches!(seller, Seller::LockingNex { .. }));
+}
+
+/// A stale view only under-reports depth, so it holds back no spend that
+/// waits on depth: a buyer near `t2` on a node whose tip is old still
+/// sends its refund, and bumps it to the urgent estimate.
+#[test]
+fn a_stale_view_still_refunds_and_bumps() {
+    let locked = locked();
+    let (swap, lock) = locked.swap();
+    let refund = swap.unsigned_tx(lock, Spend::Refund).compute_txid();
+    let node = pooled(&locked, &[], 50);
+    {
+        let mut node = node.0.borrow_mut();
+        node.urgent = Some(FeeRate::from_sat_per_vb_u32(80));
+        node.tip_age = 95 * 60;
+        // Mined at 121: at 127 cancel is 7 deep, within `margin` of `t2`.
+        node.mined
+            .push((swap.unsigned_tx(lock, Spend::Cancel), 121));
+    }
+    let bumps = bumps(locked.buyer.clone(), &node, &[127, 127], |_| {});
+    let pooled = node
+        .0
+        .borrow()
+        .mempool
+        .iter()
+        .map(|tx| tx.compute_txid())
+        .collect::<Vec<_>>();
+    assert!(pooled.contains(&refund));
+    let bumps: Vec<_> = bumps
+        .into_iter()
+        .map(|(txid, _, rate, _)| (txid, rate.to_sat_per_vb_ceil()))
+        .collect();
+    assert_eq!(bumps, [(refund, 80)]);
+}
+
+/// A tip is as old as the earlier of its block time, which its miner
+/// sets, and when this machine first saw it: one stamped fresh but first
+/// seen over `max_tip_age` ago is stale. Another tip is first seen now.
+#[test]
+fn a_tip_is_as_old_as_it_was_first_seen() {
+    let (swap, lock) = locked().swap();
+    let node = funded_node(lock, 117);
+    let tip = node.tip().unwrap().hash;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let max = Duration::from_secs(90 * 60);
+    let view = |first_seen: &mut Option<(BlockHash, u64)>| {
+        crate::driver::bitcoin_view(&node, &swap, lock, max, first_seen)
+            .unwrap()
+            .stale
+    };
+    let stale = view(&mut Some((tip, now - 91 * 60))).unwrap();
+    assert!(stale.contains("91 minutes old"), "{stale}");
+    assert_eq!(view(&mut Some((tip, now - 89 * 60))), None);
+    let mut first_seen = Some((BlockHash::all_zeros(), now - 91 * 60));
+    assert_eq!(view(&mut first_seen), None);
+    let (hash, at) = first_seen.unwrap();
+    assert_eq!(hash, tip);
+    assert!(at >= now);
+}
+
+/// The driver keeps when it first saw the tip from view to view: a tip
+/// that does not move goes stale, however fresh its block time.
+#[test]
+fn the_driver_ages_a_tip_from_when_it_first_saw_it() {
+    let locked = locked();
+    let node = pooled(&locked, &[], 50);
+    node.0.borrow_mut().height = 105;
+    clear_warnings();
+    let start = Instant::now();
+    let lasting = Duration::from_millis(1_100) + 2 * WARN_AGAIN;
+    bumps_with(
+        seller_watching(&locked, None),
+        &node,
+        |driver| driver.max_tip_age = Duration::ZERO,
+        |_, _| start.elapsed() < lasting,
+    );
+    assert!(warnings("minutes old") >= 1);
+}
+
+/// A failure to read a view is logged when it starts, again every
+/// `WARN_AGAIN` while it lasts, and at once if it comes back after a view
+/// that did not fail.
+#[test]
+fn a_failing_view_is_logged_when_it_starts_and_while_it_lasts() {
+    let locked = locked();
+    let logged = |each: &dyn Fn(usize, &mut Node) -> bool| {
+        let node = pooled(&locked, &[], 50);
+        node.0.borrow_mut().height = 105;
+        clear_warnings();
+        bumps_with(seller_watching(&locked, None), &node, |_| {}, each);
+        warnings("connection refused")
+    };
+    let start = Instant::now();
+    let lasting = |poll, node: &mut Node| {
+        node.down = true;
+        poll == 0 || start.elapsed() < 3 * WARN_AGAIN
+    };
+    assert!(logged(&lasting) >= 2);
+    let back = |poll, node: &mut Node| {
+        node.down = poll != 1;
+        poll < 3
+    };
+    assert_eq!(logged(&back), 2);
 }
 
 /// A redeem the seller saw outlives a cancel that a reorg put back in the
@@ -2428,4 +2628,58 @@ fn an_urgent_bump_in_trouble_is_logged_at_every_block() {
     let clamped = |heights: &[u32]| logged(heights, 0, 5_000, "clamped");
     assert_eq!(clamped(&[105, 106, 107]), 1);
     assert_eq!(clamped(&[117, 118, 119]), 3);
+}
+
+/// A refund gives `b` even with its cancel still in the mempool, and the
+/// buyer, who holds `s` if the redeem went out, races for the NEX: the
+/// seller claims at once, from `Redeeming` or `Cancelling`, rather than
+/// send its seen redeem again. With no refund showing, it sends the redeem.
+#[test]
+fn a_pooled_refund_is_claimed_from_at_once() {
+    let (seller, buyer, nex_lock) = locked().nex_locked();
+    let (buyer, actions) = buyer.step(nexus(account(500_000, 0), mined(nex_lock.body, 1)));
+    let (seller, _) = seller.step(btc(17, None, None));
+    let (seller, _) = seller.step(message(sent(&actions)));
+    let (seller, actions) = seller.step(btc(17, None, None));
+    let [redeem] = &broadcasts(&actions)[..] else {
+        panic!("the seller redeems");
+    };
+    let (seller, _) = seller.step(btc(17, Some((redeem, 0)), None));
+    let (cancel, refund) = cancel_and_refund(buyer);
+    let pooled = || btc(20, Some((&cancel, 0)), Some((&refund, 0)));
+
+    let (claiming, actions) = seller.clone().step(pooled());
+    assert!(actions.is_empty());
+    assert!(matches!(claiming, Seller::ClaimingNex(_)));
+
+    let (cancelling, _) = seller.step(btc(20, Some((&cancel, 1)), None));
+    assert!(matches!(cancelling, Seller::Cancelling { .. }));
+    let (_, actions) = cancelling.clone().step(btc(20, Some((&cancel, 0)), None));
+    assert_eq!(broadcasts(&actions), std::slice::from_ref(redeem));
+    let (claiming, actions) = cancelling.step(pooled());
+    assert!(actions.is_empty());
+    assert!(matches!(claiming, Seller::ClaimingNex(_)));
+}
+
+/// A temporary file left by a crash is replaced, never reused: the swap
+/// file is its owner's alone whatever the leftover's mode.
+#[cfg(unix)]
+#[test]
+fn a_leftover_temporary_file_is_replaced() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let store = || Store::new(directory.path(), terms().swap_id);
+    let leftover = store().path().with_extension("json.tmp");
+    std::fs::write(&leftover, "left by a crash").unwrap();
+    std::fs::set_permissions(&leftover, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let client = Client::new("http://127.0.0.1:9", "", Duration::from_secs(1));
+    let seller = new_seller(terms());
+    Driver::<_, _, Offline>::start(seller, vec![], Offline, client, None, store()).unwrap();
+    let mode = std::fs::metadata(store().path())
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+    assert!(!leftover.exists());
+    assert!(store().load::<Seller>().unwrap().is_some());
 }

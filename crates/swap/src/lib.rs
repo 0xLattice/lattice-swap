@@ -244,6 +244,12 @@ pub struct BitcoinView {
     pub lock_spend: Option<Spent>,
     /// What spends the cancel output, if cancel spent the lock.
     pub cancel_spend: Option<Spent>,
+    /// Why the node may be behind the network, if it may be: its tip is
+    /// old, or it lags its own headers. Such a view only under-reports how
+    /// deep things are, so it can only delay a timelocked spend, but it can
+    /// show the redeem window open after it closed: on it the seller starts
+    /// no redeem and locks no NEX.
+    pub stale: Option<String>,
 }
 
 #[derive(Clone, Debug)]

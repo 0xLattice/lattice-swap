@@ -8,7 +8,7 @@ use base64::Engine;
 use bitcoin::address::NetworkUnchecked;
 use bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
 use bitcoin::{
-    Address, Amount, Block, Denomination, FeeRate, Network, OutPoint, Script, ScriptBuf,
+    Address, Amount, Block, BlockHash, Denomination, FeeRate, Network, OutPoint, Script, ScriptBuf,
     Transaction, Txid,
 };
 use serde_json::{json, Value};
@@ -35,6 +35,8 @@ pub struct Tip {
     pub headers: u32,
     /// The tip block's time, in seconds since the Unix epoch.
     pub time: u64,
+    /// The tip block's hash.
+    pub hash: BlockHash,
 }
 
 pub trait Bitcoin {
@@ -296,6 +298,10 @@ impl Bitcoin for Bitcoind {
             time: chain["time"]
                 .as_u64()
                 .ok_or_else(|| Error(format!("getblockchaininfo time: {chain}")))?,
+            hash: chain["bestblockhash"]
+                .as_str()
+                .and_then(|hash| hash.parse().ok())
+                .ok_or_else(|| Error(format!("getblockchaininfo bestblockhash: {chain}")))?,
         })
     }
 

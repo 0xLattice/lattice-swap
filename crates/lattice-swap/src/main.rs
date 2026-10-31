@@ -15,7 +15,6 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use base64::Engine;
 use bitcoin::address::NetworkUnchecked;
 use bitcoin::hashes::Hash;
 use bitcoin::{Address, Amount, FeeRate, Network, OutPoint, PubkeyHash, ScriptBuf, WScriptHash};
@@ -199,11 +198,12 @@ impl NodeArgs {
     }
 
     /// Refuses a lattice-node that cannot say how deep a transaction is. It
-    /// works that out from the state after past blocks, which a node run
-    /// with `--state tip` or `none` does not keep: every NEX lock would
-    /// look unmined, and every claim drained. Its operator read of an
-    /// account after the block halfway up the chain shows whether it keeps
-    /// them; a chain too short to tell passes.
+    /// works that out from past blocks and the state after them, which a
+    /// node run with `--state tip` or `none`, or `--block-bodies none`,
+    /// does not keep: every NEX lock would look unmined, and every claim
+    /// drained. Its read of an account after the block halfway up the
+    /// chain shows whether it keeps that state; a chain too short to tell
+    /// passes.
     fn check_nexus(&self, client: &Client) -> Result<()> {
         let height = client.health()?.height;
         if height < 2 {
@@ -212,27 +212,13 @@ impl NodeArgs {
         let block = client
             .block_hash(height.div_ceil(2))?
             .ok_or("the Nexus node has no block halfway up its chain")?;
-        let token =
-            base64::engine::general_purpose::STANDARD.encode(read(&self.nexus_cookie)?.trim());
-        let url = format!(
-            "{}/accounts/{}?block={block}",
-            self.nexus_url.trim_end_matches('/'),
-            swap_nexus_tx::address(&[0; 32])
-        );
-        let answer = ureq::AgentBuilder::new()
-            .timeout(TIMEOUT)
-            .build()
-            .get(&url)
-            .set("Authorization", &format!("Basic {token}"))
-            .call();
-        match answer {
-            Ok(_) => Ok(()),
-            Err(ureq::Error::Status(404, _)) => Err(
+        match client.account_at(&swap_nexus_tx::address(&[0; 32]), &block)? {
+            Some(_) => Ok(()),
+            None => Err(
                 "the Nexus node keeps no state of past blocks, so it cannot tell how deep a \
-                 transaction is: run it with --state all"
+                 transaction is: run it with --state all and --block-bodies all"
                     .into(),
             ),
-            Err(e) => Err(format!("nexus: {e}").into()),
         }
     }
 
@@ -281,7 +267,8 @@ impl NexKeyArgs {
 }
 
 /// How the driver bumps, by CPFP from their payout, the swap transactions
-/// that pay this party. The defaults are the driver's.
+/// that pay this party, and how old a Bitcoin tip it trusts. The defaults
+/// are the driver's.
 #[derive(Args)]
 struct BumpArgs {
     /// The most a bump pays for, in sat/vB.
@@ -295,6 +282,11 @@ struct BumpArgs {
     /// all of it but dust.
     #[arg(long, value_parser = fee_fraction, default_value = "1")]
     max_fee_fraction: f64,
+    /// The oldest, in minutes, a Bitcoin tip may be, since its block time
+    /// or since this tool first saw it, whichever is earlier, for the
+    /// seller to start a redeem or lock its NEX on it.
+    #[arg(long, default_value_t = 90)]
+    max_tip_age: u64,
 }
 
 impl BumpArgs {
@@ -302,6 +294,7 @@ impl BumpArgs {
         driver.max_fee_rate = self.max_fee_rate;
         driver.fallback_fee_rate = self.fallback_fee_rate;
         driver.max_fee_fraction = self.max_fee_fraction;
+        driver.max_tip_age = Duration::from_secs(self.max_tip_age.saturating_mul(60));
     }
 }
 
@@ -751,9 +744,9 @@ fn offer(args: OfferArgs) -> Result<Outcome> {
         .into());
     }
     let nexus = args.nodes.nexus()?;
+    args.nodes.check_nexus(&nexus)?;
     let redeem = args.nodes.payout(&bitcoin)?;
     let punish = args.nodes.payout(&bitcoin)?;
-    args.nodes.check_nexus(&nexus)?;
     let seller = Seller::new(terms.clone(), key.nex_address(), redeem, punish)
         .map_err(|refusal| format!("refused: {refusal:?}"))?;
     fs::create_dir_all(&args.dir)?;
@@ -814,8 +807,8 @@ fn take(args: TakeArgs) -> Result<Outcome> {
     let floor = btc_fee_floor(&bitcoin, args.policy.min_btc_fee_rate)?;
     check_offer(&offer, &args.policy, args.nodes.btc_network, floor)?;
     let nexus = args.nodes.nexus()?;
-    let refund = args.nodes.payout(&bitcoin)?;
     args.nodes.check_nexus(&nexus)?;
+    let refund = args.nodes.payout(&bitcoin)?;
     let (buyer, actions) = Buyer::start(offer.terms.clone(), refund, args.nex_address)
         .map_err(|refusal| format!("refused: {refusal:?}"))?;
     fs::create_dir_all(&args.dir)?;
@@ -912,7 +905,8 @@ fn resume_hint(swap_file: &Path, error: Box<dyn std::error::Error>) -> Box<dyn s
     }
     format!(
         "{error}\nto carry on, run with the same flags, the node and key flags and \
-         --max-fee-rate, --fallback-fee-rate and --max-fee-fraction: lattice-swap resume {}",
+         --max-fee-rate, --fallback-fee-rate, --max-fee-fraction and --max-tip-age: \
+         lattice-swap resume {}",
         swap_file.display()
     )
     .into()

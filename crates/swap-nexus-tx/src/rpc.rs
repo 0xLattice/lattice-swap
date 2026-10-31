@@ -168,6 +168,26 @@ impl Client {
         })
     }
 
+    /// The account after the block `block_cid`, or `None` if the node has
+    /// no state there (404): it does not know the block, or keeps no state
+    /// of past blocks.
+    pub fn account_at(&self, address: &str, block_cid: &str) -> Result<Option<Account>> {
+        let path = format!(
+            "/accounts/{}?block={}",
+            cid_path(address)?,
+            cid_path(block_cid)?
+        );
+        let json = match self.get(&path) {
+            Ok(json) => json,
+            Err(Error::Status { status: 404, .. }) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        Ok(Some(Account {
+            balance: decimal(&json, "balance")?,
+            nonce: decimal(&json, "nonce")?,
+        }))
+    }
+
     /// Submits to the node's pool and returns the transaction CID (of the
     /// signed transaction, not of its body: [`Transaction::cid`]).
     pub fn submit(&self, transaction: &Transaction) -> Result<String> {

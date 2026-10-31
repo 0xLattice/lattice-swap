@@ -29,12 +29,13 @@ pub enum Seller {
         locked: SellerLocked,
         nex_lock: swap_nexus_tx::Transaction,
     },
-    /// Holds the redeem; broadcasts it on every view that shows the redeem
-    /// window open, until it confirms. Once a view has shown it, in the
-    /// mempool or a block, `s` may be public: it is broadcast on every
-    /// view it is missing from, window or not, until it is
-    /// `btc_confirmations` deep or a cancel in a block spent the lock, and
-    /// in `Cancelling` again whenever that cancel leaves its block.
+    /// Holds the redeem; broadcasts it on every view that is not stale and
+    /// shows the redeem window open, until it confirms. Once a view has
+    /// shown it, in the mempool or a block, `s` may be public: it is
+    /// broadcast on every view it is missing from, window or not, until it
+    /// is `btc_confirmations` deep, a cancel in a block spent the lock, or
+    /// a refund shows, and in `Cancelling` again whenever that cancel
+    /// leaves its block.
     Redeeming {
         locked: SellerLocked,
         nex_lock: swap_nexus_tx::Transaction,
@@ -238,6 +239,11 @@ impl Machine for Seller {
                     (AwaitFunding { locked, since }, vec![])
                 } else if terms.redeem_closed(&view) {
                     locked.cancelling(None, None, false, view)
+                } else if view.stale.is_some() {
+                    // The window may have closed already: no NEX is locked
+                    // on a view that cannot tell.
+                    let since = Some(since);
+                    (AwaitFunding { locked, since }, vec![])
                 } else {
                     let nex_lock = None;
                     (LockingNex { locked, nex_lock }, vec![])
@@ -344,10 +350,11 @@ impl Machine for Seller {
                         vec![],
                     ),
                     // Not seen, perhaps never sent: send it, but only while
-                    // the window is open. Seen once, it is sent whatever
-                    // the window, and against a cancel still in the mempool,
-                    // which a bump of it can replace.
-                    None if seen || !terms.redeem_closed(&view) => {
+                    // the window is open, on a view that is not stale. Seen
+                    // once, it is sent whatever the window or the view, and
+                    // against a cancel still in the mempool, which a bump of
+                    // it can replace, unless a refund already shows.
+                    None if seen || view.stale.is_none() && !terms.redeem_closed(&view) => {
                         let actions = vec![Action::Broadcast(redeem.clone())];
                         let state = Redeeming {
                             locked,
@@ -357,7 +364,18 @@ impl Machine for Seller {
                         };
                         (state, actions)
                     }
-                    Some((Spend::Cancel, 0)) if seen => {
+                    // A stale view may show the window open after it closed:
+                    // the redeem waits for a fresh one.
+                    None if !terms.redeem_closed(&view) => {
+                        let state = Redeeming {
+                            locked,
+                            nex_lock,
+                            redeem,
+                            seen,
+                        };
+                        (state, vec![])
+                    }
+                    Some((Spend::Cancel, 0)) if seen && view.cancel_spend.is_none() => {
                         let actions = vec![Action::Broadcast(redeem.clone())];
                         let state = Redeeming {
                             locked,
@@ -483,6 +501,20 @@ impl SellerLocked {
         let setup = &self.setup;
         let terms = &setup.terms;
         let mut actions = vec![];
+        // A refund gives `b`, even with its cancel still in the mempool:
+        // the buyer, who holds `s` if our redeem went out, races for the
+        // NEX already.
+        if let Some((Spend::Refund, _)) = setup.spend(self.lock, &view.cancel_spend) {
+            let refund = &view.cancel_spend.as_ref().expect("matched").tx;
+            if let Some(b) = setup.recover(self.lock, Spend::Refund, &self.refund, refund) {
+                let lock = match &nex_lock {
+                    Some(lock) => Lock::Signed(lock.body.nonce),
+                    None => Lock::Unsigned,
+                };
+                let claim = Claim::new(self.setup, b, lock);
+                return (Seller::ClaimingNex(claim), vec![]);
+            }
+        }
         match setup.spend(self.lock, &view.lock_spend) {
             // A redeem once seen may have revealed `s`: it beats any cancel
             // not yet in a block, which a bump of it can replace.
@@ -503,17 +535,8 @@ impl SellerLocked {
                 seen = true;
             }
             Some((_, cancel_depth)) => match setup.spend(self.lock, &view.cancel_spend) {
-                Some((Spend::Refund, _)) => {
-                    let refund = &view.cancel_spend.as_ref().expect("matched").tx;
-                    if let Some(b) = setup.recover(self.lock, Spend::Refund, &self.refund, refund) {
-                        let lock = match &nex_lock {
-                            Some(lock) => Lock::Signed(lock.body.nonce),
-                            None => Lock::Unsigned,
-                        };
-                        let claim = Claim::new(self.setup, b, lock);
-                        return (Seller::ClaimingNex(claim), vec![]);
-                    }
-                }
+                // One that does not give `b`: never our punish.
+                Some((Spend::Refund, _)) => {}
                 // Anything but the refund is our punish: its leaf takes our
                 // signature alone, on any transaction. Unconfirmed, it is
                 // waited for; another punish would only conflict with it.

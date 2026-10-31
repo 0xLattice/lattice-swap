@@ -84,10 +84,10 @@ fn the_node_check_requires_a_txindex() {
     assert!(refused.to_string().contains("-txindex"), "{refused}");
 }
 
-/// A node at genesis, whose tip is years old, shows no view; once it
-/// mines a block it does.
+/// A node at genesis, whose tip is years old, shows a stale view; once
+/// it mines a block, a fresh one.
 #[test]
-fn a_stale_tip_shows_no_view() {
+fn a_stale_tip_shows_a_stale_view() {
     let node = start_bare(&[]);
     let rpc = rpc(&node, "default");
     let payout = node.client.new_address().unwrap().script_pubkey();
@@ -105,12 +105,15 @@ fn a_stale_tip_shows_no_view() {
         punish_payout: payout,
     })
     .unwrap();
-    let refused = bitcoin_view(&rpc, &swap, OutPoint::null(), AGE).unwrap_err();
-    assert!(refused.to_string().contains("minutes old"), "{refused}");
+    let mut first_seen = None;
+    let view = bitcoin_view(&rpc, &swap, OutPoint::null(), AGE, &mut first_seen).unwrap();
+    let stale = view.stale.unwrap();
+    assert!(stale.contains("minutes old"), "{stale}");
     let miner = node.client.new_address().unwrap();
     node.client.generate_to_address(1, &miner).unwrap();
-    let view = bitcoin_view(&rpc, &swap, OutPoint::null(), AGE).unwrap();
+    let view = bitcoin_view(&rpc, &swap, OutPoint::null(), AGE, &mut first_seen).unwrap();
     assert_eq!(view.height, 1);
+    assert_eq!(view.stale, None);
 }
 
 fn key(n: u8) -> KeyPair<EvenY> {
@@ -158,7 +161,7 @@ fn a_punish_of_the_sellers_own_making_shows_in_the_view() {
     let cancel = swap.finalize(lock, Spend::Cancel, &a, Some(&b)).unwrap();
     rpc.broadcast(&cancel).unwrap();
     mine(3);
-    let view = bitcoin_view(&rpc, &swap, lock, AGE).unwrap();
+    let view = bitcoin_view(&rpc, &swap, lock, AGE, &mut None).unwrap();
     assert_eq!(view.lock_spend.unwrap().confirmations, 3);
     assert!(view.cancel_spend.is_none(), "the cancel output is unspent");
 
@@ -172,7 +175,7 @@ fn a_punish_of_the_sellers_own_making_shows_in_the_view() {
     );
     rpc.broadcast(&punish).unwrap();
     let spent = |depth| {
-        let spent = bitcoin_view(&rpc, &swap, lock, AGE)
+        let spent = bitcoin_view(&rpc, &swap, lock, AGE, &mut None)
             .unwrap()
             .cancel_spend
             .unwrap();
@@ -876,7 +879,7 @@ fn contest_a_refund(punish: impl FnOnce(&Bitcoind, &Transaction)) {
     // The seller ignores it and punishes, with a child paying 30 sat/vB.
     let view = BitcoinView {
         cancel_spend: None,
-        ..bitcoin_view(&seller_rpc, &swap, lock, AGE).unwrap()
+        ..bitcoin_view(&seller_rpc, &swap, lock, AGE, &mut None).unwrap()
     };
     let (_, actions) = seller.step(Event::Bitcoin(view));
     let [Action::Broadcast(tx)] = &actions[..] else {
