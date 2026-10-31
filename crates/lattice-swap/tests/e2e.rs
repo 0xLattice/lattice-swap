@@ -28,6 +28,10 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 const REWARD: u64 = 1_048_576;
 const BTC_AMOUNT: Amount = Amount::from_sat(50_000_000);
 const BTC_FEE: Amount = Amount::from_sat(1_000);
+/// Below every swap transaction's own feerate, as the fallback for
+/// regtest's missing estimate and as the cap: nothing is bumped, and each
+/// costs exactly `BTC_FEE`, but redeem, which pays two.
+const NO_BUMP: [&str; 4] = ["--fallback-fee-rate", "1", "--max-fee-rate", "1"];
 const NEX_AMOUNT: u64 = 1_000_000;
 
 fn random32() -> [u8; 32] {
@@ -294,6 +298,7 @@ fn happy_path_through_the_binary() {
             .args(["--nex-fee", &nex_fee.to_string()])
             .args(["--t1", "20", "--t2", "10", "--margin", "3"])
             .args(["--btc-confirmations", "1", "--nex-confirmations", "1"])
+            .args(NO_BUMP)
             .arg("--dir")
             .arg(&seller_dir)
             .arg("--nex-key-file")
@@ -338,6 +343,7 @@ fn happy_path_through_the_binary() {
             ])
             // Regtest has no fee estimate.
             .args(["--min-btc-fee-rate", "1"])
+            .args(NO_BUMP)
             .args([
                 "--min-btc-confirmations",
                 "1",
@@ -380,7 +386,8 @@ fn happy_path_through_the_binary() {
         nexus.balance(&seller_nex.nex_address()),
         2 * REWARD - NEX_AMOUNT - nex_fee
     );
-    assert_eq!(btc_balance(&seller_wallet), BTC_AMOUNT - BTC_FEE);
+    // Redeem pays two fees.
+    assert_eq!(btc_balance(&seller_wallet), BTC_AMOUNT - BTC_FEE * 2);
 
     // `status` reads each swap file and asks no node.
     for dir in [&seller_dir, &buyer_dir] {

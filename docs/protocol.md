@@ -77,11 +77,33 @@ swap id.
 Every timelock counts blocks after a confirmation, so every deadline is a
 number of confirmations.
 
+## Fees
+
+Each Bitcoin swap transaction is version 3 (TRUC), has one output, and
+pays a fee fixed at setup, `btc_fee`, but redeem, which pays two. The party
+a spend pays raises its feerate by CPFP: a child that spends the payout,
+sent with it as a package, and replaced by a higher-paying child to bump
+again. Redeem and punish pay the seller and refund pays the buyer; nobody
+else can spend those outputs, and TRUC lets an unconfirmed transaction have
+only one small child, so nobody else can pin them.
+
+- Cancel cannot be bumped: its output is the cancel output, which only both
+  parties together, or the seller after `t2`, can spend. A stuck cancel
+  only delays the swap, since `t2` counts from its confirmation.
+- Refund has no timelock, so after `t1` the buyer could send cancel and
+  refund as one package, paying two fees, against a redeem still pending.
+  Redeem paying two fees keeps that package from replacing it.
+- The buyer is safe as long as its refund confirms before `t2`. After
+  that, the punish leaf takes the seller's signature alone, so the seller
+  can spend the cancel output in a shape no refund can replace at any fee,
+  and contesting a punish is best effort.
+
 ## State
 
 Each party is a state machine that does no I/O. A driver feeds it what the
 chains and the counterparty show. Before any action, the driver writes the
-party's state to its swap file. The state holds the party's secrets for the
+party's state to its swap file, tagged with a state version; a build reads
+only its own version. The state holds the party's secrets for the
 swap but never the seller's Nexus wallet key, so a party that restarts picks
 up where it stopped.
 

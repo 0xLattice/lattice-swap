@@ -590,12 +590,12 @@ fn take_pays_only_a_nexus_address() {
 #[test]
 fn take_refuses_a_fee_below_its_nodes_estimate() {
     let address = swap_nexus_tx::address(&[9; 32]);
-    let vsize = largest_spend_vsize();
+    let floor = btc_fee_at(10_000);
     let mut offer = takeable();
-    offer.terms.btc_fee = Amount::from_sat(10 * vsize - 1);
+    offer.terms.btc_fee = Amount::from_sat(floor - 1);
     let refused = take_refusal(&offer, &address, &[], &bitcoind(estimate()));
     assert!(refused.contains("below the"), "{refused}");
-    offer.terms.btc_fee = Amount::from_sat(10 * vsize);
+    offer.terms.btc_fee = Amount::from_sat(floor);
     let taken = take_refusal(&offer, &address, &[], &bitcoind(estimate()));
     assert_eq!(taken, PAST_THE_CHECKS);
 
@@ -613,19 +613,20 @@ fn take_refuses_a_fee_below_its_nodes_estimate() {
     assert!(refused.contains("below the"), "{refused}");
 }
 
-/// The floor is at least what swap-bitcoin requires at 1 sat/vB.
+/// At its floor every spend pays the rate, redeem two fees and the others
+/// one, and at 1 sat/vB the floor is what swap-bitcoin requires.
 #[test]
-fn the_largest_spend_is_sized_as_swap_bitcoin_sizes_it() {
-    let vsize = largest_spend_vsize();
+fn the_fee_floor_pays_every_spend_its_rate() {
     let key = |n: u8| {
         let mut bytes = [0u8; 32];
         bytes[31] = n;
         KeyPair::new_xonly(Scalar::from_bytes(bytes).unwrap().non_zero().unwrap())
     };
+    let (seller, buyer) = (key(5), key(6));
     let payout = ScriptBuf::new_p2wsh(&WScriptHash::all_zeros());
     let params = |fee: u64| Params {
-        seller: key(5).public_key(),
-        buyer: key(6).public_key(),
+        seller: seller.public_key(),
+        buyer: buyer.public_key(),
         seller_share: key(7).public_key().normalize(),
         buyer_share: key(8).public_key().normalize(),
         amount: Amount::from_sat(50_000_000),
@@ -636,13 +637,116 @@ fn the_largest_spend_is_sized_as_swap_bitcoin_sizes_it() {
         refund_payout: payout.clone(),
         punish_payout: payout.clone(),
     };
-    // The least fee swap-bitcoin takes is 1 sat/vB of its largest spend;
-    // the floor's longer timelocks add at most a byte to it.
-    let least = (1..=vsize).find(|&fee| Swap::new(params(fee)).is_ok());
+    for per_kvb in [1_000, 10_000, 12_345] {
+        let swap = Swap::new(params(btc_fee_at(per_kvb))).unwrap();
+        let lock = OutPoint::null();
+        for spend in [Spend::Redeem, Spend::Cancel, Spend::Refund, Spend::Punish] {
+            let a = swap.sign(lock, spend, &seller);
+            let b = (spend != Spend::Punish).then(|| swap.sign(lock, spend, &buyer));
+            let vsize = swap.finalize(lock, spend, &a, b.as_ref()).unwrap().vsize() as u64;
+            assert!(
+                swap.fee(spend).to_sat() * 1000 >= per_kvb * vsize,
+                "{spend:?} at {per_kvb}"
+            );
+        }
+    }
+    // The floor's longer timelocks add at most a byte to it.
+    let floor = btc_fee_at(1_000);
+    let least = (1..=floor).find(|&fee| Swap::new(params(fee)).is_ok());
     assert!(
-        least.is_some_and(|least| vsize - least <= 1),
-        "{least:?} {vsize}"
+        least.is_some_and(|least| floor - least <= 1),
+        "{least:?} {floor}"
     );
+}
+
+/// Terms swap-bitcoin would refuse in setup, for an amount that leaves
+/// redeem's payout dust after its two fees, are refused before it.
+#[test]
+fn an_amount_that_cannot_pay_redeem_is_refused() {
+    let fee = Amount::from_sat(1_000);
+    let least = btc_amount_floor(fee);
+    assert_eq!(least, 2 * 1_000 + 546);
+    let mut terms = small(16);
+    terms.btc_fee = fee;
+    terms.btc_amount = Amount::from_sat(least);
+    assert_eq!(check_terms(&terms), Ok(()));
+    terms.btc_amount -= Amount::from_sat(1);
+    let refused = check_terms(&terms).unwrap_err();
+    assert!(refused.contains("redeem pays two btc_fee"), "{refused}");
+    terms.btc_fee = Amount::MAX;
+    assert!(check_terms(&terms).is_err(), "no overflow");
+
+    // `offer` refuses before it asks any node; `take` before it dials.
+    let mut args = offer_args(&[]);
+    args.terms.btc_amount = 2_545;
+    let refused = offer(args).unwrap_err().to_string();
+    assert!(refused.contains("redeem pays two btc_fee"), "{refused}");
+    let (policy, network) = policy(&[]);
+    let mut offer = agreed();
+    offer.terms.btc_amount = Amount::from_sat(2 * 10_000 + 545);
+    let refused = check_offer(&offer, &policy, network, FLOOR).unwrap_err();
+    assert!(refused.contains("redeem pays two btc_fee"), "{refused}");
+}
+
+/// The bump settings default to the driver's, and a fraction the driver
+/// would refuse is refused as an argument.
+#[test]
+fn the_bump_settings_default_to_the_drivers() {
+    let (_directory, path) = swap_file(Seller::Done(Outcome::Swapped));
+    let unreachable = "http://127.0.0.1:1";
+    let bitcoin = || Bitcoind::new(unreachable, "u:p", Network::Regtest, TIMEOUT);
+    let nexus = || Client::new(unreachable, "c", TIMEOUT);
+    let store = || swap_store(Path::new(&path)).unwrap();
+    let mut driver = Driver::<Seller, _, Ivy>::resume(bitcoin(), nexus(), None, store()).unwrap();
+    let defaults = |d: &Driver<Seller, Bitcoind, Ivy>| {
+        (d.max_fee_rate, d.fallback_fee_rate, d.max_fee_fraction)
+    };
+    let before = defaults(&driver);
+    offer_args(&[]).bump.apply(&mut driver);
+    assert_eq!(defaults(&driver), before);
+
+    let args = offer_args(&[
+        "--max-fee-rate",
+        "50",
+        "--fallback-fee-rate",
+        "5",
+        "--max-fee-fraction",
+        "0.25",
+    ]);
+    args.bump.apply(&mut driver);
+    let rate = |sat| FeeRate::from_sat_per_vb(sat).unwrap();
+    assert_eq!(defaults(&driver), (rate(50), rate(5), 0.25));
+    for fraction in ["0", "1"] {
+        assert!(parse(&["resume", "x.json", "--max-fee-fraction", fraction]).is_ok());
+    }
+    for fraction in ["NaN", "-0.1", "1.01", "inf", "x"] {
+        let flag = format!("--max-fee-fraction={fraction}");
+        let refused = parse(&["resume", "x.json", &flag])
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            refused.contains("--max-fee-fraction"),
+            "{fraction}: {refused}"
+        );
+    }
+    let refused = parse(&["take", "o", "--max-fee-fraction", "2"])
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(refused.contains("2 is not between 0 and 1"), "{refused}");
+    assert!(parse(&["resume", "x.json", "--max-fee-rate=-1"]).is_err());
+    let too_high = (u64::MAX / 250 + 1).to_string();
+    assert!(parse(&["resume", "x.json", "--fallback-fee-rate", &too_high]).is_err());
+
+    // A run sets them on its driver, which checks the fraction first.
+    let mut bump = offer_args(&[]).bump;
+    bump.max_fee_fraction = f64::NAN;
+    let driver = Driver::<Seller, _, Ivy>::resume(bitcoin(), nexus(), None, store());
+    let refused = run(Path::new(&path), driver, &bump)
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("max_fee_fraction NaN"), "{refused}");
 }
 
 #[test]
@@ -653,13 +757,57 @@ fn offer_refuses_an_address_nobody_can_dial() {
     assert!(refused.contains("is no address to dial"), "{refused}");
 }
 
-/// A seller swap file in `state`, in a directory of its own.
-#[cfg(unix)]
-fn seller_file(state: &Seller) -> (tempfile::TempDir, String) {
+/// A swap file in `state` as the driver saves one, in a directory of its
+/// own.
+fn swap_file<M: Machine>(state: M) -> (tempfile::TempDir, String) {
     let directory = tempfile::tempdir().unwrap();
-    let path = Store::new(directory.path(), [7; 32]).path().to_path_buf();
-    fs::write(&path, serde_json::to_string(state).unwrap()).unwrap();
-    (directory, path.to_str().unwrap().to_string())
+    let store = Store::new(directory.path(), [7; 32]);
+    let path = store.path().to_str().unwrap().to_string();
+    let unreachable = "http://127.0.0.1:1";
+    let bitcoin = Bitcoind::new(unreachable, "u:p", Network::Regtest, TIMEOUT);
+    let nexus = Client::new(unreachable, "c", TIMEOUT);
+    Driver::<_, _, Ivy>::start(state, vec![], bitcoin, nexus, None, store).unwrap();
+    (directory, path)
+}
+
+#[test]
+fn status_reads_a_swap_file_the_driver_saved() {
+    let cli = |path: &str| status(Path::new(path)).map_err(|e| e.to_string());
+    let seller = Seller::new(
+        small(16),
+        SecretBytes([7; 32]).nex_address(),
+        ScriptBuf::new(),
+        ScriptBuf::new(),
+    )
+    .unwrap();
+    let (_seller, path) = swap_file(seller);
+    assert_eq!(cli(&path), Ok(()));
+    assert_eq!(
+        Saved::load(&swap_store(Path::new(&path)).unwrap())
+            .map(|saved| matches!(saved, Saved::Seller(_)))
+            .ok(),
+        Some(true)
+    );
+    let (buyer, _) = Buyer::start(small(16), ScriptBuf::new(), "b".into()).unwrap();
+    let (_buyer, path) = swap_file(buyer);
+    assert!(matches!(
+        Saved::load(&swap_store(Path::new(&path)).unwrap()),
+        Ok(Saved::Buyer(_))
+    ));
+
+    // A file of another version, or of none, is refused by name.
+    let file: Value = serde_json::from_str(&read(Path::new(&path)).unwrap()).unwrap();
+    for other in [
+        json!({"version": 1, "state": file["state"]}),
+        file["state"].clone(),
+    ] {
+        fs::write(&path, other.to_string()).unwrap();
+        let refused = cli(&path).unwrap_err();
+        assert!(refused.contains(&path), "{refused}");
+        assert!(refused.contains("this build reads only 2"), "{refused}");
+    }
+    fs::remove_file(&path).unwrap();
+    assert_eq!(cli(&path), Err(format!("{path}: no such swap file")));
 }
 
 #[cfg(unix)]
@@ -677,7 +825,7 @@ fn resume_signs_only_with_the_swaps_own_key() {
     let home = SecretBytes([7; 32]).nex_address();
     let seller = Seller::new(small(16), home, ScriptBuf::new(), ScriptBuf::new()).unwrap();
     assert!(seller.signs_nex());
-    let (_directory, path) = seller_file(&seller);
+    let (_directory, path) = swap_file(seller);
     let unreachable = "http://127.0.0.1:1";
     let wrong = key_file(8);
     let args = [
@@ -696,7 +844,7 @@ fn resume_signs_only_with_the_swaps_own_key() {
 #[cfg(unix)]
 #[test]
 fn resume_exits_with_the_outcome_and_needs_no_key_once_signed() {
-    let (_directory, path) = seller_file(&Seller::Done(Outcome::Refunded));
+    let (_directory, path) = swap_file(Seller::Done(Outcome::Refunded));
     let cookie = tempfile::NamedTempFile::new().unwrap();
     let cookie = cookie.path().to_str().unwrap();
     let mut args = vec!["lattice-swap", "resume", &path];

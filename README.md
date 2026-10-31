@@ -78,6 +78,9 @@ address such as `0.0.0.0`.
 - `lattice-swap status <swap file>` prints the state and outcome, and asks
   no node.
 
+Both, like the driver, refuse a swap file of another state version: finish
+a swap with the build that started it.
+
 The defaults are `t1` 288 and `t2` 144 Bitcoin blocks, 6 Bitcoin and 24
 Nexus confirmations, and a margin of 12. A Nexus block is about 6 Bitcoin
 blocks, so the tool refuses any `t1` below `btc-confirmations + 6 ×
@@ -87,13 +90,23 @@ blocks, so the tool refuses any `t1` below `btc-confirmations + 6 ×
 outside its bounds: `--max-btc-fee` 10000 sat, `--max-nex-fee` 1000,
 `--max-t1` 288, `--min-t2` 144, `--min-btc-confirmations` 6,
 `--max-btc-confirmations` 12, `--min-refund-window` 72 and
-`--min-nex-confirmations` 24 by default. Once the buyer has signed the
+`--min-nex-confirmations` 24 by default. Either side refuses a
+`--btc-amount` below two `--btc-fee`, which redeem pays, plus 546 sat, the
+highest dust limit of a wallet's payout. Once the buyer has signed the
 redeem, it refunds only when cancel is `btc-confirmations` deep, and the
 seller can punish once cancel is `t2` deep: the refund window is `t2 -
-btc-confirmations` blocks. The buyer also refuses a `--btc-fee` below what
-its bitcoind's conservative fee estimate for 6 blocks asks of the largest
-swap transaction, or, where bitcoind has no estimate, as on regtest,
-`--min-btc-fee-rate` sat/vB.
+btc-confirmations` blocks. The buyer also refuses a `--btc-fee` at which
+any swap transaction, redeem paying two fees and the others one, pays less
+than its bitcoind's conservative fee estimate for 6 blocks, or, where
+bitcoind has no estimate, as on regtest, `--min-btc-fee-rate` sat/vB.
+
+While a swap transaction that pays this side waits unconfirmed (redeem and
+punish for the seller, refund for the buyer), `offer`, `take` and `resume`
+bump it by CPFP from its payout, toward bitcoind's estimate. A bump pays
+for at most `--max-fee-rate` sat/vB, 1000 by default, and at most
+`--max-fee-fraction` of the payout, from 0 to 1, 1 by default: all of it
+but dust. Where bitcoind has no estimate it aims at `--fallback-fee-rate`,
+10 sat/vB by default. Cancel is never bumped.
 
 `offer`, `take` and `resume` exit 0 only when the swap swapped: 3 when it
 refunded, 4 punished, 5 drained, 6 aborted. 1 means an error stopped the

@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use bitcoin::address::NetworkUnchecked;
 use bitcoin::hashes::Hash;
-use bitcoin::{Address, Amount, Network, OutPoint, ScriptBuf, WScriptHash};
+use bitcoin::{Address, Amount, FeeRate, Network, OutPoint, PubkeyHash, ScriptBuf, WScriptHash};
 use clap::{Args, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use rand_core::{OsRng, RngCore};
@@ -243,6 +243,46 @@ impl NexKeyArgs {
     }
 }
 
+/// How the driver bumps, by CPFP from their payout, the swap transactions
+/// that pay this party. The defaults are the driver's.
+#[derive(Args)]
+struct BumpArgs {
+    /// The most a bump pays for, in sat/vB.
+    #[arg(long, value_parser = sat_per_vb, default_value = "1000")]
+    max_fee_rate: FeeRate,
+    /// The feerate, in sat/vB, a bump pays for when bitcoind has no fee
+    /// estimate, as on regtest.
+    #[arg(long, value_parser = sat_per_vb, default_value = "10")]
+    fallback_fee_rate: FeeRate,
+    /// The share of a payout, from 0 to 1, its bump may pay in fees; 1 is
+    /// all of it but dust.
+    #[arg(long, value_parser = fee_fraction, default_value = "1")]
+    max_fee_fraction: f64,
+}
+
+impl BumpArgs {
+    fn apply<M: Machine, B: Bitcoin, T: Transport>(&self, driver: &mut Driver<M, B, T>) {
+        driver.max_fee_rate = self.max_fee_rate;
+        driver.fallback_fee_rate = self.fallback_fee_rate;
+        driver.max_fee_fraction = self.max_fee_fraction;
+    }
+}
+
+fn sat_per_vb(text: &str) -> std::result::Result<FeeRate, String> {
+    let rate: u64 = text.parse().map_err(|e| format!("{e}"))?;
+    FeeRate::from_sat_per_vb(rate).ok_or_else(|| format!("{rate} sat/vB is too high"))
+}
+
+/// The driver refuses a fraction that is not between 0 and 1, NaN among
+/// them; this refuses it before anything starts.
+fn fee_fraction(text: &str) -> std::result::Result<f64, String> {
+    let fraction: f64 = text.parse().map_err(|e| format!("{e}"))?;
+    if !(0.0..=1.0).contains(&fraction) {
+        return Err(format!("{fraction} is not between 0 and 1"));
+    }
+    Ok(fraction)
+}
+
 /// Refuses a key file anyone but its owner can open.
 #[cfg(unix)]
 fn owner_only(path: &Path) -> Result<()> {
@@ -288,6 +328,8 @@ struct OfferArgs {
     nodes: NodeArgs,
     #[command(flatten)]
     key: NexKeyArgs,
+    #[command(flatten)]
+    bump: BumpArgs,
 }
 
 #[derive(Args)]
@@ -304,6 +346,8 @@ struct TakeArgs {
     dir: PathBuf,
     #[command(flatten)]
     nodes: NodeArgs,
+    #[command(flatten)]
+    bump: BumpArgs,
 }
 
 /// What the buyer agreed to, and its bounds on every other term: `take`
@@ -359,6 +403,8 @@ struct SwapFileArgs {
     nodes: NodeArgs,
     #[command(flatten)]
     key: NexKeyArgs,
+    #[command(flatten)]
+    bump: BumpArgs,
 }
 
 /// The least `t1` this tool runs: the BTC lock `btc_confirmations` deep,
@@ -389,12 +435,29 @@ fn check_terms(terms: &Terms) -> std::result::Result<(), String> {
             terms.t1
         ));
     }
+    let least = btc_amount_floor(terms.btc_fee);
+    if terms.btc_amount.to_sat() < least {
+        return Err(format!(
+            "btc_amount is {} sat, below {least}: redeem pays two btc_fee, and its payout \
+             must stay above dust",
+            terms.btc_amount.to_sat()
+        ));
+    }
     Ok(())
 }
 
-/// The vsize of the largest of the four swap spends, signed, with the
-/// longest timelocks and payouts as large as any standard one.
-fn largest_spend_vsize() -> u64 {
+/// The least `btc_amount` swap-bitcoin takes with `fee`: two fees, as
+/// redeem pays, above the dust limit of the payout. That limit is
+/// highest for a legacy address, the largest a wallet's address can ask.
+fn btc_amount_floor(fee: Amount) -> u64 {
+    let dust = ScriptBuf::new_p2pkh(&PubkeyHash::all_zeros()).minimal_non_dust();
+    fee.to_sat().saturating_mul(2).saturating_add(dust.to_sat())
+}
+
+/// The least `btc_fee` at which every swap spend pays `per_kvb` sat/kvB:
+/// redeem pays two fees, the others one. Each is signed, with the longest
+/// timelocks and payouts as large as any standard one.
+fn btc_fee_at(per_kvb: u64) -> u64 {
     let key = |n: u8| {
         let mut bytes = [0u8; 32];
         bytes[31] = n;
@@ -424,15 +487,17 @@ fn largest_spend_vsize() -> u64 {
             let a = swap.sign(lock, spend, &seller);
             let b = (spend != Spend::Punish).then(|| swap.sign(lock, spend, &buyer));
             let tx = swap.finalize(lock, spend, &a, b.as_ref());
-            tx.expect("our own signatures").vsize() as u64
+            let vsize = tx.expect("our own signatures").vsize() as u64;
+            let fees = swap.fee(spend).to_sat() / swap.params().fee.to_sat();
+            per_kvb.saturating_mul(vsize).div_ceil(1000 * fees)
         })
         .max()
         .expect("four spends")
 }
 
 /// The least `btc_fee` the buyer takes, in satoshis: what bitcoind's
-/// conservative estimate, or else `fallback` sat/vB, asks of the largest
-/// swap spend.
+/// conservative estimate, or else `fallback` sat/vB, asks of every swap
+/// spend.
 fn btc_fee_floor(bitcoin: &Bitcoind, fallback: Option<u64>) -> Result<u64> {
     let estimate = bitcoin.call("estimatesmartfee", json!([FEE_TARGET, "CONSERVATIVE"]))?;
     let per_kvb = match estimate["feerate"].as_f64() {
@@ -441,7 +506,7 @@ fn btc_fee_floor(bitcoin: &Bitcoind, fallback: Option<u64>) -> Result<u64> {
             .ok_or("bitcoind has no fee estimate: give --min-btc-fee-rate")?
             .saturating_mul(1000),
     };
-    Ok(per_kvb.saturating_mul(largest_spend_vsize()).div_ceil(1000))
+    Ok(btc_fee_at(per_kvb))
 }
 
 /// An offer the buyer takes: terms that work, the amounts it agreed to on
@@ -628,9 +693,9 @@ fn seller_key(
 
 fn offer(args: OfferArgs) -> Result<Outcome> {
     check_listen(args.listen, args.advertise)?;
-    let key = args.key.load()?;
     let terms = args.terms.terms(random32());
     check_terms(&terms)?;
+    let key = args.key.load()?;
     let bitcoin = args.nodes.bitcoin()?;
     let nexus = args.nodes.nexus()?;
     let redeem = args.nodes.payout(&bitcoin)?;
@@ -670,6 +735,7 @@ fn offer(args: OfferArgs) -> Result<Outcome> {
             driver.nex_key = Some(key);
             driver
         }),
+        &args.bump,
     )
 }
 
@@ -699,13 +765,13 @@ fn take(args: TakeArgs) -> Result<Outcome> {
     let swap_file = store.path().to_path_buf();
     log(&format!("swap file {}", swap_file.display()));
     let driver = Driver::start(buyer, actions, bitcoin, nexus, Some(transport), store);
-    run(&swap_file, driver)
+    run(&swap_file, driver, &args.bump)
 }
 
 fn resume(args: SwapFileArgs) -> Result<Outcome> {
     let store = swap_store(&args.swap_file)?;
     let swap_file = store.path().to_path_buf();
-    match Saved::load(&swap_file)? {
+    match Saved::load(&store)? {
         Saved::Seller(seller) => {
             let given = args.key.given()?;
             let key = seller_key(seller.nex_address(), seller.signs_nex(), given)?;
@@ -718,6 +784,7 @@ fn resume(args: SwapFileArgs) -> Result<Outcome> {
                     driver.nex_key = key;
                     driver
                 }),
+                &args.bump,
             )
         }
         Saved::Buyer(_) => {
@@ -726,14 +793,14 @@ fn resume(args: SwapFileArgs) -> Result<Outcome> {
             run(
                 &swap_file,
                 Driver::<Buyer, _, Ivy>::resume(bitcoin, nexus, None, store),
+                &args.bump,
             )
         }
     }
 }
 
 fn status(swap_file: &Path) -> Result<()> {
-    let path = swap_store(swap_file)?;
-    let (role, state, outcome) = match Saved::load(path.path())? {
+    let (role, state, outcome) = match Saved::load(&swap_store(swap_file)?)? {
         Saved::Seller(seller) => ("seller", state_name(&seller), seller.outcome()),
         Saved::Buyer(buyer) => ("buyer", state_name(&buyer), buyer.outcome()),
     };
@@ -745,15 +812,17 @@ fn status(swap_file: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Runs the swap to its end, logging each state it reaches. On an error
-/// once the swap file exists, says how to carry on.
+/// Runs the swap to its end, bumping as `bump` says, logging each state it
+/// reaches. On an error once the swap file exists, says how to carry on.
 fn run<M: Machine, B: Bitcoin, T: Transport>(
     swap_file: &Path,
     driver: io::Result<Driver<M, B, T>>,
+    bump: &BumpArgs,
 ) -> Result<Outcome> {
     let last = RefCell::new(String::new());
     let outcome = driver
         .and_then(|mut driver| {
+            bump.apply(&mut driver);
             driver.run_until(|state| {
                 let name = state_name(state);
                 if *last.borrow() != name {
@@ -800,9 +869,17 @@ enum Saved {
 
 impl Saved {
     /// Both machines have `ClaimingNex` and `Done`. A claim names its side;
-    /// a swap that is done no longer needs one.
-    fn load(path: &Path) -> Result<Self> {
-        let value: Value = serde_json::from_str(&read(path)?)?;
+    /// a swap that is done no longer needs one. Fails on a file of another
+    /// state version, as the driver would.
+    fn load(store: &Store) -> Result<Self> {
+        let path = store.path();
+        let value = match store.load_value() {
+            Ok(Some(value)) => value,
+            Ok(None) => return Err(format!("{}: no such swap file", path.display()).into()),
+            // Names the file and the versions.
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => return Err(e.into()),
+            Err(e) => return Err(format!("{}: {e}", path.display()).into()),
+        };
         if value["ClaimingNex"]["setup"]["side"] != "Buyer" {
             if let Ok(seller) = serde_json::from_value(value.clone()) {
                 return Ok(Saved::Seller(seller));
