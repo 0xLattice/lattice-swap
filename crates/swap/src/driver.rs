@@ -358,20 +358,28 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
             }
             let last = self.waiting.get(&txid).copied();
             let urgent = urgent.contains(&spend);
-            // A failure is tried again at the next block, or at the next poll
-            // once a deadline is near: a block may be all that is left.
+            // A failure is tried again at the next block, or, a few times, at
+            // the next poll once a deadline is near: a block may be all that
+            // is left.
             let due = last.is_none_or(|last| {
-                height > last.height || refused && !last.refused || last.failed && urgent
+                height > last.height
+                    || refused && !last.refused
+                    || last.failed && urgent && last.retries < URGENT_RETRIES
             });
             let mut now = last.unwrap_or(Waiting {
                 height,
                 refused,
                 rate: FeeRate::ZERO,
                 failed: false,
+                retries: 0,
                 clamped: None,
             });
             now.refused = refused;
             if due {
+                now.retries = match last {
+                    Some(last) if last.height == height => last.retries + 1,
+                    _ => 0,
+                };
                 now.height = height;
                 let fee = swap.fee(spend);
                 let result = match self.target(&tx, fee, refused, urgent, &mut now.clamped) {
@@ -526,6 +534,10 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
     }
 }
 
+/// How many times a failed bump near its deadline is tried again within one
+/// block, a poll apart.
+pub(crate) const URGENT_RETRIES: u8 = 8;
+
 /// A swap transaction of ours waiting unconfirmed.
 #[derive(Clone, Copy)]
 struct Waiting {
@@ -537,6 +549,8 @@ struct Waiting {
     rate: FeeRate,
     /// Whether the last attempt to bump it failed: it is tried again.
     failed: bool,
+    /// Attempts since the first at `height`.
+    retries: u8,
     /// The last target clamped to `max_fee_rate`, already logged.
     clamped: Option<FeeRate>,
 }

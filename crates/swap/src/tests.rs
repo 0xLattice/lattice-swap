@@ -1736,6 +1736,18 @@ fn a_failed_urgent_bump_is_tried_again_at_the_next_poll() {
     assert_eq!(heights, [117, 117]);
 }
 
+/// A bump that keeps failing near its deadline is tried only a few times a
+/// block.
+#[test]
+fn a_failing_urgent_bump_is_tried_a_few_times_a_block() {
+    let locked = locked();
+    let node = pooled(&locked, &[Spend::Redeem], 50);
+    node.0.borrow_mut().failing = 100;
+    let polls = [117; 20];
+    let tried = bumps(seller_watching(&locked, None), &node, &polls, |_| {}).len();
+    assert_eq!(tried, 1 + usize::from(crate::driver::URGENT_RETRIES));
+}
+
 /// Redeem pays two fees: a target its feerate meets with both, though not
 /// with one, needs no bump.
 #[test]

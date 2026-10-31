@@ -775,7 +775,10 @@ fn contest_a_refund(punish: impl FnOnce(&Bitcoind, &Transaction)) {
     let wait = |what: &str, done: &dyn Fn() -> bool| {
         let deadline = Instant::now() + Duration::from_secs(60);
         while !done() {
-            assert!(!party.is_finished() || done(), "{what}: the driver stopped");
+            if party.is_finished() {
+                assert!(done(), "{what}: the driver stopped");
+                break;
+            }
             assert!(Instant::now() < deadline, "{what}");
             std::thread::sleep(Duration::from_millis(250));
         }
