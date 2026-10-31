@@ -218,6 +218,12 @@ fn node_accepts_transfers_and_joint_key_spends() {
     let block = seen.block.unwrap();
     assert_eq!(block.height, node.client.health().unwrap().height);
     assert!(block.hash.starts_with("bafy"));
+    // The tip and the block at its height are named by the same CID; a
+    // height past the tip names none.
+    let tip = node.client.health().unwrap();
+    assert_eq!(tip.tip.as_deref(), Some(block.hash.as_str()));
+    assert_eq!(node.client.block_hash(tip.height).unwrap(), tip.tip);
+    assert_eq!(node.client.block_hash(tip.height + 1000).unwrap(), None);
     assert!(node.client.transaction(&fund.body.cid()).unwrap().is_none());
     assert_eq!(node.client.account(&lock).unwrap().balance, 50_000);
 

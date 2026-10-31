@@ -342,11 +342,12 @@ pub fn bitcoin_view(
 
 /// The lock account is read before the watched transaction: a lock that
 /// has signed something, read first, shows that transaction mined in the
-/// later read if it is ours.
+/// later read if it is ours. The tip is read after both accounts, so a
+/// block that moved them is at or below the tip the view reports.
 fn nexus_view(client: &Client, watch: &NexusWatch) -> swap_nexus_tx::rpc::Result<NexusView> {
-    let health = client.health()?;
     let own = client.account(&watch.own_address)?;
     let lock = client.account(&watch.lock_address)?;
+    let health = client.health()?;
     let min_relay_fee = client.min_relay_fee()?;
     let watched = match &watch.cid {
         Some(cid) => match client.transaction(cid)? {

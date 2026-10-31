@@ -1171,6 +1171,19 @@ fn the_seller_ends_on_a_punish_of_its_own_making() {
     assert_eq!(seller.outcome(), Some(Outcome::Punished));
 }
 
+/// A seller that first sees the buyer's refund already deep still reads it
+/// as a refund, recovers `b` and claims its NEX back.
+#[test]
+fn a_refund_first_seen_deep_is_still_a_refund() {
+    let locked = locked();
+    let (seller, buyer, _) = locked.nex_locked();
+    let (seller, _) = seller.step(btc(18, None, None));
+    let (cancel, refund) = cancel_and_refund(buyer);
+    let (seller, actions) = seller.step(btc(40, Some((&cancel, 20)), Some((&refund, 10))));
+    assert!(actions.is_empty());
+    assert!(matches!(seller, Seller::ClaimingNex(_)));
+}
+
 /// The seller, having signed its lock at nonce 3 and learned `b`, waits
 /// with the lock address empty.
 fn seller_claiming_a_signed_lock(terms: Terms) -> Seller {
