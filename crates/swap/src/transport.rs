@@ -1,17 +1,22 @@
-//! How the parties talk: any [`Transport`], here an ivy session.
+//! How the parties talk: any [`Transport`], here an ivy session, over TCP
+//! or over a relay's WebSocket.
 
 use std::future::{poll_fn, Future};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::{pin, Pin};
-use std::task::Poll;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use futures_util::{Sink, Stream};
 use ivy::{Config, Connection};
 pub use ivy_core::PeerKey;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::runtime::Runtime;
 use tokio::time::{sleep, timeout};
+use tokio_tungstenite::tungstenite::{self, Message as Frame};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::TOPIC;
 
@@ -30,11 +35,12 @@ pub trait Transport {
     fn recv(&mut self, wait: Duration) -> io::Result<Option<Vec<u8>>>;
 }
 
-/// An ivy session over TCP, with its own single-threaded runtime so the
-/// blocking driver can use it. Messages on other topics are skipped.
-pub struct Ivy {
+/// An ivy session over TCP, or over a relay's WebSocket ([`Relayed`]),
+/// with its own single-threaded runtime so the blocking driver can use it.
+/// Messages on other topics are skipped.
+pub struct Ivy<S = TcpStream> {
     runtime: Runtime,
-    connection: Connection<TcpStream>,
+    connection: Connection<S>,
     send_timeout: Duration,
 }
 
@@ -158,7 +164,7 @@ fn runtime() -> io::Result<Runtime> {
         .build()
 }
 
-impl Transport for Ivy {
+impl<S: AsyncRead + AsyncWrite + Unpin> Transport for Ivy<S> {
     fn send(&mut self, payload: &[u8]) -> io::Result<()> {
         // The timer is made inside the runtime, which drives it.
         let send = self.connection.send(TOPIC, payload);
@@ -181,5 +187,239 @@ impl Transport for Ivy {
                 Ok(Ok(_)) => continue,
             }
         }
+    }
+}
+
+/// The most bytes [`Relayed`] puts in one WebSocket message. A relay holds
+/// a message whole while it passes it on, so this is what one costs it.
+pub const RELAY_CHUNK: usize = 64 * 1024;
+
+/// A relay's WebSocket as a byte stream: what is written goes out as binary
+/// messages of at most [`RELAY_CHUNK`] bytes, and what arrives in them is
+/// read back in order. The relay pipes them to the other party, so the ivy
+/// session runs end to end through it: the relay sees only ciphertext, and
+/// each side authenticates the other's key.
+pub struct Relayed {
+    socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    /// Received and not yet read.
+    inbound: Vec<u8>,
+    read_from: usize,
+}
+
+impl Ivy<Relayed> {
+    /// Lists `offer` on the relay at `relay`, an `http://` or `https://`
+    /// URL, and waits, at most `wait` in all, for a buyer the relay pairs
+    /// with it to complete the handshake as `peer`, each handshake within
+    /// `send_timeout`. A pairing that fails the handshake is dropped and the
+    /// offer listed again, as [`Ivy::accept`] drops a stranger. Fails if the
+    /// relay refuses the offer.
+    pub fn accept_relayed(
+        relay: &str,
+        offer: &str,
+        config: &Config,
+        peer: PeerKey,
+        wait: Duration,
+        send_timeout: Duration,
+    ) -> io::Result<Self> {
+        let runtime = runtime()?;
+        let url = relay_url(relay, "sell")?;
+        let connection = runtime.block_on(async {
+            let deadline = tokio::time::Instant::now() + wait;
+            loop {
+                let paired = async {
+                    let mut socket = dial(&url, send_timeout).await?;
+                    send_text(&mut socket, offer).await?;
+                    match timeout(send_timeout, text(&mut socket)).await {
+                        Err(_) => Err(timed_out("the relay did not answer")),
+                        Ok(Ok(reply)) if reply == "listed" => Ok(()),
+                        Ok(Ok(reply)) => Err(io::Error::other(format!("the relay: {reply}"))),
+                        Ok(Err(e)) => Err(e),
+                    }?;
+                    match text(&mut socket).await? {
+                        reply if reply == "paired" => Ok(socket),
+                        reply => Err(io::Error::other(format!("the relay: {reply}"))),
+                    }
+                };
+                let socket = tokio::time::timeout_at(deadline, paired)
+                    .await
+                    .map_err(|_| timed_out("no peer dialed"))??;
+                let accept = ivy::accept(Relayed::new(socket), config, |key| *key == peer);
+                match timeout(send_timeout, accept).await {
+                    Ok(Ok(connection)) => return io::Result::Ok(connection),
+                    Ok(Err(e)) => eprintln!("lattice-swap: a relayed handshake failed: {e}"),
+                    Err(_) => eprintln!("lattice-swap: a relayed handshake timed out"),
+                }
+            }
+        })?;
+        Ok(Self {
+            runtime,
+            connection,
+            send_timeout,
+        })
+    }
+
+    /// Asks the relay at `relay` to pair this party with the seller that
+    /// listed offer `id` there, which must hold `peer`'s key.
+    pub fn connect_relayed(
+        relay: &str,
+        id: &str,
+        config: &Config,
+        peer: PeerKey,
+        send_timeout: Duration,
+    ) -> io::Result<Self> {
+        let runtime = runtime()?;
+        let url = relay_url(relay, &format!("take/{id}"))?;
+        let connection = runtime.block_on(async {
+            let socket = dial(&url, send_timeout).await?;
+            ivy::connect(Relayed::new(socket), config, peer).await
+        })?;
+        Ok(Self {
+            runtime,
+            connection,
+            send_timeout,
+        })
+    }
+}
+
+/// `path` at the relay at `relay`, as a WebSocket URL.
+pub fn relay_url(relay: &str, path: &str) -> io::Result<String> {
+    let relay = relay.trim_end_matches('/');
+    let socket = if let Some(rest) = relay.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else if let Some(rest) = relay.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{relay} is not an http:// or https:// URL"),
+        ));
+    };
+    Ok(format!("{socket}/{path}"))
+}
+
+fn timed_out(what: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, what)
+}
+
+async fn dial(
+    url: &str,
+    send_timeout: Duration,
+) -> io::Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
+    match timeout(send_timeout, tokio_tungstenite::connect_async(url)).await {
+        Err(_) => Err(timed_out("the relay did not answer")),
+        Ok(Ok((socket, _))) => Ok(socket),
+        Ok(Err(tungstenite::Error::Http(response))) if response.status() == 404 => Err(
+            io::Error::new(io::ErrorKind::NotFound, "the relay holds no such offer"),
+        ),
+        Ok(Err(e)) => Err(io::Error::other(format!("the relay: {e}"))),
+    }
+}
+
+async fn send_text(
+    socket: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
+    text: &str,
+) -> io::Result<()> {
+    use futures_util::SinkExt;
+    socket
+        .send(Frame::text(text))
+        .await
+        .map_err(io::Error::other)
+}
+
+/// The relay's next word, skipping pings.
+async fn text(socket: &mut WebSocketStream<MaybeTlsStream<TcpStream>>) -> io::Result<String> {
+    use futures_util::StreamExt;
+    loop {
+        match socket.next().await {
+            Some(Ok(Frame::Text(text))) => return Ok(text.to_string()),
+            Some(Ok(Frame::Ping(_) | Frame::Pong(_))) => continue,
+            Some(Ok(Frame::Close(Some(close)))) => {
+                return Err(io::Error::other(format!("the relay: {}", close.reason)))
+            }
+            Some(Err(e)) => return Err(io::Error::other(e)),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "the relay closed the connection",
+                ))
+            }
+        }
+    }
+}
+
+impl Relayed {
+    fn new(socket: WebSocketStream<MaybeTlsStream<TcpStream>>) -> Self {
+        Self {
+            socket,
+            inbound: Vec::new(),
+            read_from: 0,
+        }
+    }
+}
+
+impl AsyncRead for Relayed {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        while this.read_from == this.inbound.len() {
+            match Pin::new(&mut this.socket).poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Some(Ok(Frame::Binary(bytes)))) => {
+                    this.inbound = bytes.into();
+                    this.read_from = 0;
+                }
+                // Pings are answered by the socket itself.
+                Poll::Ready(Some(Ok(Frame::Ping(_) | Frame::Pong(_)))) => {}
+                Poll::Ready(Some(Ok(Frame::Text(_) | Frame::Frame(_)))) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "the relay sent text in the session",
+                    )))
+                }
+                // The end of the stream.
+                Poll::Ready(None | Some(Ok(Frame::Close(_)))) => return Poll::Ready(Ok(())),
+                Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(io::Error::other(e))),
+            }
+        }
+        let n = buf.remaining().min(this.inbound.len() - this.read_from);
+        buf.put_slice(&this.inbound[this.read_from..this.read_from + n]);
+        this.read_from += n;
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for Relayed {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let socket = &mut self.get_mut().socket;
+        if let Err(e) = std::task::ready!(Pin::new(&mut *socket).poll_ready(cx)) {
+            return Poll::Ready(Err(io::Error::other(e)));
+        }
+        let n = buf.len().min(RELAY_CHUNK);
+        let frame = Frame::binary(buf[..n].to_vec());
+        Poll::Ready(
+            Pin::new(socket)
+                .start_send(frame)
+                .map(|()| n)
+                .map_err(io::Error::other),
+        )
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().socket)
+            .poll_flush(cx)
+            .map_err(io::Error::other)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().socket)
+            .poll_close(cx)
+            .map_err(io::Error::other)
     }
 }

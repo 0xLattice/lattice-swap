@@ -1,7 +1,8 @@
 //! Whole swaps through the `lattice-swap` binary: `offer` and `take` as two
-//! processes, killed and carried on with `resume`, against a regtest
-//! bitcoind and a lattice-node in Docker, each test its own. The test, not
-//! the parties, mines blocks on both chains.
+//! processes, meeting directly or through a relay run here, killed and
+//! carried on with `resume`, against a regtest bitcoind and a lattice-node
+//! in Docker, each test its own. The test, not the parties, mines blocks on
+//! both chains.
 //!
 //! Ignored by a plain `cargo test`; run with `NEXUS_NODE_IMAGE` naming the
 //! node image and `-- --ignored`. The node's RPC listens on loopback only,
@@ -11,6 +12,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -23,6 +25,9 @@ use swap::bitcoind::Bitcoind;
 use swap::SecretBytes;
 use swap_nexus_tx::address;
 use swap_nexus_tx::rpc::Client;
+use swap_relay::board::Board;
+use swap_relay::watch::Watchtower;
+use swap_relay::Relay;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 /// Nexus's block reward over its first halving interval.
@@ -60,6 +65,29 @@ fn wait_for<T>(what: &str, mut poll: impl FnMut() -> Option<T>) -> T {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         thread::sleep(Duration::from_millis(250));
     }
+}
+
+/// A relay on loopback, its watchtower on regtest but not watching, so
+/// the test can see the watches it is handed: its URL and the relay.
+fn relay() -> (String, Arc<Relay>, tempfile::TempDir) {
+    let watches = tempfile::tempdir().unwrap();
+    let watchtower = Watchtower::open(Network::Regtest, watches.path(), 10).unwrap();
+    let relay = Arc::new(Relay {
+        board: Board::new(10),
+        watchtower: Arc::new(watchtower),
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    listener.set_nonblocking(true).unwrap();
+    let serving = relay.clone();
+    thread::spawn(move || {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            swap_relay::serve(listener, serving).await.unwrap();
+        });
+    });
+    (url, relay, watches)
 }
 
 /// A lattice-node in Docker, as in the swap crate's end-to-end tests.
@@ -365,11 +393,27 @@ impl World {
     /// the seller's output once it ends. `t1` is at least the tool's floor
     /// of 1 + 6 x (`nex_confirmations` + 1) + 3.
     fn start(&self, t1: u16, nex_confirmations: u64) -> (Party, Party, String, JoinHandle<String>) {
+        self.start_on(t1, nex_confirmations, None)
+    }
+
+    /// [`World::start`], the seller listing its offer on the relay at
+    /// `relay`, if given, where the buyer finds it.
+    fn start_on(
+        &self,
+        t1: u16,
+        nex_confirmations: u64,
+        relay: Option<&str>,
+    ) -> (Party, Party, String, JoinHandle<String>) {
         let (t1, nex_confirmations) = (t1.to_string(), nex_confirmations.to_string());
         let nex_fee = self.nex_fee.to_string();
+        let place = match relay {
+            Some(relay) => ["--relay", relay],
+            None => ["--listen", "127.0.0.1:0"],
+        };
         let mut seller = Party(
             lattice_swap()
-                .args(["offer", "--listen", "127.0.0.1:0"])
+                .arg("offer")
+                .args(place)
                 .args(["--btc-amount", &BTC_AMOUNT.to_sat().to_string()])
                 .args(["--btc-fee", &BTC_FEE.to_sat().to_string()])
                 // Regtest has no fee estimate.
@@ -396,6 +440,19 @@ impl World {
             .as_str()
             .unwrap()
             .to_string();
+        if let Some(relay) = relay {
+            // The buyer takes it from the board, as the relay lists it.
+            let listed = wait_for("the offer listed", || {
+                let offers: Value = ureq::get(&format!("{relay}/offers"))
+                    .call()
+                    .unwrap()
+                    .into_json()
+                    .unwrap();
+                offers.as_array().unwrap().first().cloned()
+            });
+            assert_eq!(listed["terms"]["swap_id"], swap_id.as_str());
+            offer = listed.to_string();
+        }
         let offer_file = self.directory.path().join("offer");
         std::fs::write(&offer_file, &offer).unwrap();
         // The rest of the seller's output, read as it comes so it never
@@ -632,4 +689,59 @@ fn buyer_killed_after_the_redeem_resumes_to_the_swap() {
         world.nexus.balance(&world.buyer_nex),
         NEX_AMOUNT - world.nex_fee
     );
+}
+
+/// The seller lists its offer on a relay instead of listening; the buyer
+/// takes it from the relay's board, and the two swap through the relay.
+#[test]
+#[ignore = "needs Docker and NEXUS_NODE_IMAGE"]
+fn happy_path_through_a_relay() {
+    let world = World::new();
+    let (url, relay, _watches) = relay();
+    let (mut seller, mut buyer, _, seller_out) = world.start_on(20, 1, Some(&url));
+    let (mut seller_done, mut buyer_done) = (None, None);
+    world.drive(
+        false,
+        || true,
+        || {
+            seller_done = seller_done.or(seller.0.try_wait().unwrap());
+            buyer_done = buyer_done.or(buyer.0.try_wait().unwrap());
+            seller_done.is_some() && buyer_done.is_some()
+        },
+    );
+    assert!(seller_done.unwrap().success());
+    assert!(buyer_done.unwrap().success());
+    assert_eq!(seller_out.join().unwrap(), "outcome: Swapped\n");
+    assert_eq!(stdout(&mut buyer.0), "outcome: Swapped\n");
+    assert_eq!(
+        world.nexus.balance(&world.buyer_nex),
+        NEX_AMOUNT - world.nex_fee
+    );
+    // Taken, the offer left the board; the buyer never gave up, so it
+    // handed its refund to no one.
+    assert!(relay.board.offers().is_empty());
+    assert!(relay.watchtower.is_empty());
+}
+
+/// Through a relay, the seller goes once the NEX is locked, before the
+/// buyer signs the redeem. At t1 the buyer gives up, hands its cancel and
+/// refund to the relay's watchtower, on by default, and refunds.
+#[test]
+#[ignore = "needs Docker and NEXUS_NODE_IMAGE"]
+fn a_buyer_that_gives_up_hands_its_refund_to_the_relay() {
+    let world = World::new();
+    let (url, relay, _watches) = relay();
+    let (mut seller, mut buyer, swap_id, seller_out) = world.start_on(24, 2, Some(&url));
+    world.drive(
+        false,
+        || true,
+        || world.state("seller", &swap_id) == "AwaitRedeemSignature",
+    );
+    kill(&mut seller);
+    seller_out.join().unwrap();
+    assert!(relay.watchtower.is_empty(), "not before it gives up");
+    let status = world.finish(&mut buyer, true, false);
+    assert_eq!(status.code(), Some(3), "{status}");
+    assert_eq!(stdout(&mut buyer.0), "outcome: Refunded\n");
+    assert_eq!(relay.watchtower.len(), 1);
 }

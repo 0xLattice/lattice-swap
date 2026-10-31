@@ -138,32 +138,108 @@ fn a_swap_file_is_named_by_its_swap_id() {
     );
 }
 
+fn address() -> Place {
+    Place::Address("192.0.2.1:7000".parse().unwrap())
+}
+
 #[test]
 fn an_offer_parses_back_into_the_same_terms() {
-    let offer = Offer {
-        terms: offer_args(&[]).terms.terms(random32(), MAINNET.into()),
-        btc_network: Network::Signet,
-        address: "192.0.2.1:7000".parse().unwrap(),
-        seller: ivy::Config::new(SigningKey::from_bytes(&random32()))
-            .peer_key()
-            .hex(),
-        buyer_session: random32(),
-    };
-    let text = offer.encode();
-    assert!(!text.contains('\n'), "one line");
-    assert_eq!(Offer::decode(&format!("{text}\n")).unwrap(), offer);
+    let key = SigningKey::from_bytes(&random32());
+    for place in [address(), Place::Relay("https://relay.example".into())] {
+        let terms = offer_args(&[]).terms.terms(random32(), MAINNET.into());
+        let offer = Offer::new(terms, Network::Signet, place, &key, random32());
+        let text = offer.encode();
+        assert!(!text.contains('\n'), "one line");
+        assert_eq!(Offer::decode(&format!("{text}\n")).unwrap(), offer);
+    }
+    // The session authenticates the key the offer names, which signs it.
+    let offer = Offer::new(small(16), Network::Signet, address(), &key, [7; 32]);
+    let peer = ivy::Config::new(key).peer_key();
+    assert_eq!(offer.seller_key().unwrap(), peer);
 }
 
 #[test]
 fn an_offer_with_a_bad_seller_key_is_refused() {
-    let offer = Offer {
-        terms: small(16),
-        btc_network: Network::Bitcoin,
-        address: "192.0.2.1:7000".parse().unwrap(),
-        seller: "00".repeat(31),
-        buyer_session: [7; 32],
-    };
+    let key = SigningKey::from_bytes(&[1; 32]);
+    let mut offer = Offer::new(small(16), Network::Bitcoin, address(), &key, [7; 32]);
+    offer.seller = "00".repeat(31);
     assert!(Offer::decode(&offer.encode()).is_err());
+}
+
+/// Whoever carries an offer, a relay among them, cannot change its terms
+/// or network for the seller's key without the buyer refusing it: each
+/// machine checks some terms alone, which could otherwise differ between
+/// the two with neither refusing.
+#[test]
+fn an_offer_whose_terms_are_changed_is_refused() {
+    let key = SigningKey::from_bytes(&[1; 32]);
+    let signed = Offer::new(small(16), Network::Bitcoin, address(), &key, [7; 32]);
+    Offer::decode(&signed.encode()).unwrap();
+    type Change = (&'static str, fn(&mut Offer));
+    let changes: [Change; 4] = [
+        ("confirmations", |o| o.terms.nex_confirmations -= 1),
+        ("margin", |o| o.terms.margin += 1),
+        ("network", |o| o.btc_network = Network::Testnet),
+        ("signature", |o| o.signature[0] ^= 1),
+    ];
+    for (what, change) in changes {
+        let mut offer = signed.clone();
+        change(&mut offer);
+        let refused = Offer::decode(&offer.encode()).unwrap_err().to_string();
+        assert!(
+            refused.contains("not signed by its seller"),
+            "{what}: {refused}"
+        );
+    }
+    // Signed by another key, which it does not name.
+    let mut offer = signed.clone();
+    offer.sign(&SigningKey::from_bytes(&[2; 32]));
+    assert!(Offer::decode(&offer.encode()).is_err());
+    // What needs no signature: another place or buyer session reaches no
+    // seller that takes the buyer.
+    let mut offer = signed.clone();
+    offer.address = None;
+    offer.relay = Some("http://elsewhere.example".into());
+    offer.buyer_session = [8; 32];
+    Offer::decode(&offer.encode()).unwrap();
+}
+
+#[test]
+fn an_offer_names_an_address_or_a_relay() {
+    let key = SigningKey::from_bytes(&[1; 32]);
+    let mut offer = Offer::new(small(16), Network::Bitcoin, address(), &key, [7; 32]);
+    offer.relay = Some("http://relay.example".into());
+    assert!(Offer::decode(&offer.encode()).is_err());
+    offer.relay = None;
+    offer.address = None;
+    assert!(Offer::decode(&offer.encode()).is_err());
+}
+
+#[test]
+fn offer_listens_or_uses_a_relay() {
+    let relay = ["--relay", "http://127.0.0.1:1"];
+    let args = offer_args(&[]);
+    assert!(args.listen.is_some() && args.relay.is_none());
+    let base: Vec<&str> = [
+        "offer",
+        "--btc-amount",
+        "50000000",
+        "--btc-fee",
+        "2000",
+        "--nex-amount",
+        "1000000",
+        "--nex-fee",
+        "1",
+    ]
+    .to_vec();
+    let with = |extra: &[&str]| parse(&[&base[..], extra].concat());
+    let Command::Offer(args) = with(&relay).unwrap().command else {
+        panic!("an offer");
+    };
+    assert_eq!(args.relay.as_deref(), Some("http://127.0.0.1:1"));
+    assert!(with(&[]).is_err(), "neither");
+    assert!(with(&[&relay[..], &["--listen", "127.0.0.1:0"]].concat()).is_err());
+    assert!(with(&[&relay[..], &["--advertise", "192.0.2.1:7000"]].concat()).is_err());
 }
 
 #[test]
@@ -223,13 +299,8 @@ fn agreed() -> Offer {
     let mut terms = offer_args(&[]).terms.terms([7; 32], MAINNET.into());
     terms.btc_fee = Amount::from_sat(10_000);
     terms.nex_fee = 1_000;
-    Offer {
-        terms,
-        btc_network: Network::Bitcoin,
-        address: "192.0.2.1:7000".parse().unwrap(),
-        seller: "00".repeat(32),
-        buyer_session: [7; 32],
-    }
+    let key = SigningKey::from_bytes(&[1; 32]);
+    Offer::new(terms, Network::Bitcoin, address(), &key, [7; 32])
 }
 
 /// The fee floors the policy tests pass: the agreed fees.
@@ -674,6 +745,9 @@ fn take_refusal_on(
     btc_url: &str,
     nexus_url: &str,
 ) -> String {
+    // Signed again, as the seller would, after the test changed it.
+    let mut offer = offer.clone();
+    offer.sign(&SigningKey::from_bytes(&[1; 32]));
     let file = tempfile::NamedTempFile::new().unwrap();
     fs::write(file.path(), offer.encode()).unwrap();
     let path = file.path().to_str().unwrap();
@@ -683,13 +757,9 @@ fn take_refusal_on(
     refusal_on(&args, btc_url, nexus_url)
 }
 
-/// The agreed offer, with a seller key that is one.
+/// The agreed offer, whose seller key is one.
 fn takeable() -> Offer {
-    let mut offer = agreed();
-    offer.seller = ivy::Config::new(SigningKey::from_bytes(&[1; 32]))
-        .peer_key()
-        .hex();
-    offer
+    agreed()
 }
 
 /// Past every check, `take` asks its wallet for an address, which this
@@ -883,7 +953,7 @@ fn the_bump_settings_default_to_the_drivers() {
     let mut bump = offer_args(&[]).bump;
     bump.max_fee_fraction = f64::NAN;
     let driver = Driver::<Seller, _, Ivy>::resume(bitcoin(), nexus(), None, store());
-    let refused = run(Path::new(&path), driver, &bump)
+    let refused = run(Path::new(&path), driver, &bump, |_| {})
         .unwrap_err()
         .to_string();
     assert!(refused.contains("max_fee_fraction NaN"), "{refused}");
@@ -892,7 +962,7 @@ fn the_bump_settings_default_to_the_drivers() {
 #[test]
 fn offer_refuses_an_address_nobody_can_dial() {
     let mut args = offer_args(&[]);
-    args.listen = "0.0.0.0:7400".parse().unwrap();
+    args.listen = Some("0.0.0.0:7400".parse().unwrap());
     let refused = offer(args).unwrap_err().to_string();
     assert!(refused.contains("is no address to dial"), "{refused}");
 }
