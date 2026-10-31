@@ -6,17 +6,32 @@ license.workspace = true
 rust-version.workspace = true
 description = "Nexus transactions for NEX<->BTC swaps: Lattice encoding, signing and a node RPC client"
 
+[features]
+default = ["native"]
+# The node RPC client, over blocking HTTP.
+native = ["dep:base64", "dep:ureq"]
+
 [dependencies]
 swap-nexus = { path = "../swap-nexus" }
-base64 = "0.22"
+base64 = { version = "0.22", optional = true }
 data-encoding = "2"
 ed25519-dalek = "2"
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-ureq = { version = "2", default-features = false, features = ["json"] }
+ureq = { version = "2", default-features = false, features = ["json"], optional = true }
+
+# Talks to a real node.
+[[test]]
+name = "node"
+required-features = ["native"]
 
 [dev-dependencies]
 ciborium = "0.2"
 rand_core = { version = "0.6", features = ["getrandom"] }
+
+# `swap-nexus` draws its randomness from `getrandom`, which in a browser
+# asks `crypto.getRandomValues`.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }

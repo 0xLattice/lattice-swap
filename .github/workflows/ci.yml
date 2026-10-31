@@ -21,6 +21,29 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
+  # The machines without the native I/O, built for the browser, and every
+  # machine test run again in wasm under node. `secp256k1-sys` needs a clang
+  # with the WebAssembly target.
+  wasm:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CC_wasm32_unknown_unknown: clang
+      AR_wasm32_unknown_unknown: llvm-ar
+      CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq clang llvm
+      - run: rustup target add wasm32-unknown-unknown && rustup component add clippy
+      # The version Cargo.lock pins for `wasm-bindgen`.
+      - run: cargo install wasm-bindgen-cli --version 0.2.130 --locked
+      - run: cargo clippy -p swap -p swap-nexus-tx -p swap-wasm --no-default-features --target wasm32-unknown-unknown --all-targets -- -D warnings
+      - run: cargo build --release -p swap-wasm --target wasm32-unknown-unknown
+      # Unoptimized, the proofs take minutes in wasm.
+      - run: cargo test -p swap -p swap-wasm --no-default-features --target wasm32-unknown-unknown --lib
+        env:
+          CARGO_PROFILE_DEV_OPT_LEVEL: 3
+
   # Rust-signed joint-key spends checked by Lattice's own consensus signature
   # rules on Linux, where swift-crypto verifies Ed25519 through BoringSSL.
   lattice-interop:

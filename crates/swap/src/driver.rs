@@ -16,9 +16,7 @@ use crate::transport::Transport;
 use crate::{Action, BitcoinView, Event, Machine, Message, NexusView, NexusWatch, Outcome};
 use crate::{SecretBytes, Spent};
 
-/// The format of a state file. A file of another version is refused: its
-/// signatures may be over transactions this build no longer makes.
-pub const STATE_VERSION: u32 = 5;
+pub use crate::STATE_VERSION;
 
 /// One JSON file per swap, replaced atomically: written to a temporary
 /// file, synced, then renamed over the old one. It holds the party's
@@ -606,9 +604,11 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
                 amount,
             } => {
                 // Before anything is at stake: a wallet that cannot fund
-                // ends the swap. Funded at the rate a bump aims at, never
-                // the wallet's own estimate: a fresh node has none, and
-                // without `-fallbackfee` its wallet then funds nothing.
+                // ends the swap. Funded at bitcoind's estimate, else the
+                // fallback rate, never below the node's mempool minimum,
+                // and not capped by `max_fee_rate`. Never the wallet's own
+                // estimate: a fresh node has none, and without
+                // `-fallbackfee` its wallet then funds nothing.
                 let funding = self
                     .bitcoin
                     .fee_rate(false)

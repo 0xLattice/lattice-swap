@@ -1,18 +1,31 @@
 //! Both machines against each other, with the chains made up: every path,
 //! and a counterparty that cheats at each step.
 
+#[cfg(feature = "native")]
 use std::cell::RefCell;
+#[cfg(feature = "native")]
 use std::rc::Rc;
+#[cfg(feature = "native")]
 use std::time::{Duration, SystemTime};
 
 use super::*;
+#[cfg(feature = "native")]
 use crate::bitcoind::Bitcoin;
+#[cfg(feature = "native")]
 use crate::driver::{Driver, Store, WARN_AGAIN};
+#[cfg(feature = "native")]
 use crate::transport::Transport;
 use bitcoin::hashes::Hash;
-use bitcoin::{BlockHash, FeeRate, Script, TxIn, TxOut, Txid, WPubkeyHash, Witness};
+#[cfg(feature = "native")]
+use bitcoin::{BlockHash, FeeRate, Script};
+use bitcoin::{TxIn, TxOut, Txid, WPubkeyHash, Witness};
+#[cfg(feature = "native")]
 use serde_json::json;
-use swap_nexus_tx::rpc::{Client, Inclusion};
+#[cfg(feature = "native")]
+use swap_nexus_tx::rpc::Client;
+use swap_nexus_tx::rpc::Inclusion;
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen_test::wasm_bindgen_test as test;
 
 const SELLER_NEX: SecretBytes = SecretBytes([7; 32]);
 const BUYER_NEX: &str = "buyer-payout";
@@ -1051,6 +1064,7 @@ fn a_funding_transaction_with_two_lock_outputs_is_refused() {
     assert_eq!(seller.outcome(), Some(Outcome::Aborted(Refusal::Funding)));
 }
 
+#[cfg(feature = "native")]
 #[test]
 fn a_swap_cannot_be_started_twice() {
     let start = |seller: Seller, directory: &std::path::Path| {
@@ -1328,6 +1342,7 @@ fn a_passed_nonce_must_hold_nex_confirmations_blocks() {
 
 /// A Bitcoin node the test moves by hand. The lock is mined at height 101,
 /// as in [`btc`]; whatever is in `mempool` waits unconfirmed.
+#[cfg(feature = "native")]
 #[derive(Default)]
 struct Node {
     height: u32,
@@ -1362,9 +1377,11 @@ struct Node {
     funded: Vec<FeeRate>,
 }
 
+#[cfg(feature = "native")]
 #[derive(Clone, Default)]
 struct Fake(Rc<RefCell<Node>>);
 
+#[cfg(feature = "native")]
 impl Bitcoin for Fake {
     fn broadcast(&self, tx: &Transaction) -> crate::bitcoind::Result<()> {
         let mut node = self.0.borrow_mut();
@@ -1448,8 +1465,10 @@ impl Bitcoin for Fake {
     }
 }
 
+#[cfg(feature = "native")]
 struct Offline;
 
+#[cfg(feature = "native")]
 impl Bitcoin for Offline {
     fn broadcast(&self, _: &Transaction) -> crate::bitcoind::Result<()> {
         unreachable!()
@@ -1486,6 +1505,7 @@ impl Bitcoin for Offline {
     }
 }
 
+#[cfg(feature = "native")]
 impl Transport for Offline {
     fn send(&mut self, _: &[u8]) -> std::io::Result<()> {
         unreachable!()
@@ -1497,6 +1517,7 @@ impl Transport for Offline {
 
 /// Watches a locked swap, with `role`'s view of which spends are its own,
 /// and broadcasts `broadcast`, if any, at every view.
+#[cfg(feature = "native")]
 #[derive(Clone, Serialize, Deserialize)]
 struct Watching<R> {
     watcher: Buyer,
@@ -1504,6 +1525,7 @@ struct Watching<R> {
     broadcast: Option<Transaction>,
 }
 
+#[cfg(feature = "native")]
 impl<R: Machine> Machine for Watching<R> {
     fn step(self, event: Event) -> (Self, Vec<Action>) {
         let actions = match (&event, &self.broadcast) {
@@ -1533,6 +1555,7 @@ impl<R: Machine> Machine for Watching<R> {
 
 /// Runs `machine`'s driver for one poll at each of `heights`, and returns
 /// the bumps it asked for.
+#[cfg(feature = "native")]
 fn bumps<M: Machine>(
     machine: M,
     node: &Fake,
@@ -1548,22 +1571,26 @@ fn bumps<M: Machine>(
     })
 }
 
+#[cfg(feature = "native")]
 thread_local! {
     /// This thread's time, which only [`advance`] moves: the drivers under
     /// test and [`Fake`] tips read it.
     static NOW: std::cell::Cell<SystemTime> = std::cell::Cell::new(SystemTime::now());
 }
 
+#[cfg(feature = "native")]
 fn now() -> SystemTime {
     NOW.with(std::cell::Cell::get)
 }
 
+#[cfg(feature = "native")]
 fn advance(by: Duration) {
     NOW.with(|now| now.set(now.get() + by));
 }
 
 /// Runs `machine`'s driver on [`now`], changing the node with `each` before
 /// every poll until it returns false, and returns the bumps it asked for.
+#[cfg(feature = "native")]
 fn bumps_with<M: Machine>(
     machine: M,
     node: &Fake,
@@ -1589,6 +1616,7 @@ fn bumps_with<M: Machine>(
 
 /// A node whose mempool holds `spends` of a locked swap, and estimates
 /// `estimate` sat/vB.
+#[cfg(feature = "native")]
 fn pooled(locked: &Locked, spends: &[Spend], estimate: u32) -> Fake {
     let (swap, lock) = locked.swap();
     let funding = Transaction {
@@ -1607,6 +1635,7 @@ fn pooled(locked: &Locked, spends: &[Spend], estimate: u32) -> Fake {
     })))
 }
 
+#[cfg(feature = "native")]
 fn txids(locked: &Locked, spends: &[Spend]) -> Vec<Txid> {
     let (swap, lock) = locked.swap();
     spends
@@ -1617,6 +1646,7 @@ fn txids(locked: &Locked, spends: &[Spend]) -> Vec<Txid> {
 
 /// Each party bumps only what pays it: the seller its redeem and punish,
 /// the buyer its refund, and neither ever bumps cancel.
+#[cfg(feature = "native")]
 #[test]
 fn each_party_bumps_only_what_pays_it() {
     fn bumped<R: Machine>(locked: &Locked, role: R, spends: &[Spend]) -> Vec<Txid> {
@@ -1650,6 +1680,7 @@ fn each_party_bumps_only_what_pays_it() {
 
 /// The seller's driver watching `locked`, as the buyer's view, with
 /// `broadcast` broadcast at every view.
+#[cfg(feature = "native")]
 fn seller_watching(locked: &Locked, broadcast: Option<Transaction>) -> Watching<Seller> {
     Watching {
         watcher: locked.buyer.clone(),
@@ -1660,6 +1691,7 @@ fn seller_watching(locked: &Locked, broadcast: Option<Transaction>) -> Watching<
 
 /// Bumped when first seen, then again only at a new block whose estimate
 /// is above the last bump's, however often the driver polls.
+#[cfg(feature = "native")]
 #[test]
 fn a_waiting_spend_is_rebumped_only_when_a_new_block_raises_its_target() {
     let locked = locked();
@@ -1695,6 +1727,7 @@ fn a_waiting_spend_is_rebumped_only_when_a_new_block_raises_its_target() {
 /// A spend the mempool refuses is raised to the node's floor, not only the
 /// estimate, and at once whenever it is newly refused, as when the other
 /// party's package displaced it, without waiting for a block.
+#[cfg(feature = "native")]
 #[test]
 fn a_refused_spend_is_raised_to_the_floor_at_once() {
     let locked = locked();
@@ -1743,6 +1776,7 @@ fn a_refused_spend_is_raised_to_the_floor_at_once() {
 /// A bump pays at most `max_fee_rate`, and nothing when the estimate is
 /// not above what the spend already pays; its child pays at most
 /// `max_fee_fraction` of the payout, all of it by default.
+#[cfg(feature = "native")]
 #[test]
 fn a_bump_pays_the_estimate_up_to_the_caps() {
     let locked = locked();
@@ -1770,6 +1804,7 @@ fn a_bump_pays_the_estimate_up_to_the_caps() {
 
 /// A redeem sent at the last block the window is open is bumped at once,
 /// long before cancel is valid.
+#[cfg(feature = "native")]
 #[test]
 fn a_redeem_sent_at_the_last_open_block_is_bumped_before_t1() {
     let (seller, buyer, nex_lock) = locked().nex_locked();
@@ -1801,6 +1836,7 @@ fn a_redeem_sent_at_the_last_open_block_is_bumped_before_t1() {
 }
 
 /// A state file of another format is refused, not misread.
+#[cfg(feature = "native")]
 #[test]
 fn a_state_file_of_another_version_is_refused() {
     let directory = tempfile::tempdir().unwrap();
@@ -1837,6 +1873,7 @@ fn a_state_file_of_another_version_is_refused() {
 
 /// A bump that fails records nothing: the spend is bumped again at the
 /// next block, not at every poll, unless its deadline is near.
+#[cfg(feature = "native")]
 #[test]
 fn a_failed_bump_is_tried_again_at_the_next_block() {
     let locked = locked();
@@ -1857,6 +1894,7 @@ fn a_failed_bump_is_tried_again_at_the_next_block() {
 
 /// A replacing child pays the old fee and its own relay, and also a feerate
 /// above the old child's when it is a vbyte larger.
+#[cfg(feature = "native")]
 #[test]
 fn a_replacing_child_pays_a_higher_feerate() {
     let incremental = FeeRate::from_sat_per_kwu(25);
@@ -1871,6 +1909,7 @@ fn a_replacing_child_pays_a_higher_feerate() {
 
 /// Near its deadline a failed bump is tried again at the next poll: a
 /// block may be all that is left.
+#[cfg(feature = "native")]
 #[test]
 fn a_failed_urgent_bump_is_tried_again_at_the_next_poll() {
     let locked = locked();
@@ -1884,6 +1923,7 @@ fn a_failed_urgent_bump_is_tried_again_at_the_next_poll() {
 
 /// A bump that keeps failing near its deadline is tried only a few times a
 /// block.
+#[cfg(feature = "native")]
 #[test]
 fn a_failing_urgent_bump_is_tried_a_few_times_a_block() {
     let locked = locked();
@@ -1896,6 +1936,7 @@ fn a_failing_urgent_bump_is_tried_a_few_times_a_block() {
 
 /// Redeem pays two fees: a target its feerate meets with both, though not
 /// with one, needs no bump.
+#[cfg(feature = "native")]
 #[test]
 fn a_redeem_is_bumped_only_past_what_its_two_fees_pay() {
     let locked = locked();
@@ -1916,6 +1957,7 @@ fn a_redeem_is_bumped_only_past_what_its_two_fees_pay() {
 /// Within `margin` blocks of its deadline a spend is bumped to the
 /// conservative estimate: redeem as the lock nears `t1`, refund as cancel
 /// nears `t2`.
+#[cfg(feature = "native")]
 #[test]
 fn the_target_rises_near_the_deadline() {
     let locked = locked();
@@ -1958,6 +2000,7 @@ fn the_target_rises_near_the_deadline() {
 
 /// A refused spend needs a package, as against a conflict, even when the
 /// target is below what it pays alone.
+#[cfg(feature = "native")]
 #[test]
 fn a_refused_spend_is_bumped_below_its_own_feerate() {
     let locked = locked();
@@ -1985,6 +2028,7 @@ fn a_refused_spend_is_bumped_below_its_own_feerate() {
 }
 
 /// A child may pay a share of the payout from 0 to 1, nothing else.
+#[cfg(feature = "native")]
 #[test]
 fn a_fee_fraction_outside_zero_to_one_is_refused() {
     for fraction in [f64::NAN, -0.1, 1.5] {
@@ -2069,6 +2113,7 @@ fn a_redeem_never_sent_is_abandoned_when_the_window_closes() {
 
 /// A source is an IPv4 address or an IPv6 /64, an IPv4 address mapped
 /// into IPv6 being its IPv4 one.
+#[cfg(feature = "native")]
 #[test]
 fn a_handshake_source_is_an_address_or_a_64() {
     use crate::transport::source;
@@ -2086,6 +2131,7 @@ fn a_handshake_source_is_an_address_or_a_64() {
 
 /// A flood from one source evicts only its own handshakes; past the cap
 /// in all, the oldest of any goes.
+#[cfg(feature = "native")]
 #[test]
 fn a_flood_from_one_source_evicts_only_its_own() {
     use crate::transport::{evicted, HANDSHAKES, PER_SOURCE};
@@ -2148,6 +2194,7 @@ fn btc_deep() -> Terms {
 
 /// A node holding a locked swap's funding, mined at height 101, at
 /// `height`.
+#[cfg(feature = "native")]
 fn funded_node(lock: OutPoint, height: u32) -> Fake {
     let funding = Transaction {
         version: bitcoin::transaction::Version::TWO,
@@ -2163,10 +2210,12 @@ fn funded_node(lock: OutPoint, height: u32) -> Fake {
     })))
 }
 
+#[cfg(feature = "native")]
 fn warnings(containing: &str) -> usize {
     crate::driver::WARNINGS.with(|w| w.borrow().iter().filter(|w| w.contains(containing)).count())
 }
 
+#[cfg(feature = "native")]
 fn clear_warnings() {
     crate::driver::WARNINGS.with(|w| w.borrow_mut().clear());
 }
@@ -2175,6 +2224,7 @@ fn clear_warnings() {
 /// `max_tip_age`, would show the redeem window open after it closed: the
 /// seller starts no redeem on it, and the driver warns only once that has
 /// lasted, not at every block a node briefly lags.
+#[cfg(feature = "native")]
 #[test]
 fn a_stale_or_lagging_node_starts_no_redeem() {
     let (seller, redeem, _) = seller_holding();
@@ -2211,6 +2261,7 @@ fn a_stale_or_lagging_node_starts_no_redeem() {
 
 /// A fresh view ends a stale spell: staleness that comes back is logged
 /// only once it has lasted again.
+#[cfg(feature = "native")]
 #[test]
 fn a_fresh_view_restarts_the_wait_before_a_stale_one_is_logged() {
     let locked = locked();
@@ -2279,6 +2330,7 @@ fn a_stale_view_locks_no_nex() {
 /// A stale view only under-reports depth, so it holds back no spend that
 /// waits on depth: a buyer near `t2` on a node whose tip is old still
 /// sends its refund, and bumps it to the urgent estimate.
+#[cfg(feature = "native")]
 #[test]
 fn a_stale_view_still_refunds_and_bumps() {
     let locked = locked();
@@ -2312,6 +2364,7 @@ fn a_stale_view_still_refunds_and_bumps() {
 /// A tip is as old as the earlier of its block time, which its miner
 /// sets, and when this machine first saw it: one stamped fresh but first
 /// seen over `max_tip_age` ago is stale. Another tip is first seen now.
+#[cfg(feature = "native")]
 #[test]
 fn a_tip_is_as_old_as_it_was_first_seen() {
     let (swap, lock) = locked().swap();
@@ -2339,6 +2392,7 @@ fn a_tip_is_as_old_as_it_was_first_seen() {
 
 /// The driver keeps when it first saw the tip from view to view: a tip
 /// that does not move goes stale, however fresh its block time.
+#[cfg(feature = "native")]
 #[test]
 fn the_driver_ages_a_tip_from_when_it_first_saw_it() {
     let locked = locked();
@@ -2363,6 +2417,7 @@ fn the_driver_ages_a_tip_from_when_it_first_saw_it() {
 /// A failure to read a view is logged when it starts, again every
 /// `WARN_AGAIN` while it lasts, and at once if it comes back after a view
 /// that did not fail.
+#[cfg(feature = "native")]
 #[test]
 fn a_failing_view_is_logged_when_it_starts_and_while_it_lasts() {
     let locked = locked();
@@ -2389,6 +2444,7 @@ fn a_failing_view_is_logged_when_it_starts_and_while_it_lasts() {
 /// A redeem the seller saw outlives a cancel that a reorg put back in the
 /// mempool and that evicted the redeem: `s` may be public, and the redeem,
 /// bumped, can replace the cancel.
+#[cfg(feature = "native")]
 #[test]
 fn a_seen_redeem_is_sent_again_when_cancel_leaves_its_block() {
     let (seller, redeem, cancel) = seller_redeeming();
@@ -2438,6 +2494,7 @@ fn a_seen_redeem_is_sent_again_when_cancel_leaves_its_block() {
 
 /// The state is on disk before any action of the step that made it, so a
 /// crash between the two leaves a state that knows what went out.
+#[cfg(feature = "native")]
 #[test]
 fn the_state_is_saved_before_its_actions() {
     let (seller, _, _) = locked().nex_locked();
@@ -2631,6 +2688,7 @@ fn the_swap_file_is_its_owners_alone() {
 
 /// One driver at a time runs a swap: a second refuses while the first
 /// lives.
+#[cfg(feature = "native")]
 #[test]
 fn a_swap_runs_in_one_driver_at_a_time() {
     let directory = tempfile::tempdir().unwrap();
@@ -2670,6 +2728,7 @@ fn terms_whose_nex_debit_does_not_fit_are_refused() {
 
 /// Near its deadline a bump that keeps failing, or that is clamped to
 /// `max_fee_rate`, is logged at every block, not once.
+#[cfg(feature = "native")]
 #[test]
 fn an_urgent_bump_in_trouble_is_logged_at_every_block() {
     let locked = locked();
@@ -3086,6 +3145,7 @@ fn a_late_refund_is_contested_with_no_redeem_held() {
 
 /// The driver bumps a punish the mempool refused against a pooled refund,
 /// at the floor that replaces it.
+#[cfg(feature = "native")]
 #[test]
 fn a_punish_against_a_late_refund_is_bumped() {
     let (seller, _, [_, cancel, refund]) = seller_claiming_beside_a_redeem();
@@ -3111,6 +3171,7 @@ fn a_punish_against_a_late_refund_is_bumped() {
 
 /// A clock that goes back neither panics nor counts as time gone by: a
 /// stale spell and a logged failure are timed from none.
+#[cfg(feature = "native")]
 #[test]
 fn a_clock_that_goes_back_does_not_panic() {
     let locked = locked();
@@ -3148,8 +3209,10 @@ fn a_sent_redeem_gone_from_the_view_goes_out_with_cancel_once_due() {
 
 /// Hands the driver `inbox`, a message at a time, and takes whatever it
 /// sends.
+#[cfg(feature = "native")]
 struct Inbox(Vec<Vec<u8>>);
 
+#[cfg(feature = "native")]
 impl Transport for Inbox {
     fn send(&mut self, _: &[u8]) -> std::io::Result<()> {
         Ok(())
@@ -3162,6 +3225,7 @@ impl Transport for Inbox {
 /// The buyer's driver funds the lock at bitcoind's estimate while it has
 /// one, and at `fallback_fee_rate`, whatever it is set to, while it has
 /// none: never at the wallet's own estimate, which a fresh node lacks.
+#[cfg(feature = "native")]
 #[test]
 fn the_lock_is_funded_at_the_estimate_or_the_fallback_rate() {
     let funded = |estimate: Option<u32>, fallback: u32| {
