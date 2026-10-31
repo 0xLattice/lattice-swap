@@ -38,6 +38,31 @@ no Nexus consensus change is required.
   `-- --ignored`.
 - `lattice-swap`: the command line tool that runs one side of a swap.
 
+## Install
+
+Download the archive for your platform from
+[Releases](https://github.com/0xLattice/lattice-swap/releases):
+`lattice-swap-<version>-<target>.tar.gz` for `x86_64-unknown-linux-gnu`,
+`aarch64-unknown-linux-gnu` or `aarch64-apple-darwin`. Check it against its
+`.sha256` file or `SHA256SUMS`, then unpack it:
+
+```sh
+shasum -a 256 -c lattice-swap-<version>-<target>.tar.gz.sha256
+tar -xzf lattice-swap-<version>-<target>.tar.gz
+```
+
+The Linux binaries link glibc dynamically and are built on Ubuntu 24.04, so
+they need glibc 2.39 or later. Each archive carries a build provenance
+attestation: `gh attestation verify <archive> --repo 0xLattice/lattice-swap`.
+
+Or build from source with Rust 1.89 or later:
+
+```sh
+cargo build --release -p lattice-swap
+```
+
+The binary is `target/release/lattice-swap`.
+
 ## Usage
 
 Each party runs its own bitcoind with `-txindex` and a wallet, and its own
