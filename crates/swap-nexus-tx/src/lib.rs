@@ -31,6 +31,23 @@ pub fn cid(dag_cbor: &[u8]) -> String {
     format!("b{}", base32.to_ascii_lowercase())
 }
 
+/// Whether `text` is spelled exactly as [`cid`] spells a CID, as every
+/// address and transaction CID is.
+pub fn is_cid(text: &str) -> bool {
+    let Some(base32) = text.strip_prefix('b') else {
+        return false;
+    };
+    if !base32
+        .bytes()
+        .all(|c| matches!(c, b'a'..=b'z' | b'2'..=b'7'))
+    {
+        return false;
+    }
+    data_encoding::BASE32_NOPAD
+        .decode(base32.to_ascii_uppercase().as_bytes())
+        .is_ok_and(|binary| binary.len() == 36 && binary.starts_with(&[0x01, 0x71, 0x12, 0x20]))
+}
+
 /// The Multikey hex Lattice names an Ed25519 key by.
 pub fn multikey_hex(public_key: &[u8; 32]) -> String {
     format!("{ED25519_MULTIKEY_PREFIX}{}", hex::encode(public_key))

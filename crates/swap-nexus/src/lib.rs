@@ -103,11 +103,20 @@ impl Drop for JointKey {
 }
 
 fn sign_with_scalar(secret: &Scalar, public: &CompressedEdwardsY, message: &[u8]) -> [u8; 64] {
+    let mut entropy = Zeroizing::new([0u8; 32]);
+    OsRng.fill_bytes(entropy.as_mut_slice());
+    sign_with_entropy(secret, public, message, &entropy)
+}
+
+fn sign_with_entropy(
+    secret: &Scalar,
+    public: &CompressedEdwardsY,
+    message: &[u8],
+    entropy: &[u8; 32],
+) -> [u8; 64] {
     // The nonce mixes fresh randomness with the key and message, so it is
     // never reused even if the random source repeats. A reused nonce would
     // leak the joint key.
-    let mut entropy = [0u8; 32];
-    OsRng.fill_bytes(&mut entropy);
     let secret_bytes = Zeroizing::new(secret.to_bytes());
     let mut nonce = Scalar::from_hash(
         Sha512::new()
@@ -115,7 +124,6 @@ fn sign_with_scalar(secret: &Scalar, public: &CompressedEdwardsY, message: &[u8]
             .chain_update(secret_bytes.as_slice())
             .chain_update(message),
     );
-    entropy.zeroize();
 
     let r = (&nonce * ED25519_BASEPOINT_TABLE).compress();
     let k = Scalar::from_hash(
@@ -196,6 +204,18 @@ mod tests {
     fn nonces_are_fresh() {
         let joint = JointKey::from_shares(&KeyShare::random(), &KeyShare::random());
         assert_ne!(joint.sign(MESSAGE)[..32], joint.sign(MESSAGE)[..32]);
+    }
+
+    #[test]
+    fn nonces_differ_even_if_the_entropy_repeats() {
+        let (a, b) = (KeyShare::random(), KeyShare::random());
+        let public = JointKey::from_shares(&a, &b).public;
+        let entropy = [7u8; 32];
+        let r = |secret: &Scalar, message: &[u8]| {
+            sign_with_entropy(secret, &public, message, &entropy)[..32].to_vec()
+        };
+        assert_ne!(r(&a.0, MESSAGE), r(&a.0, b"lattice-tx-v1:other"));
+        assert_ne!(r(&a.0, MESSAGE), r(&b.0, MESSAGE));
     }
 
     #[test]

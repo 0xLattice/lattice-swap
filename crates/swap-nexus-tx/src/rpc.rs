@@ -28,6 +28,9 @@ pub enum Error {
     Transport(String),
     /// A 2xx answer without the expected field.
     Malformed(String),
+    /// An address or transaction CID not spelled as [`crate::cid`] spells
+    /// one. It is refused before any request, so it never reaches the URL.
+    NotCid(String),
 }
 
 impl fmt::Display for Error {
@@ -36,6 +39,7 @@ impl fmt::Display for Error {
             Error::Status { status, body } => write!(f, "node answered {status}: {body}"),
             Error::Transport(e) => write!(f, "node unreachable: {e}"),
             Error::Malformed(e) => write!(f, "unexpected node answer: {e}"),
+            Error::NotCid(text) => write!(f, "not a CID: {text:?}"),
         }
     }
 }
@@ -157,7 +161,7 @@ impl Client {
     /// address it has never seen; a 404 means it has no executed tip (or is
     /// not a node of this version), so it stays an error.
     pub fn account(&self, address: &str) -> Result<Account> {
-        let json = self.get(&format!("/api/state/account/{address}"))?;
+        let json = self.get(&format!("/api/state/account/{}", cid_path(address)?))?;
         Ok(Account {
             balance: decimal(&json, "balance")?,
             nonce: decimal(&json, "nonce")?,
@@ -182,7 +186,8 @@ impl Client {
     /// The transaction `transaction_cid` names, or `None` if the node does not
     /// hold it (404: never seen, or not stored here).
     pub fn transaction(&self, transaction_cid: &str) -> Result<Option<TransactionStatus>> {
-        let json = match self.get(&format!("/api/transaction/{transaction_cid}")) {
+        let path = format!("/api/transaction/{}", cid_path(transaction_cid)?);
+        let json = match self.get(&path) {
             Ok(json) => json,
             Err(Error::Status { status: 404, .. }) => return Ok(None),
             Err(e) => return Err(e),
@@ -262,6 +267,14 @@ impl Client {
                 .set("Authorization", &self.authorization)
                 .call(),
         )
+    }
+}
+
+fn cid_path(text: &str) -> Result<&str> {
+    if crate::is_cid(text) {
+        Ok(text)
+    } else {
+        Err(Error::NotCid(text.into()))
     }
 }
 
@@ -346,18 +359,67 @@ mod tests {
             "nonce": "0",
             "chainPath": ["Nexus"],
         });
+        let cid = crate::cid(b"transaction");
         let status = answering(answer.clone())
-            .transaction("cid")
+            .transaction(&cid)
             .unwrap()
             .unwrap();
         assert_eq!(status.body.account_actions[0].delta, 5);
         for kind in ["depositActions", "receiptActions", "withdrawalActions"] {
             let mut answer = answer.clone();
             answer[kind] = serde_json::json!([{}]);
-            let result = answering(answer).transaction("cid");
+            let result = answering(answer).transaction(&cid);
             assert!(
                 matches!(result, Err(Error::Malformed(_))),
                 "{kind}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_canonical_cids_reach_the_url() {
+        let cid = crate::cid(b"transaction");
+        assert_eq!(cid.len(), 59);
+        let address = crate::address(&[7; 32]);
+        let account = serde_json::json!({"balance": "5", "nonce": "1"});
+        assert_eq!(answering(account).account(&address).unwrap().balance, 5);
+        let bad = [
+            format!("../{cid}"),
+            format!("{}../", &cid[..56]),
+            format!("{cid}?x=1"),
+            format!("{}?", &cid[..58]),
+            format!("{}#", &cid[..58]),
+            format!("{}/", &cid[..58]),
+            cid[..58].into(),
+            format!("{cid}a"),
+            format!("{cid}aaaaaaaa"),
+            cid.to_ascii_uppercase(),
+            format!("b{}", cid[1..].to_ascii_uppercase()),
+            format!("B{}", &cid[1..]),
+            format!("z{}", &cid[1..]),
+            String::new(),
+            "b".into(),
+            // A CID, but of raw bytes, not dag-cbor.
+            format!(
+                "b{}",
+                data_encoding::BASE32_NOPAD
+                    .encode(&[[0x01, 0x55, 0x12, 0x20].as_slice(), &[0; 32]].concat())
+                    .to_ascii_lowercase()
+            ),
+        ];
+        // Unreachable: a refused CID never makes a request.
+        let client = Client::new("http://127.0.0.1:9", "", Duration::from_secs(1));
+        for text in &bad {
+            assert!(!crate::is_cid(text), "{text}");
+            let result = client.account(text);
+            assert!(
+                matches!(result, Err(Error::NotCid(_))),
+                "{text}: {result:?}"
+            );
+            let result = client.transaction(text);
+            assert!(
+                matches!(result, Err(Error::NotCid(_))),
+                "{text}: {result:?}"
             );
         }
     }

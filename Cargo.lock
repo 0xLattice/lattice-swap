@@ -1383,6 +1383,7 @@ dependencies = [
  "sha2",
  "sigma_fun",
  "swap-nexus",
+ "zeroize",
 ]
 
 [[package]]
