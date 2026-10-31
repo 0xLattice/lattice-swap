@@ -296,10 +296,14 @@ fn warn(what: &str) {
     eprintln!("lattice-swap: {what}");
 }
 
-/// Only the swap's own transactions can spend the lock and cancel outputs,
-/// and their txids are fixed before any is signed, so each is looked up by
-/// txid.
-fn bitcoin_view(
+/// Only the swap's own transactions can spend the lock output, and their
+/// txids are fixed before any is signed, so each is looked up by txid. The
+/// same holds for the cancel output but for punish: its leaf takes the
+/// seller's signature alone, so the seller can spend through it with any
+/// transaction. Only when cancel is in a block, neither refund nor punish
+/// shows, and the cancel output is spent anyway, is the spender searched
+/// for.
+pub fn bitcoin_view(
     bitcoin: &impl Bitcoin,
     swap: &Swap,
     lock: OutPoint,
@@ -316,7 +320,18 @@ fn bitcoin_view(
         Ok(None)
     };
     let lock_spend = spent([Spend::Redeem, Spend::Cancel])?;
-    let cancel_spend = spent([Spend::Refund, Spend::Punish])?;
+    let mut cancel_spend = spent([Spend::Refund, Spend::Punish])?;
+    let cancel = swap.unsigned_tx(lock, Spend::Cancel).compute_txid();
+    if let Some(Spent { tx, confirmations }) = &lock_spend {
+        if cancel_spend.is_none() && *confirmations > 0 && tx.compute_txid() == cancel {
+            // Punish can be mined no earlier than `t2` blocks after cancel.
+            let mined = (height + 1).saturating_sub(*confirmations);
+            let from = mined + u32::from(swap.params().t2);
+            cancel_spend = bitcoin
+                .spender(OutPoint::new(cancel, 0), from)?
+                .map(|(tx, confirmations)| Spent { tx, confirmations });
+        }
+    }
     Ok(BitcoinView {
         height,
         funding,

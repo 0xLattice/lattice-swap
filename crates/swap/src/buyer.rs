@@ -355,7 +355,7 @@ impl BuyerLocked {
             // Once the seller holds our redeem signature, a seller that
             // orphans the block could do just that, so cancel must be
             // `btc_confirmations` deep.
-            Some((_, cancel_depth)) => match setup.spend(self.lock, &view.cancel_spend) {
+            Some((_, cancel_depth)) => match &view.cancel_spend {
                 None if cancel_depth >= self.refund_depth(&redeem) => {
                     let swap = setup.swap();
                     let seller = setup.decrypt(&self.refund);
@@ -365,13 +365,17 @@ impl BuyerLocked {
                         .expect("the seller's adaptor signature was verified");
                     actions.push(Action::Broadcast(refund));
                 }
-                Some((Spend::Refund, depth)) if depth >= terms.btc_confirmations => {
-                    return (Buyer::Done(Outcome::Refunded), vec![]);
+                None => {}
+                // Anything but our refund is the seller's punish: its leaf
+                // takes the seller's signature alone, on any transaction.
+                Some(spent) if spent.confirmations >= terms.btc_confirmations => {
+                    let outcome = match setup.spend(self.lock, &view.cancel_spend) {
+                        Some((Spend::Refund, _)) => Outcome::Refunded,
+                        _ => Outcome::Punished,
+                    };
+                    return (Buyer::Done(outcome), vec![]);
                 }
-                Some((Spend::Punish, depth)) if depth >= terms.btc_confirmations => {
-                    return (Buyer::Done(Outcome::Punished), vec![]);
-                }
-                _ => {}
+                Some(_) => {}
             },
         }
         (

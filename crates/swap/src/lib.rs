@@ -33,7 +33,10 @@
 //! the lock can still land until the seller's nonce passes `n`. If its node
 //! refused that lock for good, the operator ends the wait by spending once
 //! from the seller's Nexus wallet, at nonce `n`, with any transaction. Once
-//! that is mined the lock can never land, and the swap ends `Refunded`.
+//! that is mined, and the seller's node still shows it after the tip has
+//! moved `nex_confirmations` blocks, the lock can never land, and the swap
+//! ends `Refunded`. Until then a reorg could take that spend back and let
+//! the lock land.
 //!
 //! A buyer whose node never shows its funding transaction rebroadcasts it
 //! and waits, keeping its secrets: other nodes may still hold the funding
@@ -547,7 +550,8 @@ enum Lock {
     /// The seller never signed one: an empty lock stays empty.
     Unsigned,
     /// The seller signed one at this nonce of its own. It can still land
-    /// until the seller's nonce moves past it.
+    /// until the seller's nonce moves past it, and stays past it
+    /// `nex_confirmations` blocks.
     Signed(u64),
     /// The buyer saw it confirmed: it is waited for.
     Seen,
@@ -561,6 +565,11 @@ pub struct Claim {
     #[serde(with = "hex::serde")]
     other: [u8; 32],
     lock: Lock,
+    /// The Nexus tip height at which a synced node first showed a `Signed`
+    /// lock that can no longer land: the seller's nonce past it, and the
+    /// lock address short of `nex_amount`. Cleared once it shows otherwise.
+    #[serde(default)]
+    passed_at: Option<u64>,
     /// The claim, signed once and submitted again, byte for byte, until it
     /// is mined. The joint key signs with fresh randomness: signed again,
     /// it would be another transaction under another CID.
@@ -584,6 +593,7 @@ impl Claim {
             setup,
             other,
             lock,
+            passed_at: None,
             claim: None,
         }
     }
@@ -625,14 +635,23 @@ impl Claim {
             return Claimed::Pending(self, vec![Action::Submit(claim)]);
         }
         // Below `nex_amount` the lock never landed: anyone may send it dust.
-        let empty = view.lock.balance < terms.nex_amount
-            && match self.lock {
-                Lock::Unsigned => true,
-                // The seller's nonce moved past its lock, which did not credit
-                // the lock address: the lock can never land.
-                Lock::Signed(nonce) => view.own.nonce > nonce,
-                Lock::Seen => false,
-            };
+        let short = view.lock.balance < terms.nex_amount;
+        let empty = match self.lock {
+            Lock::Unsigned => short,
+            // The seller's nonce moved past its lock, which did not credit
+            // the lock address: the lock can never land, unless a reorg takes
+            // back what moved the nonce. That must hold `nex_confirmations`
+            // blocks of the tip.
+            Lock::Signed(nonce) if short && view.own.nonce > nonce => {
+                let since = *self.passed_at.get_or_insert(view.health.height);
+                view.health.height >= since + terms.nex_confirmations
+            }
+            Lock::Signed(_) => {
+                self.passed_at = None;
+                false
+            }
+            Lock::Seen => false,
+        };
         if empty {
             Claimed::Empty
         } else {
