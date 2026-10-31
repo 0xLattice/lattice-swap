@@ -222,7 +222,9 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
             return Ok(());
         };
         match nexus_view(&self.nexus, &watch) {
-            Ok(view) => self.apply(Event::Nexus(view)),
+            Ok(Some(view)) => self.apply(Event::Nexus(view)),
+            // The tip moved while the view was read: read again next time.
+            Ok(None) => Ok(()),
             Err(e) => {
                 warn(&format!("nexus: {e}"));
                 Ok(())
@@ -296,10 +298,14 @@ fn warn(what: &str) {
     eprintln!("lattice-swap: {what}");
 }
 
-/// Only the swap's own transactions can spend the lock and cancel outputs,
-/// and their txids are fixed before any is signed, so each is looked up by
-/// txid.
-fn bitcoin_view(
+/// Only the swap's own transactions can spend the lock output, and their
+/// txids are fixed before any is signed, so each is looked up by txid. The
+/// same holds for the cancel output but for punish: its leaf takes the
+/// seller's signature alone, so the seller can spend through it with any
+/// transaction. Only when cancel is in a block, neither refund nor punish
+/// shows, and the cancel output is spent anyway, is the spender searched
+/// for.
+pub fn bitcoin_view(
     bitcoin: &impl Bitcoin,
     swap: &Swap,
     lock: OutPoint,
@@ -316,7 +322,18 @@ fn bitcoin_view(
         Ok(None)
     };
     let lock_spend = spent([Spend::Redeem, Spend::Cancel])?;
-    let cancel_spend = spent([Spend::Refund, Spend::Punish])?;
+    let mut cancel_spend = spent([Spend::Refund, Spend::Punish])?;
+    let cancel = swap.unsigned_tx(lock, Spend::Cancel).compute_txid();
+    if let Some(Spent { tx, confirmations }) = &lock_spend {
+        if cancel_spend.is_none() && *confirmations > 0 && tx.compute_txid() == cancel {
+            // Punish can be mined no earlier than `t2` blocks after cancel.
+            let mined = (height + 1).saturating_sub(*confirmations);
+            let from = mined + u32::from(swap.params().t2);
+            cancel_spend = bitcoin
+                .spender(OutPoint::new(cancel, 0), from)?
+                .map(|(tx, confirmations)| Spent { tx, confirmations });
+        }
+    }
     Ok(BitcoinView {
         height,
         funding,
@@ -327,8 +344,14 @@ fn bitcoin_view(
 
 /// The lock account is read before the watched transaction: a lock that
 /// has signed something, read first, shows that transaction mined in the
-/// later read if it is ours.
-fn nexus_view(client: &Client, watch: &NexusWatch) -> swap_nexus_tx::rpc::Result<NexusView> {
+/// later read if it is ours. The view is one tip's: `None` if the tip
+/// moved while it was read, so no read in it comes from another block.
+/// That needs the operator port, whose `/health` is never cached; a public
+/// read port caches it, and would let the reads straddle two tips.
+fn nexus_view(
+    client: &Client,
+    watch: &NexusWatch,
+) -> swap_nexus_tx::rpc::Result<Option<NexusView>> {
     let health = client.health()?;
     let own = client.account(&watch.own_address)?;
     let lock = client.account(&watch.lock_address)?;
@@ -340,11 +363,20 @@ fn nexus_view(client: &Client, watch: &NexusWatch) -> swap_nexus_tx::rpc::Result
         },
         None => None,
     };
-    Ok(NexusView {
+    let block_at = match watch.block_at {
+        Some(height) => client.block_hash(height)?,
+        None => None,
+    };
+    let after = client.health()?;
+    if (after.height, &after.tip) != (health.height, &health.tip) {
+        return Ok(None);
+    }
+    Ok(Some(NexusView {
         health,
         own,
         lock,
         min_relay_fee,
         watched,
-    })
+        block_at,
+    }))
 }

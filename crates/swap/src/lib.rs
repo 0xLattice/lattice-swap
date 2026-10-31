@@ -33,7 +33,10 @@
 //! the lock can still land until the seller's nonce passes `n`. If its node
 //! refused that lock for good, the operator ends the wait by spending once
 //! from the seller's Nexus wallet, at nonce `n`, with any transaction. Once
-//! that is mined the lock can never land, and the swap ends `Refunded`.
+//! that is mined, and the seller's node still shows it after the tip has
+//! moved `nex_confirmations` blocks without a reorg below where it was first
+//! seen, the lock can never land, and the swap ends `Refunded`. Until then a
+//! reorg could take that spend back and let the lock land.
 //!
 //! A buyer whose node never shows its funding transaction rebroadcasts it
 //! and waits, keeping its secrets: other nodes may still hold the funding
@@ -258,6 +261,9 @@ pub struct NexusView {
     /// The transaction the machine watches, if it watches one and the node
     /// holds it, with its confirmations.
     pub watched: Option<(TransactionStatus, Option<u64>)>,
+    /// The CID of the canonical block at [`NexusWatch::block_at`], if the
+    /// machine asked for one and the node has it.
+    pub block_at: Option<String>,
 }
 
 /// How a swap ended.
@@ -547,7 +553,8 @@ enum Lock {
     /// The seller never signed one: an empty lock stays empty.
     Unsigned,
     /// The seller signed one at this nonce of its own. It can still land
-    /// until the seller's nonce moves past it.
+    /// until the seller's nonce moves past it, and stays past it
+    /// `nex_confirmations` blocks on one chain.
     Signed(u64),
     /// The buyer saw it confirmed: it is waited for.
     Seen,
@@ -561,6 +568,12 @@ pub struct Claim {
     #[serde(with = "hex::serde")]
     other: [u8; 32],
     lock: Lock,
+    /// The Nexus tip, height and block CID, at which a synced node first
+    /// showed a `Signed` lock that can no longer land: the seller's nonce
+    /// past it, and the lock address short of `nex_amount`. Cleared once it
+    /// shows otherwise, or that block leaves the canonical chain.
+    #[serde(default)]
+    passed_at: Option<(u64, String)>,
     /// The claim, signed once and submitted again, byte for byte, until it
     /// is mined. The joint key signs with fresh randomness: signed again,
     /// it would be another transaction under another CID.
@@ -584,6 +597,7 @@ impl Claim {
             setup,
             other,
             lock,
+            passed_at: None,
             claim: None,
         }
     }
@@ -625,14 +639,34 @@ impl Claim {
             return Claimed::Pending(self, vec![Action::Submit(claim)]);
         }
         // Below `nex_amount` the lock never landed: anyone may send it dust.
-        let empty = view.lock.balance < terms.nex_amount
-            && match self.lock {
-                Lock::Unsigned => true,
-                // The seller's nonce moved past its lock, which did not credit
-                // the lock address: the lock can never land.
-                Lock::Signed(nonce) => view.own.nonce > nonce,
-                Lock::Seen => false,
-            };
+        let short = view.lock.balance < terms.nex_amount;
+        let empty = match self.lock {
+            Lock::Unsigned => short,
+            // The seller's nonce moved past its lock, which did not credit
+            // the lock address: the lock can never land, unless a reorg takes
+            // back what moved the nonce. That must hold `nex_confirmations`
+            // blocks of the tip. A reorg below the tip it was first seen at,
+            // even one between two views, replaces that block: the count
+            // starts again.
+            Lock::Signed(nonce) if short && view.own.nonce > nonce => {
+                let reorged = self
+                    .passed_at
+                    .as_ref()
+                    .is_some_and(|(_, tip)| view.block_at.as_ref() != Some(tip));
+                if reorged || self.passed_at.is_none() {
+                    let tip = view.health.tip.clone();
+                    self.passed_at = tip.map(|tip| (view.health.height, tip));
+                }
+                self.passed_at
+                    .as_ref()
+                    .is_some_and(|(since, _)| view.health.height >= since + terms.nex_confirmations)
+            }
+            Lock::Signed(_) => {
+                self.passed_at = None;
+                false
+            }
+            Lock::Seen => false,
+        };
         if empty {
             Claimed::Empty
         } else {
@@ -657,9 +691,13 @@ impl Claim {
     }
 
     fn watch(&self) -> Watch {
+        let mut nexus = self.setup.watch_nexus(self.claim.as_ref().map(|c| c.cid()));
+        if let Some(watch) = &mut nexus {
+            watch.block_at = self.passed_at.as_ref().map(|(height, _)| *height);
+        }
         Watch {
             bitcoin: None,
-            nexus: self.setup.watch_nexus(self.claim.as_ref().map(|c| c.cid())),
+            nexus,
         }
     }
 }
@@ -688,6 +726,8 @@ pub struct NexusWatch {
     pub own_address: String,
     /// The transaction to report in [`NexusView::watched`].
     pub cid: Option<String>,
+    /// The height whose block to report in [`NexusView::block_at`].
+    pub block_at: Option<u64>,
 }
 
 impl Setup {
@@ -696,6 +736,7 @@ impl Setup {
             lock_address: self.lock_address(),
             own_address: self.nex_address.clone(),
             cid,
+            block_at: None,
         })
     }
 }

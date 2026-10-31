@@ -523,7 +523,8 @@ fn seller_never_locks_nex() {
     world.drive(Pace::Steady, true, || finished(&buyer));
     assert_eq!(outcome(buyer).0, Some(Outcome::Refunded));
     // The seller signed a lock at nonce 0, so it cannot tell it will never
-    // land, and keeps the shares to claim it, until its nonce moves on.
+    // land, and keeps the shares to claim it, until its nonce moves on and
+    // stays moved `nex_confirmations` blocks.
     assert!(!finished(&seller));
     let n = &world.nexus;
     let seller_nex = world.seller_nex.nex_address();
@@ -534,7 +535,15 @@ fn seller_never_locks_nex() {
     let mut spend = Transaction::new(body);
     spend.sign(&SigningKey::from_bytes(&world.seller_nex.0));
     n.client().submit(&spend).unwrap();
-    world.drive(Pace::OnDemand, true, || finished(&seller));
+    // The seller ends only once that spend has stayed mined while the tip
+    // moved `nex_confirmations` blocks, so Nexus mines with an empty pool.
+    wait_for("the seller to end", || {
+        if finished(&seller) {
+            return Some(());
+        }
+        n.mine(None);
+        None
+    });
     assert_eq!(outcome(seller).0, Some(Outcome::Refunded));
 
     assert_eq!(n.balance(&world.buyer_nex), 0);

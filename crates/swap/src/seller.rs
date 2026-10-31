@@ -435,10 +435,17 @@ impl SellerLocked {
                         return (Seller::ClaimingNex(claim), vec![]);
                     }
                 }
-                Some((Spend::Punish, depth)) if depth >= terms.btc_confirmations => {
+                // Anything but the refund is our punish: its leaf takes our
+                // signature alone, on any transaction. Unconfirmed, it is
+                // waited for; another punish would only conflict with it.
+                _ if view
+                    .cancel_spend
+                    .as_ref()
+                    .is_some_and(|spent| spent.confirmations >= terms.btc_confirmations) =>
+                {
                     return (Seller::Done(Outcome::Punished), vec![]);
                 }
-                None if cancel_depth >= u32::from(terms.t2) => {
+                None if view.cancel_spend.is_none() && cancel_depth >= u32::from(terms.t2) => {
                     let swap = setup.swap();
                     let key = setup.secrets.key();
                     let signature = swap.sign(self.lock, Spend::Punish, &key);

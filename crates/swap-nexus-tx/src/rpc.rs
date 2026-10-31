@@ -61,6 +61,8 @@ pub struct Health {
     pub height: u64,
     /// Height of the best header chain the node knows; `None` before any.
     pub best_header_height: Option<u64>,
+    /// CID of the block at `height`; `None` before any.
+    pub tip: Option<String>,
 }
 
 /// A transaction the node holds, as `GET /api/transaction/:cid` shows it.
@@ -127,7 +129,22 @@ impl Client {
                 .into(),
             height: decimal(&json, "height")?,
             best_header_height,
+            tip: json["tipCID"].as_str().map(String::from),
         })
+    }
+
+    /// The CID of the canonical block at `height`, or `None` if the node has
+    /// none there (404).
+    pub fn block_hash(&self, height: u64) -> Result<Option<String>> {
+        let json = match self.get(&format!("/api/block/{height}")) {
+            Ok(json) => json,
+            Err(Error::Status { status: 404, .. }) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        json["hash"]
+            .as_str()
+            .map(|hash| Some(hash.into()))
+            .ok_or_else(|| Error::Malformed(format!("no hash in {json}")))
     }
 
     /// The smallest fee this node pools: a whole-transaction amount (debits
@@ -302,6 +319,20 @@ mod tests {
             stream.write_all(body.as_bytes()).unwrap();
         });
         Client::new(&url, "cookie", Duration::from_secs(5))
+    }
+
+    #[test]
+    fn the_tip_and_a_block_are_named_by_cid() {
+        let health = serde_json::json!({"phase": "active", "height": "7", "tipCID": "bafytip"});
+        assert_eq!(
+            answering(health).health().unwrap().tip,
+            Some("bafytip".into())
+        );
+        let block = serde_json::json!({"height": "7", "hash": "bafytip"});
+        assert_eq!(
+            answering(block).block_hash(7).unwrap(),
+            Some("bafytip".into())
+        );
     }
 
     #[test]

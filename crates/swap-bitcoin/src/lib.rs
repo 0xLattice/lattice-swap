@@ -279,7 +279,25 @@ impl Swap {
 
     /// BIP341 script-path sighash (`SIGHASH_DEFAULT`) of the spend.
     pub fn sighash(&self, lock: OutPoint, spend: Spend) -> [u8; 32] {
-        let tx = self.unsigned_tx(lock, spend);
+        self.sighash_of(&self.unsigned_tx(lock, spend), spend)
+    }
+
+    /// `tx`, whose one input spends the cancel output, signed by the seller
+    /// alone through the punish leaf. That leaf takes no other signature, so
+    /// the seller can sign any such transaction, whatever it pays, and not
+    /// only the punish that [`Swap::finalize`] builds. For tests: it checks
+    /// nothing, and panics if `tx` has no input.
+    #[doc(hidden)]
+    pub fn sign_punish_leaf(&self, mut tx: Transaction, key: &KeyPair<EvenY>) -> Transaction {
+        let sighash = self.sighash_of(&tx, Spend::Punish);
+        let signature = self.schnorr.sign(key, Message::raw(&sighash));
+        tx.input[0].witness = self.witness(Spend::Punish, signature.to_bytes(), None);
+        tx
+    }
+
+    /// The sighash of `tx`, whose one input spends what `spend` spends,
+    /// through the same leaf.
+    fn sighash_of(&self, tx: &Transaction, spend: Spend) -> [u8; 32] {
         let script_pubkey = match spend {
             Spend::Redeem | Spend::Cancel => self.lock_script_pubkey(),
             Spend::Refund | Spend::Punish => self.cancel_output(),
@@ -289,7 +307,7 @@ impl Swap {
             script_pubkey,
         };
         let leaf_hash = TapLeafHash::from_script(self.leaf(spend), LeafVersion::TapScript);
-        SighashCache::new(&tx)
+        SighashCache::new(tx)
             .taproot_script_spend_signature_hash(
                 0,
                 &Prevouts::All(&[prevout]),

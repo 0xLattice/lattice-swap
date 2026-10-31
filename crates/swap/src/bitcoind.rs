@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use base64::Engine;
 use bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
-use bitcoin::{Address, Amount, Denomination, Network, Script, Transaction, Txid};
+use bitcoin::{Address, Amount, Block, Denomination, Network, OutPoint, Script, Transaction, Txid};
 use serde_json::{json, Value};
 
 #[derive(Debug)]
@@ -29,13 +29,18 @@ pub trait Bitcoin {
     /// confirmations (0 in the mempool); `None` if the node knows neither,
     /// as for a transaction only in a block that left the active chain.
     fn transaction(&self, txid: Txid) -> Result<Option<(Transaction, u32)>>;
+    /// What spends `outpoint`, in the mempool or in a block at `from` or
+    /// above, with its confirmations; `None` if the mempool and the chain
+    /// show `outpoint` unspent, or no such spend is found.
+    fn spender(&self, outpoint: OutPoint, from: u32) -> Result<Option<(Transaction, u32)>>;
     /// A transaction from the wallet paying `amount` to `script`, signed but
     /// not broadcast.
     fn fund_lock(&self, script: &Script, amount: Amount) -> Result<Transaction>;
 }
 
 /// bitcoind's JSON-RPC. `transaction` reads any transaction, so the node
-/// needs `-txindex`; `fund_lock` needs a wallet, so `url` names one
+/// needs `-txindex`; `spender` calls `gettxspendingprevout`, so it needs
+/// Bitcoin Core 24 or later; `fund_lock` needs a wallet, so `url` names one
 /// (`http://host:port/wallet/<name>`).
 pub struct Bitcoind {
     agent: ureq::Agent,
@@ -117,6 +122,33 @@ impl Bitcoin for Bitcoind {
             Err(Error(e)) if e.contains("\"code\":-5") => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    fn spender(&self, outpoint: OutPoint, from: u32) -> Result<Option<(Transaction, u32)>> {
+        let (txid, vout) = (outpoint.txid, outpoint.vout);
+        if !self.call("gettxout", json!([txid, vout, true]))?.is_null() {
+            return Ok(None);
+        }
+        let pooled = self.call(
+            "gettxspendingprevout",
+            json!([[{"txid": txid, "vout": vout}]]),
+        )?;
+        if let Some(spender) = pooled[0]["spendingtxid"].as_str() {
+            let spender = spender
+                .parse()
+                .map_err(|e| Error(format!("txid {spender}: {e}")))?;
+            return self.transaction(spender);
+        }
+        let tip = self.height()?;
+        for height in from..=tip {
+            let hash = self.call("getblockhash", json!([height]))?;
+            let block: Block = decode(&self.call("getblock", json!([hash, 0]))?)?;
+            let spends = |tx: &&Transaction| tx.input.iter().any(|i| i.previous_output == outpoint);
+            if let Some(tx) = block.txdata.iter().find(spends) {
+                return Ok(Some((tx.clone(), tip - height + 1)));
+            }
+        }
+        Ok(None)
     }
 
     fn fund_lock(&self, script: &Script, amount: Amount) -> Result<Transaction> {

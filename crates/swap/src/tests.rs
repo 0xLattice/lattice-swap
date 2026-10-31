@@ -118,10 +118,18 @@ fn btc(
 }
 
 fn healthy() -> Health {
+    synced_at(10)
+}
+
+/// The CID the made-up Nexus chain shows at every height: it never reorgs.
+const BLOCK: &str = "bafyblock";
+
+fn synced_at(height: u64) -> Health {
     Health {
         phase: "active".into(),
-        height: 10,
-        best_header_height: Some(10),
+        height,
+        best_header_height: Some(height),
+        tip: Some(BLOCK.into()),
     }
 }
 
@@ -148,6 +156,7 @@ fn nexus_at(
         lock,
         min_relay_fee: 0,
         watched,
+        block_at: Some(BLOCK.into()),
     })
 }
 
@@ -175,7 +184,7 @@ fn mined(body: TransactionBody, depth: u64) -> Option<(TransactionStatus, Option
         body,
         block: Some(Inclusion {
             height: 10 + 1 - depth,
-            hash: "bafyblock".into(),
+            hash: BLOCK.into(),
         }),
     };
     Some((status, Some(depth)))
@@ -662,10 +671,13 @@ fn a_lock_whose_answer_was_lost_is_still_claimed_back() {
     assert!(actions.is_empty());
     assert_eq!(seller.outcome(), None, "the node is still syncing");
 
-    // Once the seller's nonce has passed it with nothing at the lock, it
-    // never will.
+    // Once the seller's nonce has passed it with nothing at the lock, for
+    // `nex_confirmations` blocks, it never will.
     let passed = nexus_at(healthy(), account(0, 4), account(0, 0), None);
     let (done, _) = seller.clone().step(passed);
+    assert_eq!(done.outcome(), None, "not yet a block deep");
+    let deeper = nexus_at(synced_at(11), account(0, 4), account(0, 0), None);
+    let (done, _) = done.step(deeper);
     assert_eq!(done.outcome(), Some(Outcome::Refunded));
 
     // The lock lands: the seller claims it back.
@@ -957,6 +969,13 @@ fn a_swap_cannot_be_started_twice() {
         fn transaction(&self, _: Txid) -> crate::bitcoind::Result<Option<(Transaction, u32)>> {
             unreachable!()
         }
+        fn spender(
+            &self,
+            _: OutPoint,
+            _: u32,
+        ) -> crate::bitcoind::Result<Option<(Transaction, u32)>> {
+            unreachable!()
+        }
         fn fund_lock(&self, _: &Script, _: Amount) -> crate::bitcoind::Result<Transaction> {
             unreachable!()
         }
@@ -1024,8 +1043,9 @@ fn dust_does_not_keep_an_empty_lock_open() {
     assert_eq!(seller.outcome(), Some(Outcome::Refunded));
 }
 
-/// A lock that landed but would cost more to claim than it holds is not
-/// empty: the seller keeps its shares.
+/// A lock holding `nex_amount`, while the node's relay fee would take all
+/// of it, is neither claimed nor empty: the seller submits nothing and keeps
+/// waiting with its shares.
 #[test]
 fn a_lock_too_small_to_claim_is_not_empty() {
     let locked = locked();
@@ -1039,6 +1059,7 @@ fn a_lock_too_small_to_claim_is_not_empty() {
         lock: account(500_000, 0),
         min_relay_fee: 500_000,
         watched: None,
+        block_at: None,
     });
     let (seller, actions) = seller.step(costly);
     assert!(actions.is_empty());
@@ -1094,4 +1115,145 @@ fn a_buyer_whose_funding_does_not_show_keeps_its_secrets() {
     assert!(matches!(buyer, Buyer::AwaitNexLock { .. }));
     assert_eq!(broadcasts(&actions).len(), 1, "still broadcasting");
     assert_eq!(buyer.outcome(), None);
+}
+
+/// A buyer whose cancel output the seller spent through the punish leaf with
+/// a transaction of its own, not the agreed punish, is punished all the
+/// same, and stops refunding once it sees that spend.
+#[test]
+fn a_punish_of_the_sellers_own_making_ends_punished() {
+    let locked = locked();
+    let (swap, lock) = locked.swap();
+    let (_, buyer, _) = locked.nex_locked();
+    let (buyer, actions) = buyer.step(btc(20, None, None));
+    let [cancel] = &broadcasts(&actions)[..] else {
+        panic!("cancel");
+    };
+    let mut punish = swap.unsigned_tx(lock, Spend::Punish);
+    punish.output[0] = TxOut {
+        value: Amount::from_sat(990_000),
+        script_pubkey: payout(9),
+    };
+    // In the mempool, a refund may still replace it.
+    let (buyer, actions) = buyer.step(btc(31, Some((cancel, 11)), Some((&punish, 0))));
+    let [refund] = &broadcasts(&actions)[..] else {
+        panic!("refund");
+    };
+    assert_eq!(
+        refund.input[0].previous_output,
+        punish.input[0].previous_output
+    );
+    assert_eq!(buyer.outcome(), None);
+    let (buyer, actions) = buyer.step(btc(32, Some((cancel, 12)), Some((&punish, 1))));
+    assert!(actions.is_empty(), "no refund once it is in a block");
+    assert_eq!(buyer.outcome(), Some(Outcome::Punished));
+}
+
+/// The same from the seller's side: a punish of its own making ends it
+/// punished, and while that punish is in the mempool it broadcasts nothing
+/// that would conflict with it.
+#[test]
+fn the_seller_ends_on_a_punish_of_its_own_making() {
+    let locked = locked();
+    let (swap, lock) = locked.swap();
+    let (seller, _, _) = locked.nex_locked();
+    let (seller, actions) = seller.step(btc(20, None, None));
+    let [cancel] = &broadcasts(&actions)[..] else {
+        panic!("cancel");
+    };
+    let mut punish = swap.unsigned_tx(lock, Spend::Punish);
+    punish.output[0].script_pubkey = payout(9);
+    let (seller, actions) = seller.step(btc(31, Some((cancel, 11)), Some((&punish, 0))));
+    assert!(actions.is_empty(), "no punish against its own");
+    assert_eq!(seller.outcome(), None);
+    let (seller, actions) = seller.step(btc(32, Some((cancel, 12)), Some((&punish, 1))));
+    assert!(actions.is_empty());
+    assert_eq!(seller.outcome(), Some(Outcome::Punished));
+}
+
+/// A seller that first sees the buyer's refund already deep still reads it
+/// as a refund, recovers `b` and claims its NEX back.
+#[test]
+fn a_refund_first_seen_deep_is_still_a_refund() {
+    let locked = locked();
+    let (seller, buyer, _) = locked.nex_locked();
+    let (seller, _) = seller.step(btc(18, None, None));
+    let (cancel, refund) = cancel_and_refund(buyer);
+    let (seller, actions) = seller.step(btc(40, Some((&cancel, 20)), Some((&refund, 10))));
+    assert!(actions.is_empty());
+    assert!(matches!(seller, Seller::ClaimingNex(_)));
+}
+
+/// The seller, having signed its lock at nonce 3 and learned `b`, waits
+/// with the lock address empty.
+fn seller_claiming_a_signed_lock(terms: Terms) -> Seller {
+    let locked = locked_with(terms);
+    let (seller, buyer, lock) = locked.nex_signed();
+    assert_eq!(lock.body.nonce, 3);
+    let (seller, _) = seller.step(btc(18, None, None));
+    let (cancel, refund) = cancel_and_refund(buyer);
+    let (seller, _) = seller.step(btc(21, Some((&cancel, 1)), Some((&refund, 0))));
+    assert!(matches!(seller, Seller::ClaimingNex(_)));
+    seller
+}
+
+/// A seller whose nonce passed its signed lock ends empty only once that
+/// held over `nex_confirmations` blocks of the tip: a reorg shallower than
+/// that could take back what moved the nonce and let the lock land.
+#[test]
+fn a_passed_nonce_must_hold_nex_confirmations_blocks() {
+    let deep = Terms {
+        nex_confirmations: 3,
+        ..terms()
+    };
+    let seller = seller_claiming_a_signed_lock(deep);
+    let at = |height, nonce| nexus_at(synced_at(height), account(0, nonce), account(0, 0), None);
+
+    let (seller, _) = seller.step(at(10, 4));
+    let seller = restart(&seller);
+    assert_eq!(seller.watch().nexus.unwrap().block_at, Some(10));
+    let (seller, _) = seller.step(at(12, 4));
+    assert_eq!(seller.outcome(), None, "two blocks are not three");
+    let (done, _) = seller.clone().step(at(13, 4));
+    assert_eq!(done.outcome(), Some(Outcome::Refunded));
+
+    // A reorg between two views replaced the block at 10: even with the
+    // nonce still past, the count starts again.
+    let reorged = Event::Nexus(NexusView {
+        block_at: Some("bafyother".into()),
+        ..nexus_view(at(13, 4))
+    });
+    let (moved, _) = seller.clone().step(reorged);
+    assert_eq!(moved.outcome(), None);
+    assert_eq!(moved.watch().nexus.unwrap().block_at, Some(13));
+    let (moved, _) = moved.step(at(15, 4));
+    assert_eq!(moved.outcome(), None, "counted from 13, not 10");
+    let (moved, _) = moved.step(at(16, 4));
+    assert_eq!(moved.outcome(), Some(Outcome::Refunded));
+
+    // A reorg took back what moved the nonce: the count starts again.
+    let (seller, _) = seller.step(at(12, 3));
+    assert_eq!(seller.outcome(), None);
+    let (seller, _) = seller.step(at(13, 4));
+    let (seller, _) = seller.step(at(15, 4));
+    assert_eq!(seller.outcome(), None, "counted from 13, not 10");
+    let (done, _) = seller.clone().step(at(16, 4));
+    assert_eq!(done.outcome(), Some(Outcome::Refunded));
+
+    // So it does when the lock shows up, too costly to claim yet.
+    let costly = Event::Nexus(NexusView {
+        min_relay_fee: 500_000,
+        ..nexus_view(nexus_at(
+            synced_at(15),
+            account(0, 4),
+            account(500_000, 0),
+            None,
+        ))
+    });
+    let (seller, actions) = seller.step(costly);
+    assert!(actions.is_empty());
+    let (seller, _) = seller.step(at(16, 4));
+    assert_eq!(seller.outcome(), None, "counted from 16, not 13");
+    let (done, _) = seller.step(at(19, 4));
+    assert_eq!(done.outcome(), Some(Outcome::Refunded));
 }
