@@ -49,10 +49,13 @@
 //! is a number of confirmations: a transaction with a relative timelock of
 //! `t` blocks can be broadcast once the output it spends is `t` deep.
 
+#[cfg(feature = "native")]
 pub mod bitcoind;
 mod buyer;
+#[cfg(feature = "native")]
 pub mod driver;
 mod seller;
+#[cfg(feature = "native")]
 pub mod transport;
 
 pub use buyer::Buyer;
@@ -73,6 +76,10 @@ use swap_nexus_tx::{address, TransactionBody};
 
 /// The ivy topic every swap message travels on.
 pub const TOPIC: &str = "lattice-swap/v1";
+
+/// The format of a state file. A file of another version is refused: its
+/// signatures may be over transactions this build no longer makes.
+pub const STATE_VERSION: u32 = 5;
 
 /// What both parties agreed to off-band, before either says anything here.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -200,13 +207,13 @@ impl Message {
 }
 
 /// Something the driver saw. The machines act only on these.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Event {
     Message(Message),
     Bitcoin(BitcoinView),
     Nexus(NexusView),
     /// The buyer's wallet built and signed the funding transaction.
-    Funded(Transaction),
+    Funded(#[serde(with = "hex_tx")] Transaction),
     /// The seller's Nexus wallet signed the transaction asked for.
     NexSigned(swap_nexus_tx::Transaction),
     /// The last message went out on the session.
@@ -219,16 +226,17 @@ pub enum Event {
 /// again on the next observation until what it was for is seen, so the
 /// driver only logs failures.
 #[allow(clippy::large_enum_variant)] // Short-lived: carried out as soon as made.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Action {
     Send(Message),
     /// Build and sign, but do not broadcast, a transaction from the
     /// buyer's wallet paying `amount` to `script_pubkey`.
     FundLock {
         script_pubkey: ScriptBuf,
+        #[serde(with = "bitcoin::amount::serde::as_sat")]
         amount: Amount,
     },
-    Broadcast(Transaction),
+    Broadcast(#[serde(with = "hex_tx")] Transaction),
     /// Sign with the seller's Nexus wallet key, which the state never
     /// holds, and answer with [`Event::NexSigned`].
     SignNex(TransactionBody),
@@ -236,7 +244,7 @@ pub enum Action {
 }
 
 /// The swap's Bitcoin transactions as one node sees them.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BitcoinView {
     /// The height of the tip.
     pub height: u32,
@@ -256,15 +264,16 @@ pub struct BitcoinView {
     pub stale: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Spent {
+    #[serde(with = "hex_tx")]
     pub tx: Transaction,
     /// 0 in the mempool.
     pub confirmations: u32,
 }
 
 /// Nexus as one node sees it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NexusView {
     pub health: Health,
     /// The party's own address: the seller's funds, the buyer's payout.

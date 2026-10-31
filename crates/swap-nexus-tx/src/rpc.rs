@@ -8,15 +8,24 @@
 //! changes at every node restart. Every 64-bit integer on this API is a
 //! decimal string.
 
+#[cfg(feature = "native")]
 use std::io::Read;
+#[cfg(feature = "native")]
 use std::time::Duration;
+#[cfg(feature = "native")]
 use std::{fmt, fs, io, path::Path};
 
+#[cfg(feature = "native")]
 use base64::Engine;
+use serde::{Deserialize, Serialize};
+#[cfg(feature = "native")]
 use serde_json::Value;
 
-use crate::{AccountAction, Transaction, TransactionBody};
+use crate::TransactionBody;
+#[cfg(feature = "native")]
+use crate::{AccountAction, Transaction};
 
+#[cfg(feature = "native")]
 #[derive(Debug)]
 pub enum Error {
     /// The node answered with a non-2xx status; `body` names the refusal
@@ -33,6 +42,7 @@ pub enum Error {
     NotCid(String),
 }
 
+#[cfg(feature = "native")]
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -44,12 +54,14 @@ impl fmt::Display for Error {
     }
 }
 
+#[cfg(feature = "native")]
 impl std::error::Error for Error {}
 
+#[cfg(feature = "native")]
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// An account at the node's current tip.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Account {
     pub balance: u64,
     /// The nonce the account's next transaction must carry.
@@ -58,7 +70,7 @@ pub struct Account {
 
 /// `GET /health`: a caller should refuse a node that is not `active` or
 /// whose `height` trails `best_header_height` (still syncing).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Health {
     pub phase: String,
     /// Height of the heaviest executed tip, the block the node acts on.
@@ -70,7 +82,7 @@ pub struct Health {
 }
 
 /// A transaction the node holds, as `GET /api/transaction/:cid` shows it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransactionStatus {
     /// Rebuilt from the node's explorer view, which lists account actions,
     /// signers, nonce and chain path but not general `actions`; a transaction
@@ -83,7 +95,7 @@ pub struct TransactionStatus {
     pub block: Option<Inclusion>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Inclusion {
     pub height: u64,
     pub hash: String,
@@ -91,14 +103,17 @@ pub struct Inclusion {
 
 /// Every answer this client reads is small; a larger one is refused rather
 /// than buffered.
+#[cfg(feature = "native")]
 const MAX_RESPONSE_BYTES: u64 = 1 << 20;
 
+#[cfg(feature = "native")]
 pub struct Client {
     agent: ureq::Agent,
     base: String,
     authorization: String,
 }
 
+#[cfg(feature = "native")]
 impl Client {
     /// `base` is like `http://127.0.0.1:8080`; `cookie` is the cookie file's
     /// content. `timeout` bounds each request as a whole, so a stalled node
@@ -304,6 +319,7 @@ impl Client {
     }
 }
 
+#[cfg(feature = "native")]
 fn cid_path(text: &str) -> Result<&str> {
     if crate::is_cid(text) {
         Ok(text)
@@ -312,6 +328,7 @@ fn cid_path(text: &str) -> Result<&str> {
     }
 }
 
+#[cfg(feature = "native")]
 fn read(response: std::result::Result<ureq::Response, ureq::Error>) -> Result<Value> {
     let (status, response) = match response {
         Ok(response) => (None, response),
@@ -336,6 +353,7 @@ fn read(response: std::result::Result<ureq::Response, ureq::Error>) -> Result<Va
     }
 }
 
+#[cfg(feature = "native")]
 fn decimal<T: std::str::FromStr>(json: &Value, field: &str) -> Result<T> {
     json[field]
         .as_str()
@@ -343,6 +361,7 @@ fn decimal<T: std::str::FromStr>(json: &Value, field: &str) -> Result<T> {
         .ok_or_else(|| Error::Malformed(format!("{field} is not a decimal string in {json}")))
 }
 
+#[cfg(feature = "native")]
 #[cfg(test)]
 mod tests {
     use super::*;

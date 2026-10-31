@@ -6,26 +6,49 @@ license.workspace = true
 rust-version.workspace = true
 description = "NEX<->BTC atomic swaps end to end: the protocol, its messages and the drivers that run it"
 
+[features]
+default = ["native"]
+# The driver and what it runs on: a bitcoind, a Nexus node and an ivy
+# session over TCP.
+native = ["dep:base64", "dep:ivy", "dep:ivy-core", "dep:tokio", "dep:ureq", "swap-nexus-tx/native"]
+
 [dependencies]
 swap-bitcoin = { path = "../swap-bitcoin" }
 swap-core = { path = "../swap-core" }
 swap-nexus = { path = "../swap-nexus" }
-swap-nexus-tx = { path = "../swap-nexus-tx" }
-base64 = "0.22"
+swap-nexus-tx = { path = "../swap-nexus-tx", default-features = false }
+base64 = { version = "0.22", optional = true }
 bitcoin = { version = "0.32", features = ["serde"] }
 curve25519-dalek = "4"
 ed25519-dalek = "2"
 hex = { version = "0.4", features = ["serde"] }
-ivy = { git = "https://github.com/0xLattice/ivy-rs", rev = "e020256" }
+ivy = { git = "https://github.com/0xLattice/ivy-rs", rev = "e020256", optional = true }
 # `ivy` does not re-export the peer key type.
-ivy-core = { git = "https://github.com/0xLattice/ivy-rs", rev = "e020256" }
+ivy-core = { git = "https://github.com/0xLattice/ivy-rs", rev = "e020256", optional = true }
 rand_core = { version = "0.6", features = ["getrandom"] }
 schnorr_fun = { version = "0.13", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["net", "rt", "time"] }
-ureq = { version = "2", default-features = false, features = ["json"] }
+tokio = { version = "1", features = ["net", "rt", "time"], optional = true }
+ureq = { version = "2", default-features = false, features = ["json"], optional = true }
 
-[dev-dependencies]
+# Drive real nodes.
+[[test]]
+name = "bitcoind"
+required-features = ["native"]
+
+[[test]]
+name = "e2e"
+required-features = ["native"]
+
+# The machines draw their secrets from `getrandom`, which in a browser asks
+# `crypto.getRandomValues`.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 corepc-node = { version = "0.12", features = ["30_2", "download"] }
 tempfile = "3"
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"

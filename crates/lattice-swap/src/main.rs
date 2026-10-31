@@ -291,7 +291,9 @@ struct BumpArgs {
     max_fee_rate: FeeRate,
     /// The feerate, in sat/vB, a bump, and the buyer's lock funding, pays
     /// for when bitcoind has no fee estimate, as on regtest or a freshly
-    /// synced node; the lock funding pays the mempool's minimum if higher.
+    /// synced node. The lock funding pays bitcoind's estimate, else this,
+    /// never below the node's mempool minimum, and is not capped by
+    /// --max-fee-rate.
     #[arg(long, value_parser = sat_per_vb, default_value = "10")]
     fallback_fee_rate: FeeRate,
     /// The share of a payout, from 0 to 1, its bump may pay in fees; 1 is

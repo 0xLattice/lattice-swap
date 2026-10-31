@@ -36,6 +36,10 @@ no Nexus consensus change is required.
   Its end-to-end tests run whole swaps on regtest and a Nexus node; like the
   node test, they are ignored by default and need `NEXUS_NODE_IMAGE` and
   `-- --ignored`.
+- `swap-wasm`: the machines built for a browser, with JSON in and out: no
+  I/O, which the page does. `swap` and `swap-nexus-tx` keep their native I/O
+  behind the default `native` feature, so without it they build for
+  `wasm32-unknown-unknown`, with a clang that has the WebAssembly target.
 - `lattice-swap`: the command line tool that runs one side of a swap.
 
 ## Install
@@ -171,8 +175,8 @@ for at most `--max-fee-rate` sat/vB, 1000 by default, and at most
 `--max-fee-fraction` of the payout, from 0 to 1, 1 by default: all of it
 but dust. Where bitcoind has no estimate it aims at `--fallback-fee-rate`,
 10 sat/vB by default. Cancel is never bumped. The buyer's wallet funds the
-lock at the rate a bump aims at, bitcoind's estimate or else
-`--fallback-fee-rate`, or the mempool's minimum if higher; never at the
+lock at bitcoind's estimate, or else `--fallback-fee-rate`, never below the
+node's mempool minimum, and not capped by `--max-fee-rate`; never at the
 wallet's own estimate, which a freshly synced node lacks, and without
 `-fallbackfee` funds nothing.
 
