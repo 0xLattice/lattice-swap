@@ -14,6 +14,10 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::oneshot;
 
+/// The most bytes an offer may hold; a real one holds about 1 KiB. With
+/// the most sellers held, it bounds the board's memory.
+pub const MAX_OFFER: usize = 4 * 1024;
+
 /// The offers held, each with the way to hand it a buyer's connection `T`.
 pub struct Board<T> {
     /// The most sellers connected at once, listed or swapping: each holds a
@@ -120,6 +124,10 @@ impl<T> Board<T> {
 
     /// Lists `offer` under its swap id.
     pub fn list(self: &Arc<Self>, offer: String) -> Result<Ticket<T>, Refusal> {
+        if offer.len() > MAX_OFFER {
+            let why = format!("larger than {MAX_OFFER} bytes");
+            return Err(Refusal::NotAnOffer(why));
+        }
         let id = offer_id(&offer).map_err(Refusal::NotAnOffer)?;
         let mut inner = self.inner.lock().expect("the board's lock");
         if inner.listed.contains_key(&id) {
@@ -235,6 +243,25 @@ mod tests {
         assert_eq!(board.list(offer(3)).err(), Some(Refusal::Full));
         drop(a);
         board.list(offer(3)).unwrap();
+    }
+
+    #[test]
+    fn an_offer_is_at_most_max_offer_bytes() {
+        let board = Board::<u32>::new(2);
+        let id = hex::encode([1; 32]);
+        let sized = |n: usize| {
+            let offer = format!(r#"{{"terms":{{"swap_id":"{id}"}},"pad":""}}"#);
+            offer.replace(
+                r#""pad":"""#,
+                &format!(r#""pad":"{}""#, "x".repeat(n - offer.len())),
+            )
+        };
+        assert!(matches!(
+            board.list(sized(MAX_OFFER + 1)),
+            Err(Refusal::NotAnOffer(_))
+        ));
+        assert_eq!(sized(MAX_OFFER).len(), MAX_OFFER);
+        board.list(sized(MAX_OFFER)).unwrap();
     }
 
     #[test]

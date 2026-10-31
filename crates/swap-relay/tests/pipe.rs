@@ -10,7 +10,7 @@ use bitcoin::Network;
 use ed25519_dalek::SigningKey;
 use swap::transport::{Ivy, PeerKey, Relayed, Transport};
 use swap_relay::board::Board;
-use swap_relay::watch::Watchtower;
+use swap_relay::watch::{Esplora, Watchtower};
 use swap_relay::Relay;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -21,6 +21,8 @@ fn relay(max_offers: usize) -> (String, tempfile::TempDir) {
     let relay = Arc::new(Relay {
         board: Board::new(max_offers),
         watchtower: Arc::new(Watchtower::open(Network::Regtest, watches.path(), 10).unwrap()),
+        // Nothing here watches.
+        chain: Arc::new(Esplora::new("http://127.0.0.1:9", TIMEOUT)),
     });
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());

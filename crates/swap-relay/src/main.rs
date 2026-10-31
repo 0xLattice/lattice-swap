@@ -9,7 +9,7 @@ use std::time::Duration;
 use bitcoin::Network;
 use clap::Parser;
 use swap_relay::board::Board;
-use swap_relay::watch::{Esplora, Watchtower};
+use swap_relay::watch::{Chain, Esplora, Watchtower};
 use swap_relay::Relay;
 
 /// Bounds each Esplora request.
@@ -85,13 +85,15 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         watchtower.len(),
         args.network
     );
-    let watcher = watchtower.clone();
+    let chain: Arc<dyn Chain> = Arc::new(Esplora::new(&esplora, ESPLORA_TIMEOUT));
+    let (watcher, reader) = (watchtower.clone(), chain.clone());
     let every = Duration::from_secs(args.poll);
-    std::thread::spawn(move || watcher.run(&Esplora::new(&esplora, ESPLORA_TIMEOUT), every));
+    std::thread::spawn(move || watcher.run(&*reader, every));
 
     let relay = Arc::new(Relay {
         board: Board::new(args.max_offers),
         watchtower,
+        chain,
     });
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {

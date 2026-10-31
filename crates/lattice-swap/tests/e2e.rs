@@ -8,7 +8,7 @@
 //! node image and `-- --ignored`. The node's RPC listens on loopback only,
 //! so its container shares the host's network.
 
-use std::io::{BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Read};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use bitcoin::{Amount, Denomination, Network};
+use bitcoin::{Amount, Denomination, Network, OutPoint, Transaction, Txid};
 use corepc_node::{Conf, Node};
 use ed25519_dalek::SigningKey;
 use rand_core::{OsRng, RngCore};
@@ -26,7 +26,7 @@ use swap::SecretBytes;
 use swap_nexus_tx::address;
 use swap_nexus_tx::rpc::Client;
 use swap_relay::board::Board;
-use swap_relay::watch::Watchtower;
+use swap_relay::watch::{Chain, Watchtower};
 use swap_relay::Relay;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -67,14 +67,37 @@ fn wait_for<T>(what: &str, mut poll: impl FnMut() -> Option<T>) -> T {
     }
 }
 
+/// What the relay asks of `bitcoind` as it takes a watch: whether it has
+/// seen cancel. Its watchtower does not watch here.
+struct Seen(Bitcoind);
+
+impl Chain for Seen {
+    fn tip(&self) -> io::Result<u32> {
+        Err(io::Error::other("not watching"))
+    }
+    fn transaction(&self, txid: Txid) -> io::Result<Option<Option<u32>>> {
+        let tx = self
+            .0
+            .call("getrawtransaction", json!([txid.to_string(), true]));
+        Ok(tx.ok().map(|tx| tx["blockhash"].as_str().map(|_| 0)))
+    }
+    fn spender(&self, _: OutPoint) -> io::Result<Option<(Txid, Option<u32>)>> {
+        Err(io::Error::other("not watching"))
+    }
+    fn broadcast(&self, _: &Transaction) -> io::Result<()> {
+        Err(io::Error::other("not watching"))
+    }
+}
+
 /// A relay on loopback, its watchtower on regtest but not watching, so
 /// the test can see the watches it is handed: its URL and the relay.
-fn relay() -> (String, Arc<Relay>, tempfile::TempDir) {
+fn relay(world: &World) -> (String, Arc<Relay>, tempfile::TempDir) {
     let watches = tempfile::tempdir().unwrap();
     let watchtower = Watchtower::open(Network::Regtest, watches.path(), 10).unwrap();
     let relay = Arc::new(Relay {
         board: Board::new(10),
         watchtower: Arc::new(watchtower),
+        chain: Arc::new(Seen(wallet_client(&world.bitcoind, ""))),
     });
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -697,7 +720,7 @@ fn buyer_killed_after_the_redeem_resumes_to_the_swap() {
 #[ignore = "needs Docker and NEXUS_NODE_IMAGE"]
 fn happy_path_through_a_relay() {
     let world = World::new();
-    let (url, relay, _watches) = relay();
+    let (url, relay, _watches) = relay(&world);
     let (mut seller, mut buyer, _, seller_out) = world.start_on(20, 1, Some(&url));
     let (mut seller_done, mut buyer_done) = (None, None);
     world.drive(
@@ -730,7 +753,7 @@ fn happy_path_through_a_relay() {
 #[ignore = "needs Docker and NEXUS_NODE_IMAGE"]
 fn a_buyer_that_gives_up_hands_its_refund_to_the_relay() {
     let world = World::new();
-    let (url, relay, _watches) = relay();
+    let (url, relay, _watches) = relay(&world);
     let (mut seller, mut buyer, swap_id, seller_out) = world.start_on(24, 2, Some(&url));
     world.drive(
         false,

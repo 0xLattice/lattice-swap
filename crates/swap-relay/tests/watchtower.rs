@@ -271,11 +271,14 @@ fn the_relay_refunds_a_buyer_that_went_offline() {
     );
     assert_eq!(refund.output[0].script_pubkey, refund_payout);
 
-    // The relay takes the watch over HTTP; the buyer goes offline.
+    // The relay takes the watch over HTTP once it sees cancel; the buyer
+    // goes offline.
+    let esplora_url = esplora(rpc(&node, ""));
     let watches = tempfile::tempdir().unwrap();
     let relay = Arc::new(Relay {
         board: Board::new(10),
         watchtower: Arc::new(Watchtower::open(Network::Regtest, watches.path(), 10).unwrap()),
+        chain: Arc::new(Esplora::new(&esplora_url, TIMEOUT)),
     });
     let url = serve(swap_relay::router(relay));
     let watch = json!({
@@ -284,21 +287,25 @@ fn the_relay_refunds_a_buyer_that_went_offline() {
         "refund": serialize_hex(&refund),
         "depth": 1,
     });
-    // On another network, refused.
+    // The answer, or the status refusing the watch.
+    let post = |watch: &Value| match ureq::post(&format!("{url}/watch")).send_json(watch) {
+        Ok(answer) => Ok(answer.into_string().unwrap()),
+        Err(ureq::Error::Status(status, _)) => Err(status),
+        Err(e) => panic!("{e}"),
+    };
+    // On another network, refused for good.
     let mut mainnet = watch.clone();
     mainnet["network"] = "bitcoin".into();
-    let refused = ureq::post(&format!("{url}/watch")).send_json(mainnet);
-    assert!(matches!(refused, Err(ureq::Error::Status(400, _))));
-    let answer = ureq::post(&format!("{url}/watch"))
-        .send_json(watch)
-        .unwrap()
-        .into_string()
+    assert_eq!(post(&mainnet), Err(400));
+    // Before cancel is out, refused for now.
+    assert_eq!(post(&watch), Err(503));
+    default
+        .call("sendrawtransaction", json!([serialize_hex(cancel)]))
         .unwrap();
-    assert_eq!(answer, refund.compute_txid().to_string());
+    assert_eq!(post(&watch), Ok(refund.compute_wtxid().to_string()));
     drop(buyer);
 
     // The relay restarts: the watch is read back from disk, and watched.
-    let esplora_url = esplora(rpc(&node, ""));
     let tower = Arc::new(Watchtower::open(Network::Regtest, watches.path(), 10).unwrap());
     assert_eq!(tower.len(), 1);
     let watcher = tower.clone();
@@ -307,11 +314,8 @@ fn the_relay_refunds_a_buyer_that_went_offline() {
         watcher.run(&esplora, Duration::from_millis(200))
     });
 
-    // Cancel goes out, as the seller would send it, but no refund until it
-    // is in a block.
-    default
-        .call("sendrawtransaction", json!([serialize_hex(cancel)]))
-        .unwrap();
+    // No refund while cancel waits in the mempool; once it is in a block,
+    // the refund goes out.
     thread::sleep(Duration::from_secs(1));
     assert!(!pooled(&default, refund.compute_txid()));
     mine(1);

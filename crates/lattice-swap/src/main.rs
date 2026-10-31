@@ -40,7 +40,8 @@ const BTC_PASSWORD_ENV: &str = "LATTICE_SWAP_BTC_PASSWORD";
 /// The blocks the buyer's fee estimate aims to confirm in.
 const FEE_TARGET: u16 = 6;
 /// The least time between two tries to hand a refund to a watchtower: a
-/// relay that is down is not asked again at every poll.
+/// relay that is down, or has not yet seen cancel, is not asked again at
+/// every poll.
 const WATCH_RETRY: Duration = Duration::from_secs(60);
 /// What a seller is told without its Nexus key.
 const NO_KEY: &str = "the seller needs its Nexus key: --nex-key-file or LATTICE_SWAP_NEX_KEY";
@@ -410,8 +411,8 @@ struct TakeArgs {
     #[arg(long, default_value = ".")]
     dir: PathBuf,
     /// The relay, by its URL, whose watchtower gets the cancel and the
-    /// signed refund, to broadcast the refund once cancel confirms if this
-    /// buyer is offline then; the offer's relay by default. They are handed
+    /// signed refund, to broadcast the refund once cancel is in a block if
+    /// this buyer is offline then; the offer's relay by default. They are handed
     /// over only once the buyer gives up on the swap without signing the
     /// redeem: before that, the refund would let a seller take both coins.
     #[arg(long)]
@@ -1009,6 +1010,7 @@ impl Watchtower {
             "network": self.network,
             "cancel": bitcoin::consensus::encode::serialize_hex(&cancel),
             "refund": bitcoin::consensus::encode::serialize_hex(&refund),
+            // How deep the refund must be before the watch is done.
             "depth": terms.btc_confirmations,
         });
         let url = format!("{}/watch", relay.trim_end_matches('/'));

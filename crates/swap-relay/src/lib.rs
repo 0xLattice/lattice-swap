@@ -15,13 +15,14 @@
 //! - `GET /take/<swap id>`, a WebSocket: pairs the buyer with the seller of
 //!   that offer, which leaves the board; 404 if none is listed.
 //! - `POST /watch`: a [`watch::Watch`], as JSON. Answers the refund's
-//!   txid once the watch is on disk.
+//!   wtxid once the watch is on disk; 503 while its cancel is not yet seen
+//!   on the network, to be asked again.
 
 pub mod board;
 pub mod watch;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -33,12 +34,12 @@ use axum::Router;
 use tokio::time::{interval, timeout, MissedTickBehavior};
 
 use board::Board;
-use watch::{Refusal, Watch, Watchtower};
+use watch::{Chain, Refusal, Watch, Watchtower};
 
-/// The most bytes one WebSocket message may hold: an offer, or a piece of
-/// the session, which the CLI sends at most 64 KiB at a time. The relay
-/// holds a message whole while it passes it on, so this bounds what each
-/// pipe holds in each direction.
+/// The most bytes one WebSocket message may hold: a piece of the session,
+/// which the CLI sends at most 64 KiB at a time. The relay holds a message
+/// whole while it passes it on, so this bounds what each pipe holds in each
+/// direction. An offer is held to [`board::MAX_OFFER`].
 pub const MAX_MESSAGE: usize = 64 * 1024;
 
 /// The most bytes a watch may hold: a cancel and a refund, each about 200
@@ -49,16 +50,21 @@ pub const MAX_WATCH: usize = 16 * 1024;
 /// that lists nothing holds a socket, and no slot on the board.
 pub const OFFER_WAIT: Duration = Duration::from_secs(10);
 
-/// How often the relay pings each connection it holds. A peer gone without
-/// a word, with its connection still open, is found by the ping that
-/// cannot be sent, so its offer and its pipe do not stay; and a proxy in
+/// How often the relay pings each connection it holds, so a proxy in
 /// between sees traffic on a pipe that waits an hour for a confirmation.
 pub const PING: Duration = Duration::from_secs(30);
+
+/// How long a connection may go without a word, a pong among them, before
+/// the relay closes it: a peer gone with its connection still open would
+/// otherwise keep its offer listed, or its pipe, for good.
+pub const SILENCE: Duration = PING.saturating_mul(2);
 
 /// The relay's state, shared by every connection.
 pub struct Relay {
     pub board: Arc<Board<WebSocket>>,
     pub watchtower: Arc<Watchtower>,
+    /// What the watchtower reads Bitcoin through.
+    pub chain: Arc<dyn Chain>,
 }
 
 /// The relay's routes.
@@ -104,6 +110,7 @@ async fn seller(relay: Arc<Relay>, mut socket: WebSocket) {
         return;
     }
     let mut ping = pinger();
+    let mut heard = Instant::now();
     let buyer = loop {
         tokio::select! {
             buyer = &mut ticket.taker => match buyer {
@@ -111,12 +118,14 @@ async fn seller(relay: Arc<Relay>, mut socket: WebSocket) {
                 Err(_) => return,
             },
             message = socket.recv() => match message {
-                Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => heard = Instant::now(),
                 // The seller left, or said something out of turn.
                 _ => return,
             },
             _ = ping.tick() => {
-                if socket.send(Message::Ping(Bytes::new())).await.is_err() {
+                if heard.elapsed() > SILENCE
+                    || socket.send(Message::Ping(Bytes::new())).await.is_err()
+                {
                     return;
                 }
             }
@@ -150,16 +159,26 @@ async fn take(
 }
 
 /// Carries binary messages between `a` and `b` until either closes, says
-/// anything else, or cannot be pinged.
+/// anything else, cannot be pinged, or is silent past [`SILENCE`].
 async fn pipe(mut a: WebSocket, mut b: WebSocket) {
     let mut ping = pinger();
+    let mut heard = [Instant::now(); 2];
     loop {
         let (message, to) = tokio::select! {
-            message = a.recv() => (message, &mut b),
-            message = b.recv() => (message, &mut a),
+            message = a.recv() => {
+                heard[0] = Instant::now();
+                (message, &mut b)
+            }
+            message = b.recv() => {
+                heard[1] = Instant::now();
+                (message, &mut a)
+            }
             _ = ping.tick() => {
                 let ping = || Message::Ping(Bytes::new());
-                if a.send(ping()).await.is_err() || b.send(ping()).await.is_err() {
+                if heard.iter().any(|heard| heard.elapsed() > SILENCE)
+                    || a.send(ping()).await.is_err()
+                    || b.send(ping()).await.is_err()
+                {
                     break;
                 }
                 continue;
@@ -192,11 +211,20 @@ async fn add_watch(State(relay): State<Arc<Relay>>, body: Bytes) -> Response {
         Ok(watch) => watch,
         Err(e) => return (StatusCode::BAD_REQUEST, format!("not a watch: {e}")).into_response(),
     };
-    let watchtower = relay.watchtower.clone();
-    let added = tokio::task::spawn_blocking(move || watchtower.add(watch)).await;
-    match added.expect("adding a watch does not panic") {
-        Ok(txid) => txid.to_string().into_response(),
+    let added = tokio::task::spawn_blocking(move || relay.watchtower.add(watch, &*relay.chain));
+    match added.await.expect("adding a watch does not panic") {
+        Ok(wtxid) => wtxid.to_string().into_response(),
         Err(Refusal::Invalid(why)) => (StatusCode::BAD_REQUEST, why).into_response(),
+        Err(Refusal::Unseen) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "cancel is not yet seen on the network: ask again once it is",
+        )
+            .into_response(),
+        Err(Refusal::Chain(e)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("could not ask about cancel: {e}; ask again"),
+        )
+            .into_response(),
         Err(Refusal::Full) => {
             (StatusCode::SERVICE_UNAVAILABLE, "the watchtower is full").into_response()
         }

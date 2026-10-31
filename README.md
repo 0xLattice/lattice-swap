@@ -214,8 +214,10 @@ TLS in front of it for `https://`. Each bound says what it protects:
 `--max-offers`, 10000 by default, the sellers held at once, listed or
 swapping, each a connection and its offer in memory; `--max-watches`, 10000,
 the watches held, each in memory and on disk, and two or three Esplora
-requests a round; one WebSocket message at most 64 KiB, which a pipe holds
-whole while passing it on; a watch at most 16 KiB.
+requests a round; an offer at most 4 KiB, the board's memory; one WebSocket
+message at most 64 KiB, which a pipe holds whole while passing it on; a
+watch at most 16 KiB. A connection silent for 60 seconds, not even
+answering the relay's pings, is closed, and its offer withdrawn.
 
 The seller gives `--relay` instead of `--listen`; the offer it prints names
 the relay, not an address. Anyone can list the relay's offers and take one,
@@ -228,14 +230,17 @@ curl -s https://relay.example/offers
 
 `take` on an offer that names a relay reaches the seller through it. The
 buyer also hands the relay's watchtower its cancel and fully signed refund,
-for it to broadcast the refund once cancel confirms if the buyer is offline
-then: `--watchtower <url>` names another relay, `--no-watchtower` none, and
+for it to broadcast the refund as soon as cancel is in a block if the buyer
+is offline then: `--watchtower <url>` names another relay, `--no-watchtower` none, and
 `resume --watchtower <url>` hands them over from a resumed swap. The refund
 reveals the buyer's key share, with which a seller that can still redeem
 takes both coins, so the buyer hands it over only once it has given up on
-the swap at `t1` without signing the redeem. It does not cover a buyer that
-signed the redeem: that buyer must itself be online to refund between
-cancel and `t2`.
+the swap at `t1` without signing the redeem, and broadcasts its cancel. The
+watchtower takes a watch only once its cancel is on the network, so each
+costs a real transaction, and only with a refund signed by both keys; the
+buyer asks again every minute until it is taken. It does not cover a
+buyer that signed the redeem: that buyer must itself be online to refund
+between cancel and `t2`.
 
 ## License
 
