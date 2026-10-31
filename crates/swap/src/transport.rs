@@ -8,7 +8,7 @@ use ivy::{Config, Connection};
 pub use ivy_core::PeerKey;
 use tokio::net::TcpStream;
 use tokio::runtime::Runtime;
-use tokio::time::timeout;
+use tokio::time::{timeout, timeout_at};
 
 use crate::TOPIC;
 
@@ -50,8 +50,9 @@ impl Ivy {
         })
     }
 
-    /// Takes the next connection on `listener` and accepts it only from
-    /// `peer`. Waits at most `wait` for it.
+    /// Takes connections on `listener` until one completes the handshake
+    /// as `peer`, dropping any other. Waits at most `wait` in all, and each
+    /// handshake at most `send_timeout`.
     pub fn accept(
         listener: std::net::TcpListener,
         config: &Config,
@@ -63,10 +64,18 @@ impl Ivy {
         listener.set_nonblocking(true)?;
         let connection = runtime.block_on(async {
             let listener = tokio::net::TcpListener::from_std(listener)?;
-            let (stream, _) = timeout(wait, listener.accept())
-                .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "no peer dialed"))??;
-            ivy::accept(stream, config, |key| *key == peer).await
+            let deadline = tokio::time::Instant::now() + wait;
+            let no_peer = || io::Error::new(io::ErrorKind::TimedOut, "no peer dialed");
+            loop {
+                let (stream, _) = timeout_at(deadline, listener.accept())
+                    .await
+                    .map_err(|_| no_peer())??;
+                let handshake = deadline.min(tokio::time::Instant::now() + send_timeout);
+                let accept = ivy::accept(stream, config, |key| *key == peer);
+                if let Ok(Ok(connection)) = timeout_at(handshake, accept).await {
+                    return Ok::<_, io::Error>(connection);
+                }
+            }
         })?;
         Ok(Self {
             runtime,

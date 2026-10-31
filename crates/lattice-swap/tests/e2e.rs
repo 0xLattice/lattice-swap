@@ -276,6 +276,11 @@ fn happy_path_through_the_binary() {
     std::fs::write(&nexus_cookie, &nexus.cookie).unwrap();
     let key_file = directory.path().join("nex.key");
     std::fs::write(&key_file, hex::encode(seller_nex.0)).unwrap();
+    std::fs::set_permissions(
+        &key_file,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .unwrap();
     let seller_dir = directory.path().join("seller");
     let buyer_dir = directory.path().join("buyer");
 
@@ -319,7 +324,17 @@ fn happy_path_through_the_binary() {
             .arg("take")
             .arg(&offer_file)
             .args(["--nex-address", &buyer_nex])
-            .args(["--min-nex-confirmations", "1"])
+            .args(["--btc-amount", &BTC_AMOUNT.to_sat().to_string()])
+            .args(["--nex-amount", &NEX_AMOUNT.to_string()])
+            .args(["--max-btc-fee", &BTC_FEE.to_sat().to_string()])
+            .args(["--max-nex-fee", &nex_fee.to_string()])
+            .args(["--max-t1", "20", "--min-t2", "10"])
+            .args([
+                "--min-btc-confirmations",
+                "1",
+                "--min-nex-confirmations",
+                "1",
+            ])
             .arg("--dir")
             .arg(&buyer_dir)
             .args(node_args(&bitcoind, "buyer", &nexus, &nexus_cookie))

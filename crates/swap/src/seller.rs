@@ -94,6 +94,27 @@ impl Seller {
     }
 }
 
+impl Seller {
+    /// The Nexus address the NEX is sold from, whose key the driver must
+    /// hold, until the swap ends.
+    pub fn nex_address(&self) -> Option<&str> {
+        use Seller::*;
+        match self {
+            AwaitBuyerHello(start) => Some(&start.nex_address),
+            AwaitLockProposal(setup) | AwaitBuyerSignatures { setup, .. } => {
+                Some(&setup.nex_address)
+            }
+            AwaitFunding { locked, .. }
+            | LockingNex { locked, .. }
+            | AwaitRedeemSignature { locked, .. }
+            | Redeeming { locked, .. }
+            | Cancelling { locked, .. } => Some(&locked.setup.nex_address),
+            ClaimingNex(claim) => Some(&claim.setup.nex_address),
+            Done(_) => None,
+        }
+    }
+}
+
 fn abort(refusal: Refusal) -> (Seller, Vec<Action>) {
     (Seller::Done(Outcome::Aborted(refusal)), vec![])
 }

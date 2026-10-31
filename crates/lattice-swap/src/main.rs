@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 use swap::bitcoind::{Bitcoin, Bitcoind};
 use swap::driver::{Driver, Store};
 use swap::transport::{Ivy, PeerKey, Transport};
-use swap::{Buyer, Machine, SecretBytes, Seller, Terms};
+use swap::{Buyer, Machine, Outcome, SecretBytes, Seller, Terms};
 use swap_nexus_tx::rpc::Client;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -43,7 +43,10 @@ const BTC_BLOCKS_PER_NEXUS_BLOCK: u64 = 6;
 #[command(
     name = "lattice-swap",
     version,
-    about = "Atomic swaps between NEX and BTC"
+    about = "Atomic swaps between NEX and BTC",
+    after_help = "Exit status of offer, take and resume: 0 Swapped, 3 Refunded, 4 Punished, \
+                  5 Drained, 6 Aborted; 1 an error stopped the tool before the swap ended, \
+                  so resume it; 2 bad arguments. status exits 0 once it reads the swap file."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -60,12 +63,10 @@ enum Command {
     Take(TakeArgs),
     /// Carries on a swap from its swap file until it ends. There is no
     /// session: the rest runs from the chains alone, and a swap still
-    /// waiting on a message cancels and refunds once its timelocks allow.
+    /// waiting on a message cancels and refunds once its timelocks allow,
+    /// so `refund` is this same command.
+    #[command(visible_alias = "refund")]
     Resume(SwapFileArgs),
-    /// The same as `resume`. A swap cancels and refunds by itself once its
-    /// timelocks allow, so there is no separate step: this runs the swap
-    /// until it ends.
-    Refund(SwapFileArgs),
     /// Prints a swap's state and outcome from its swap file. Asks no node.
     Status {
         /// The swap file, `<swap id>.json`.
@@ -160,12 +161,27 @@ impl NodeArgs {
             }
             (None, None) => return Err("--btc-cookie or --btc-user is required".into()),
         };
-        let url = format!(
-            "{}/wallet/{}",
-            self.btc_url.trim_end_matches('/'),
-            self.btc_wallet
-        );
-        Ok(Bitcoind::new(&url, &auth, self.btc_network, TIMEOUT))
+        Ok(Bitcoind::new(
+            &self.wallet_url(),
+            &auth,
+            self.btc_network,
+            TIMEOUT,
+        ))
+    }
+
+    /// The wallet's RPC URL, its name percent-escaped.
+    fn wallet_url(&self) -> String {
+        let wallet: String = self
+            .btc_wallet
+            .bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                    char::from(b).to_string()
+                }
+                _ => format!("%{b:02X}"),
+            })
+            .collect();
+        format!("{}/wallet/{wallet}", self.btc_url.trim_end_matches('/'))
     }
 
     fn nexus(&self) -> Result<Client> {
@@ -190,7 +206,8 @@ impl NodeArgs {
 #[derive(Args)]
 struct NexKeyArgs {
     /// A file holding the seller's Nexus wallet key, its Ed25519 seed in
-    /// hex; or set LATTICE_SWAP_NEX_KEY. It never reaches the swap file.
+    /// hex, readable by its owner alone; or set LATTICE_SWAP_NEX_KEY. It
+    /// never reaches the swap file.
     #[arg(long)]
     nex_key_file: Option<PathBuf>,
 }
@@ -198,7 +215,10 @@ struct NexKeyArgs {
 impl NexKeyArgs {
     fn load(&self) -> Result<SecretBytes> {
         let hex = match &self.nex_key_file {
-            Some(path) => read(path)?,
+            Some(path) => {
+                owner_only(path)?;
+                read(path)?
+            }
             None => std::env::var(NEX_KEY_ENV).map_err(|_| {
                 format!("the seller needs its Nexus key: --nex-key-file or {NEX_KEY_ENV}")
             })?,
@@ -210,6 +230,30 @@ impl NexKeyArgs {
     }
 }
 
+/// Refuses a key file anyone but its owner can open.
+#[cfg(unix)]
+fn owner_only(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = fs::metadata(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?
+        .permissions()
+        .mode();
+    if mode & 0o077 != 0 {
+        return Err(format!(
+            "{} is open to others (mode {:o}): chmod 600 it",
+            path.display(),
+            mode & 0o777
+        )
+        .into());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn owner_only(_: &Path) -> Result<()> {
+    Ok(())
+}
+
 #[derive(Args)]
 struct OfferArgs {
     #[command(flatten)]
@@ -217,7 +261,8 @@ struct OfferArgs {
     /// Where to listen for the buyer.
     #[arg(long)]
     listen: SocketAddr,
-    /// The address the buyer dials, if not the one listened on.
+    /// The address the buyer dials, if not the one listened on. Required
+    /// when listening on an unspecified address, such as 0.0.0.0.
     #[arg(long)]
     advertise: Option<SocketAddr>,
     /// Seconds to wait for the buyer to dial.
@@ -239,14 +284,43 @@ struct TakeArgs {
     /// Where the NEX is paid.
     #[arg(long)]
     nex_address: String,
-    /// The fewest Nexus confirmations of the NEX lock this buyer accepts.
-    #[arg(long, default_value_t = 24)]
-    min_nex_confirmations: u64,
+    #[command(flatten)]
+    policy: PolicyArgs,
     /// The directory the swap file goes in.
     #[arg(long, default_value = ".")]
     dir: PathBuf,
     #[command(flatten)]
     nodes: NodeArgs,
+}
+
+/// What the buyer agreed to, and its bounds on every other term: `take`
+/// refuses an offer outside them. Defaults are this tool's settings.
+#[derive(Args)]
+struct PolicyArgs {
+    /// The BTC agreed to pay, in satoshis.
+    #[arg(long)]
+    btc_amount: u64,
+    /// The NEX agreed to buy.
+    #[arg(long)]
+    nex_amount: u64,
+    /// The most each Bitcoin swap transaction may pay, in satoshis.
+    #[arg(long, default_value_t = 10_000)]
+    max_btc_fee: u64,
+    /// The most the NEX lock and the claim from it may pay.
+    #[arg(long, default_value_t = 1_000)]
+    max_nex_fee: u64,
+    /// The most Bitcoin blocks the BTC stays locked before cancel.
+    #[arg(long, default_value_t = 288)]
+    max_t1: u16,
+    /// The fewest Bitcoin blocks after cancel to refund in, before punish.
+    #[arg(long, default_value_t = 144)]
+    min_t2: u16,
+    /// The fewest Bitcoin confirmations the offer may ask.
+    #[arg(long, default_value_t = 6)]
+    min_btc_confirmations: u32,
+    /// The fewest Nexus confirmations of the NEX lock this buyer accepts.
+    #[arg(long, default_value_t = 24)]
+    min_nex_confirmations: u64,
 }
 
 #[derive(Args)]
@@ -290,12 +364,73 @@ fn check_terms(terms: &Terms) -> std::result::Result<(), String> {
     Ok(())
 }
 
+/// An offer the buyer takes: terms that work, the amounts it agreed to on
+/// its network, and every other term within its bounds.
+fn check_offer(
+    offer: &Offer,
+    policy: &PolicyArgs,
+    network: Network,
+) -> std::result::Result<(), String> {
+    let terms = &offer.terms;
+    check_terms(terms)?;
+    let refused = |why: String| Err(format!("refused: the offer {why}"));
+    if offer.btc_network != network {
+        return refused(format!("is on {}, not {network}", offer.btc_network));
+    }
+    if terms.btc_amount.to_sat() != policy.btc_amount {
+        return refused(format!(
+            "asks {} sat, not {}",
+            terms.btc_amount.to_sat(),
+            policy.btc_amount
+        ));
+    }
+    if terms.nex_amount != policy.nex_amount {
+        return refused(format!(
+            "sells {} NEX, not {}",
+            terms.nex_amount, policy.nex_amount
+        ));
+    }
+    if terms.btc_fee.to_sat() > policy.max_btc_fee {
+        return refused(format!(
+            "pays {} sat a Bitcoin transaction, above {}",
+            terms.btc_fee.to_sat(),
+            policy.max_btc_fee
+        ));
+    }
+    if terms.nex_fee > policy.max_nex_fee {
+        return refused(format!(
+            "pays {} NEX a Nexus transaction, above {}",
+            terms.nex_fee, policy.max_nex_fee
+        ));
+    }
+    if terms.t1 > policy.max_t1 {
+        return refused(format!("has t1 {}, above {}", terms.t1, policy.max_t1));
+    }
+    if terms.t2 < policy.min_t2 {
+        return refused(format!("has t2 {}, below {}", terms.t2, policy.min_t2));
+    }
+    if terms.btc_confirmations < policy.min_btc_confirmations {
+        return refused(format!(
+            "asks {} Bitcoin confirmations, fewer than {}",
+            terms.btc_confirmations, policy.min_btc_confirmations
+        ));
+    }
+    if terms.nex_confirmations < policy.min_nex_confirmations {
+        return refused(format!(
+            "asks {} Nexus confirmations, fewer than {}",
+            terms.nex_confirmations, policy.min_nex_confirmations
+        ));
+    }
+    Ok(())
+}
+
 /// What the buyer needs to take the swap: the terms, where the seller
 /// listens and its key, and the session key the seller made for the buyer,
 /// the only one it accepts. Whoever holds an offer can take it.
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 struct Offer {
     terms: Terms,
+    btc_network: Network,
     address: SocketAddr,
     seller: String,
     #[serde(with = "hex::serde")]
@@ -317,6 +452,26 @@ impl Offer {
     fn seller_key(&self) -> Result<PeerKey> {
         Ok(PeerKey::from_hex(&self.seller).ok_or("the offer's seller key is not a key")?)
     }
+
+    /// The terms, for the buyer to read before it dials.
+    fn describe(&self) -> String {
+        let t = &self.terms;
+        format!(
+            "taking {} sat for {} NEX on {}: fees {} sat and {} NEX, t1 {}, t2 {}, \
+             {} Bitcoin and {} Nexus confirmations, margin {}; dialling {}",
+            t.btc_amount.to_sat(),
+            t.nex_amount,
+            self.btc_network,
+            t.btc_fee.to_sat(),
+            t.nex_fee,
+            t.t1,
+            t.t2,
+            t.btc_confirmations,
+            t.nex_confirmations,
+            t.margin,
+            self.address
+        )
+    }
 }
 
 /// A Nexus address as Lattice prints one: a CIDv1, dag-cbor, sha2-256, in
@@ -336,7 +491,30 @@ fn check_nex_address(text: &str) -> Result<()> {
     }
 }
 
-fn offer(args: OfferArgs) -> Result<()> {
+/// Refuses a listen address the buyer cannot dial unless `--advertise`
+/// names one.
+fn check_listen(listen: SocketAddr, advertise: Option<SocketAddr>) -> Result<()> {
+    if advertise.is_none() && listen.ip().is_unspecified() {
+        return Err(format!("--listen {listen} is no address to dial: give --advertise").into());
+    }
+    Ok(())
+}
+
+/// The key, if it is the one the swap sells from: the NEX lock signed with
+/// any other never verifies.
+fn seller_key(seller: &Seller, key: SecretBytes) -> Result<SecretBytes> {
+    match seller.nex_address() {
+        Some(address) if address != key.nex_address() => Err(format!(
+            "the Nexus key is for {}, but the swap sells from {address}",
+            key.nex_address()
+        )
+        .into()),
+        _ => Ok(key),
+    }
+}
+
+fn offer(args: OfferArgs) -> Result<Outcome> {
+    check_listen(args.listen, args.advertise)?;
     let key = args.key.load()?;
     let terms = args.terms.terms(random32());
     check_terms(&terms)?;
@@ -355,6 +533,7 @@ fn offer(args: OfferArgs) -> Result<()> {
     let buyer = ivy::Config::new(SigningKey::from_bytes(&buyer_session)).peer_key();
     let offer = Offer {
         terms,
+        btc_network: args.nodes.btc_network,
         address: args.advertise.unwrap_or(listener.local_addr()?),
         seller: config.peer_key().hex(),
         buyer_session,
@@ -369,13 +548,19 @@ fn offer(args: OfferArgs) -> Result<()> {
         Duration::from_secs(args.wait),
         TIMEOUT,
     )?;
-    log(&format!("swap file {}", store.path().display()));
-    let mut driver = Driver::start(seller, vec![], bitcoin, nexus, Some(transport), store)?;
-    driver.nex_key = Some(key);
-    run(driver)
+    let swap_file = store.path().to_path_buf();
+    log(&format!("swap file {}", swap_file.display()));
+    let driver = Driver::start(seller, vec![], bitcoin, nexus, Some(transport), store);
+    run(
+        &swap_file,
+        driver.map(|mut driver| {
+            driver.nex_key = Some(key);
+            driver
+        }),
+    )
 }
 
-fn take(args: TakeArgs) -> Result<()> {
+fn take(args: TakeArgs) -> Result<Outcome> {
     let text = if args.offer == Path::new("-") {
         let mut text = String::new();
         io::stdin().read_to_string(&mut text)?;
@@ -384,14 +569,7 @@ fn take(args: TakeArgs) -> Result<()> {
         read(&args.offer)?
     };
     let offer = Offer::decode(&text)?;
-    check_terms(&offer.terms)?;
-    if offer.terms.nex_confirmations < args.min_nex_confirmations {
-        return Err(format!(
-            "the offer asks {} Nexus confirmations, fewer than {}",
-            offer.terms.nex_confirmations, args.min_nex_confirmations
-        )
-        .into());
-    }
+    check_offer(&offer, &args.policy, args.nodes.btc_network)?;
     check_nex_address(&args.nex_address)?;
     let bitcoin = args.nodes.bitcoin()?;
     let nexus = args.nodes.nexus()?;
@@ -402,35 +580,38 @@ fn take(args: TakeArgs) -> Result<()> {
     let store = Store::new(&args.dir, offer.terms.swap_id);
 
     let config = ivy::Config::new(SigningKey::from_bytes(&offer.buyer_session));
+    log(&offer.describe());
     let transport = Ivy::connect(offer.address, &config, offer.seller_key()?, TIMEOUT)?;
-    log(&format!("swap file {}", store.path().display()));
-    run(Driver::start(
-        buyer,
-        actions,
-        bitcoin,
-        nexus,
-        Some(transport),
-        store,
-    )?)
+    let swap_file = store.path().to_path_buf();
+    log(&format!("swap file {}", swap_file.display()));
+    let driver = Driver::start(buyer, actions, bitcoin, nexus, Some(transport), store);
+    run(&swap_file, driver)
 }
 
-fn resume(args: SwapFileArgs) -> Result<()> {
+fn resume(args: SwapFileArgs) -> Result<Outcome> {
     let store = swap_store(&args.swap_file)?;
+    let swap_file = store.path().to_path_buf();
     let bitcoin = args.nodes.bitcoin()?;
     let nexus = args.nodes.nexus()?;
-    match Saved::load(store.path())? {
+    match Saved::load(&swap_file)? {
         Saved::Seller(seller) => {
             let key = match seller.outcome() {
                 Some(_) => None,
-                None => Some(args.key.load()?),
+                None => Some(seller_key(&seller, args.key.load()?)?),
             };
-            let mut driver = Driver::<Seller, _, Ivy>::resume(bitcoin, nexus, None, store)?;
-            driver.nex_key = key;
-            run(driver)
+            let driver = Driver::<Seller, _, Ivy>::resume(bitcoin, nexus, None, store);
+            run(
+                &swap_file,
+                driver.map(|mut driver| {
+                    driver.nex_key = key;
+                    driver
+                }),
+            )
         }
-        Saved::Buyer(_) => run(Driver::<Buyer, _, Ivy>::resume(
-            bitcoin, nexus, None, store,
-        )?),
+        Saved::Buyer(_) => run(
+            &swap_file,
+            Driver::<Buyer, _, Ivy>::resume(bitcoin, nexus, None, store),
+        ),
     }
 }
 
@@ -448,20 +629,51 @@ fn status(swap_file: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Runs the swap to its end, logging each state it reaches.
-fn run<M: Machine, B: Bitcoin, T: Transport>(mut driver: Driver<M, B, T>) -> Result<()> {
+/// Runs the swap to its end, logging each state it reaches. On an error
+/// once the swap file exists, says how to carry on.
+fn run<M: Machine, B: Bitcoin, T: Transport>(
+    swap_file: &Path,
+    driver: io::Result<Driver<M, B, T>>,
+) -> Result<Outcome> {
     let last = RefCell::new(String::new());
-    let outcome = driver.run_until(|state| {
-        let name = state_name(state);
-        if *last.borrow() != name {
-            log(&name);
-            *last.borrow_mut() = name;
-        }
-        false
-    })?;
+    let outcome = driver
+        .and_then(|mut driver| {
+            driver.run_until(|state| {
+                let name = state_name(state);
+                if *last.borrow() != name {
+                    log(&name);
+                    *last.borrow_mut() = name;
+                }
+                false
+            })
+        })
+        .map_err(|e| resume_hint(swap_file, e.into()))?;
     let outcome = outcome.expect("only an outcome ends a run that never stops");
     println!("outcome: {outcome:?}");
-    Ok(())
+    Ok(outcome)
+}
+
+/// The error, and how to carry on if the swap file exists.
+fn resume_hint(swap_file: &Path, error: Box<dyn std::error::Error>) -> Box<dyn std::error::Error> {
+    if !swap_file.exists() {
+        return error;
+    }
+    format!(
+        "{error}\nresume with: lattice-swap resume {}",
+        swap_file.display()
+    )
+    .into()
+}
+
+/// The exit status of a swap that ended: 0 only when it swapped.
+fn exit_code(outcome: Outcome) -> u8 {
+    match outcome {
+        Outcome::Swapped => 0,
+        Outcome::Refunded => 3,
+        Outcome::Punished => 4,
+        Outcome::Drained => 5,
+        Outcome::Aborted(_) => 6,
+    }
 }
 
 /// A swap file as the driver saved it.
@@ -526,13 +738,13 @@ fn log(what: &str) {
 
 fn main() -> ExitCode {
     let result = match Cli::parse().command {
-        Command::Offer(args) => offer(args),
-        Command::Take(args) => take(args),
-        Command::Resume(args) | Command::Refund(args) => resume(args),
-        Command::Status { swap_file } => status(&swap_file),
+        Command::Offer(args) => offer(args).map(exit_code),
+        Command::Take(args) => take(args).map(exit_code),
+        Command::Resume(args) => resume(args).map(exit_code),
+        Command::Status { swap_file } => status(&swap_file).map(|()| 0),
     };
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => ExitCode::from(code),
         Err(e) => {
             log(&e.to_string());
             ExitCode::FAILURE

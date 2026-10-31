@@ -760,6 +760,11 @@ fn terms_leave_room_for_a_block_and_for_the_refund() {
     };
     assert!(!tight.check(), "7 + 3 = t2");
     assert!(Terms { t2: 11, ..tight }.check());
+    let deepest = Terms {
+        btc_confirmations: u32::MAX,
+        ..terms()
+    };
+    assert!(!deepest.check(), "no overflow");
 }
 
 /// Once the seller holds its redeem signature, the buyer refunds only on

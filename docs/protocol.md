@@ -70,6 +70,9 @@ swap id.
 - A buyer whose node never shows its funding transaction rebroadcasts it and
   keeps its secrets, because only they can refund it if it confirms. The
   operator ends the wait by spending one of the funding's inputs elsewhere.
+  The buyer never notices that spend: once it is `btc_confirmations` deep,
+  the funding can no longer confirm, and the operator stops the process and
+  discards the swap file.
 
 Every timelock counts blocks after a confirmation, so every deadline is a
 number of confirmations.
