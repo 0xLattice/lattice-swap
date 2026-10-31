@@ -878,7 +878,8 @@ fn contest_a_refund(punish: impl FnOnce(&Bitcoind, &Transaction)) {
         btc_fee: Amount::from_sat(1_000),
         nex_amount: 1_000,
         nex_fee: 0,
-        t1: 6,
+        // The floor: 1 + 6 x (1 + 1) + 2.
+        t1: 15,
         t2: 6,
         btc_confirmations: 1,
         nex_confirmations: 1,
@@ -999,7 +1000,8 @@ fn lock_funded_by_the_driver(args: &[&'static str]) -> f64 {
         btc_fee: Amount::from_sat(1_000),
         nex_amount: 1_000,
         nex_fee: 1,
-        t1: 6,
+        // The floor: 1 + 6 x (1 + 1) + 2.
+        t1: 15,
         t2: 6,
         btc_confirmations: 1,
         nex_confirmations: 1,

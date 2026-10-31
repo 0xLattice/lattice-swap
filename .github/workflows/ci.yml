@@ -20,6 +20,8 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      # The machines without the native I/O, natively.
+      - run: cargo test -p swap --no-default-features
 
   # The machines without the native I/O, built for the browser, and every
   # machine test run again in wasm under node. `secp256k1-sys` needs a clang

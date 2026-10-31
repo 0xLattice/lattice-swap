@@ -16,8 +16,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use bitcoin::address::NetworkUnchecked;
-use bitcoin::hashes::Hash;
-use bitcoin::{Address, Amount, FeeRate, Network, OutPoint, PubkeyHash, ScriptBuf, WScriptHash};
+use bitcoin::{Address, Amount, FeeRate, Network, ScriptBuf};
 use clap::{Args, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use rand_core::{OsRng, RngCore};
@@ -26,8 +25,7 @@ use serde_json::{json, Value};
 use swap::bitcoind::{Bitcoin, Bitcoind};
 use swap::driver::{Driver, Store};
 use swap::transport::{Ivy, PeerKey, Transport};
-use swap::{Buyer, Machine, Outcome, SecretBytes, Seller, Terms};
-use swap_bitcoin::{KeyPair, Params, Scalar, Spend, Swap};
+use swap::{btc_fee_at, Buyer, Machine, Outcome, SecretBytes, Seller, Terms};
 use swap_nexus_tx::rpc::Client;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -38,8 +36,6 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 const NEX_KEY_ENV: &str = "LATTICE_SWAP_NEX_KEY";
 /// Holds the password for `--btc-user`.
 const BTC_PASSWORD_ENV: &str = "LATTICE_SWAP_BTC_PASSWORD";
-/// A Nexus block is about this many Bitcoin blocks.
-const BTC_BLOCKS_PER_NEXUS_BLOCK: u64 = 6;
 /// The blocks the buyer's fee estimate aims to confirm in.
 const FEE_TARGET: u16 = 6;
 /// What a seller is told without its Nexus key.
@@ -474,94 +470,6 @@ struct SwapFileArgs {
     bump: BumpArgs,
 }
 
-/// The least `t1` this tool runs: the BTC lock `btc_confirmations` deep,
-/// then the NEX lock mined and `nex_confirmations` deep, at about six
-/// Bitcoin blocks a Nexus block, still `margin` blocks before cancel.
-fn t1_floor(terms: &Terms) -> u64 {
-    let nexus =
-        BTC_BLOCKS_PER_NEXUS_BLOCK.saturating_mul(terms.nex_confirmations.saturating_add(1));
-    u64::from(terms.btc_confirmations)
-        .saturating_add(nexus)
-        .saturating_add(u64::from(terms.margin))
-}
-
-/// Terms this tool runs: they can work, and `t1` leaves time for both locks.
-fn check_terms(terms: &Terms) -> std::result::Result<(), String> {
-    if !terms.check() {
-        return Err(
-            "the terms cannot work: confirmations must be at least 1, the margin at \
-                    least 2, t1 and t2 above btc_confirmations + margin, and nex_amount above \
-                    nex_fee"
-                .into(),
-        );
-    }
-    let floor = t1_floor(terms);
-    if u64::from(terms.t1) < floor {
-        return Err(format!(
-            "t1 is {}, below {floor}: btc_confirmations + 6 x (nex_confirmations + 1) + margin",
-            terms.t1
-        ));
-    }
-    let least = btc_amount_floor(terms.btc_fee);
-    if terms.btc_amount.to_sat() < least {
-        return Err(format!(
-            "btc_amount is {} sat, below {least}: redeem pays two btc_fee, and its payout \
-             must stay above dust",
-            terms.btc_amount.to_sat()
-        ));
-    }
-    Ok(())
-}
-
-/// The least `btc_amount` swap-bitcoin takes with `fee`: two fees, as
-/// redeem pays, above the dust limit of the payout. That limit is
-/// highest for a legacy address, the largest a wallet's address can ask.
-fn btc_amount_floor(fee: Amount) -> u64 {
-    let dust = ScriptBuf::new_p2pkh(&PubkeyHash::all_zeros()).minimal_non_dust();
-    fee.to_sat().saturating_mul(2).saturating_add(dust.to_sat())
-}
-
-/// The least `btc_fee` at which cancel and refund, the spends the buyer
-/// relies on, each pay `per_kvb` sat/kvB. Each is signed, with the longest
-/// timelocks; refund pays the buyer's own wallet address, at most
-/// P2WSH-sized. Redeem and punish pay the seller.
-fn btc_fee_at(per_kvb: u64) -> u64 {
-    let key = |n: u8| {
-        let mut bytes = [0u8; 32];
-        bytes[31] = n;
-        let secret = Scalar::from_bytes(bytes).and_then(|s| s.non_zero());
-        KeyPair::new_xonly(secret.expect("a nonzero scalar"))
-    };
-    let (seller, buyer) = (key(1), key(2));
-    let payout = ScriptBuf::new_p2wsh(&WScriptHash::all_zeros());
-    let swap = Swap::new(Params {
-        seller: seller.public_key(),
-        buyer: buyer.public_key(),
-        seller_share: key(3).public_key().normalize(),
-        buyer_share: key(4).public_key().normalize(),
-        amount: Amount::ONE_BTC,
-        fee: Amount::from_sat(100_000),
-        t1: u16::MAX,
-        t2: u16::MAX,
-        redeem_payout: payout.clone(),
-        refund_payout: payout.clone(),
-        punish_payout: payout,
-    })
-    .expect("these parameters work");
-    let lock = OutPoint::null();
-    [Spend::Cancel, Spend::Refund]
-        .into_iter()
-        .map(|spend| {
-            let a = swap.sign(lock, spend, &seller);
-            let b = swap.sign(lock, spend, &buyer);
-            let tx = swap.finalize(lock, spend, &a, Some(&b));
-            let vsize = tx.expect("our own signatures").vsize() as u64;
-            per_kvb.saturating_mul(vsize).div_ceil(1000)
-        })
-        .max()
-        .expect("two spends")
-}
-
 /// The least `btc_fee` the buyer takes, in satoshis: what bitcoind's
 /// conservative estimate, or else `fallback` sat/vB, asks of every swap
 /// spend.
@@ -597,7 +505,7 @@ fn check_offer(
     nex_fee_floor: u64,
 ) -> std::result::Result<(), String> {
     let terms = &offer.terms;
-    check_terms(terms)?;
+    terms.check()?;
     let refused = |why: String| Err(format!("refused: the offer {why}"));
     if offer.btc_network != network {
         return refused(format!("is on {}, not {network}", offer.btc_network));
@@ -788,7 +696,7 @@ fn offer(args: OfferArgs) -> Result<Outcome> {
     let terms = args
         .terms
         .terms(random32(), args.nodes.nexus_genesis.clone());
-    check_terms(&terms)?;
+    terms.check()?;
     let key = args.key.load()?;
     let bitcoin = args.nodes.bitcoin()?;
     let floor = btc_fee_floor(&bitcoin, args.min_btc_fee_rate)?;

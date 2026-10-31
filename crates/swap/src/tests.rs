@@ -481,11 +481,12 @@ fn a_seller_that_never_signed_a_lock_ends_with_nothing_to_claim() {
 
 /// The buyer, never having signed the redeem, cancels at t1 and refunds.
 fn cancel_and_refund(buyer: Buyer) -> (Transaction, Transaction) {
-    let (buyer, actions) = buyer.step(btc(20, None, None));
+    let t1 = u32::from(buyer.terms().unwrap().t1);
+    let (buyer, actions) = buyer.step(btc(t1, None, None));
     let [cancel] = &broadcasts(&actions)[..] else {
         panic!("cancel");
     };
-    let (_, actions) = buyer.step(btc(21, Some((cancel, 1)), None));
+    let (_, actions) = buyer.step(btc(t1 + 1, Some((cancel, 1)), None));
     let [refund] = &broadcasts(&actions)[..] else {
         panic!("refund");
     };
@@ -787,12 +788,15 @@ fn a_redeem_signature_waits_for_a_fresh_view() {
 
 #[test]
 fn terms_leave_room_for_a_block_and_for_the_refund() {
-    assert!(terms().check());
+    assert!(terms().check().is_ok());
     let margin_one = Terms {
         margin: 1,
         ..terms()
     };
-    assert!(!margin_one.check(), "a block can land before the redeem");
+    assert!(
+        margin_one.check().is_err(),
+        "a block can land before the redeem"
+    );
     // The buyer refunds on a cancel `btc_confirmations` deep, `margin`
     // blocks before punish.
     let tight = Terms {
@@ -800,13 +804,13 @@ fn terms_leave_room_for_a_block_and_for_the_refund() {
         t1: 30,
         ..terms()
     };
-    assert!(!tight.check(), "7 + 3 = t2");
-    assert!(Terms { t2: 11, ..tight }.check());
+    assert!(tight.check().is_err(), "7 + 3 = t2");
+    assert!(Terms { t2: 11, ..tight }.check().is_ok());
     let deepest = Terms {
         btc_confirmations: u32::MAX,
         ..terms()
     };
-    assert!(!deepest.check(), "no overflow");
+    assert!(deepest.check().is_err(), "no overflow");
 }
 
 /// Once the seller holds its redeem signature, the buyer refunds only on
@@ -1267,12 +1271,13 @@ fn a_refund_first_seen_deep_is_still_a_refund() {
 /// The seller, having signed its lock at nonce 3 and learned `b`, waits
 /// with the lock address empty.
 fn seller_claiming_a_signed_lock(terms: Terms) -> Seller {
+    let t1 = u32::from(terms.t1);
     let locked = locked_with(terms);
     let (seller, buyer, lock) = locked.nex_signed();
     assert_eq!(lock.body.nonce, 3);
-    let (seller, _) = seller.step(btc(18, None, None));
+    let (seller, _) = seller.step(btc(t1 - 2, None, None));
     let (cancel, refund) = cancel_and_refund(buyer);
-    let (seller, _) = seller.step(btc(21, Some((&cancel, 1)), Some((&refund, 0))));
+    let (seller, _) = seller.step(btc(t1 + 1, Some((&cancel, 1)), Some((&refund, 0))));
     assert!(matches!(seller, Seller::ClaimingNex(_)));
     seller
 }
@@ -1284,6 +1289,8 @@ fn seller_claiming_a_signed_lock(terms: Terms) -> Seller {
 fn a_passed_nonce_must_hold_nex_confirmations_blocks() {
     let deep = Terms {
         nex_confirmations: 3,
+        // The floor: 1 + 6 x (3 + 1) + 3.
+        t1: 28,
         ..terms()
     };
     let seller = seller_claiming_a_signed_lock(deep);
@@ -2444,7 +2451,6 @@ fn a_failing_view_is_logged_when_it_starts_and_while_it_lasts() {
 /// A redeem the seller saw outlives a cancel that a reorg put back in the
 /// mempool and that evicted the redeem: `s` may be public, and the redeem,
 /// bumped, can replace the cancel.
-#[cfg(feature = "native")]
 #[test]
 fn a_seen_redeem_is_sent_again_when_cancel_leaves_its_block() {
     let (seller, redeem, cancel) = seller_redeeming();
@@ -2470,8 +2476,12 @@ fn a_seen_redeem_is_sent_again_when_cancel_leaves_its_block() {
     assert_eq!(broadcasts(&actions), std::slice::from_ref(&redeem));
     let (_, actions) = seller.step(btc(20, Some((&cancel, 0)), None));
     assert_eq!(broadcasts(&actions), std::slice::from_ref(&redeem));
+}
 
-    // The driver bumps it past the pooled cancel.
+/// The driver bumps such a redeem past the pooled cancel.
+#[cfg(feature = "native")]
+#[test]
+fn a_seen_redeem_is_bumped_past_a_pooled_cancel() {
     let (seller, redeem, cancel) = seller_redeeming();
     let (seller, _) = seller.step(btc(17, Some((&redeem, 0)), None));
     let (seller, _) = seller.step(btc(20, Some((&cancel, 1)), None));
@@ -2524,6 +2534,8 @@ fn the_state_is_saved_before_its_actions() {
 fn the_buyer_signs_only_on_a_deep_nex_lock() {
     let deep = Terms {
         nex_confirmations: 3,
+        // The floor: 1 + 6 x (3 + 1) + 3.
+        t1: 28,
         ..terms()
     };
     let (_, buyer, nex_lock) = locked_with(deep).nex_locked();
@@ -2632,6 +2644,8 @@ fn the_buyer_ends_only_on_a_deep_refund_or_punish() {
 fn a_claim_is_done_only_nex_confirmations_deep() {
     let deep = Terms {
         nex_confirmations: 3,
+        // The floor: 1 + 6 x (3 + 1) + 3.
+        t1: 28,
         ..terms()
     };
     let (buyer, actions) = buyer_claiming_with(deep).step(nexus(account(500_000, 0), None));
@@ -2665,7 +2679,7 @@ fn a_lock_drained_after_the_claim_was_signed_is_drained() {
 
 /// The swap file, which holds the party's secrets, is its owner's alone,
 /// and a temporary file planted as a link is never written through.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "native"))]
 #[test]
 fn the_swap_file_is_its_owners_alone() {
     use std::os::unix::fs::PermissionsExt;
@@ -2713,17 +2727,18 @@ fn terms_whose_nex_debit_does_not_fit_are_refused() {
         nex_amount: i64::MAX as u64 - 100,
         ..terms()
     };
-    assert!(most.check());
-    assert!(!Terms {
+    assert!(most.check().is_ok());
+    assert!(Terms {
         nex_fee: 101,
         ..most
     }
-    .check());
+    .check()
+    .is_err());
     let past = Terms {
         nex_amount: u64::MAX,
         ..terms()
     };
-    assert!(!past.check(), "no overflow");
+    assert!(past.check().is_err(), "no overflow");
 }
 
 /// Near its deadline a bump that keeps failing, or that is clamped to
@@ -2805,7 +2820,7 @@ fn a_pooled_refund_with_no_seen_redeem_is_claimed_from_at_once() {
 
 /// A temporary file left by a crash is replaced, never reused: the swap
 /// file is its owner's alone whatever the leftover's mode.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "native"))]
 #[test]
 fn a_leftover_temporary_file_is_replaced() {
     use std::os::unix::fs::PermissionsExt;
@@ -3252,4 +3267,24 @@ fn the_lock_is_funded_at_the_estimate_or_the_fallback_rate() {
     assert_eq!(funded(Some(50), 10), [rate(50)]);
     assert_eq!(funded(None, 10), [rate(10)]);
     assert_eq!(funded(None, 33), [rate(33)]);
+}
+
+/// A view looks up redeem before cancel and refund before punish, and
+/// searches the cancel output from `t2` blocks after cancel.
+#[test]
+fn a_view_looks_up_the_swaps_own_spends() {
+    let (swap, lock) = locked().swap();
+    let txid = |spend| swap.unsigned_tx(lock, spend).compute_txid();
+    let lookups = view::Lookups::new(&swap, lock);
+    assert_eq!(lookups.lock, lock);
+    assert_eq!(
+        lookups.lock_spends,
+        [txid(Spend::Redeem), txid(Spend::Cancel)]
+    );
+    assert_eq!(
+        lookups.cancel_spends,
+        [txid(Spend::Refund), txid(Spend::Punish)]
+    );
+    assert_eq!(lookups.cancel_output, OutPoint::new(txid(Spend::Cancel), 0));
+    assert_eq!(lookups.t2, terms().t2);
 }

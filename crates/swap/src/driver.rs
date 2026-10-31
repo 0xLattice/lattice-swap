@@ -13,8 +13,8 @@ use swap_nexus_tx::rpc::Client;
 
 use crate::bitcoind::{self, Bitcoin};
 use crate::transport::Transport;
+use crate::{view, SecretBytes, Spent};
 use crate::{Action, BitcoinView, Event, Machine, Message, NexusView, NexusWatch, Outcome};
-use crate::{SecretBytes, Spent};
 
 pub use crate::STATE_VERSION;
 
@@ -713,21 +713,8 @@ thread_local! {
     };
 }
 
-/// Only the swap's own transactions can spend the lock output, and their
-/// txids are fixed before any is signed, so each is looked up by txid. The
-/// same holds for the cancel output but for punish: its leaf takes the
-/// seller's signature alone, so the seller can spend through it with any
-/// transaction. Only when cancel is in a block, neither refund nor punish
-/// shows, and the cancel output is spent anyway, is the spender searched
-/// for.
-///
-/// The view is [`BitcoinView::stale`] if the node lags the best header
-/// chain it knows, or if its tip is more than `max_tip_age` old at `now`:
-/// since its block time or since `first_seen`, when this machine first saw
-/// it, whichever is earlier. A block time alone is the
-/// miner's to set, up to two hours ahead; `first_seen` is updated to the
-/// tip. A node that stalled, or is fed by someone who cut it off, would
-/// show the redeem window still open after it closed.
+/// The view [`view::Lookups`] asks for, aged by [`view::stale`] with
+/// `max_tip_age` at `now`.
 pub fn bitcoin_view(
     bitcoin: &impl Bitcoin,
     swap: &Swap,
@@ -740,50 +727,26 @@ pub fn bitcoin_view(
     let now = now
         .duration_since(UNIX_EPOCH)
         .map_or(0, |now| now.as_secs());
-    let seen = match *first_seen {
-        Some((hash, at)) if hash == tip.hash => at,
-        _ => first_seen.insert((tip.hash, now)).1,
-    };
-    let age = now.saturating_sub(tip.time.min(seen));
-    let stale = if tip.headers > tip.height {
-        Some(format!(
-            "the node has blocks to {} of headers to {}: no redeem or NEX lock starts until it \
-             catches up",
-            tip.height, tip.headers
-        ))
-    } else if age > max_tip_age.as_secs() {
-        Some(format!(
-            "the node's tip, block {}, is {} minutes old: no redeem or NEX lock starts until it \
-             has a fresh one, since a stalled or cut-off node hides the swap's deadlines",
-            tip.height,
-            age / 60
-        ))
-    } else {
-        None
-    };
+    let stale = view::stale(&tip, max_tip_age.as_secs(), now, first_seen);
     let height = tip.height;
-    let funding = bitcoin.transaction(lock.txid)?.map(|(_, depth)| depth);
-    let spent = |spends: [Spend; 2]| -> bitcoind::Result<Option<Spent>> {
-        for spend in spends {
-            let txid = swap.unsigned_tx(lock, spend).compute_txid();
+    let lookups = view::Lookups::new(swap, lock);
+    let funding = bitcoin
+        .transaction(lookups.lock.txid)?
+        .map(|(_, depth)| depth);
+    let spent = |txids: [Txid; 2]| -> bitcoind::Result<Option<Spent>> {
+        for txid in txids {
             if let Some((tx, confirmations)) = bitcoin.transaction(txid)? {
                 return Ok(Some(Spent { tx, confirmations }));
             }
         }
         Ok(None)
     };
-    let lock_spend = spent([Spend::Redeem, Spend::Cancel])?;
-    let mut cancel_spend = spent([Spend::Refund, Spend::Punish])?;
-    let cancel = swap.unsigned_tx(lock, Spend::Cancel).compute_txid();
-    if let Some(Spent { tx, confirmations }) = &lock_spend {
-        if cancel_spend.is_none() && *confirmations > 0 && tx.compute_txid() == cancel {
-            // Punish can be mined no earlier than `t2` blocks after cancel.
-            let mined = (height + 1).saturating_sub(*confirmations);
-            let from = mined.saturating_add(swap.params().t2.into());
-            cancel_spend = bitcoin
-                .spender(OutPoint::new(cancel, 0), from)?
-                .map(|(tx, confirmations)| Spent { tx, confirmations });
-        }
+    let lock_spend = spent(lookups.lock_spends)?;
+    let mut cancel_spend = spent(lookups.cancel_spends)?;
+    if let Some(from) = lookups.search_from(height, &lock_spend, &cancel_spend) {
+        cancel_spend = bitcoin
+            .spender(lookups.cancel_output, from)?
+            .map(|(tx, confirmations)| Spent { tx, confirmations });
     }
     Ok(BitcoinView {
         height,
@@ -796,10 +759,8 @@ pub fn bitcoin_view(
 
 /// The lock account is read before the watched transaction: a lock that
 /// has signed something, read first, shows that transaction mined in the
-/// later read if it is ours. The view is one tip's: `None` if the tip
-/// moved while it was read, so no read in it comes from another block.
-/// That needs the operator port, whose `/health` is never cached; a public
-/// read port caches it, and would let the reads straddle two tips.
+/// later read if it is ours. The view is one tip's: `None` unless
+/// [`view::one_tip`] holds, so no read in it comes from another block.
 fn nexus_view(
     client: &Client,
     watch: &NexusWatch,
@@ -820,7 +781,7 @@ fn nexus_view(
         None => None,
     };
     let after = client.health()?;
-    if (after.height, &after.tip) != (health.height, &health.tip) {
+    if !view::one_tip(&health, &after) {
         return Ok(None);
     }
     Ok(Some(NexusView {
