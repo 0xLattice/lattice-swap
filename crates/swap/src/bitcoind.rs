@@ -1,11 +1,16 @@
 //! What a party needs from Bitcoin, and a bitcoind JSON-RPC client for it.
 
 use std::fmt;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use base64::Engine;
+use bitcoin::address::NetworkUnchecked;
 use bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
-use bitcoin::{Address, Amount, Block, Denomination, Network, OutPoint, Script, Transaction, Txid};
+use bitcoin::{
+    Address, Amount, Block, Denomination, FeeRate, Network, OutPoint, Script, ScriptBuf,
+    Transaction, Txid,
+};
 use serde_json::{json, Value};
 
 #[derive(Debug)]
@@ -36,17 +41,42 @@ pub trait Bitcoin {
     /// A transaction from the wallet paying `amount` to `script`, signed but
     /// not broadcast.
     fn fund_lock(&self, script: &Script, amount: Amount) -> Result<Transaction>;
+    /// A feerate to confirm within a couple of blocks, if the node has an
+    /// estimate; a conservative one for the next block if `urgent`.
+    fn fee_rate(&self, urgent: bool) -> Result<Option<FeeRate>>;
+    /// The lowest package feerate at which `parent`, which the mempool
+    /// refused, would enter it with a child spending its payout: the
+    /// mempool's minimum, and if another transaction spends `parent`'s input
+    /// there, enough to replace it and its descendants.
+    fn floor(&self, parent: &Transaction) -> Result<FeeRate>;
+    /// The feerate of `parent` and its descendants in the mempool, as a
+    /// child that bumped it made it; `None` if `parent` is not there.
+    fn package_rate(&self, parent: &Transaction) -> Result<Option<FeeRate>>;
+    /// Raises unconfirmed `parent`, which pays `fee`, to `rate`, above its
+    /// own feerate, with a CPFP child spending its payout, output 0, into
+    /// the wallet, and submits both as a package; returns the child's txid.
+    /// The child pays at most `max`, and less if its change would be dust
+    /// otherwise. A child replacing the last pays at least what Bitcoin
+    /// Core asks of a replacement: the last's fee and the incremental
+    /// feerate on its own size. Fails if the wallet cannot sign for the
+    /// payout.
+    fn bump(&self, parent: &Transaction, fee: Amount, rate: FeeRate, max: Amount) -> Result<Txid>;
 }
 
 /// bitcoind's JSON-RPC. `transaction` reads any transaction, so the node
 /// needs `-txindex`; `spender` calls `gettxspendingprevout`, so it needs
-/// Bitcoin Core 24 or later; `fund_lock` needs a wallet, so `url` names one
-/// (`http://host:port/wallet/<name>`).
+/// Bitcoin Core 24 or later; `fund_lock` and `bump` need a wallet, so `url`
+/// names one (`http://host:port/wallet/<name>`).
 pub struct Bitcoind {
     agent: ureq::Agent,
     url: String,
     authorization: String,
     network: Network,
+    /// The last parent sized for a child: its txid, the change script the
+    /// child pays, and the package's vsize. `floor` and `bump`, and every
+    /// rebump, reuse them rather than ask for another change address and
+    /// sign again.
+    sized: Mutex<Option<(Txid, ScriptBuf, Option<u64>)>>,
 }
 
 impl Bitcoind {
@@ -59,6 +89,7 @@ impl Bitcoind {
             url: url.into(),
             authorization: format!("Basic {token}"),
             network,
+            sized: Mutex::new(None),
         }
     }
 
@@ -83,6 +114,88 @@ impl Bitcoind {
         }
         Ok(body["result"].clone())
     }
+
+    /// A change script of the wallet for a child of `parent`, and the
+    /// package's vsize with that child signed: worked out once per parent.
+    fn sized(&self, parent: &Transaction) -> Result<(ScriptBuf, u64)> {
+        let txid = parent.compute_txid();
+        let mut sized = self.sized.lock().expect("not poisoned");
+        let change = match &*sized {
+            Some((sized, change, Some(size))) if *sized == txid => {
+                return Ok((change.clone(), *size));
+            }
+            // Kept when sizing failed, so a retry takes no new address.
+            Some((sized, change, None)) if *sized == txid => change.clone(),
+            _ => self.change_for(parent)?,
+        };
+        *sized = Some((txid, change.clone(), None));
+        let size = self.package_vsize(parent, change.clone())?;
+        *sized = Some((txid, change.clone(), Some(size)));
+        Ok((change, size))
+    }
+
+    /// The script of a new change address of the wallet, if the wallet can
+    /// sign for `parent`'s payout; only the payee can bump.
+    fn change_for(&self, parent: &Transaction) -> Result<ScriptBuf> {
+        // An operator's external payout script is not this wallet's to bump
+        // with.
+        let payout = Address::from_script(&parent.output[0].script_pubkey, self.network)
+            .map_err(|e| Error(format!("payout: {e}")))?;
+        let info = self.call("getaddressinfo", json!([payout.to_string()]))?;
+        if info["ismine"] != true {
+            return Err(Error(format!("payout {payout} is not this wallet's")));
+        }
+        let change = self.call("getrawchangeaddress", json!([]))?;
+        Ok(change
+            .as_str()
+            .and_then(|a| a.parse::<Address<NetworkUnchecked>>().ok())
+            .and_then(|a| a.require_network(self.network).ok())
+            .ok_or_else(|| Error(format!("change address {change}")))?
+            .script_pubkey())
+    }
+
+    /// `parent` and a signed child spending its payout, in vbytes.
+    fn package_vsize(&self, parent: &Transaction, change: ScriptBuf) -> Result<u64> {
+        let child = swap_bitcoin::cpfp(parent, change, Amount::ZERO)
+            .ok_or_else(|| Error("the payout is dust".into()))?;
+        Ok((parent.vsize() + self.sign_child(parent, &child)?.vsize()) as u64)
+    }
+
+    /// The wallet's signature on `child`, which spends `parent`'s payout.
+    fn sign_child(&self, parent: &Transaction, child: &Transaction) -> Result<Transaction> {
+        let payout = &parent.output[0];
+        let prevtxs = json!([{
+            "txid": parent.compute_txid(),
+            "vout": 0,
+            "scriptPubKey": payout.script_pubkey.to_hex_string(),
+            "amount": payout.value.to_string_in(Denomination::Bitcoin),
+        }]);
+        let signed = self.call(
+            "signrawtransactionwithwallet",
+            json!([serialize_hex(child), prevtxs]),
+        )?;
+        if signed["complete"] != true {
+            return Err(Error(format!("wallet could not sign: {signed}")));
+        }
+        decode(&signed["hex"])
+    }
+}
+
+fn btc(value: &Value) -> Result<Amount> {
+    value
+        .as_f64()
+        .and_then(|btc| Amount::from_btc(btc).ok())
+        .ok_or_else(|| Error(format!("not an amount: {value}")))
+}
+
+/// A feerate in BTC/kvB, as bitcoind reports one.
+fn per_kvb(value: &Value) -> Result<FeeRate> {
+    Ok(FeeRate::from_sat_per_kwu(btc(value)?.to_sat().div_ceil(4)))
+}
+
+/// `fee` over `vsize`, rounded up.
+fn over(fee: Amount, vsize: u64) -> FeeRate {
+    FeeRate::from_sat_per_kwu((fee.to_sat() * 250).div_ceil(vsize.max(1)))
 }
 
 fn decode<T: bitcoin::consensus::Decodable>(hex: &Value) -> Result<T> {
@@ -172,4 +285,127 @@ impl Bitcoin for Bitcoind {
         }
         decode(&signed["hex"])
     }
+
+    fn fee_rate(&self, urgent: bool) -> Result<Option<FeeRate>> {
+        // Bitcoin Core takes targets from 1 block, which it reads as 2, and
+        // estimates economically unless asked otherwise.
+        let target = match urgent {
+            true => json!([1, "conservative"]),
+            false => json!([2]),
+        };
+        let estimate = self.call("estimatesmartfee", target)?;
+        // BTC per kvB; absent while the node has too little data.
+        if estimate["feerate"].is_null() {
+            return Ok(None);
+        }
+        per_kvb(&estimate["feerate"]).map(Some)
+    }
+
+    fn floor(&self, parent: &Transaction) -> Result<FeeRate> {
+        let mempool = self.call("getmempoolinfo", json!([]))?;
+        let minimum = per_kvb(&mempool["mempoolminfee"])?;
+        let input = parent.input[0].previous_output;
+        let spending = self.call(
+            "gettxspendingprevout",
+            json!([[{"txid": input.txid, "vout": input.vout}]]),
+        )?;
+        let other = match spending[0]["spendingtxid"].as_str() {
+            Some(other) if other != parent.compute_txid().to_string() => other,
+            _ => return Ok(minimum),
+        };
+        // Bitcoin Core replaces a package only with one at a better feerate
+        // that also pays all of its fees and the incremental feerate on its
+        // own size. A low-feerate child of up to 1000 vB under the other
+        // spend raises that: the whole fee spread over our smaller package.
+        // Best effort: a non-TRUC conflict with two children, which the
+        // punish leaf lets the seller make, cannot be replaced at all.
+        let entry = self.call("getmempoolentry", json!([other]))?;
+        let size = |key: &str| {
+            entry[key]
+                .as_u64()
+                .ok_or_else(|| Error(format!("mempool entry {key}: {entry}")))
+        };
+        let (own, all) = (
+            btc(&entry["fees"]["base"])?,
+            btc(&entry["fees"]["descendant"])?,
+        );
+        let (_, ours) = self.sized(parent)?;
+        let beat = over(own, size("vsize")?)
+            .max(over(all, size("descendantsize")?))
+            .max(over(all, ours));
+        let incremental = per_kvb(&mempool["incrementalrelayfee"])?;
+        let above = beat.to_sat_per_kwu() + incremental.to_sat_per_kwu();
+        Ok(minimum.max(FeeRate::from_sat_per_kwu(above)))
+    }
+
+    fn package_rate(&self, parent: &Transaction) -> Result<Option<FeeRate>> {
+        let entry = match self.call("getmempoolentry", json!([parent.compute_txid()])) {
+            Ok(entry) => entry,
+            // RPC_INVALID_ADDRESS_OR_KEY: not in the mempool.
+            Err(Error(e)) if e.contains("\"code\":-5") => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let size = entry["descendantsize"]
+            .as_u64()
+            .ok_or_else(|| Error(format!("mempool entry descendantsize: {entry}")))?;
+        let fees = btc(&entry["fees"]["descendant"])?.to_sat();
+        // Rounded down: it is compared with a target the package must meet.
+        Ok(Some(FeeRate::from_sat_per_kwu(fees * 250 / size.max(1))))
+    }
+
+    fn bump(&self, parent: &Transaction, fee: Amount, rate: FeeRate, max: Amount) -> Result<Txid> {
+        // The child pays all the package needs but `fee`, and what replacing
+        // the last child takes, short of `max` and of leaving dust.
+        let (change, size) = self.sized(parent)?;
+        let mut fee = rate
+            .fee_vb(size)
+            .and_then(|package| package.checked_sub(fee))
+            .ok_or_else(|| Error(format!("feerate {rate}")))?;
+        let txid = parent.compute_txid();
+        let spending = self.call("gettxspendingprevout", json!([[{"txid": txid, "vout": 0}]]))?;
+        if let Some(last) = spending[0]["spendingtxid"].as_str() {
+            let entry = self.call("getmempoolentry", json!([last]))?;
+            let mempool = self.call("getmempoolinfo", json!([]))?;
+            let incremental = per_kvb(&mempool["incrementalrelayfee"])?;
+            // A vbyte over the sized child's: a signature can come out a
+            // byte longer than the one it was sized with.
+            let own = size - parent.vsize() as u64 + 1;
+            let malformed = || Error(format!("mempool entry {last}: {entry}"));
+            // With its descendants: a replacement pays for all it evicts. A
+            // TRUC child has none, so its fee and size are its own.
+            let base = btc(&entry["fees"]["descendant"])?;
+            let last_size = entry["vsize"].as_u64().ok_or_else(malformed)?;
+            let replace = replacing(base, last_size, own, incremental).ok_or_else(malformed)?;
+            fee = fee.max(replace);
+        }
+        let spendable = parent.output[0]
+            .value
+            .checked_sub(change.minimal_non_dust())
+            .ok_or_else(|| Error("the payout is dust".into()))?;
+        let fee = fee.min(max).min(spendable);
+        let child = swap_bitcoin::cpfp(parent, change, fee).expect("change above dust");
+        let signed = self.sign_child(parent, &child)?;
+        let result = self.call(
+            "submitpackage",
+            json!([[serialize_hex(parent), serialize_hex(&signed)]]),
+        )?;
+        if result["package_msg"] != "success" {
+            return Err(Error(format!("submitpackage: {result}")));
+        }
+        Ok(signed.compute_txid())
+    }
+}
+
+/// The least a child of `own` vbytes pays to replace one of `last_size`
+/// that paid `base`: Core takes a replacement that pays the old fee and its
+/// own relay at the incremental rate, at a feerate above the old one.
+pub(crate) fn replacing(
+    base: Amount,
+    last_size: u64,
+    own: u64,
+    incremental: FeeRate,
+) -> Option<Amount> {
+    let more = base.checked_add(incremental.fee_vb(own)?)?;
+    let above = (1000 * base.to_sat() / last_size.max(1) + 1).div_ceil(4);
+    Some(more.max(FeeRate::from_sat_per_kwu(above).fee_vb(own)?))
 }

@@ -14,7 +14,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use bitcoin::address::NetworkUnchecked;
-use bitcoin::{Address, Amount, Denomination, Network, ScriptBuf};
+use bitcoin::{Address, Amount, Denomination, FeeRate, Network, ScriptBuf};
 use corepc_node::{Conf, Node};
 use ed25519_dalek::SigningKey;
 use rand_core::{OsRng, RngCore};
@@ -34,6 +34,11 @@ const BTC_FEE: Amount = Amount::from_sat(1_000);
 const NEX_AMOUNT: u64 = 1_000_000;
 /// What the buyer's wallet starts with.
 const BUYER_BTC: Amount = Amount::ONE_BTC;
+
+/// Below every swap transaction's own feerate, as the fallback for
+/// regtest's missing estimate and as the cap: nothing is bumped, and each
+/// costs exactly `BTC_FEE`, but redeem, which pays two.
+const NO_BUMP: FeeRate = FeeRate::from_sat_per_vb_u32(1);
 
 fn random32() -> [u8; 32] {
     let mut bytes = [0u8; 32];
@@ -401,6 +406,8 @@ fn spawn_seller(
         let mut driver =
             Driver::start(seller, vec![], bitcoin, nexus, Some(transport), store).unwrap();
         driver.nex_key = Some(key);
+        driver.fallback_fee_rate = NO_BUMP;
+        driver.max_fee_rate = NO_BUMP;
         let outcome = driver.run_until(stop).unwrap();
         (outcome, driver.state().clone())
     })
@@ -428,6 +435,8 @@ fn spawn_buyer(
         let transport = Ivy::connect(seller.0, &config, seller.1, TIMEOUT).unwrap();
         let mut driver =
             Driver::start(buyer, actions, bitcoin, nexus, Some(transport), store).unwrap();
+        driver.fallback_fee_rate = NO_BUMP;
+        driver.max_fee_rate = NO_BUMP;
         let outcome = driver.run_until(stop).unwrap();
         (outcome, driver.state().clone())
     })
@@ -442,6 +451,8 @@ fn resume_buyer(world: &World) -> Party<Buyer> {
     );
     thread::spawn(move || {
         let mut driver = Driver::<Buyer, _, Ivy>::resume(bitcoin, nexus, None, store).unwrap();
+        driver.fallback_fee_rate = NO_BUMP;
+        driver.max_fee_rate = NO_BUMP;
         let outcome = driver.run().unwrap();
         (Some(outcome), driver.state().clone())
     })
@@ -507,7 +518,7 @@ fn happy_path() {
         2 * REWARD - NEX_AMOUNT - fee
     );
     assert_eq!(n.balance(&lock_address(&lock)), 0);
-    assert_eq!(btc_balance(&world.seller_wallet), BTC_AMOUNT - BTC_FEE);
+    assert_eq!(btc_balance(&world.seller_wallet), BTC_AMOUNT - BTC_FEE * 2);
     assert_eq!(
         btc_balance(&world.buyer_wallet),
         BUYER_BTC - BTC_AMOUNT - world.funding_fee()
@@ -639,7 +650,7 @@ fn buyer_restarts_from_its_state_file() {
         2 * REWARD - NEX_AMOUNT - fee
     );
     assert_eq!(n.balance(&lock_address(&lock)), 0);
-    assert_eq!(btc_balance(&world.seller_wallet), BTC_AMOUNT - BTC_FEE);
+    assert_eq!(btc_balance(&world.seller_wallet), BTC_AMOUNT - BTC_FEE * 2);
     assert_eq!(
         btc_balance(&world.buyer_wallet),
         BUYER_BTC - BTC_AMOUNT - world.funding_fee()

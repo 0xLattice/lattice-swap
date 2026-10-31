@@ -14,7 +14,13 @@ no Nexus consensus change is required.
 - `swap-core`: key setup: one secret per party on two curves, and the proof
   that ties them.
 - `swap-bitcoin`: the Taproot lock, with cancel, refund and punish paths
-  using adaptor signatures.
+  using adaptor signatures. Each swap transaction has one output; redeem,
+  refund and punish pay a party, who alone can raise its fee by CPFP from
+  that payout. Redeem pays two fees, so cancel and refund together cannot
+  replace it. Cancel cannot be bumped. The buyer is safe only if its refund
+  confirms before `t2`: after it, the seller can spend the cancel output
+  through the punish leaf in a shape no refund can replace, and contesting
+  it is best effort.
 - `swap-nexus`: the joint key, `(s + b)·G`, and Ed25519 signing with it.
 - `swap-nexus-tx`: Nexus transfers encoded and signed exactly as Lattice
   54.2.1 does, checked against Lattice's conformance vectors, and a small
@@ -24,9 +30,12 @@ no Nexus consensus change is required.
 
 - `swap`: the protocol: the messages, a state machine for each party, and
   drivers that run them against bitcoind, a lattice-node and an ivy session,
-  saving each party's state so it survives a restart. Its end-to-end tests
-  run whole swaps on regtest and a Nexus node; like the node test, they are
-  ignored by default and need `NEXUS_NODE_IMAGE` and `-- --ignored`.
+  saving each party's state so it survives a restart. A driver bumps the
+  swap transactions that pay its party while they wait unconfirmed, from
+  their payout, up to `max_fee_rate` and `max_fee_fraction` of the payout.
+  Its end-to-end tests run whole swaps on regtest and a Nexus node; like the
+  node test, they are ignored by default and need `NEXUS_NODE_IMAGE` and
+  `-- --ignored`.
 
 ## License
 
