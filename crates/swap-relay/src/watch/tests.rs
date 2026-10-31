@@ -73,7 +73,10 @@ struct Fake {
     /// Where each transaction is: `None` in the mempool.
     seen: HashMap<Txid, Option<u32>>,
     spenders: HashMap<OutPoint, (Txid, Option<u32>)>,
+    /// The broadcasts taken.
     broadcasts: Mutex<Vec<Transaction>>,
+    /// Whether every broadcast is refused.
+    refuse: bool,
     tip: u32,
 }
 
@@ -98,6 +101,9 @@ impl Chain for Fake {
         Ok(self.spenders.get(&outpoint).copied())
     }
     fn broadcast(&self, tx: &Transaction) -> io::Result<()> {
+        if self.refuse {
+            return Err(io::Error::other("refused"));
+        }
         self.broadcasts.lock().unwrap().push(tx.clone());
         Ok(())
     }
@@ -431,39 +437,82 @@ fn a_bad_file_on_disk_is_skipped() {
     }
 }
 
-/// A watch whose cancel is in neither the mempool nor a block for
-/// `unseen` rounds in a row is dropped; one whose cancel waits in the
-/// mempool is not, however long.
+/// A watch whose cancel drops out of the mempool broadcasts it again, and
+/// is dropped only once the network has refused it `unseen` rounds in a
+/// row; one whose cancel waits in the mempool, or is taken again, is not.
 #[test]
-fn a_watch_whose_cancel_stays_unseen_is_dropped() {
+fn an_unseen_cancel_is_broadcast_again_and_dropped_only_once_refused() {
     let dir = tempfile::tempdir().unwrap();
     let tower = Watchtower::open(Network::Regtest, dir.path(), 10).unwrap();
     let watch = watch();
     let txid = watch.cancel.compute_txid();
     let mut chain = Fake::with_cancel(&watch, None);
-    let cancel = tower.add(watch, &chain).unwrap();
-    for _ in 0..10 * UNSEEN {
-        tower.round(&chain, UNSEEN);
-    }
+    let cancel = tower.add(watch.clone(), &chain).unwrap();
+    let rounds = |chain: &Fake, n| (0..n).for_each(|_| tower.round(chain, UNSEEN));
+    rounds(&chain, 10 * UNSEEN);
     assert_eq!(tower.len(), 1);
-    // Evicted, then back once: the count starts again.
+    assert!(chain.broadcasts.lock().unwrap().is_empty());
+    // Evicted, and broadcast again each round, and taken: kept.
     chain.seen.remove(&txid);
-    for _ in 1..UNSEEN {
-        tower.round(&chain, UNSEEN);
-    }
+    rounds(&chain, 10 * UNSEEN);
+    assert_eq!(tower.len(), 1);
+    let again = vec![watch.cancel.clone(); 10 * UNSEEN as usize];
+    assert_eq!(*chain.broadcasts.lock().unwrap(), again);
+    // Refused, but taken again once, then seen once: the count starts
+    // again each time.
+    chain.refuse = true;
+    rounds(&chain, UNSEEN - 1);
+    chain.refuse = false;
+    rounds(&chain, 1);
+    chain.refuse = true;
+    rounds(&chain, UNSEEN - 1);
     chain.seen.insert(txid, None);
-    tower.round(&chain, UNSEEN);
+    rounds(&chain, 1);
     chain.seen.remove(&txid);
-    for _ in 1..UNSEEN {
-        tower.round(&chain, UNSEEN);
-    }
+    rounds(&chain, UNSEEN - 1);
     assert_eq!(tower.len(), 1);
+    rounds(&chain, 1);
+    assert!(tower.is_empty());
+    assert!(!dir.path().join(format!("{cancel}.json")).exists());
+}
+
+/// A cancel more than `MAX_STALE` deep, its output's spend unconfirmed,
+/// ends the watch: `t2` is shorter, so punish has long been valid.
+#[test]
+fn a_cancel_deep_past_max_stale_without_a_confirmed_spend_is_dropped() {
+    assert_eq!(MAX_STALE, u32::from(swap::T2_LIMIT));
+    let watch = watch();
+    let output = watch.cancel_output();
+    let refund = watch.refund.compute_txid();
+    let mut chain = Fake::with_cancel(&watch, Some(100));
+    // At `last`, cancel is `MAX_STALE` deep.
+    let last = 100 + MAX_STALE - 1;
+    let at = |chain: &Fake, tip| step(&watch, tip, chain).unwrap();
+    assert_eq!(at(&chain, last), Step::Broadcast);
+    assert_eq!(at(&chain, last + 1), Step::Stale);
+    chain.spenders.insert(output, (refund, None));
+    assert_eq!(at(&chain, last), Step::Wait);
+    assert_eq!(at(&chain, last + 1), Step::Stale);
+    // A spend in a block, however shallow, is waited on.
+    chain.spenders.insert(output, (refund, Some(last + 1)));
+    assert_eq!(at(&chain, last + 1), Step::Wait);
+
+    let dir = tempfile::tempdir().unwrap();
+    let tower = Watchtower::open(Network::Regtest, dir.path(), 10).unwrap();
+    let mut chain = Fake {
+        tip: last,
+        ..Fake::with_cancel(&watch, Some(100))
+    };
+    let cancel = tower.add(watch, &chain).unwrap();
+    tower.round(&chain, UNSEEN);
+    assert_eq!(tower.len(), 1);
+    chain.tip = last + 1;
     tower.round(&chain, UNSEEN);
     assert!(tower.is_empty());
     assert!(!dir.path().join(format!("{cancel}.json")).exists());
 }
 
-/// A watch done, or unseen too long, whose file is already gone, is
+/// A watch done, or refused too long, whose file is already gone, is
 /// forgotten all the same.
 #[test]
 fn a_watch_whose_file_is_gone_is_still_forgotten() {
@@ -473,8 +522,12 @@ fn a_watch_whose_file_is_gone_is_still_forgotten() {
     let chain = Fake::with_cancel(&watch, None);
     let cancel = tower.add(watch, &chain).unwrap();
     fs::remove_file(dir.path().join(format!("{cancel}.json"))).unwrap();
+    let refusing = Fake {
+        refuse: true,
+        ..Fake::default()
+    };
     for _ in 0..UNSEEN {
-        tower.round(&Fake::default(), UNSEEN);
+        tower.round(&refusing, UNSEEN);
     }
     assert!(tower.is_empty());
 }

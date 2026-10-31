@@ -7,16 +7,17 @@
 //! reveals the buyer's key share, which a seller that can still redeem
 //! could use to take both coins (see `swap::Buyer::watchtower`). So no
 //! redeem can displace cancel, and the refund goes out as soon as cancel is
-//! in a block. The watchtower never broadcasts cancel; it waits for either
-//! party to.
+//! in a block. The watchtower broadcasts cancel only again, when it drops
+//! out of the mempool: a party broadcast it first.
 //!
 //! It reads Bitcoin through an Esplora API, as mempool.space serves one.
 //! Each watch is written to its own file before it is accepted, so a
 //! restart keeps it, and removed once there is nothing left to do.
 //!
 //! A watch is held per cancel: one for each distinct cancel Esplora has
-//! seen, until the cancel output's spend is deep or the cancel goes unseen
-//! for [`UNSEEN_FOR`].
+//! seen, until the cancel output's spend is deep, the network refuses the
+//! cancel for [`UNSEEN_FOR`], or the cancel is [`MAX_STALE`] deep with its
+//! output's spend still unconfirmed.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -54,10 +55,17 @@ pub struct Watch {
 /// watch, and its Esplora requests, for as long as they ask.
 pub const MAX_DEPTH: u32 = 144;
 
-/// How long a watch's cancel may be in neither Esplora's mempool nor its
-/// chain before the watch is dropped. A cancel in the mempool is never
-/// dropped for this.
+/// How long the network may refuse a watch's cancel, the cancel in neither
+/// Esplora's mempool nor its chain and its rebroadcast refused, before the
+/// watch is dropped. A cancel in the mempool is never dropped for this.
 pub const UNSEEN_FOR: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How deep a cancel may be, its output's spend unconfirmed, before the
+/// watch is dropped: about a week of blocks. `swap::Terms::check` refuses a
+/// `t2` this long or longer, so punish is valid well before, and the race
+/// between it and the refund, broadcast every round since cancel
+/// confirmed, has been the miners' to settle for most of the week.
+pub const MAX_STALE: u32 = 1008;
 
 impl Watch {
     /// Refuses a watch on another network; whose `depth` is not 1 to
@@ -185,19 +193,24 @@ pub enum Step {
     Broadcast,
     /// Nothing is left to do: the cancel output is spent, `depth` deep.
     Done,
+    /// Cancel is more than [`MAX_STALE`] deep, and its output's spend
+    /// still unconfirmed.
+    Stale,
 }
 
 /// The refund goes out once cancel is in a block and nothing in a block
 /// spends its output: a spend still in the mempool may yet be replaced by
 /// the refund, as the buyer's own driver tries. The watch is done once the
 /// cancel output's spend is `depth` deep: the refund, or the seller's
-/// punish.
+/// punish; and stale once cancel is more than [`MAX_STALE`] deep with that
+/// spend unconfirmed.
 pub fn step(watch: &Watch, tip: u32, chain: &dyn Chain) -> io::Result<Step> {
-    let deep = |height: u32| tip.saturating_add(1).saturating_sub(height) >= watch.depth;
+    let depth = |height: u32| tip.saturating_add(1).saturating_sub(height);
     match chain.transaction(watch.cancel.compute_txid())? {
-        Some(Some(_)) => match chain.spender(watch.cancel_output())? {
-            Some((_, Some(height))) if deep(height) => Ok(Step::Done),
+        Some(Some(at)) => match chain.spender(watch.cancel_output())? {
+            Some((_, Some(height))) if depth(height) >= watch.depth => Ok(Step::Done),
             Some((_, Some(_))) => Ok(Step::Wait),
+            _ if depth(at) > MAX_STALE => Ok(Step::Stale),
             Some((txid, None)) if txid == watch.refund.compute_txid() => Ok(Step::Wait),
             _ => Ok(Step::Broadcast),
         },
@@ -237,7 +250,7 @@ pub struct Watchtower {
 
 struct Held {
     watch: Watch,
-    /// The rounds in a row its cancel has been unseen.
+    /// The rounds in a row the network has refused its cancel.
     unseen: u32,
 }
 
@@ -324,9 +337,19 @@ impl Watchtower {
         self.dir.join(format!("{cancel}.json"))
     }
 
-    /// One round over every watch: broadcasts the refunds due, and forgets
-    /// the watches done and those whose cancel is unseen `unseen` rounds in
+    /// One round over every watch: broadcasts the refunds due, and the
+    /// cancels dropped from the mempool, and forgets the watches done or
+    /// stale and those whose cancel the network refuses `unseen` rounds in
     /// a row. A failure is logged, and the watch tried again next round.
+    ///
+    /// Rebroadcasting cancel is what makes forgetting it safe for a buyer
+    /// gone offline. An evicted cancel would otherwise wait for the seller
+    /// to broadcast it again, after the watch was gone, and punish at `t2`.
+    /// The relay keeps it in the mempool instead, and forgets it only after
+    /// the network has refused it for a day: its lock spent otherwise, so
+    /// no copy of it can ever confirm, or a day of fees above it. The count
+    /// lives in memory: a restart starts it again, which only delays
+    /// forgetting.
     pub fn round(&self, chain: &dyn Chain, unseen: u32) {
         let tip = match chain.tip() {
             Ok(tip) => tip,
@@ -337,31 +360,45 @@ impl Watchtower {
             watches.iter().map(|(t, h)| (*t, h.watch.clone())).collect()
         };
         for (cancel, watch) in watches {
-            let step = step(&watch, tip, chain);
-            let rounds = {
-                let mut watches = self.watches.lock().expect("the watches' lock");
-                let Some(held) = watches.get_mut(&cancel) else {
-                    continue;
-                };
-                match step {
-                    Ok(Step::Unseen) => held.unseen += 1,
-                    Ok(_) => held.unseen = 0,
-                    Err(_) => {}
-                }
-                held.unseen
-            };
-            match step {
+            match step(&watch, tip, chain) {
                 Err(e) => log(&format!("cancel {cancel}: esplora: {e}")),
-                Ok(Step::Wait) => {}
-                Ok(Step::Unseen) if rounds < unseen => {}
-                Ok(Step::Unseen) => self.forget(cancel, "its cancel is unseen"),
-                Ok(Step::Broadcast) => match chain.broadcast(&watch.refund) {
-                    Ok(()) => log(&format!("broadcast the refund of cancel {cancel}")),
-                    Err(e) => log(&format!("the refund of cancel {cancel}: {e}")),
+                Ok(Step::Wait) => {
+                    self.count(cancel, false);
+                }
+                Ok(Step::Unseen) => match chain.broadcast(&watch.cancel) {
+                    Ok(()) => {
+                        log(&format!("broadcast cancel {cancel} again"));
+                        self.count(cancel, false);
+                    }
+                    Err(e) => {
+                        log(&format!("cancel {cancel}, broadcast again: {e}"));
+                        if self.count(cancel, true) >= unseen {
+                            self.forget(cancel, "the network refuses its cancel");
+                        }
+                    }
                 },
+                Ok(Step::Broadcast) => {
+                    self.count(cancel, false);
+                    match chain.broadcast(&watch.refund) {
+                        Ok(()) => log(&format!("broadcast the refund of cancel {cancel}")),
+                        Err(e) => log(&format!("the refund of cancel {cancel}: {e}")),
+                    }
+                }
                 Ok(Step::Done) => self.forget(cancel, "done"),
+                Ok(Step::Stale) => self.forget(cancel, "its refund never confirmed"),
             }
         }
+    }
+
+    /// Counts a round in which the network refused `cancel`, or held it:
+    /// the rounds in a row it has refused it.
+    fn count(&self, cancel: Txid, refused: bool) -> u32 {
+        let mut watches = self.watches.lock().expect("the watches' lock");
+        let Some(held) = watches.get_mut(&cancel) else {
+            return 0;
+        };
+        held.unseen = if refused { held.unseen + 1 } else { 0 };
+        held.unseen
     }
 
     /// Drops the watch of `cancel`, its file first.
@@ -380,7 +417,7 @@ impl Watchtower {
     }
 
     /// Runs a round every `every`, for good, forgetting a watch whose
-    /// cancel is unseen for [`UNSEEN_FOR`].
+    /// cancel the network refuses for [`UNSEEN_FOR`].
     pub fn run(&self, chain: &dyn Chain, every: Duration) -> ! {
         let unseen = (UNSEEN_FOR.as_secs_f64() / every.as_secs_f64()).ceil() as u32;
         loop {

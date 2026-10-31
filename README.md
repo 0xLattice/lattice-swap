@@ -240,7 +240,10 @@ watchtower takes a watch only once its cancel is on the network, and only
 with a refund signed by both keys, so it holds at most one watch for each
 distinct cancel output seen on the network, each a real transaction. A
 watch is freed once that output's spend is `depth` deep, at most 144
-blocks, or once its cancel is in neither the mempool nor a block for a day.
+blocks; once cancel is 1008 blocks deep with that spend unconfirmed, which
+is why `t2` must be below 1008; or once the network has refused cancel for
+a day. A cancel that drops out of the mempool, the watchtower broadcasts
+again.
 The buyer asks again every minute until it is taken. It does not cover a
 buyer that signed the redeem: that buyer must itself be online to refund
 between cancel and `t2`.

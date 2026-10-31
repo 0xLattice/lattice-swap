@@ -805,7 +805,24 @@ fn terms_leave_room_for_a_block_and_for_the_refund() {
         ..terms()
     };
     assert!(tight.check().is_err(), "7 + 3 = t2");
-    assert!(Terms { t2: 11, ..tight }.check().is_ok());
+    assert!(Terms {
+        t2: 11,
+        ..tight.clone()
+    }
+    .check()
+    .is_ok());
+    // A relay's watchtower forgets a cancel `T2_LIMIT` deep.
+    let longest = Terms {
+        t2: T2_LIMIT - 1,
+        ..tight.clone()
+    };
+    assert!(longest.check().is_ok());
+    assert!(Terms {
+        t2: T2_LIMIT,
+        ..tight
+    }
+    .check()
+    .is_err());
     let deepest = Terms {
         btc_confirmations: u32::MAX,
         ..terms()
