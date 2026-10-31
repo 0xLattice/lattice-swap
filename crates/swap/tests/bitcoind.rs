@@ -3,7 +3,8 @@
 
 use std::time::{Duration, Instant};
 
-use bitcoin::{Address, Amount, FeeRate, Network, OutPoint, ScriptBuf, Transaction, Txid};
+use bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
+use bitcoin::{Address, Amount, FeeRate, Network, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 use corepc_node::{Conf, Node};
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
@@ -11,7 +12,9 @@ use serde_json::json;
 use swap::bitcoind::{Bitcoin, Bitcoind};
 use swap::driver::{bitcoin_view, Driver, Store};
 use swap::transport::Ivy;
-use swap::{Action, Event, Machine, Outcome, Watch};
+use swap::{
+    Action, BitcoinView, Buyer, Event, Machine, Outcome, SecretBytes, Seller, Terms, Watch,
+};
 use swap_bitcoin::{EvenY, KeyPair, Params, Scalar, Spend, Swap};
 use swap_nexus_tx::rpc::Client;
 
@@ -132,6 +135,7 @@ struct Redeems {
     /// Seller and buyer keys, then their shares.
     keys: [[u8; 32]; 4],
     payout: ScriptBuf,
+    amount: Amount,
     lock: OutPoint,
     redeem: Transaction,
     confirmed: bool,
@@ -152,7 +156,7 @@ impl Redeems {
             buyer: self.key(1).public_key(),
             seller_share: self.key(2).public_key().normalize(),
             buyer_share: self.key(3).public_key().normalize(),
-            amount: Amount::from_sat(100_000_000),
+            amount: self.amount,
             fee: Amount::from_sat(1_000),
             t1: 3,
             t2: 2,
@@ -163,12 +167,17 @@ impl Redeems {
         .unwrap()
     }
 
-    /// A swap paying `payout`, its lock funded and mined once, and its
-    /// redeem signed. Returns it and the signed cancel.
+    /// A swap of 1 BTC paying `payout`, its lock funded and mined once, and
+    /// its redeem signed. Returns it and the signed cancel.
     fn funded(node: &Node, payout: ScriptBuf) -> (Self, Transaction) {
+        Self::funded_with(node, payout, Amount::ONE_BTC)
+    }
+
+    fn funded_with(node: &Node, payout: ScriptBuf, amount: Amount) -> (Self, Transaction) {
         let mut machine = Redeems {
             keys: [(); 4].map(|_| Scalar::random(&mut OsRng).to_bytes()),
             payout,
+            amount,
             lock: OutPoint::null(),
             redeem: empty(),
             confirmed: false,
@@ -328,6 +337,36 @@ fn the_driver_bumps_a_stalled_redeem_from_its_payout() {
     assert!(payout.is_null(), "the payout was spent by the bump");
 }
 
+/// A redeem below the mempool's minimum feerate is refused alone. The
+/// driver raises it to that minimum, though the estimate is below the
+/// redeem's own feerate, and it confirms.
+#[test]
+fn the_driver_raises_a_refused_redeem_to_the_mempool_minimum() {
+    let node = start(&["-minrelaytxfee=0.0001"]);
+    let (seller, payout) = empty_wallet(&node, "seller");
+    let (machine, _) = Redeems::funded(&node, payout);
+    let refused = seller.broadcast(&machine.redeem).unwrap_err().to_string();
+    assert!(refused.contains("min relay fee not met"), "{refused}");
+    let low = FeeRate::from_sat_per_vb_u32(2);
+    assert!(low.fee_vb(machine.redeem.vsize() as u64).unwrap() < Amount::from_sat(1_000));
+
+    let nexus = Client::new("http://127.0.0.1:9", "", Duration::from_secs(1));
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::new(directory.path(), [7; 32]);
+    let mut driver =
+        Driver::<_, _, Ivy>::start(machine, vec![], seller, nexus, None, store).unwrap();
+    driver.fallback_fee_rate = low;
+    let party = std::thread::spawn(move || driver.run().unwrap());
+    let miner = node.client.new_address().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !party.is_finished() {
+        assert!(Instant::now() < deadline, "redeem never confirmed");
+        std::thread::sleep(Duration::from_millis(500));
+        node.client.generate_to_address(1, &miner).unwrap();
+    }
+    assert_eq!(party.join().unwrap(), Outcome::Swapped);
+}
+
 /// The first child spends the payout, so a wallet with no other coins bumps
 /// again by replacing that child with one paying more.
 #[test]
@@ -339,12 +378,13 @@ fn a_rebump_replaces_the_child_from_a_wallet_with_no_coins() {
     let fee = Amount::from_sat(1_000);
     seller.broadcast(&redeem).unwrap();
 
+    let all = redeem.output[0].value;
     let first = seller
-        .bump(&redeem, fee, FeeRate::from_sat_per_vb_u32(10))
+        .bump(&redeem, fee, FeeRate::from_sat_per_vb_u32(10), all)
         .unwrap();
     assert!(pooled(&seller, first));
     let second = seller
-        .bump(&redeem, fee, FeeRate::from_sat_per_vb_u32(50))
+        .bump(&redeem, fee, FeeRate::from_sat_per_vb_u32(50), all)
         .unwrap();
     assert!(pooled(&seller, second));
     assert!(!pooled(&seller, first), "replaced");
@@ -375,7 +415,231 @@ fn a_cancel_cannot_displace_a_waiting_redeem() {
         &cancel,
         Amount::from_sat(1_000),
         FeeRate::from_sat_per_vb_u32(100),
+        cancel.output[0].value,
     );
     assert!(bumped.is_err());
     assert!(pooled(&seller, redeem));
+}
+
+/// A payout the child cannot cover is spent to all but dust rather than
+/// not bumped, and the child pays no more than it may.
+#[test]
+fn a_bump_past_the_payout_leaves_dust_and_keeps_to_its_cap() {
+    let node = start(&[]);
+    let (seller, payout) = empty_wallet(&node, "seller");
+    let (machine, _) = Redeems::funded_with(&node, payout, Amount::from_sat(20_000));
+    let redeem = machine.redeem;
+    let (fee, value) = (Amount::from_sat(1_000), redeem.output[0].value);
+    seller.broadcast(&redeem).unwrap();
+    let rate = FeeRate::from_sat_per_vb_u32(500);
+    assert!(rate.fee_vb(250).unwrap() > value, "more than the payout");
+    let change = |child| {
+        let (tx, _) = seller.transaction(child).unwrap().unwrap();
+        tx.output[0].clone()
+    };
+
+    let capped = seller
+        .bump(&redeem, fee, rate, Amount::from_sat(5_000))
+        .unwrap();
+    assert_eq!(value - change(capped).value, Amount::from_sat(5_000));
+    let all = seller.bump(&redeem, fee, rate, value).unwrap();
+    let left = change(all);
+    assert_eq!(left.value, left.script_pubkey.minimal_non_dust());
+    assert!(pooled(&seller, all) && !pooled(&seller, capped));
+}
+
+fn sent(actions: &[Action]) -> swap::Message {
+    let [Action::Send(message)] = actions else {
+        panic!("one message: {actions:?}");
+    };
+    message.clone()
+}
+
+/// After `t2` the seller can contest a pending refund with its punish and a
+/// child paying more. The buyer's driver, running the real buyer, sees its
+/// refund refused and outbids that package from the refund's payout, so
+/// the refund confirms.
+#[test]
+fn the_buyers_driver_outbids_a_punish_package_with_its_refund() {
+    contest_a_refund(|seller, punish| {
+        let rate = FeeRate::from_sat_per_vb_u32(30);
+        seller
+            .bump(
+                punish,
+                Amount::from_sat(1_000),
+                rate,
+                punish.output[0].value,
+            )
+            .unwrap();
+    });
+}
+
+/// The same against a punish pinned with a child near the 1000 vB TRUC
+/// allows, at a low feerate: replacing it means paying that child's whole
+/// fee over a package about a quarter its size, which the buyer's driver
+/// does.
+#[test]
+fn the_buyers_driver_outbids_a_punish_pinned_by_a_large_child() {
+    contest_a_refund(|seller, punish| {
+        let outputs = 28;
+        let scripts: Vec<ScriptBuf> = (0..outputs)
+            .map(|_| {
+                let address = seller.call("getnewaddress", json!([])).unwrap();
+                let address: Address<bitcoin::address::NetworkUnchecked> =
+                    address.as_str().unwrap().parse().unwrap();
+                address.assume_checked().script_pubkey()
+            })
+            .collect();
+        let payout = &punish.output[0];
+        let sign = |child: &Transaction| {
+            let prevtxs = json!([{
+                "txid": punish.compute_txid(),
+                "vout": 0,
+                "scriptPubKey": payout.script_pubkey.to_hex_string(),
+                "amount": payout.value.to_btc(),
+            }]);
+            let signed = seller
+                .call(
+                    "signrawtransactionwithwallet",
+                    json!([serialize_hex(child), prevtxs]),
+                )
+                .unwrap();
+            deserialize_hex::<Transaction>(signed["hex"].as_str().unwrap()).unwrap()
+        };
+        let mut child = swap_bitcoin::cpfp(punish, scripts[0].clone(), Amount::ZERO).unwrap();
+        let pay = |fee: Amount| -> Vec<TxOut> {
+            let each = (payout.value - fee) / outputs;
+            let out = |script: &ScriptBuf| TxOut {
+                value: each,
+                script_pubkey: script.clone(),
+            };
+            scripts.iter().map(out).collect()
+        };
+        child.output = pay(Amount::ZERO);
+        let child_size = sign(&child).vsize() as u64;
+        assert!(child_size > 900 && child_size <= 1_000, "{child_size} vB");
+        let size = punish.vsize() as u64 + child_size;
+        let package = FeeRate::from_sat_per_vb_u32(12).fee_vb(size).unwrap();
+        child.output = pay(package - Amount::from_sat(1_000));
+        let child = sign(&child);
+        let hexes = [punish, &child].map(serialize_hex);
+        let result = seller.call("submitpackage", json!([hexes])).unwrap();
+        assert_eq!(result["package_msg"], "success", "{result}");
+    });
+}
+
+/// Runs the real buyer under its driver to a refund pending at `t2`, then
+/// has `punish` send the seller's punish, with a child, against it, and
+/// waits for the refund to take the cancel output back and confirm. The
+/// seller is the real seller machine, stepped by hand, whose punish the
+/// test sends as a seller ignoring the refund would.
+fn contest_a_refund(punish: impl FnOnce(&Bitcoind, &Transaction)) {
+    let node = start(&[]);
+    let default = rpc(&node, "default");
+    let (seller_rpc, seller_payout) = empty_wallet(&node, "seller");
+    let (buyer_rpc, refund_payout) = empty_wallet(&node, "buyer");
+    let address = buyer_rpc.call("getnewaddress", json!([])).unwrap();
+    default
+        .call("sendtoaddress", json!([address, 1.0]))
+        .unwrap();
+    let miner = node.client.new_address().unwrap();
+    let mine = |blocks| drop(node.client.generate_to_address(blocks, &miner).unwrap());
+    mine(1);
+
+    let terms = Terms {
+        swap_id: [5; 32],
+        btc_amount: Amount::from_sat(1_000_000),
+        btc_fee: Amount::from_sat(1_000),
+        nex_amount: 1_000,
+        nex_fee: 0,
+        t1: 6,
+        t2: 6,
+        btc_confirmations: 1,
+        nex_confirmations: 1,
+        margin: 2,
+    };
+    let seller_nex = SecretBytes([3; 32]).nex_address();
+    let seller = Seller::new(
+        terms.clone(),
+        seller_nex,
+        seller_payout.clone(),
+        seller_payout,
+    );
+    let (buyer, actions) = Buyer::start(terms, refund_payout, "buyer".into()).unwrap();
+    let step = |machine: Seller, actions: &[Action]| machine.step(Event::Message(sent(actions)));
+    let (seller, actions) = step(seller.unwrap(), &actions);
+    let (buyer, actions) = buyer.step(Event::Message(sent(&actions)));
+    let [Action::FundLock {
+        script_pubkey,
+        amount,
+    }] = &actions[..]
+    else {
+        panic!("fund the lock: {actions:?}");
+    };
+    let funding = buyer_rpc.fund_lock(script_pubkey, *amount).unwrap();
+    let (buyer, actions) = buyer.step(Event::Funded(funding));
+    let (seller, actions) = step(seller, &actions);
+    let (buyer, actions) = buyer.step(Event::Message(sent(&actions)));
+    let (seller, _) = step(seller, &actions);
+    let (buyer, actions) = buyer.step(Event::Sent);
+    let (swap, lock) = buyer.watch().bitcoin.unwrap();
+    let txid = |spend| swap.unsigned_tx(lock, spend).compute_txid();
+    let (cancel, refund, punish_txid) = (
+        txid(Spend::Cancel),
+        txid(Spend::Refund),
+        txid(Spend::Punish),
+    );
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::new(directory.path(), [5; 32]);
+    let nexus = Client::new("http://127.0.0.1:9", "", Duration::from_secs(1));
+    let mut driver =
+        Driver::<_, _, Ivy>::start(buyer, actions, buyer_rpc, nexus, None, store).unwrap();
+    driver.fallback_fee_rate = FeeRate::from_sat_per_vb_u32(10);
+    let party = std::thread::spawn(move || driver.run().unwrap());
+    let wait = |what: &str, done: &dyn Fn() -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !done() {
+            assert!(Instant::now() < deadline, "{what}");
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    };
+
+    // The buyer gives up at `t1` and cancels; once cancel is in a block it
+    // refunds, and its driver bumps the refund. No block takes it.
+    wait("cancel", &|| {
+        mine(1);
+        default
+            .transaction(cancel)
+            .unwrap()
+            .is_some_and(|(_, depth)| depth > 0)
+    });
+    wait("refund", &|| pooled(&default, refund));
+    while default.transaction(cancel).unwrap().unwrap().1 < 6 {
+        mine_empty(&node);
+    }
+    assert!(pooled(&default, refund), "refund pending at t2");
+
+    // The seller ignores it and punishes, with a child paying 30 sat/vB.
+    let view = BitcoinView {
+        cancel_spend: None,
+        ..bitcoin_view(&seller_rpc, &swap, lock).unwrap()
+    };
+    let (_, actions) = seller.step(Event::Bitcoin(view));
+    let [Action::Broadcast(tx)] = &actions[..] else {
+        panic!("punish: {actions:?}");
+    };
+    assert_eq!(tx.compute_txid(), punish_txid);
+    punish(&seller_rpc, tx);
+    assert!(pooled(&default, punish_txid) && !pooled(&default, refund));
+
+    // Without a block, the buyer's driver takes the cancel output back.
+    wait("refund back", &|| pooled(&default, refund));
+    assert!(!pooled(&default, punish_txid));
+    wait("refunded", &|| {
+        mine(1);
+        party.is_finished()
+    });
+    assert_eq!(party.join().unwrap(), Outcome::Refunded);
+    assert!(default.transaction(refund).unwrap().unwrap().1 > 0);
 }

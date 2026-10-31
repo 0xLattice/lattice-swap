@@ -3,6 +3,7 @@
 use corepc_node::serde_json::Value;
 use corepc_node::{Conf, Node};
 use rand_core::OsRng;
+use swap_bitcoin::bitcoin::address::NetworkUnchecked;
 use swap_bitcoin::bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
 use swap_bitcoin::bitcoin::hashes::Hash;
 use swap_bitcoin::bitcoin::sighash::{Prevouts, SighashCache};
@@ -378,6 +379,73 @@ fn a_spend_below_the_relay_feerate_relays_as_a_package() {
     assert_eq!(result["package_msg"], "success", "{result}");
     chain.mine(1);
     assert_eq!(chain.confirmations(redeem.compute_txid()), 1);
+}
+
+/// A script of the node's wallet, of `address_type` ("bech32", "bech32m").
+fn wallet_script(chain: &Chain, address_type: &str) -> ScriptBuf {
+    let address: Value = chain
+        .node
+        .client
+        .call("getnewaddress", &["".into(), address_type.into()])
+        .unwrap();
+    let address: Address<NetworkUnchecked> = address.as_str().unwrap().parse().unwrap();
+    address.assume_checked().script_pubkey()
+}
+
+/// After `t1` the buyer holds everything to send cancel and refund as one
+/// package against a redeem still pending. With a P2WPKH refund against a
+/// P2TR redeem that package pays a higher feerate than redeem and would
+/// replace it, so `Swap::new` refuses those payouts. With the tightest
+/// payouts it accepts, P2TR both, the package is one vbyte too heavy and
+/// the redeem stays.
+#[test]
+fn cancel_and_refund_cannot_displace_a_pending_redeem() {
+    let chain = Chain::start();
+    let parties = Parties::random();
+    let refused = Params {
+        redeem_payout: wallet_script(&chain, "bech32m"),
+        refund_payout: wallet_script(&chain, "bech32"),
+        ..parties.params(chain.script())
+    };
+    assert_eq!(Swap::new(refused).err(), Some(Error::Outbid));
+
+    let swap = Swap::new(Params {
+        redeem_payout: wallet_script(&chain, "bech32m"),
+        refund_payout: wallet_script(&chain, "bech32m"),
+        ..parties.params(chain.script())
+    })
+    .unwrap();
+    let lock = chain.fund(&swap.lock_script_pubkey(), swap.params().amount);
+    let both = |spend| {
+        let a = swap.sign(lock, spend, &parties.seller);
+        let b = swap.sign(lock, spend, &parties.buyer);
+        swap.finalize(lock, spend, &a, Some(&b)).unwrap()
+    };
+    let (redeem, cancel, refund) = (
+        both(Spend::Redeem),
+        both(Spend::Cancel),
+        both(Spend::Refund),
+    );
+    assert_eq!(cancel.vsize() + refund.vsize(), 2 * redeem.vsize() + 1);
+    let redeem = chain.broadcast(&redeem).unwrap();
+    for _ in 0..T1 {
+        let empty = Value::from(Vec::<String>::new());
+        let _: Value = chain
+            .node
+            .client
+            .call("generateblock", &[chain.miner.to_string().into(), empty])
+            .unwrap();
+    }
+    assert_eq!(chain.confirmations(redeem), 0, "redeem pending past t1");
+
+    let result = chain.submit_package(&cancel, &refund);
+    assert_ne!(result["package_msg"], "success", "{result}");
+    assert_eq!(
+        result["replaced-transactions"],
+        Value::from(Vec::<String>::new())
+    );
+    chain.mine(1);
+    assert_eq!(chain.confirmations(redeem), 1);
 }
 
 #[test]

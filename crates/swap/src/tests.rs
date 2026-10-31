@@ -515,6 +515,21 @@ fn a_bad_share_proof_aborts() {
     assert!(actions.is_empty());
 }
 
+/// A refund payout short enough that cancel and refund would outbid a
+/// pending redeem: the seller refuses it before anything is at stake.
+#[test]
+fn a_refund_payout_that_would_outbid_redeem_aborts() {
+    let p2tr = ScriptBuf::from_bytes([[0x51, 32].as_slice(), &[1; 32]].concat());
+    let seller = Seller::new(terms(), SELLER_NEX.nex_address(), p2tr, payout(2)).unwrap();
+    let (_, actions) = Buyer::start(terms(), payout(3), BUYER_NEX.into()).unwrap();
+    let (seller, actions) = seller.step(message(sent(&actions)));
+    assert_eq!(
+        seller.outcome(),
+        Some(Outcome::Aborted(Refusal::Parameters))
+    );
+    assert!(actions.is_empty());
+}
+
 #[test]
 fn a_mirrored_share_aborts() {
     let (buyer, actions) = Buyer::start(terms(), payout(3), BUYER_NEX.into()).unwrap();
@@ -1241,8 +1256,13 @@ struct Node {
     lock: Option<Txid>,
     mempool: Vec<Transaction>,
     estimate: Option<FeeRate>,
-    /// Each bump asked of the node: the parent, the height, the feerate.
-    bumps: Vec<(Txid, u32, FeeRate)>,
+    /// What [`Bitcoin::floor`] answers, in sat/vB.
+    floor: u32,
+    /// Refuse every broadcast, as a mempool holding a better conflict does.
+    refuse: bool,
+    /// Each bump asked of the node: the parent, the height, the feerate and
+    /// the most the child may pay.
+    bumps: Vec<(Txid, u32, FeeRate, Amount)>,
 }
 
 #[derive(Clone, Default)]
@@ -1250,7 +1270,11 @@ struct Fake(Rc<RefCell<Node>>);
 
 impl Bitcoin for Fake {
     fn broadcast(&self, tx: &Transaction) -> crate::bitcoind::Result<()> {
-        self.0.borrow_mut().mempool.push(tx.clone());
+        let mut node = self.0.borrow_mut();
+        if node.refuse {
+            return Err(crate::bitcoind::Error("insufficient fee".into()));
+        }
+        node.mempool.push(tx.clone());
         Ok(())
     }
     fn height(&self) -> crate::bitcoind::Result<u32> {
@@ -1273,15 +1297,19 @@ impl Bitcoin for Fake {
     fn fee_rate(&self) -> crate::bitcoind::Result<Option<FeeRate>> {
         Ok(self.0.borrow().estimate)
     }
+    fn floor(&self, _: &Transaction) -> crate::bitcoind::Result<FeeRate> {
+        Ok(FeeRate::from_sat_per_vb_u32(self.0.borrow().floor))
+    }
     fn bump(
         &self,
         parent: &Transaction,
         _: Amount,
         rate: FeeRate,
+        max: Amount,
     ) -> crate::bitcoind::Result<Txid> {
         let mut node = self.0.borrow_mut();
         let height = node.height;
-        node.bumps.push((parent.compute_txid(), height, rate));
+        node.bumps.push((parent.compute_txid(), height, rate, max));
         Ok(Txid::all_zeros())
     }
 }
@@ -1307,7 +1335,16 @@ impl Bitcoin for Offline {
     fn fee_rate(&self) -> crate::bitcoind::Result<Option<FeeRate>> {
         unreachable!()
     }
-    fn bump(&self, _: &Transaction, _: Amount, _: FeeRate) -> crate::bitcoind::Result<Txid> {
+    fn floor(&self, _: &Transaction) -> crate::bitcoind::Result<FeeRate> {
+        unreachable!()
+    }
+    fn bump(
+        &self,
+        _: &Transaction,
+        _: Amount,
+        _: FeeRate,
+        _: Amount,
+    ) -> crate::bitcoind::Result<Txid> {
         unreachable!()
     }
 }
@@ -1321,17 +1358,22 @@ impl Transport for Offline {
     }
 }
 
-/// Watches a locked swap and does nothing, with `role`'s view of which
-/// spends are its own.
+/// Watches a locked swap, with `role`'s view of which spends are its own,
+/// and broadcasts `broadcast`, if any, at every view.
 #[derive(Clone, Serialize, Deserialize)]
 struct Watching<R> {
     watcher: Buyer,
     role: R,
+    broadcast: Option<Transaction>,
 }
 
 impl<R: Machine> Machine for Watching<R> {
-    fn step(self, _: Event) -> (Self, Vec<Action>) {
-        (self, vec![])
+    fn step(self, event: Event) -> (Self, Vec<Action>) {
+        let actions = match (&event, &self.broadcast) {
+            (Event::Bitcoin(_), Some(tx)) => vec![Action::Broadcast(tx.clone())],
+            _ => vec![],
+        };
+        (self, actions)
     }
     fn outcome(&self) -> Option<Outcome> {
         None
@@ -1357,7 +1399,24 @@ fn bumps<M: Machine>(
     node: &Fake,
     heights: &[u32],
     set: impl FnOnce(&mut Driver<M, Fake, Offline>),
-) -> Vec<(Txid, u32, FeeRate)> {
+) -> Vec<(Txid, u32, FeeRate, Amount)> {
+    bumps_with(machine, node, set, |poll, node| match heights.get(poll) {
+        Some(&height) => {
+            node.height = height;
+            true
+        }
+        None => false,
+    })
+}
+
+/// Runs `machine`'s driver, changing the node with `each` before every poll
+/// until it returns false, and returns the bumps it asked for.
+fn bumps_with<M: Machine>(
+    machine: M,
+    node: &Fake,
+    set: impl FnOnce(&mut Driver<M, Fake, Offline>),
+    each: impl Fn(usize, &mut Node) -> bool,
+) -> Vec<(Txid, u32, FeeRate, Amount)> {
     let directory = tempfile::tempdir().unwrap();
     let store = Store::new(directory.path(), terms().swap_id);
     let client = Client::new("http://127.0.0.1:9", "", Duration::from_secs(1));
@@ -1366,12 +1425,9 @@ fn bumps<M: Machine>(
     set(&mut driver);
     let polls = std::cell::Cell::new(0);
     let stopped = driver.run_until(|_| {
-        let Some(&height) = heights.get(polls.get()) else {
-            return true;
-        };
+        let more = each(polls.get(), &mut node.0.borrow_mut());
         polls.set(polls.get() + 1);
-        node.0.borrow_mut().height = height;
-        false
+        !more
     });
     assert!(stopped.unwrap().is_none());
     node.0.borrow().bumps.clone()
@@ -1412,7 +1468,12 @@ fn each_party_bumps_only_what_pays_it() {
     fn bumped<R: Machine>(locked: &Locked, role: R, spends: &[Spend]) -> Vec<Txid> {
         let node = pooled(locked, spends, 50);
         let watcher = locked.buyer.clone();
-        let bumps = bumps(Watching { watcher, role }, &node, &[105], |_| {});
+        let watching = Watching {
+            watcher,
+            role,
+            broadcast: None,
+        };
+        let bumps = bumps(watching, &node, &[105], |_| {});
         bumps.into_iter().map(|(txid, ..)| txid).collect()
     }
     let locked = locked();
@@ -1433,54 +1494,124 @@ fn each_party_bumps_only_what_pays_it() {
     assert_eq!(bumped(&locked, buyer, &[Cancel, Punish]), []);
 }
 
-/// Bumped when first seen, then every `bump_after` blocks however often
-/// the driver polls; 0 is every new block.
+/// The seller's driver watching `locked`, as the buyer's view, with
+/// `broadcast` broadcast at every view.
+fn seller_watching(locked: &Locked, broadcast: Option<Transaction>) -> Watching<Seller> {
+    Watching {
+        watcher: locked.buyer.clone(),
+        role: locked.seller.clone(),
+        broadcast,
+    }
+}
+
+/// Bumped when first seen, then again only at a new block whose estimate
+/// is above the last bump's, however often the driver polls.
 #[test]
-fn a_waiting_spend_is_bumped_once_every_bump_after_blocks() {
+fn a_waiting_spend_is_rebumped_only_when_a_new_block_raises_its_target() {
     let locked = locked();
-    let heights = |bump_after, polls: &[u32]| {
-        let node = pooled(&locked, &[Spend::Redeem], 50);
-        let watcher = locked.buyer.clone();
-        let role = locked.seller.clone();
-        let bumps = bumps(Watching { watcher, role }, &node, polls, |driver| {
-            driver.bump_after = bump_after;
-        });
-        bumps
-            .into_iter()
-            .map(|(_, height, _)| height)
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(
-        heights(2, &[105, 105, 106, 107, 107, 108, 109]),
-        [105, 107, 109]
+    let node = pooled(&locked, &[Spend::Redeem], 50);
+    let polls = [
+        (105, 50),
+        (105, 60),
+        (106, 50),
+        (106, 60),
+        (107, 60),
+        (108, 70),
+    ];
+    let bumps = bumps_with(
+        seller_watching(&locked, None),
+        &node,
+        |_| {},
+        |poll, node| {
+            let Some(&(height, estimate)) = polls.get(poll) else {
+                return false;
+            };
+            node.height = height;
+            node.estimate = Some(FeeRate::from_sat_per_vb_u32(estimate));
+            true
+        },
     );
-    assert_eq!(heights(0, &[105, 105, 106, 106, 107]), [105, 106, 107]);
+    let bumps: Vec<_> = bumps
+        .into_iter()
+        .map(|(_, height, rate, _)| (height, rate.to_sat_per_vb_ceil()))
+        .collect();
+    assert_eq!(bumps, [(105, 50), (107, 60), (108, 70)]);
+}
+
+/// A spend the mempool refuses is raised to the node's floor, not only the
+/// estimate, and at once whenever it is newly refused, as when the other
+/// party's package displaced it, without waiting for a block.
+#[test]
+fn a_refused_spend_is_raised_to_the_floor_at_once() {
+    let locked = locked();
+    let (swap, lock) = locked.swap();
+    let refund = swap.unsigned_tx(lock, Spend::Refund);
+    let node = pooled(&locked, &[Spend::Cancel], 10);
+    let watching = Watching {
+        watcher: locked.buyer.clone(),
+        role: locked.buyer.clone(),
+        broadcast: Some(refund.clone()),
+    };
+    // (height, refused, floor)
+    let polls = [
+        (105, true, 30),
+        (105, true, 30),
+        (105, false, 30),
+        (105, true, 45),
+        (106, true, 45),
+        (107, true, 50),
+    ];
+    let txid = refund.compute_txid();
+    let bumps = bumps_with(
+        watching,
+        &node,
+        |_| {},
+        |poll, node| {
+            let Some(&(height, refuse, floor)) = polls.get(poll) else {
+                return false;
+            };
+            node.height = height;
+            node.refuse = refuse;
+            node.floor = floor;
+            // Refused: displaced from the mempool.
+            node.mempool
+                .retain(|tx| !refuse || tx.compute_txid() != txid);
+            true
+        },
+    );
+    let bumps: Vec<_> = bumps
+        .into_iter()
+        .map(|(bumped, height, rate, _)| (bumped, height, rate.to_sat_per_vb_ceil()))
+        .collect();
+    assert_eq!(bumps, [(txid, 105, 30), (txid, 105, 45), (txid, 107, 50)]);
 }
 
 /// A bump pays at most `max_fee_rate`, and nothing when the estimate is
-/// not above what the spend already pays.
+/// not above what the spend already pays; its child pays at most
+/// `max_fee_fraction` of the payout, all of it by default.
 #[test]
-fn a_bump_pays_the_estimate_up_to_the_cap() {
+fn a_bump_pays_the_estimate_up_to_the_caps() {
     let locked = locked();
-    let rates = |estimate, max: Option<u32>| {
+    let (swap, lock) = locked.swap();
+    let payout = swap.unsigned_tx(lock, Spend::Redeem).output[0].value;
+    let bumped = |estimate, set: &dyn Fn(&mut Driver<_, Fake, Offline>)| {
         let node = pooled(&locked, &[Spend::Redeem], estimate);
-        let watcher = locked.buyer.clone();
-        let role = locked.seller.clone();
-        let bumps = bumps(Watching { watcher, role }, &node, &[105], |driver| {
-            if let Some(max) = max {
-                driver.max_fee_rate = FeeRate::from_sat_per_vb_u32(max);
-            }
-        });
+        let bumps = bumps(seller_watching(&locked, None), &node, &[105], set);
         bumps
             .into_iter()
-            .map(|(.., rate)| rate.to_sat_per_vb_ceil())
+            .map(|(.., rate, max)| (rate.to_sat_per_vb_ceil(), max))
             .collect::<Vec<_>>()
     };
-    assert_eq!(rates(50, None), [50]);
-    assert_eq!(rates(5_000, None), [1_000], "the default cap");
-    assert_eq!(rates(50, Some(20)), [20]);
+    assert_eq!(bumped(50, &|_| {}), [(50, payout)]);
+    assert_eq!(bumped(5_000, &|_| {}), [(1_000, payout)], "the default cap");
+    let rate = |driver: &mut Driver<_, Fake, Offline>| {
+        driver.max_fee_rate = FeeRate::from_sat_per_vb_u32(20);
+    };
+    assert_eq!(bumped(50, &rate), [(20, payout)]);
+    let quarter = |driver: &mut Driver<_, Fake, Offline>| driver.max_fee_fraction = 0.25;
+    assert_eq!(bumped(50, &quarter), [(50, payout / 4)]);
     // The redeem alone pays more than 1 sat/vB.
-    assert_eq!(rates(1, None), [0u64; 0]);
+    assert_eq!(bumped(1, &|_| {}), []);
 }
 
 /// A redeem sent at the last block the window is open is bumped at once,
@@ -1510,7 +1641,7 @@ fn a_redeem_sent_at_the_last_open_block_is_bumped_before_t1() {
     let bumps = bumps(seller, &node, &[117, 118, 119], |_| {});
     assert_eq!(node.0.borrow().mempool[1].compute_txid(), redeem);
     assert_eq!(
-        bumps.first().map(|&(txid, height, _)| (txid, height)),
+        bumps.first().map(|&(txid, height, ..)| (txid, height)),
         Some((redeem, 117))
     );
 }
@@ -1528,14 +1659,24 @@ fn a_state_file_of_another_version_is_refused() {
 
     let saved: serde_json::Value =
         serde_json::from_slice(&std::fs::read(store.path()).unwrap()).unwrap();
+    // The state alone, as a caller reads it to tell the side.
+    let state = store.load_value().unwrap().unwrap();
+    assert_eq!(state, saved["state"]);
+    assert!(state.get("AwaitBuyerHello").is_some(), "{state}");
     for other in [json!(crate::driver::STATE_VERSION + 1), json!(null)] {
         let mut file = saved.clone();
         file["version"] = other;
         std::fs::write(store.path(), serde_json::to_vec(&file).unwrap()).unwrap();
         let refused = store.load::<Seller>().err().expect("refused");
         assert_eq!(refused.kind(), std::io::ErrorKind::InvalidData);
+        assert!(refused
+            .to_string()
+            .contains("finish the swap with the build that started it"));
+        let refused = store.load_value().expect_err("refused");
+        assert_eq!(refused.kind(), std::io::ErrorKind::InvalidData);
     }
     // A file from before versions: the state itself, at the top.
     std::fs::write(store.path(), serde_json::to_vec(&saved["state"]).unwrap()).unwrap();
     assert!(store.load::<Seller>().is_err());
+    assert!(store.load_value().is_err());
 }

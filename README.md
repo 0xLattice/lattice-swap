@@ -29,9 +29,10 @@ no Nexus consensus change is required.
   drivers that run them against bitcoind, a lattice-node and an ivy session,
   saving each party's state so it survives a restart. A driver bumps the
   swap transactions that pay its party while they wait unconfirmed, from
-  their payout, up to `max_fee_rate`. Its end-to-end tests
-  run whole swaps on regtest and a Nexus node; like the node test, they are
-  ignored by default and need `NEXUS_NODE_IMAGE` and `-- --ignored`.
+  their payout, up to `max_fee_rate` and `max_fee_fraction` of the payout.
+  Its end-to-end tests run whole swaps on regtest and a Nexus node; like the
+  node test, they are ignored by default and need `NEXUS_NODE_IMAGE` and
+  `-- --ignored`.
 
 ## License
 

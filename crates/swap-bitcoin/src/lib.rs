@@ -33,8 +33,17 @@
 //! - Cancel cannot be bumped: its only output is the cancel output, which
 //!   only both parties together, or the seller after `t2` blocks, can spend.
 //!   A cancel that sits unconfirmed only delays the swap, since `t2` counts
-//!   from cancel's confirmation. It also means cancel, paying the same fee as
-//!   redeem, can never outbid a redeem that is already in the mempool.
+//!   from cancel's confirmation.
+//! - A pending redeem cannot be displaced by the buyer. After `t1` the
+//!   buyer's only spends of the lock are cancel alone, which pays exactly
+//!   redeem's fee where a replacement must pay more, and cancel with refund
+//!   as one package, which [`Swap::new`] keeps strictly below redeem's
+//!   feerate ([`Error::Outbid`]). No larger package exists: refund's child
+//!   would be a grandchild of an unconfirmed cancel, which TRUC forbids, and
+//!   punish needs cancel `t2` deep, so it never joins a cancel package. Once
+//!   redeem is bumped it is only further ahead.
+//! - A pending refund can be displaced only by punish, once cancel is `t2`
+//!   deep: nothing else spends the cancel output but the 2-of-2.
 //! - After `t2`, refund and punish both spend the cancel output, and each
 //!   party bumps its own: a fee race between the two owners.
 //! - A TRUC transaction spends no unconfirmed non-TRUC output. Redeem and
@@ -132,6 +141,9 @@ pub enum Error {
     Amount,
     /// The fee is below 1 sat/vB for the largest of the four spends.
     Fee,
+    /// Cancel and refund together would pay at least redeem's feerate, so
+    /// the buyer could replace a pending redeem after `t1` with them.
+    Outbid,
     /// `A == B` or `S == T_b`.
     Keys,
     /// This party's signature does not verify.
@@ -150,6 +162,10 @@ impl std::fmt::Display for Error {
             Error::Timelock => write!(f, "timelocks must be at least one block"),
             Error::Amount => write!(f, "amount does not cover fees above dust"),
             Error::Fee => write!(f, "fee is below the minimum relay fee"),
+            Error::Outbid => write!(
+                f,
+                "cancel and refund would outbid redeem: the refund payout is too short"
+            ),
             Error::Keys => write!(f, "the two parties' keys or shares are equal"),
             Error::Signature(party) => write!(f, "{party:?} signature does not verify"),
             Error::Signatures => write!(f, "wrong set of signatures for this spend"),
@@ -175,8 +191,9 @@ pub struct Swap {
 
 impl Swap {
     /// Fails if the parties' keys or shares coincide, a timelock is zero, any
-    /// payout would be dust after fees, or the fee is below 1 sat/vB for any
-    /// spend: a refund that cannot relay would strand the BTC.
+    /// payout would be dust after fees, the fee is below 1 sat/vB for any
+    /// spend (a refund that cannot relay would strand the BTC), or cancel
+    /// and refund would outbid redeem (see [`Error::Outbid`]).
     pub fn new(params: Params) -> Result<Self, Error> {
         if params.seller == params.buyer || params.seller_share == params.buyer_share {
             return Err(Error::Keys);
@@ -237,18 +254,27 @@ impl Swap {
 
         // Size each spend with placeholder signatures: the witness has the
         // same shape and size once signed.
-        let largest = [Spend::Redeem, Spend::Cancel, Spend::Refund, Spend::Punish]
-            .into_iter()
-            .map(|spend| {
+        let [redeem, cancel, refund, punish] =
+            [Spend::Redeem, Spend::Cancel, Spend::Refund, Spend::Punish].map(|spend| {
                 let buyer = (spend != Spend::Punish).then_some([0; 64]);
                 let mut tx = swap.unsigned_tx(OutPoint::null(), spend);
                 tx.input[0].witness = swap.witness(spend, [0; 64], buyer);
                 tx.vsize() as u64
-            })
-            .max()
-            .expect("four spends");
+            });
+        let largest = redeem.max(cancel).max(refund).max(punish);
         if swap.params.fee < Amount::from_sat(largest) {
             return Err(Error::Fee);
+        }
+        // Refund has no timelock, so after `t1` the buyer can send cancel
+        // and refund as one package, paying two fees, against a redeem still
+        // pending, whose `s` it has already read. Bitcoin Core takes the
+        // package if it improves the mempool's feerate diagram, which it
+        // does at an equal feerate too: it pays more in total, and the
+        // diagram it replaces is flat past redeem. So the package's feerate,
+        // 2·fee/(cancel + refund), must be strictly below redeem's,
+        // fee/redeem. Core's feerates are over these same integer vsizes.
+        if cancel + refund <= 2 * redeem {
+            return Err(Error::Outbid);
         }
         Ok(swap)
     }
@@ -729,6 +755,54 @@ mod tests {
         assert_eq!(rejects(with(0)), Error::Fee);
         assert_eq!(rejects(with(largest - 1)), Error::Fee);
         assert!(Swap::new(with(largest)).is_ok());
+    }
+
+    /// Accepted exactly when cancel and refund, signed, weigh more than two
+    /// redeems: then their package pays a lower feerate than redeem alone.
+    #[test]
+    fn cancel_and_refund_must_pay_below_redeems_feerate() {
+        let p2tr = |n| {
+            let key = bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(xonly(
+                &key(n).public_key(),
+            ));
+            ScriptBuf::new_p2tr_tweaked(key)
+        };
+        // A witness v2 program two bytes shorter than P2TR: at t1 = 288 it
+        // makes cancel and refund exactly two redeems.
+        let short = ScriptBuf::from_bytes([[0x52, 30].as_slice(), &[1; 30]].concat());
+        // Cancel plus refund, less two redeems, in vbytes.
+        let cases = [
+            (payout(), payout(), 14),
+            (p2tr(9), p2tr(10), 2),
+            (payout(), p2tr(9), 26),
+            (p2tr(9), payout(), -10),
+            (p2tr(9), short, 0),
+        ];
+        let (seller, buyer) = (key(1), key(2));
+        for (redeem_payout, refund_payout, margin) in cases {
+            let p = Params {
+                redeem_payout,
+                refund_payout,
+                ..params()
+            };
+            // Payouts are in no script, so a swap with these params signs
+            // as one that `new` would build.
+            let vsize = |spend| {
+                let swap = Swap {
+                    params: p.clone(),
+                    ..Swap::new(params()).unwrap()
+                };
+                let a = swap.sign(lock(), spend, &seller);
+                let b = swap.sign(lock(), spend, &buyer);
+                swap.finalize(lock(), spend, &a, Some(&b)).unwrap().vsize() as i64
+            };
+            let signed = vsize(Spend::Cancel) + vsize(Spend::Refund) - 2 * vsize(Spend::Redeem);
+            assert_eq!(signed, margin, "{p:?}");
+            match Swap::new(p) {
+                Ok(_) => assert!(margin > 0),
+                Err(e) => assert_eq!((e, margin > 0), (Error::Outbid, false)),
+            }
+        }
     }
 
     #[test]

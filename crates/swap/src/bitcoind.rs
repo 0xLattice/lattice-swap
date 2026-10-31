@@ -7,7 +7,8 @@ use base64::Engine;
 use bitcoin::address::NetworkUnchecked;
 use bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
 use bitcoin::{
-    Address, Amount, Block, Denomination, FeeRate, Network, OutPoint, Script, Transaction, Txid,
+    Address, Amount, Block, Denomination, FeeRate, Network, OutPoint, Script, ScriptBuf,
+    Transaction, Txid,
 };
 use serde_json::{json, Value};
 
@@ -42,11 +43,18 @@ pub trait Bitcoin {
     /// A feerate to confirm within a couple of blocks, if the node has an
     /// estimate.
     fn fee_rate(&self) -> Result<Option<FeeRate>>;
-    /// Raises unconfirmed `parent`, which pays `fee`, to `rate` with a CPFP
-    /// child spending its payout, output 0, into the wallet, and submits both
-    /// as a package; returns the child's txid. A child at a higher rate
-    /// replaces the last. Fails if the wallet cannot sign for the payout.
-    fn bump(&self, parent: &Transaction, fee: Amount, rate: FeeRate) -> Result<Txid>;
+    /// The lowest package feerate at which `parent`, which the mempool
+    /// refused, would enter it with a child spending its payout: the
+    /// mempool's minimum, and if another transaction spends `parent`'s input
+    /// there, enough to replace it and its descendants.
+    fn floor(&self, parent: &Transaction) -> Result<FeeRate>;
+    /// Raises unconfirmed `parent`, which pays `fee`, to `rate`, above its
+    /// own feerate, with a CPFP child spending its payout, output 0, into
+    /// the wallet, and submits both as a package; returns the child's txid.
+    /// The child pays at most `max`, and less if its change would be dust
+    /// otherwise. A child at a higher rate replaces the last. Fails if the
+    /// wallet cannot sign for the payout.
+    fn bump(&self, parent: &Transaction, fee: Amount, rate: FeeRate, max: Amount) -> Result<Txid>;
 }
 
 /// bitcoind's JSON-RPC. `transaction` reads any transaction, so the node
@@ -95,6 +103,33 @@ impl Bitcoind {
         Ok(body["result"].clone())
     }
 
+    /// The script of a new change address of the wallet, if the wallet can
+    /// sign for `parent`'s payout; only the payee can bump.
+    fn change_for(&self, parent: &Transaction) -> Result<ScriptBuf> {
+        // An operator's external payout script is not this wallet's to bump
+        // with.
+        let payout = Address::from_script(&parent.output[0].script_pubkey, self.network)
+            .map_err(|e| Error(format!("payout: {e}")))?;
+        let info = self.call("getaddressinfo", json!([payout.to_string()]))?;
+        if info["ismine"] != true {
+            return Err(Error(format!("payout {payout} is not this wallet's")));
+        }
+        let change = self.call("getrawchangeaddress", json!([]))?;
+        Ok(change
+            .as_str()
+            .and_then(|a| a.parse::<Address<NetworkUnchecked>>().ok())
+            .and_then(|a| a.require_network(self.network).ok())
+            .ok_or_else(|| Error(format!("change address {change}")))?
+            .script_pubkey())
+    }
+
+    /// `parent` and a signed child spending its payout, in vbytes.
+    fn package_vsize(&self, parent: &Transaction, change: ScriptBuf) -> Result<u64> {
+        let child = swap_bitcoin::cpfp(parent, change, Amount::ZERO)
+            .ok_or_else(|| Error("the payout is dust".into()))?;
+        Ok((parent.vsize() + self.sign_child(parent, &child)?.vsize()) as u64)
+    }
+
     /// The wallet's signature on `child`, which spends `parent`'s payout.
     fn sign_child(&self, parent: &Transaction, child: &Transaction) -> Result<Transaction> {
         let payout = &parent.output[0];
@@ -120,6 +155,16 @@ fn btc(value: &Value) -> Result<Amount> {
         .as_f64()
         .and_then(|btc| Amount::from_btc(btc).ok())
         .ok_or_else(|| Error(format!("not an amount: {value}")))
+}
+
+/// A feerate in BTC/kvB, as bitcoind reports one.
+fn per_kvb(value: &Value) -> Result<FeeRate> {
+    Ok(FeeRate::from_sat_per_kwu(btc(value)?.to_sat().div_ceil(4)))
+}
+
+/// `fee` over `vsize`, rounded up.
+fn over(fee: Amount, vsize: u64) -> FeeRate {
+    FeeRate::from_sat_per_kwu((fee.to_sat() * 250).div_ceil(vsize.max(1)))
 }
 
 fn decode<T: bitcoin::consensus::Decodable>(hex: &Value) -> Result<T> {
@@ -216,40 +261,60 @@ impl Bitcoin for Bitcoind {
         if estimate["feerate"].is_null() {
             return Ok(None);
         }
-        let per_kvb = btc(&estimate["feerate"])?.to_sat();
-        Ok(Some(FeeRate::from_sat_per_kwu(per_kvb.div_ceil(4))))
+        per_kvb(&estimate["feerate"]).map(Some)
     }
 
-    fn bump(&self, parent: &Transaction, fee: Amount, rate: FeeRate) -> Result<Txid> {
-        // Only the payee can spend the payout: an operator's external
-        // payout script is not this wallet's to bump with.
-        let payout = Address::from_script(&parent.output[0].script_pubkey, self.network)
-            .map_err(|e| Error(format!("payout: {e}")))?;
-        let info = self.call("getaddressinfo", json!([payout.to_string()]))?;
-        if info["ismine"] != true {
-            return Err(Error(format!("payout {payout} is not this wallet's")));
-        }
-        let change = self.call("getrawchangeaddress", json!([]))?;
-        let change = change
-            .as_str()
-            .and_then(|a| a.parse::<Address<NetworkUnchecked>>().ok())
-            .and_then(|a| a.require_network(self.network).ok())
-            .ok_or_else(|| Error(format!("change address {change}")))?
-            .script_pubkey();
-        let child = |fee| {
-            swap_bitcoin::cpfp(parent, change.clone(), fee)
-                .ok_or_else(|| Error(format!("a {fee} child would leave the payout dust")))
+    fn floor(&self, parent: &Transaction) -> Result<FeeRate> {
+        let mempool = self.call("getmempoolinfo", json!([]))?;
+        let minimum = per_kvb(&mempool["mempoolminfee"])?;
+        let input = parent.input[0].previous_output;
+        let spending = self.call(
+            "gettxspendingprevout",
+            json!([[{"txid": input.txid, "vout": input.vout}]]),
+        )?;
+        let other = match spending[0]["spendingtxid"].as_str() {
+            Some(other) if other != parent.compute_txid().to_string() => other,
+            _ => return Ok(minimum),
         };
+        // Bitcoin Core replaces a package only with one at a better feerate
+        // that also pays all of its fees and the incremental feerate on its
+        // own size. A low-feerate child of up to 1000 vB under the other
+        // spend raises that: the whole fee spread over our smaller package.
+        let entry = self.call("getmempoolentry", json!([other]))?;
+        let size = |key: &str| {
+            entry[key]
+                .as_u64()
+                .ok_or_else(|| Error(format!("mempool entry {key}: {entry}")))
+        };
+        let (own, all) = (
+            btc(&entry["fees"]["base"])?,
+            btc(&entry["fees"]["descendant"])?,
+        );
+        let ours = self.package_vsize(parent, self.change_for(parent)?)?;
+        let beat = over(own, size("vsize")?)
+            .max(over(all, size("descendantsize")?))
+            .max(over(all, ours));
+        let incremental = per_kvb(&mempool["incrementalrelayfee"])?;
+        let above = beat.to_sat_per_kwu() + incremental.to_sat_per_kwu();
+        Ok(minimum.max(FeeRate::from_sat_per_kwu(above)))
+    }
 
-        // Signed once to learn its size, then again paying for it.
-        let size = self.sign_child(parent, &child(Amount::ZERO)?)?.vsize() as u64;
-        let package = rate.fee_vb(parent.vsize() as u64 + size);
-        let own = rate.fee_vb(size);
-        let fee = package
+    fn bump(&self, parent: &Transaction, fee: Amount, rate: FeeRate, max: Amount) -> Result<Txid> {
+        let change = self.change_for(parent)?;
+        // Signed once to learn its size, then again paying for it: all the
+        // package needs but `fee`, short of `max` and of leaving dust.
+        let size = self.package_vsize(parent, change.clone())?;
+        let fee = rate
+            .fee_vb(size)
             .and_then(|package| package.checked_sub(fee))
-            .max(own)
             .ok_or_else(|| Error(format!("feerate {rate}")))?;
-        let signed = self.sign_child(parent, &child(fee)?)?;
+        let spendable = parent.output[0]
+            .value
+            .checked_sub(change.minimal_non_dust())
+            .ok_or_else(|| Error("the payout is dust".into()))?;
+        let fee = fee.min(max).min(spendable);
+        let child = swap_bitcoin::cpfp(parent, change, fee).expect("change above dust");
+        let signed = self.sign_child(parent, &child)?;
         let result = self.call(
             "submitpackage",
             json!([[serialize_hex(parent), serialize_hex(&signed)]]),
