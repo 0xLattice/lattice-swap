@@ -1,5 +1,9 @@
 use super::*;
+use bitcoin::hashes::Hash;
+use bitcoin::{OutPoint, WScriptHash};
 use clap::CommandFactory;
+use swap::btc_amount_floor;
+use swap_bitcoin::{KeyPair, Params, Scalar, Spend, Swap};
 use swap_nexus_tx::MAINNET_GENESIS as MAINNET;
 
 const NODES: [&str; 6] = [
@@ -68,33 +72,33 @@ fn the_defaults_are_the_agreed_settings_and_pass() {
     assert_eq!((terms.btc_confirmations, terms.nex_confirmations), (6, 24));
     assert_eq!(terms.btc_amount, Amount::from_sat(50_000_000));
     assert_eq!(args.nodes.btc_network, Network::Bitcoin);
-    assert_eq!(check_terms(&terms), Ok(()));
+    assert_eq!(Terms::check(&terms), Ok(()));
 }
 
 #[test]
 fn t1_below_the_floor_is_refused() {
-    assert_eq!(t1_floor(&small(16)), 16);
-    let refused = check_terms(&small(15)).unwrap_err();
+    assert_eq!(small(16).t1_floor(), 16);
+    let refused = Terms::check(&small(15)).unwrap_err();
     assert!(refused.contains("below 16"), "{refused}");
 }
 
 #[test]
 fn t1_at_the_floor_is_accepted() {
-    assert_eq!(check_terms(&small(16)), Ok(()));
+    assert_eq!(Terms::check(&small(16)), Ok(()));
 }
 
 #[test]
 fn terms_that_cannot_work_are_refused() {
     let mut terms = small(16);
     terms.margin = 1;
-    assert!(check_terms(&terms).is_err());
+    assert!(Terms::check(&terms).is_err());
 }
 
 #[test]
 fn the_floor_does_not_overflow() {
     let mut terms = small(16);
     terms.nex_confirmations = u64::MAX;
-    assert!(check_terms(&terms).is_err());
+    assert!(Terms::check(&terms).is_err());
 }
 
 #[test]
@@ -263,7 +267,7 @@ fn take_refuses_any_term_outside_its_policy() {
     for (what, change) in changes {
         let mut offer = agreed();
         change(&mut offer);
-        assert_eq!(check_terms(&offer.terms), Ok(()), "{what}");
+        assert_eq!(Terms::check(&offer.terms), Ok(()), "{what}");
         let refused = check_offer(&offer, &policy, network, MAINNET, FLOOR, NEX_FLOOR).unwrap_err();
         assert!(
             refused.starts_with("refused: the offer"),
@@ -795,12 +799,12 @@ fn an_amount_that_cannot_pay_redeem_is_refused() {
     let mut terms = small(16);
     terms.btc_fee = fee;
     terms.btc_amount = Amount::from_sat(least);
-    assert_eq!(check_terms(&terms), Ok(()));
+    assert_eq!(Terms::check(&terms), Ok(()));
     terms.btc_amount -= Amount::from_sat(1);
-    let refused = check_terms(&terms).unwrap_err();
+    let refused = Terms::check(&terms).unwrap_err();
     assert!(refused.contains("redeem pays two btc_fee"), "{refused}");
     terms.btc_fee = Amount::MAX;
-    assert!(check_terms(&terms).is_err(), "no overflow");
+    assert!(Terms::check(&terms).is_err(), "no overflow");
 
     // `offer` refuses before it asks any node; `take` before it dials.
     let mut args = offer_args(&[]);

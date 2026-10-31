@@ -8,7 +8,7 @@ use base64::Engine;
 use bitcoin::address::NetworkUnchecked;
 use bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
 use bitcoin::{
-    Address, Amount, Block, BlockHash, Denomination, FeeRate, Network, OutPoint, Script, ScriptBuf,
+    Address, Amount, Block, Denomination, FeeRate, Network, OutPoint, Script, ScriptBuf,
     Transaction, Txid,
 };
 use serde_json::{json, Value};
@@ -26,18 +26,7 @@ impl std::error::Error for Error {}
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// A node's tip, as `getblockchaininfo` reports it.
-#[derive(Clone, Copy, Debug)]
-pub struct Tip {
-    /// The height of the last block the node has.
-    pub height: u32,
-    /// The height of the best header chain it knows.
-    pub headers: u32,
-    /// The tip block's time, in seconds since the Unix epoch.
-    pub time: u64,
-    /// The tip block's hash.
-    pub hash: BlockHash,
-}
+pub use crate::view::Tip;
 
 pub trait Bitcoin {
     fn broadcast(&self, tx: &Transaction) -> Result<()>;

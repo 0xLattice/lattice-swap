@@ -65,7 +65,7 @@ impl Buyer {
         refund_payout: ScriptBuf,
         nex_address: String,
     ) -> Result<(Self, Vec<Action>), Refusal> {
-        if !terms.check() {
+        if terms.check().is_err() {
             return Err(Refusal::Terms);
         }
         let secrets = Secrets::random();

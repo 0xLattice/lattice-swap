@@ -113,7 +113,7 @@ impl Seller {
         redeem_payout: ScriptBuf,
         punish_payout: ScriptBuf,
     ) -> Result<Self, Refusal> {
-        if !terms.check() {
+        if terms.check().is_err() {
             return Err(Refusal::Terms);
         }
         Ok(Seller::AwaitBuyerHello(SellerStart {

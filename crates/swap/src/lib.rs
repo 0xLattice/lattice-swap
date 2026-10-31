@@ -57,12 +57,14 @@ pub mod driver;
 mod seller;
 #[cfg(feature = "native")]
 pub mod transport;
+pub mod view;
 
 pub use buyer::Buyer;
 pub use seller::{Claiming, Seller};
 
 use bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
-use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction};
+use bitcoin::hashes::Hash;
+use bitcoin::{Amount, OutPoint, PubkeyHash, ScriptBuf, Transaction, WScriptHash};
 use curve25519_dalek::edwards::CompressedEdwardsY;
 use rand_core::OsRng;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -115,11 +117,14 @@ pub struct Terms {
 }
 
 impl Terms {
-    /// Whether the terms can work at all. Each party also checks them
-    /// against its own policy before starting.
-    pub fn check(&self) -> bool {
+    /// Whether the terms can work, and `t1` leaves time for both locks
+    /// ([`Terms::t1_floor`]) and `btc_amount` for redeem's two fees
+    /// ([`btc_amount_floor`]); if not, why. Each party also checks them
+    /// against its own policy before starting, among it a `btc_fee` of at
+    /// least [`btc_fee_at`] its own fee rate.
+    pub fn check(&self) -> Result<(), String> {
         let floor = u64::from(self.btc_confirmations) + u64::from(self.margin);
-        self.btc_confirmations >= 1
+        let works = self.btc_confirmations >= 1
             && self.nex_confirmations >= 1
             && self.margin >= 2
             && floor < u64::from(self.t1)
@@ -131,7 +136,42 @@ impl Terms {
             && self
                 .nex_amount
                 .checked_add(self.nex_fee)
-                .is_some_and(|debit| debit <= i64::MAX as u64)
+                .is_some_and(|debit| debit <= i64::MAX as u64);
+        if !works {
+            return Err(
+                "the terms cannot work: confirmations must be at least 1, the margin at \
+                    least 2, t1 and t2 above btc_confirmations + margin, and nex_amount above \
+                    nex_fee"
+                    .into(),
+            );
+        }
+        let floor = self.t1_floor();
+        if u64::from(self.t1) < floor {
+            return Err(format!(
+                "t1 is {}, below {floor}: btc_confirmations + 6 x (nex_confirmations + 1) + margin",
+                self.t1
+            ));
+        }
+        let least = btc_amount_floor(self.btc_fee);
+        if self.btc_amount.to_sat() < least {
+            return Err(format!(
+                "btc_amount is {} sat, below {least}: redeem pays two btc_fee, and its payout \
+                 must stay above dust",
+                self.btc_amount.to_sat()
+            ));
+        }
+        Ok(())
+    }
+
+    /// The least `t1` that works: the BTC lock `btc_confirmations` deep,
+    /// then the NEX lock mined and `nex_confirmations` deep, at about six
+    /// Bitcoin blocks a Nexus block, still `margin` blocks before cancel.
+    pub fn t1_floor(&self) -> u64 {
+        let nexus =
+            BTC_BLOCKS_PER_NEXUS_BLOCK.saturating_mul(self.nex_confirmations.saturating_add(1));
+        u64::from(self.btc_confirmations)
+            .saturating_add(nexus)
+            .saturating_add(u64::from(self.margin))
     }
 
     /// The seller may no longer broadcast the redeem: the lock is
@@ -144,6 +184,59 @@ impl Terms {
     fn cancel_due(&self, view: &BitcoinView) -> bool {
         view.funding.unwrap_or(0) >= u32::from(self.t1)
     }
+}
+
+/// A Nexus block is about this many Bitcoin blocks.
+pub const BTC_BLOCKS_PER_NEXUS_BLOCK: u64 = 6;
+
+/// The least `btc_amount` swap-bitcoin takes with `fee`: two fees, as
+/// redeem pays, above the dust limit of the payout. That limit is
+/// highest for a legacy address, the largest a wallet's address can ask.
+pub fn btc_amount_floor(fee: Amount) -> u64 {
+    let dust = ScriptBuf::new_p2pkh(&PubkeyHash::all_zeros()).minimal_non_dust();
+    fee.to_sat().saturating_mul(2).saturating_add(dust.to_sat())
+}
+
+/// The least `btc_fee` at which cancel and refund, the spends the buyer
+/// relies on, each pay `per_kvb` sat/kvB. Each is signed, with the longest
+/// timelocks; refund pays the buyer's own wallet address, at most
+/// P2WSH-sized. Redeem and punish pay the seller. Pure: the caller brings
+/// its own fee rate.
+pub fn btc_fee_at(per_kvb: u64) -> u64 {
+    let key = |n: u8| {
+        let mut bytes = [0u8; 32];
+        bytes[31] = n;
+        let secret = Scalar::from_bytes(bytes).and_then(|s| s.non_zero());
+        KeyPair::new_xonly(secret.expect("a nonzero scalar"))
+    };
+    let (seller, buyer) = (key(1), key(2));
+    let payout = ScriptBuf::new_p2wsh(&WScriptHash::all_zeros());
+    let swap = Swap::new(Params {
+        seller: seller.public_key(),
+        buyer: buyer.public_key(),
+        seller_share: key(3).public_key().normalize(),
+        buyer_share: key(4).public_key().normalize(),
+        amount: Amount::ONE_BTC,
+        fee: Amount::from_sat(100_000),
+        t1: u16::MAX,
+        t2: u16::MAX,
+        redeem_payout: payout.clone(),
+        refund_payout: payout.clone(),
+        punish_payout: payout,
+    })
+    .expect("these parameters work");
+    let lock = OutPoint::null();
+    [Spend::Cancel, Spend::Refund]
+        .into_iter()
+        .map(|spend| {
+            let a = swap.sign(lock, spend, &seller);
+            let b = swap.sign(lock, spend, &buyer);
+            let tx = swap.finalize(lock, spend, &a, Some(&b));
+            let vsize = tx.expect("our own signatures").vsize() as u64;
+            per_kvb.saturating_mul(vsize).div_ceil(1000)
+        })
+        .max()
+        .expect("two spends")
 }
 
 /// The messages, in the order they are sent.
@@ -758,6 +851,7 @@ pub struct Watch {
     pub margin: u16,
 }
 
+#[derive(Serialize)]
 pub struct NexusWatch {
     pub lock_address: String,
     pub own_address: String,
