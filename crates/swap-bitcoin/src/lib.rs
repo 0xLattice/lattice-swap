@@ -860,7 +860,7 @@ mod tests {
             recover(Spend::Redeem, &tx),
             Err(Error::Signature(Party::Buyer))
         );
-        // No signature there at all.
+        // The seller's signature in the buyer's place.
         tx.input[0].witness = Witness::from_slice(&witness[1..]);
         assert_eq!(
             recover(Spend::Redeem, &tx),
