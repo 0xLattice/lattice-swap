@@ -302,7 +302,7 @@ fn the_relay_refunds_a_buyer_that_went_offline() {
     default
         .call("sendrawtransaction", json!([serialize_hex(cancel)]))
         .unwrap();
-    assert_eq!(post(&watch), Ok(refund.compute_wtxid().to_string()));
+    assert_eq!(post(&watch), Ok(cancel.compute_txid().to_string()));
     drop(buyer);
 
     // The relay restarts: the watch is read back from disk, and watched.

@@ -13,6 +13,10 @@
 //! It reads Bitcoin through an Esplora API, as mempool.space serves one.
 //! Each watch is written to its own file before it is accepted, so a
 //! restart keeps it, and removed once there is nothing left to do.
+//!
+//! A watch is held per cancel: one for each distinct cancel Esplora has
+//! seen, until the cancel output's spend is deep or the cancel goes unseen
+//! for [`UNSEEN_FOR`].
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -27,7 +31,7 @@ use bitcoin::key::TweakedPublicKey;
 use bitcoin::secp256k1::{schnorr, Message, Secp256k1};
 use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
 use bitcoin::taproot::{ControlBlock, LeafVersion, TapLeafHash};
-use bitcoin::{Network, OutPoint, Script, Transaction, TxOut, Txid, Wtxid, XOnlyPublicKey};
+use bitcoin::{Network, OutPoint, Script, Transaction, TxOut, Txid, XOnlyPublicKey};
 use serde::{Deserialize, Serialize};
 
 /// What a buyer hands the watchtower.
@@ -42,14 +46,24 @@ pub struct Watch {
     #[serde(with = "hex_tx")]
     pub refund: Transaction,
     /// How deep the cancel output's spend, the refund or a punish, must be
-    /// before the watch is done.
+    /// before the watch is done: 1 to [`MAX_DEPTH`].
     pub depth: u32,
 }
 
+/// The deepest `depth` taken, a day of blocks: deeper ones would hold a
+/// watch, and its Esplora requests, for as long as they ask.
+pub const MAX_DEPTH: u32 = 144;
+
+/// How long a watch's cancel may be in neither Esplora's mempool nor its
+/// chain before the watch is dropped. A cancel in the mempool is never
+/// dropped for this.
+pub const UNSEEN_FOR: Duration = Duration::from_secs(24 * 60 * 60);
+
 impl Watch {
-    /// Refuses a watch on another network; whose transactions do not chain
-    /// as cancel and refund do, cancel spending one output, the lock, and
-    /// the refund one output of cancel; or whose refund is not signed by
+    /// Refuses a watch on another network; whose `depth` is not 1 to
+    /// [`MAX_DEPTH`]; whose transactions do not chain as cancel and refund
+    /// do, cancel spending one output, the lock, into one output, and the
+    /// refund spending that; or whose refund is not signed by
     /// both keys of the 2-of-2 leaf it spends through. A refund that cannot
     /// confirm is refused here, so none can stand in for a valid one.
     pub fn check(&self, network: Network) -> Result<(), String> {
@@ -59,20 +73,21 @@ impl Watch {
                 self.network
             ));
         }
-        if self.depth == 0 {
-            return Err("depth must be at least 1".into());
+        if !(1..=MAX_DEPTH).contains(&self.depth) {
+            return Err(format!("depth must be 1 to {MAX_DEPTH}"));
         }
         if self.cancel.input.len() != 1 {
             return Err("cancel must spend one output, the lock".into());
         }
+        let [prevout] = &self.cancel.output[..] else {
+            return Err("cancel must have one output, the cancel output".into());
+        };
         let [input] = &self.refund.input[..] else {
             return Err("the refund must spend one output, cancel's".into());
         };
-        let spent = input.previous_output;
-        let prevout = self.cancel.output.get(spent.vout as usize);
-        let Some(prevout) = prevout.filter(|_| spent.txid == self.cancel.compute_txid()) else {
+        if input.previous_output != self.cancel_output() {
             return Err("the refund does not spend cancel's output".into());
-        };
+        }
         if !signed(&self.refund, prevout) {
             return Err("the refund is not signed by both keys of the output it spends".into());
         }
@@ -80,7 +95,7 @@ impl Watch {
     }
 
     fn cancel_output(&self) -> OutPoint {
-        self.refund.input[0].previous_output
+        OutPoint::new(self.cancel.compute_txid(), 0)
     }
 }
 
@@ -165,6 +180,8 @@ pub trait Chain: Send + Sync {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Step {
     Wait,
+    /// Cancel is in neither the mempool nor a block.
+    Unseen,
     Broadcast,
     /// Nothing is left to do: the cancel output is spent, `depth` deep.
     Done,
@@ -184,7 +201,8 @@ pub fn step(watch: &Watch, tip: u32, chain: &dyn Chain) -> io::Result<Step> {
             Some((txid, None)) if txid == watch.refund.compute_txid() => Ok(Step::Wait),
             _ => Ok(Step::Broadcast),
         },
-        _ => Ok(Step::Wait),
+        Some(None) => Ok(Step::Wait),
+        None => Ok(Step::Unseen),
     }
 }
 
@@ -202,8 +220,11 @@ pub enum Refusal {
     Io(io::Error),
 }
 
-/// The watches held, each in its own file in `dir`, by the refund's wtxid:
-/// two refunds of one swap, each validly signed, are both held.
+/// The watches held, each in its own file in `dir`, by cancel's txid: one
+/// a cancel, the first taken. Another refund for that cancel changes
+/// nothing, and need not: a refund that passes [`Watch::check`] carries the
+/// buyer's signature, over a sighash that commits to its outputs, so any
+/// two pay the buyer alike.
 pub struct Watchtower {
     network: Network,
     dir: PathBuf,
@@ -211,12 +232,19 @@ pub struct Watchtower {
     /// they take, and the Esplora requests each round makes: two or three
     /// a watch.
     max: usize,
-    watches: Mutex<BTreeMap<Wtxid, Watch>>,
+    watches: Mutex<BTreeMap<Txid, Held>>,
+}
+
+struct Held {
+    watch: Watch,
+    /// The rounds in a row its cancel has been unseen.
+    unseen: u32,
 }
 
 impl Watchtower {
     /// The watchtower for `network`, with the watches saved in `dir`, each
-    /// checked again as it is read back.
+    /// checked again as it is read back. A file that does not hold a valid
+    /// watch, under its cancel's name, is logged and left alone.
     pub fn open(network: Network, dir: &Path, max: usize) -> io::Result<Self> {
         fs::create_dir_all(dir)?;
         let mut watches = BTreeMap::new();
@@ -225,14 +253,22 @@ impl Watchtower {
             if path.extension().is_none_or(|e| e != "json") {
                 continue;
             }
-            let invalid = |why: String| {
-                let why = format!("{}: {why}", path.display());
-                io::Error::new(io::ErrorKind::InvalidData, why)
+            let read = || -> Result<(Txid, Watch), String> {
+                let text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+                let watch: Watch = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+                watch.check(network)?;
+                let cancel = watch.cancel.compute_txid();
+                if path != dir.join(format!("{cancel}.json")) {
+                    return Err(format!("the watch of cancel {cancel}, misnamed"));
+                }
+                Ok((cancel, watch))
             };
-            let text = fs::read_to_string(&path)?;
-            let watch: Watch = serde_json::from_str(&text).map_err(|e| invalid(e.to_string()))?;
-            watch.check(network).map_err(invalid)?;
-            watches.insert(watch.refund.compute_wtxid(), watch);
+            match read() {
+                Ok((cancel, watch)) => {
+                    watches.insert(cancel, Held { watch, unseen: 0 });
+                }
+                Err(why) => log(&format!("skipping {}: {why}", path.display())),
+            }
         }
         Ok(Self {
             network,
@@ -245,23 +281,22 @@ impl Watchtower {
     /// Takes `watch` once it is on disk, if `chain` has seen its cancel. A
     /// watch then costs whoever makes it a real transaction: a cancel in the
     /// mempool or a block, which spends an output that exists, and whose
-    /// output the refund's own keys sign for. One taken already is taken
-    /// again. Returns the refund's wtxid.
-    pub fn add(&self, watch: Watch, chain: &dyn Chain) -> Result<Wtxid, Refusal> {
+    /// one output the refund's own keys sign for. A cancel watched already
+    /// is taken as it was. Returns cancel's txid.
+    pub fn add(&self, watch: Watch, chain: &dyn Chain) -> Result<Txid, Refusal> {
         watch.check(self.network).map_err(Refusal::Invalid)?;
         let cancel = watch.cancel.compute_txid();
         if chain.transaction(cancel).map_err(Refusal::Chain)?.is_none() {
             return Err(Refusal::Unseen);
         }
-        let wtxid = watch.refund.compute_wtxid();
         let mut watches = self.watches.lock().expect("the watches' lock");
-        if watches.contains_key(&wtxid) {
-            return Ok(wtxid);
+        if watches.contains_key(&cancel) {
+            return Ok(cancel);
         }
         if watches.len() >= self.max {
             return Err(Refusal::Full);
         }
-        let path = self.path(wtxid);
+        let path = self.path(cancel);
         let partial = path.with_extension("partial");
         let text = serde_json::to_vec(&watch).expect("watches serialize");
         let write = || -> io::Result<()> {
@@ -273,8 +308,8 @@ impl Watchtower {
             fs::File::open(&self.dir)?.sync_all()
         };
         write().map_err(Refusal::Io)?;
-        watches.insert(wtxid, watch);
-        Ok(wtxid)
+        watches.insert(cancel, Held { watch, unseen: 0 });
+        Ok(cancel)
     }
 
     pub fn len(&self) -> usize {
@@ -285,49 +320,71 @@ impl Watchtower {
         self.len() == 0
     }
 
-    fn path(&self, wtxid: Wtxid) -> PathBuf {
-        self.dir.join(format!("{wtxid}.json"))
+    fn path(&self, cancel: Txid) -> PathBuf {
+        self.dir.join(format!("{cancel}.json"))
     }
 
-    /// One round over every watch: broadcasts the refunds due and forgets
-    /// the watches done. A failure is logged, and the watch tried again
-    /// next round.
-    pub fn round(&self, chain: &dyn Chain) {
+    /// One round over every watch: broadcasts the refunds due, and forgets
+    /// the watches done and those whose cancel is unseen `unseen` rounds in
+    /// a row. A failure is logged, and the watch tried again next round.
+    pub fn round(&self, chain: &dyn Chain, unseen: u32) {
         let tip = match chain.tip() {
             Ok(tip) => tip,
             Err(e) => return log(&format!("esplora: {e}")),
         };
-        let watches: Vec<(Wtxid, Watch)> = {
+        let watches: Vec<(Txid, Watch)> = {
             let watches = self.watches.lock().expect("the watches' lock");
-            watches.iter().map(|(t, w)| (*t, w.clone())).collect()
+            watches.iter().map(|(t, h)| (*t, h.watch.clone())).collect()
         };
-        for (wtxid, watch) in watches {
-            match step(&watch, tip, chain) {
-                Err(e) => log(&format!("{wtxid}: esplora: {e}")),
-                Ok(Step::Wait) => {}
-                Ok(Step::Broadcast) => match chain.broadcast(&watch.refund) {
-                    Ok(()) => log(&format!("broadcast refund {wtxid}")),
-                    Err(e) => log(&format!("refund {wtxid}: {e}")),
-                },
-                Ok(Step::Done) => {
-                    if let Err(e) = fs::remove_file(self.path(wtxid)) {
-                        log(&format!("{wtxid}: {e}"));
-                        continue;
-                    }
-                    self.watches
-                        .lock()
-                        .expect("the watches' lock")
-                        .remove(&wtxid);
-                    log(&format!("done watching refund {wtxid}"));
+        for (cancel, watch) in watches {
+            let step = step(&watch, tip, chain);
+            let rounds = {
+                let mut watches = self.watches.lock().expect("the watches' lock");
+                let Some(held) = watches.get_mut(&cancel) else {
+                    continue;
+                };
+                match step {
+                    Ok(Step::Unseen) => held.unseen += 1,
+                    Ok(_) => held.unseen = 0,
+                    Err(_) => {}
                 }
+                held.unseen
+            };
+            match step {
+                Err(e) => log(&format!("cancel {cancel}: esplora: {e}")),
+                Ok(Step::Wait) => {}
+                Ok(Step::Unseen) if rounds < unseen => {}
+                Ok(Step::Unseen) => self.forget(cancel, "its cancel is unseen"),
+                Ok(Step::Broadcast) => match chain.broadcast(&watch.refund) {
+                    Ok(()) => log(&format!("broadcast the refund of cancel {cancel}")),
+                    Err(e) => log(&format!("the refund of cancel {cancel}: {e}")),
+                },
+                Ok(Step::Done) => self.forget(cancel, "done"),
             }
         }
     }
 
-    /// Runs a round every `every`, for good.
+    /// Drops the watch of `cancel`, its file first.
+    fn forget(&self, cancel: Txid, why: &str) {
+        match fs::remove_file(self.path(cancel)) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                return log(&format!("cancel {cancel}: {e}"));
+            }
+            _ => {}
+        }
+        self.watches
+            .lock()
+            .expect("the watches' lock")
+            .remove(&cancel);
+        log(&format!("stopped watching cancel {cancel}: {why}"));
+    }
+
+    /// Runs a round every `every`, for good, forgetting a watch whose
+    /// cancel is unseen for [`UNSEEN_FOR`].
     pub fn run(&self, chain: &dyn Chain, every: Duration) -> ! {
+        let unseen = (UNSEEN_FOR.as_secs_f64() / every.as_secs_f64()).ceil() as u32;
         loop {
-            self.round(chain);
+            self.round(chain, unseen.max(1));
             std::thread::sleep(every);
         }
     }

@@ -1010,8 +1010,9 @@ impl Watchtower {
             "network": self.network,
             "cancel": bitcoin::consensus::encode::serialize_hex(&cancel),
             "refund": bitcoin::consensus::encode::serialize_hex(&refund),
-            // How deep the refund must be before the watch is done.
-            "depth": terms.btc_confirmations,
+            // How deep the refund must be before the watch is done, at most
+            // the 144 a relay takes.
+            "depth": terms.btc_confirmations.min(144),
         });
         let url = format!("{}/watch", relay.trim_end_matches('/'));
         match ureq::post(&url).timeout(TIMEOUT).send_json(watch) {

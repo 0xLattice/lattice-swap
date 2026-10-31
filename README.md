@@ -236,9 +236,12 @@ is offline then: `--watchtower <url>` names another relay, `--no-watchtower` non
 reveals the buyer's key share, with which a seller that can still redeem
 takes both coins, so the buyer hands it over only once it has given up on
 the swap at `t1` without signing the redeem, and broadcasts its cancel. The
-watchtower takes a watch only once its cancel is on the network, so each
-costs a real transaction, and only with a refund signed by both keys; the
-buyer asks again every minute until it is taken. It does not cover a
+watchtower takes a watch only once its cancel is on the network, and only
+with a refund signed by both keys, so it holds at most one watch for each
+distinct cancel output seen on the network, each a real transaction. A
+watch is freed once that output's spend is `depth` deep, at most 144
+blocks, or once its cancel is in neither the mempool nor a block for a day.
+The buyer asks again every minute until it is taken. It does not cover a
 buyer that signed the redeem: that buyer must itself be online to refund
 between cancel and `t2`.
 

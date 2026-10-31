@@ -14,8 +14,8 @@
 //!   the session's bytes, as binary messages, to and from the buyer.
 //! - `GET /take/<swap id>`, a WebSocket: pairs the buyer with the seller of
 //!   that offer, which leaves the board; 404 if none is listed.
-//! - `POST /watch`: a [`watch::Watch`], as JSON. Answers the refund's
-//!   wtxid once the watch is on disk; 503 while its cancel is not yet seen
+//! - `POST /watch`: a [`watch::Watch`], as JSON. Answers cancel's txid
+//!   once the watch is on disk; 503 while its cancel is not yet seen
 //!   on the network, to be asked again.
 
 pub mod board;
@@ -213,7 +213,7 @@ async fn add_watch(State(relay): State<Arc<Relay>>, body: Bytes) -> Response {
     };
     let added = tokio::task::spawn_blocking(move || relay.watchtower.add(watch, &*relay.chain));
     match added.await.expect("adding a watch does not panic") {
-        Ok(wtxid) => wtxid.to_string().into_response(),
+        Ok(cancel) => cancel.to_string().into_response(),
         Err(Refusal::Invalid(why)) => (StatusCode::BAD_REQUEST, why).into_response(),
         Err(Refusal::Unseen) => (
             StatusCode::SERVICE_UNAVAILABLE,
