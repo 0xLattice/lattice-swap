@@ -197,6 +197,31 @@ impl NodeArgs {
         ))
     }
 
+    /// Refuses a lattice-node that cannot say how deep a transaction is. It
+    /// works that out from past blocks and the state after them, which a
+    /// node run with `--state tip` or `none`, or `--block-bodies none`,
+    /// does not keep: every NEX lock would look unmined, and every claim
+    /// drained. Its read of an account after the block halfway up the
+    /// chain shows whether it keeps that state; a chain too short to tell
+    /// passes.
+    fn check_nexus(&self, client: &Client) -> Result<()> {
+        let height = client.health()?.height;
+        if height < 2 {
+            return Ok(());
+        }
+        let block = client
+            .block_hash(height.div_ceil(2))?
+            .ok_or("the Nexus node has no block halfway up its chain")?;
+        match client.account_at(&swap_nexus_tx::address(&[0; 32]), &block)? {
+            Some(_) => Ok(()),
+            None => Err(
+                "the Nexus node keeps no state of past blocks, so it cannot tell how deep a \
+                 transaction is: run it with --state all and --block-bodies all"
+                    .into(),
+            ),
+        }
+    }
+
     /// A fresh address from the wallet, as the script that pays it.
     fn payout(&self, bitcoin: &Bitcoind) -> Result<ScriptBuf> {
         let address = bitcoin.call("getnewaddress", json!([]))?;
@@ -242,7 +267,8 @@ impl NexKeyArgs {
 }
 
 /// How the driver bumps, by CPFP from their payout, the swap transactions
-/// that pay this party. The defaults are the driver's.
+/// that pay this party, and how old a Bitcoin tip it trusts. The defaults
+/// are the driver's.
 #[derive(Args)]
 struct BumpArgs {
     /// The most a bump pays for, in sat/vB.
@@ -256,6 +282,11 @@ struct BumpArgs {
     /// all of it but dust.
     #[arg(long, value_parser = fee_fraction, default_value = "1")]
     max_fee_fraction: f64,
+    /// The oldest, in minutes, a Bitcoin tip may be, since its block time
+    /// or since this tool first saw it, whichever is earlier, for the
+    /// seller to start a redeem or lock its NEX on it.
+    #[arg(long, default_value_t = 90)]
+    max_tip_age: u64,
 }
 
 impl BumpArgs {
@@ -263,6 +294,7 @@ impl BumpArgs {
         driver.max_fee_rate = self.max_fee_rate;
         driver.fallback_fee_rate = self.fallback_fee_rate;
         driver.max_fee_fraction = self.max_fee_fraction;
+        driver.max_tip_age = Duration::from_secs(self.max_tip_age.saturating_mul(60));
     }
 }
 
@@ -319,6 +351,12 @@ struct OfferArgs {
     /// Seconds to wait for the buyer to dial.
     #[arg(long, default_value_t = 600)]
     wait: u64,
+    /// The fee rate, in sat/vB, that each Bitcoin swap transaction must pay
+    /// when bitcoind has no fee estimate, as on regtest. Otherwise its
+    /// conservative estimate for 6 blocks is the floor: cancel, which the
+    /// seller needs to reclaim its NEX, pays btc-fee and is never bumped.
+    #[arg(long)]
+    min_btc_fee_rate: Option<u64>,
     /// The directory the swap file goes in.
     #[arg(long, default_value = ".")]
     dir: PathBuf,
@@ -651,18 +689,10 @@ impl Offer {
 /// A Nexus address as Lattice prints one: a CIDv1, dag-cbor, sha2-256, in
 /// lowercase base32. NEX paid to anything else is lost.
 fn check_nex_address(text: &str) -> Result<()> {
-    let binary = text
-        .strip_prefix('b')
-        .and_then(|rest| {
-            data_encoding::BASE32_NOPAD
-                .decode(rest.to_ascii_uppercase().as_bytes())
-                .ok()
-        })
-        .filter(|binary| binary.len() == 36 && binary.starts_with(&[0x01, 0x71, 0x12, 0x20]));
-    match binary {
-        Some(_) if text == text.to_ascii_lowercase() => Ok(()),
-        _ => Err(format!("{text} is not a Nexus address").into()),
+    if !swap_nexus_tx::is_cid(text) {
+        return Err(format!("{text} is not a Nexus address").into());
     }
+    Ok(())
 }
 
 /// Refuses an address the buyer cannot dial: an unspecified `--advertise`,
@@ -704,7 +734,17 @@ fn offer(args: OfferArgs) -> Result<Outcome> {
     check_terms(&terms)?;
     let key = args.key.load()?;
     let bitcoin = args.nodes.bitcoin()?;
+    let floor = btc_fee_floor(&bitcoin, args.min_btc_fee_rate)?;
+    if terms.btc_fee.to_sat() < floor {
+        return Err(format!(
+            "btc_fee is {} sat, below the {floor} sat the node's fee rate asks of cancel and \
+             refund",
+            terms.btc_fee.to_sat()
+        )
+        .into());
+    }
     let nexus = args.nodes.nexus()?;
+    args.nodes.check_nexus(&nexus)?;
     let redeem = args.nodes.payout(&bitcoin)?;
     let punish = args.nodes.payout(&bitcoin)?;
     let seller = Seller::new(terms.clone(), key.nex_address(), redeem, punish)
@@ -767,6 +807,7 @@ fn take(args: TakeArgs) -> Result<Outcome> {
     let floor = btc_fee_floor(&bitcoin, args.policy.min_btc_fee_rate)?;
     check_offer(&offer, &args.policy, args.nodes.btc_network, floor)?;
     let nexus = args.nodes.nexus()?;
+    args.nodes.check_nexus(&nexus)?;
     let refund = args.nodes.payout(&bitcoin)?;
     let (buyer, actions) = Buyer::start(offer.terms.clone(), refund, args.nex_address)
         .map_err(|refusal| format!("refused: {refusal:?}"))?;
@@ -790,6 +831,9 @@ fn resume(args: SwapFileArgs) -> Result<Outcome> {
             let key = seller_key(seller.nex_address(), seller.signs_nex(), given)?;
             let bitcoin = args.nodes.bitcoin()?;
             let nexus = args.nodes.nexus()?;
+            if seller.outcome().is_none() {
+                args.nodes.check_nexus(&nexus)?;
+            }
             let driver = Driver::<Seller, _, Ivy>::resume(bitcoin, nexus, None, store);
             run(
                 &swap_file,
@@ -800,9 +844,12 @@ fn resume(args: SwapFileArgs) -> Result<Outcome> {
                 &args.bump,
             )
         }
-        Saved::Buyer(_) => {
+        Saved::Buyer(buyer) => {
             let bitcoin = args.nodes.bitcoin()?;
             let nexus = args.nodes.nexus()?;
+            if buyer.outcome().is_none() {
+                args.nodes.check_nexus(&nexus)?;
+            }
             run(
                 &swap_file,
                 Driver::<Buyer, _, Ivy>::resume(bitcoin, nexus, None, store),
@@ -858,7 +905,8 @@ fn resume_hint(swap_file: &Path, error: Box<dyn std::error::Error>) -> Box<dyn s
     }
     format!(
         "{error}\nto carry on, run with the same flags, the node and key flags and \
-         --max-fee-rate, --fallback-fee-rate and --max-fee-fraction: lattice-swap resume {}",
+         --max-fee-rate, --fallback-fee-rate, --max-fee-fraction and --max-tip-age: \
+         lattice-swap resume {}",
         swap_file.display()
     )
     .into()

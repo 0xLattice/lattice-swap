@@ -15,6 +15,12 @@ seller's share and `b` the buyer's. Whoever learns both shares can spend
 from it. Nexus needs nothing new: the lock is an ordinary transfer, and so
 is the claim from it.
 
+Never use one Nexus wallet seed on two networks, such as a testnet and
+mainnet. A Lattice signature commits to the chain path, `Nexus`, but not to
+the genesis block, so a transfer signed on one network is valid on any
+other where its nonce is next. A testnet NEX lock replayed on mainnet pays
+mainnet NEX to a lock address whose key the testnet counterparty holds.
+
 Bitcoin carries every timelock. The buyer funds a Taproot output that only
 the seller's and the buyer's Bitcoin keys can spend together. Four
 transactions can move it, each with its txid fixed before any is signed:
@@ -61,7 +67,38 @@ swap id.
   1` deep, so a redeem it starts sending has `margin - 1` blocks to confirm
   before cancel can be broadcast. A redeem it has seen, in the mempool or a
   block, may have made `s` public, so S keeps broadcasting it until it is
-  `btc_confirmations` deep.
+  `btc_confirmations` deep, in place of cancel, and against a cancel still
+  in the mempool. Only a cancel in a block stops it; a reorg that puts that
+  cancel back in the mempool starts it again, even with a refund pooled on
+  that cancel: only a B racing the redeem sends one, and B holds `s` and
+  may have taken the NEX already. Once the cancel is in a block, a refund
+  gives S `b`, and S claims the NEX. A refund of a cancel S saw no redeem
+  of gives S `b` at once, even in the mempool.
+- Every deadline is read from the party's own Bitcoin node. A node that
+  stalled, or that someone cut off from the network, shows fewer blocks
+  than there are: every depth it reports is too low. That only delays
+  cancel and punish, which consensus holds to their timelocks, and the
+  refund, which waits on depth, so they and their bumps go on whatever the
+  node shows. A node fed a fork reports that fork's depths instead;
+  acting on them, even B's refund, needs a cancel on the fork, which takes
+  fork blocks of full difficulty from where the node left the network
+  until the lock is `t1` deep. The one thing a stale node
+  makes unsafe is the redeem window, which such a node shows open after it
+  closed: S starts a redeem, and locks the NEX, only on a view whose node
+  has every block of the best header chain it knows and whose tip is at
+  most `max_tip_age` old, 90 minutes by default. The tip's age counts from
+  the earlier of its block time and when S's driver first saw it: a block
+  time is the miner's to set, up to two hours ahead, but first sight is
+  S's own. A redeem S has seen is sent again on any view. Once its views
+  have been stale for a minute, the driver warns, and again every minute.
+- So to keep S's node showing the window open, whoever cut it off must feed
+  it a fork block of full difficulty at least every `max_tip_age`: about
+  11% of the network's hashrate at 90 minutes, sustained over the redeem
+  window. The protection is the connectivity of S's own node; for a large
+  swap, run a well-connected one. S's driver does not also bound the
+  window by its clock: the window is set in blocks, which come at no fixed
+  rate, and a clock bound tight enough to matter would close it before the
+  NEX lock could be deep enough for B, so most swaps would cancel.
 - Before anything is at stake, a party whose counterparty goes quiet
   aborts.
 - A seller that signed a NEX lock and then learned `b` keeps waiting while
@@ -91,7 +128,11 @@ only one small child, so nobody else can pin them.
 
 - Cancel cannot be bumped: its output is the cancel output, which only both
   parties together, or the seller after `t2`, can spend. A stuck cancel
-  only delays the swap, since `t2` counts from its confirmation.
+  only delays the swap, since `t2` counts from its confirmation. Its fee is
+  fixed when both sign it, so choose `btc_fee` with headroom over today's
+  rates; both sides refuse one below their node's estimate. Sending cancel
+  and refund as a package is no fix: a refund broadcast while cancel is
+  unconfirmed reveals `b` while the seller can still redeem.
 - Refund has no timelock, so after `t1` the buyer could send cancel and
   refund as one package, paying two fees, against a redeem still pending.
   Redeem paying two fees keeps that package from replacing it.

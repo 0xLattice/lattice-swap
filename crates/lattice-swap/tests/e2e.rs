@@ -364,6 +364,8 @@ impl World {
                 .args(["offer", "--listen", "127.0.0.1:0"])
                 .args(["--btc-amount", &BTC_AMOUNT.to_sat().to_string()])
                 .args(["--btc-fee", &BTC_FEE.to_sat().to_string()])
+                // Regtest has no fee estimate.
+                .args(["--min-btc-fee-rate", "1"])
                 .args(["--nex-amount", &NEX_AMOUNT.to_string()])
                 .args(["--nex-fee", &nex_fee])
                 .args(["--t1", &t1, "--t2", "10", "--margin", "3"])

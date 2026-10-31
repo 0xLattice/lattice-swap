@@ -8,7 +8,7 @@ use base64::Engine;
 use bitcoin::address::NetworkUnchecked;
 use bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
 use bitcoin::{
-    Address, Amount, Block, Denomination, FeeRate, Network, OutPoint, Script, ScriptBuf,
+    Address, Amount, Block, BlockHash, Denomination, FeeRate, Network, OutPoint, Script, ScriptBuf,
     Transaction, Txid,
 };
 use serde_json::{json, Value};
@@ -26,10 +26,23 @@ impl std::error::Error for Error {}
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// A node's tip, as `getblockchaininfo` reports it.
+#[derive(Clone, Copy, Debug)]
+pub struct Tip {
+    /// The height of the last block the node has.
+    pub height: u32,
+    /// The height of the best header chain it knows.
+    pub headers: u32,
+    /// The tip block's time, in seconds since the Unix epoch.
+    pub time: u64,
+    /// The tip block's hash.
+    pub hash: BlockHash,
+}
+
 pub trait Bitcoin {
     fn broadcast(&self, tx: &Transaction) -> Result<()>;
-    /// The height of the tip.
-    fn height(&self) -> Result<u32>;
+    /// The tip, and how far the node's headers reach past it.
+    fn tip(&self) -> Result<Tip>;
     /// The transaction `txid` in the mempool or the chain, with its
     /// confirmations (0 in the mempool); `None` if the node knows neither,
     /// as for a transaction only in a block that left the active chain.
@@ -271,12 +284,25 @@ impl Bitcoin for Bitcoind {
             .map(drop)
     }
 
-    fn height(&self) -> Result<u32> {
-        let height = self.call("getblockcount", json!([]))?;
-        height
-            .as_u64()
-            .and_then(|h| u32::try_from(h).ok())
-            .ok_or_else(|| Error(format!("height {height}")))
+    fn tip(&self) -> Result<Tip> {
+        let chain = self.call("getblockchaininfo", json!([]))?;
+        let height = |key: &str| {
+            chain[key]
+                .as_u64()
+                .and_then(|h| u32::try_from(h).ok())
+                .ok_or_else(|| Error(format!("getblockchaininfo {key}: {chain}")))
+        };
+        Ok(Tip {
+            height: height("blocks")?,
+            headers: height("headers")?,
+            time: chain["time"]
+                .as_u64()
+                .ok_or_else(|| Error(format!("getblockchaininfo time: {chain}")))?,
+            hash: chain["bestblockhash"]
+                .as_str()
+                .and_then(|hash| hash.parse().ok())
+                .ok_or_else(|| Error(format!("getblockchaininfo bestblockhash: {chain}")))?,
+        })
     }
 
     fn transaction(&self, txid: Txid) -> Result<Option<(Transaction, u32)>> {
@@ -312,7 +338,7 @@ impl Bitcoin for Bitcoind {
                 .map_err(|e| Error(format!("txid {spender}: {e}")))?;
             return self.transaction(spender);
         }
-        let tip = self.height()?;
+        let tip = self.tip()?.height;
         for height in from..=tip {
             let hash = self.call("getblockhash", json!([height]))?;
             let block: Block = decode(&self.call("getblock", json!([hash, 0]))?)?;

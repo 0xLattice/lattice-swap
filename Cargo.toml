@@ -5,3 +5,5 @@ members = ["crates/lattice-swap", "crates/swap", "crates/swap-bitcoin", "crates/
 [workspace.package]
 edition = "2021"
 license = "MIT"
+# `File::try_lock`.
+rust-version = "1.89"

@@ -166,6 +166,11 @@ fn only_a_nexus_address_is_paid() {
     let address = swap_nexus_tx::address(&[9; 32]);
     assert!(check_nex_address(&address).is_ok());
     assert!(check_nex_address(&address.to_ascii_uppercase()).is_err());
+    let upper = format!("b{}", address[1..].to_ascii_uppercase());
+    assert!(
+        check_nex_address(&upper).is_err(),
+        "its digits lowercase too"
+    );
     assert!(check_nex_address(&address[..address.len() - 1]).is_err());
     assert!(check_nex_address("bc1qexample").is_err());
 }
@@ -366,7 +371,8 @@ fn a_failure_after_the_swap_file_exists_says_how_to_resume() {
     let hinted = resume_hint(file.path(), "lost".into()).to_string();
     let hint = format!(
         "lost\nto carry on, run with the same flags, the node and key flags and \
-         --max-fee-rate, --fallback-fee-rate and --max-fee-fraction: lattice-swap resume {}",
+         --max-fee-rate, --fallback-fee-rate, --max-fee-fraction and --max-tip-age: \
+         lattice-swap resume {}",
         file.path().display()
     );
     assert_eq!(hinted, hint);
@@ -612,8 +618,14 @@ fn estimate() -> Value {
 }
 
 /// What `lattice-swap` says when `args` stop it, run with the other
-/// flags it needs: node files that exist, and a bitcoind at `btc_url`.
+/// flags it needs: node files that exist, a bitcoind at `btc_url`, and a
+/// lattice-node that keeps past state.
 fn refusal(args: &[&str], btc_url: &str) -> String {
+    refusal_on(args, btc_url, &nexus_node(10, true))
+}
+
+/// [`refusal`], with the lattice-node at `nexus_url`.
+fn refusal_on(args: &[&str], btc_url: &str, nexus_url: &str) -> String {
     let cookie = tempfile::NamedTempFile::new().unwrap();
     fs::write(cookie.path(), "user:password").unwrap();
     let cookie = cookie.path().to_str().unwrap();
@@ -625,7 +637,7 @@ fn refusal(args: &[&str], btc_url: &str) -> String {
         "--btc-cookie",
         cookie,
         "--nexus-url",
-        "http://127.0.0.1:1",
+        nexus_url,
         "--nexus-cookie",
         cookie,
     ];
@@ -635,13 +647,24 @@ fn refusal(args: &[&str], btc_url: &str) -> String {
 
 /// `take` on `offer`, paying `address`.
 fn take_refusal(offer: &Offer, address: &str, extra: &[&str], btc_url: &str) -> String {
+    take_refusal_on(offer, address, extra, btc_url, &nexus_node(10, true))
+}
+
+/// [`take_refusal`], with the lattice-node at `nexus_url`.
+fn take_refusal_on(
+    offer: &Offer,
+    address: &str,
+    extra: &[&str],
+    btc_url: &str,
+    nexus_url: &str,
+) -> String {
     let file = tempfile::NamedTempFile::new().unwrap();
     fs::write(file.path(), offer.encode()).unwrap();
     let path = file.path().to_str().unwrap();
     let mut args = vec!["take", path, "--nex-address", address];
     args.extend(["--btc-amount", "50000000", "--nex-amount", "1000000"]);
     args.extend(extra);
-    refusal(&args, btc_url)
+    refusal_on(&args, btc_url, nexus_url)
 }
 
 /// The agreed offer, with a seller key that is one.
@@ -790,7 +813,12 @@ fn the_bump_settings_default_to_the_drivers() {
     let store = || swap_store(Path::new(&path)).unwrap();
     let mut driver = Driver::<Seller, _, Ivy>::resume(bitcoin(), nexus(), None, store()).unwrap();
     let defaults = |d: &Driver<Seller, Bitcoind, Ivy>| {
-        (d.max_fee_rate, d.fallback_fee_rate, d.max_fee_fraction)
+        (
+            d.max_fee_rate,
+            d.fallback_fee_rate,
+            d.max_fee_fraction,
+            d.max_tip_age,
+        )
     };
     let before = defaults(&driver);
     offer_args(&[]).bump.apply(&mut driver);
@@ -803,10 +831,13 @@ fn the_bump_settings_default_to_the_drivers() {
         "5",
         "--max-fee-fraction",
         "0.25",
+        "--max-tip-age",
+        "30",
     ]);
     args.bump.apply(&mut driver);
     let rate = |sat| FeeRate::from_sat_per_vb(sat).unwrap();
-    assert_eq!(defaults(&driver), (rate(50), rate(5), 0.25));
+    let age = Duration::from_secs(30 * 60);
+    assert_eq!(defaults(&driver), (rate(50), rate(5), 0.25, age));
     for fraction in ["0", "1"] {
         assert!(parse(&["resume", "x.json", "--max-fee-fraction", fraction]).is_ok());
     }
@@ -830,7 +861,9 @@ fn the_bump_settings_default_to_the_drivers() {
     let too_high = (u64::MAX / 250 + 1).to_string();
     assert!(parse(&["resume", "x.json", "--fallback-fee-rate", &too_high]).is_err());
 
-    // A run sets them on its driver, which checks the fraction first.
+    // A run sets them on its driver, which checks the fraction first. One
+    // driver at a time holds the swap.
+    drop(driver);
     let mut bump = offer_args(&[]).bump;
     bump.max_fee_fraction = f64::NAN;
     let driver = Driver::<Seller, _, Ivy>::resume(bitcoin(), nexus(), None, store());
@@ -895,7 +928,7 @@ fn status_reads_a_swap_file_the_driver_saved() {
         fs::write(&path, other.to_string()).unwrap();
         let refused = cli(&path).unwrap_err();
         assert!(refused.contains(&path), "{refused}");
-        assert!(refused.contains("this build reads only 2"), "{refused}");
+        assert!(refused.contains("this build reads only 3"), "{refused}");
     }
     fs::remove_file(&path).unwrap();
     assert_eq!(cli(&path), Err(format!("{path}: no such swap file")));
@@ -1119,4 +1152,157 @@ fn a_claiming_swap_file_loads_as_its_side() {
         };
         assert_eq!(loaded, (side, "ClaimingNex".to_string()));
     }
+}
+
+/// `offer` holds its own `btc_fee` to its node's fee floor, as `take`
+/// does: cancel, which the seller needs to reclaim its NEX, pays it as
+/// signed.
+#[cfg(unix)]
+#[test]
+fn offer_refuses_a_fee_below_its_nodes_estimate() {
+    let key = key_file(7);
+    let cookie = tempfile::NamedTempFile::new().unwrap();
+    let offered = |fee: u64, rate: Option<u64>, result: Value| {
+        let mut args = offer_args(&["--nex-key-file", key.path().to_str().unwrap()]);
+        args.terms.btc_fee = fee;
+        args.min_btc_fee_rate = rate;
+        args.nodes.btc_url = bitcoind(result);
+        args.nodes.btc_cookie = Some(cookie.path().to_path_buf());
+        args.nodes.nexus_cookie = cookie.path().to_path_buf();
+        args.nodes.nexus_url = nexus_node(10, true);
+        offer(args).unwrap_err().to_string()
+    };
+    let floor = btc_fee_at(10_000);
+    let refused = offered(floor - 1, None, estimate());
+    assert!(refused.contains("below the"), "{refused}");
+    assert_eq!(offered(floor, None, estimate()), PAST_THE_CHECKS);
+    let none = || json!({"errors": ["Insufficient data"], "blocks": 0});
+    let refused = offered(floor, None, none());
+    assert!(refused.contains("--min-btc-fee-rate"), "{refused}");
+    assert_eq!(offered(floor, Some(10), none()), PAST_THE_CHECKS);
+    let refused = offered(floor, Some(11), none());
+    assert!(refused.contains("below the"), "{refused}");
+}
+
+/// A lattice-node at `height` whose operator reads answer, but whose read
+/// of an account after the block halfway up answers only if it
+/// `keeps_state`.
+fn nexus_node(height: u64, keeps_state: bool) -> String {
+    use std::io::BufRead;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let mut reader = io::BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            reader.read_line(&mut request).unwrap();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            let path = request.split(' ').nth(1).unwrap_or_default();
+            let half = format!("/api/block/{}", height.div_ceil(2));
+            let block = swap_nexus_tx::cid(b"half");
+            let answer = if path == "/health" {
+                let height = height.to_string();
+                Some(json!({"phase": "active", "height": height, "bestHeaderHeight": height}))
+            } else if path == half {
+                Some(json!({"hash": block}))
+            } else if path.starts_with("/accounts/") && path.ends_with(&format!("?block={block}")) {
+                keeps_state.then(|| json!({"balance": "0", "nonce": "0"}))
+            } else {
+                None
+            };
+            let (status, body) = match answer {
+                Some(answer) => ("200 OK", answer.to_string()),
+                None => ("404 Not Found", String::new()),
+            };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    url
+}
+
+/// A lattice-node that keeps no state of past blocks cannot say how deep
+/// a transaction is, so every swap on it would cancel: it is refused.
+#[test]
+fn a_nexus_node_that_keeps_no_past_state_is_refused() {
+    let cookie = tempfile::NamedTempFile::new().unwrap();
+    let check = |height, keeps_state| {
+        let mut nodes = offer_args(&[]).nodes;
+        nodes.nexus_url = nexus_node(height, keeps_state);
+        nodes.nexus_cookie = cookie.path().to_path_buf();
+        let client = nodes.nexus().unwrap();
+        nodes.check_nexus(&client).map_err(|e| e.to_string())
+    };
+    assert_eq!(check(10, true), Ok(()));
+    let refused = check(10, false).unwrap_err();
+    assert!(
+        refused.contains("--state all and --block-bodies all"),
+        "{refused}"
+    );
+    assert_eq!(check(1, false), Ok(()), "too short to tell");
+}
+
+/// `offer`, `take` and `resume` of a swap still running each check the
+/// lattice-node, and `offer` and `take` before they take an address from
+/// the wallet.
+#[cfg(unix)]
+#[test]
+fn offer_take_and_resume_check_the_nexus_node() {
+    let refused = |refusal: String| {
+        assert!(refusal.contains("--state all"), "{refusal}");
+    };
+    let forgetful = || nexus_node(10, false);
+    let url = bitcoind(estimate());
+    let key = key_file(7);
+    let key = key.path().to_str().unwrap();
+    let fee = btc_fee_at(10_000).to_string();
+    refused(refusal_on(
+        &[
+            "offer",
+            "--btc-amount",
+            "50000000",
+            "--btc-fee",
+            &fee,
+            "--nex-amount",
+            "1000000",
+            "--nex-fee",
+            "10",
+            "--listen",
+            "127.0.0.1:0",
+            "--nex-key-file",
+            key,
+        ],
+        &url,
+        &forgetful(),
+    ));
+    let address = swap_nexus_tx::address(&[9; 32]);
+    refused(take_refusal_on(
+        &takeable(),
+        &address,
+        &[],
+        &url,
+        &forgetful(),
+    ));
+    let home = SecretBytes([7; 32]).nex_address();
+    let seller = Seller::new(small(16), home, ScriptBuf::new(), ScriptBuf::new()).unwrap();
+    let (_directory, path) = swap_file(seller);
+    refused(refusal_on(
+        &["resume", &path, "--nex-key-file", key],
+        &url,
+        &forgetful(),
+    ));
+    let (buyer, _) = Buyer::start(small(16), ScriptBuf::new(), "b".into()).unwrap();
+    let (_directory, path) = swap_file(buyer);
+    refused(refusal_on(&["resume", &path], &url, &forgetful()));
 }

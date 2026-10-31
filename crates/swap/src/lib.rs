@@ -117,6 +117,11 @@ impl Terms {
             // the refund needs time to confirm before punish is valid.
             && floor < u64::from(self.t2)
             && self.nex_amount > self.nex_fee
+            // A Nexus amount is signed: the lock debits both.
+            && self
+                .nex_amount
+                .checked_add(self.nex_fee)
+                .is_some_and(|debit| debit <= i64::MAX as u64)
     }
 
     /// The seller may no longer broadcast the redeem: the lock is
@@ -239,6 +244,13 @@ pub struct BitcoinView {
     pub lock_spend: Option<Spent>,
     /// What spends the cancel output, if cancel spent the lock.
     pub cancel_spend: Option<Spent>,
+    /// Why the node may be behind the network, if it may be: its tip is
+    /// old, or it lags its own headers. A stalled node under-reports how
+    /// deep things are, which only delays a timelocked spend, and a fork
+    /// fed to it takes full-difficulty blocks to deepen; but either can
+    /// show the redeem window open after it closed: on it the seller starts
+    /// no redeem and locks no NEX.
+    pub stale: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -657,9 +669,9 @@ impl Claim {
                     let tip = view.health.tip.clone();
                     self.passed_at = tip.map(|tip| (view.health.height, tip));
                 }
-                self.passed_at
-                    .as_ref()
-                    .is_some_and(|(since, _)| view.health.height >= since + terms.nex_confirmations)
+                self.passed_at.as_ref().is_some_and(|(since, _)| {
+                    view.health.height >= since.saturating_add(terms.nex_confirmations)
+                })
             }
             Lock::Signed(_) => {
                 self.passed_at = None;
@@ -763,6 +775,26 @@ mod hex_tx {
     ) -> Result<Transaction, D::Error> {
         let hex = String::deserialize(deserializer)?;
         deserialize_hex(&hex).map_err(D::Error::custom)
+    }
+
+    /// An optional one, as consensus hex or null.
+    pub mod option {
+        use super::*;
+
+        pub fn serialize<S: Serializer>(
+            tx: &Option<Transaction>,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            tx.as_ref().map(serialize_hex).serialize(serializer)
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Option<Transaction>, D::Error> {
+            Option::<String>::deserialize(deserializer)?
+                .map(|hex| deserialize_hex(&hex).map_err(D::Error::custom))
+                .transpose()
+        }
     }
 }
 

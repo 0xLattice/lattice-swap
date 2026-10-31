@@ -45,8 +45,19 @@ lattice-node. Before anything else, `offer`, `take` and `resume` check the
 bitcoind: Bitcoin Core 28 or later, its txindex synced, not in initial block
 download, on the chain `--btc-network` names, and `--btc-wallet` loaded with
 private keys and, if encrypted, unlocked; an unlock that times out mid-swap
-stops its bumps. Nothing checks which Nexus the lattice-node follows: point it
-at the one you mean to trade on. The two agree on the terms off-tool. The
+stops its bumps. They also check that the lattice-node keeps past blocks and
+the state after them (`--state all` and `--block-bodies all`, its defaults),
+without which it cannot say how deep a transaction is. Nothing checks which Nexus the lattice-node follows: point it
+at the one you mean to trade on, and never use one Nexus wallet seed on two
+networks: a Lattice signature does not commit to the genesis block, so a NEX
+lock signed on a testnet can be replayed on mainnet, paying a lock whose key
+the testnet counterparty holds. While a swap runs, a bitcoind that falls
+behind its headers, or whose tip is over `--max-tip-age` minutes old, 90 by
+default, since its block time or since the tool first saw it, may hide that
+the redeem window closed: the seller starts no redeem and locks no NEX on it,
+and the tool warns until it catches up. Every other spend and bump goes on.
+The seller's protection against a node someone cut off is that node's own
+connectivity: for a large swap, run a well-connected one. The two agree on the terms off-tool. The
 seller, who has NEX, makes an offer and waits for the buyer to dial:
 
 ```sh
@@ -78,7 +89,8 @@ address such as `0.0.0.0`.
 
 - `lattice-swap resume <swap file>` carries on after a restart, from the
   chains alone, with the same flags: the node flags, and `--max-fee-rate`,
-  `--fallback-fee-rate` and `--max-fee-fraction`, which are not saved. A
+  `--fallback-fee-rate`, `--max-fee-fraction` and `--max-tip-age`, which are
+  not saved. A
   seller also needs its Nexus key until the NEX lock is signed; a key given
   later must still be the swap's. `refund` is the same command: a swap cancels
   and refunds by itself once its timelocks allow.
@@ -104,7 +116,9 @@ the buyer has signed the redeem, it refunds only when cancel is
 the refund window is `t2 - btc-confirmations` blocks. The buyer also refuses a
 `--btc-fee` at which cancel or refund, the spends it relies on, pays less than
 its bitcoind's conservative fee estimate for 6 blocks, or, where bitcoind has
-no estimate, as on regtest, `--min-btc-fee-rate` sat/vB.
+no estimate, as on regtest, `--min-btc-fee-rate` sat/vB. The seller refuses
+to offer such a `--btc-fee` too: cancel, which it needs to reclaim its NEX,
+pays it as signed and is never bumped, so leave headroom.
 
 While a swap transaction that pays this side waits unconfirmed (redeem and
 punish for the seller, refund for the buyer), `offer`, `take` and `resume`
@@ -118,7 +132,8 @@ but dust. Where bitcoind has no estimate it aims at `--fallback-fee-rate`,
 refunded, 4 punished, 5 drained, 6 aborted. 1 means an error stopped the
 tool before the swap ended; if the swap file exists by then, it prints the
 `resume` command to carry on with, given the same flags. A `take` run again
-on an offer it took refuses, and prints the same command.
+on an offer it took refuses, and prints the same command. A swap file is run
+by one process at a time: a second `resume` while one runs refuses.
 `docs/protocol.md` describes the protocol.
 
 ## License
