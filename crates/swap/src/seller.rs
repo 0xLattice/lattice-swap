@@ -33,9 +33,8 @@ pub enum Seller {
     /// shows the redeem window open, until it confirms. Once a view has
     /// shown it, in the mempool or a block, `s` may be public: it is
     /// broadcast on every view it is missing from, window or not, until it
-    /// is `btc_confirmations` deep, a cancel in a block spent the lock, or
-    /// a refund shows, and in `Cancelling` again whenever that cancel
-    /// leaves its block.
+    /// is `btc_confirmations` deep or a cancel in a block spent the lock,
+    /// and in `Cancelling` again whenever that cancel leaves its block.
     Redeeming {
         locked: SellerLocked,
         nex_lock: swap_nexus_tx::Transaction,

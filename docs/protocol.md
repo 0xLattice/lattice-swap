@@ -76,13 +76,13 @@ swap id.
   of gives S `b` at once, even in the mempool.
 - Every deadline is read from the party's own Bitcoin node. A node that
   stalled, or that someone cut off from the network, shows fewer blocks
-  than there are: every depth it reports is too low. A node fed a fork
-  reports that fork's depths instead; acting on them, even B's refund,
-  needs a cancel on the fork, which takes `t1` fork blocks of full
-  difficulty. That only delays
+  than there are: every depth it reports is too low. That only delays
   cancel and punish, which consensus holds to their timelocks, and the
   refund, which waits on depth, so they and their bumps go on whatever the
-  node shows. The one thing it
+  node shows. A node fed a fork reports that fork's depths instead;
+  acting on them, even B's refund, needs a cancel on the fork, which takes
+  fork blocks of full difficulty from where the node left the network
+  until the lock is `t1` deep. The one thing a stale node
   makes unsafe is the redeem window, which such a node shows open after it
   closed: S starts a redeem, and locks the NEX, only on a view whose node
   has every block of the best header chain it knows and whose tip is at
