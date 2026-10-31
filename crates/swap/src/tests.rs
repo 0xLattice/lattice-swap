@@ -283,7 +283,8 @@ impl Locked {
 
     /// The seller signs and submits its NEX lock; it is not mined yet.
     fn nex_signed(self) -> (Seller, Buyer, swap_nexus_tx::Transaction) {
-        let (seller, actions) = self.seller.step(btc(2, None, None));
+        // Deep enough for `btc_deep` too.
+        let (seller, actions) = self.seller.step(btc(3, None, None));
         assert!(actions.is_empty());
         let (seller, actions) = seller.step(nexus(account(0, 0), None));
         let (seller, actions) = seller.step(signed_nex(&actions));
@@ -751,11 +752,13 @@ fn a_redeem_signature_waits_for_a_fresh_view() {
     assert!(matches!(seller, Seller::Redeeming { .. }));
 
     let (open, actions) = seller.clone().step(btc(17, None, None));
-    assert_eq!(broadcasts(&actions).len(), 1, "the window is open");
-    // Not seen yet, and the window closed: not again.
+    let [redeem] = &broadcasts(&actions)[..] else {
+        panic!("the window is open");
+    };
+    // Sent, so perhaps public: again once the window closed.
     let (closed, actions) = open.step(btc(18, None, None));
-    assert!(actions.is_empty());
-    assert!(matches!(closed, Seller::Cancelling { .. }));
+    assert_eq!(broadcasts(&actions), std::slice::from_ref(redeem));
+    assert!(matches!(closed, Seller::Redeeming { .. }));
     let (closed, actions) = seller.step(btc(18, None, None));
     assert!(actions.is_empty(), "the window closed");
     assert!(matches!(closed, Seller::Cancelling { .. }));
@@ -1969,22 +1972,37 @@ fn a_fee_fraction_outside_zero_to_one_is_refused() {
     }
 }
 
-/// The seller holding the redeem at the last open block, and the redeem.
-fn seller_redeeming() -> (Seller, Transaction, Transaction) {
-    let (seller, buyer, nex_lock) = locked().nex_locked();
+/// The seller holding the redeem at the last open block, never sent; the
+/// buyer that signed it; the redeem and cancel.
+fn seller_holding_with(terms: Terms) -> (Seller, Buyer, Transaction, Transaction) {
+    let (seller, buyer, nex_lock) = locked_with(terms).nex_locked();
     let (swap, lock) = seller.watch().bitcoin.unwrap();
-    let (_, actions) = buyer.step(nexus(account(500_000, 0), mined(nex_lock.body, 1)));
+    let (buyer, actions) = buyer.step(nexus(account(500_000, 0), mined(nex_lock.body, 1)));
     let (seller, _) = seller.step(btc(17, None, None));
-    let (seller, _) = seller.step(message(sent(&actions)));
-    let (seller, actions) = seller.step(btc(17, None, None));
+    let (seller, none) = seller.step(message(sent(&actions)));
+    assert!(none.is_empty());
+    let (_, actions) = seller.clone().step(btc(17, None, None));
     let [redeem] = &broadcasts(&actions)[..] else {
         panic!("the seller redeems");
     };
-    (
-        seller,
-        redeem.clone(),
-        swap.unsigned_tx(lock, Spend::Cancel),
-    )
+    let cancel = swap.unsigned_tx(lock, Spend::Cancel);
+    (seller, buyer, redeem.clone(), cancel)
+}
+
+/// The seller holding the redeem at the last open block, never sent, the
+/// redeem and cancel.
+fn seller_holding() -> (Seller, Transaction, Transaction) {
+    let (seller, _, redeem, cancel) = seller_holding_with(terms());
+    (seller, redeem, cancel)
+}
+
+/// The seller that has sent the redeem at the last open block, the redeem
+/// and cancel.
+fn seller_redeeming() -> (Seller, Transaction, Transaction) {
+    let (seller, redeem, cancel) = seller_holding();
+    let (seller, actions) = seller.step(btc(17, None, None));
+    assert_eq!(broadcasts(&actions), std::slice::from_ref(&redeem));
+    (seller, redeem, cancel)
 }
 
 /// A redeem the seller once saw may have revealed `s`: when it vanishes
@@ -2007,11 +2025,11 @@ fn a_redeem_once_seen_is_never_abandoned() {
     assert!(matches!(seller, Seller::Cancelling { .. }));
 }
 
-/// A redeem never seen may never have gone out: once the window closes,
+/// A redeem never sent cannot have revealed `s`: once the window closes,
 /// the seller cancels instead.
 #[test]
-fn a_redeem_never_seen_is_abandoned_when_the_window_closes() {
-    let (seller, _, _) = seller_redeeming();
+fn a_redeem_never_sent_is_abandoned_when_the_window_closes() {
+    let (seller, _, _) = seller_holding();
     // As saved before `seen` existed: the field is missing, and false.
     let mut saved = serde_json::to_value(&seller).unwrap();
     let fields = saved["Redeeming"].as_object_mut().unwrap();
@@ -2132,7 +2150,7 @@ fn clear_warnings() {
 /// lasted, not at every block a node briefly lags.
 #[test]
 fn a_stale_or_lagging_node_starts_no_redeem() {
-    let (seller, redeem, _) = seller_redeeming();
+    let (seller, redeem, _) = seller_holding();
     let (_, lock) = seller.watch().bitcoin.unwrap();
     let redeemed = |set: fn(&mut Node), lasting: Duration| {
         // The window is open: the lock 17 deep.
@@ -2198,17 +2216,21 @@ fn a_fresh_view_restarts_the_wait_before_a_stale_one_is_logged() {
 }
 
 /// A stale view can show the window open after it closed, but a redeem
-/// once seen may have revealed `s`: the seller starts none on it, but
-/// sends a seen one again.
+/// once sent or seen may have revealed `s`: the seller starts none on it,
+/// but sends a sent or seen one again.
 #[test]
-fn a_stale_view_starts_no_redeem_but_sends_a_seen_one_again() {
-    let (seller, redeem, _) = seller_redeeming();
+fn a_stale_view_starts_no_redeem_but_sends_a_sent_one_again() {
+    let (seller, redeem, _) = seller_holding();
     let (seller, actions) = seller.step(stale(17, None, None));
     assert!(actions.is_empty());
     assert!(matches!(seller, Seller::Redeeming { .. }));
-    let (seller, _) = seller.step(btc(17, Some((&redeem, 0)), None));
-    let (_, actions) = seller.step(stale(17, None, None));
-    assert_eq!(broadcasts(&actions), [redeem]);
+    let (seller, actions) = seller.step(btc(17, None, None));
+    assert_eq!(broadcasts(&actions), std::slice::from_ref(&redeem));
+    let (seen, _) = seller.clone().step(btc(17, Some((&redeem, 0)), None));
+    for seller in [seller, seen] {
+        let (_, actions) = seller.step(stale(17, None, None));
+        assert_eq!(broadcasts(&actions), std::slice::from_ref(&redeem));
+    }
 }
 
 /// The NEX is locked only on a view that can tell the window is open.
@@ -2348,11 +2370,10 @@ fn a_seen_redeem_is_sent_again_when_cancel_leaves_its_block() {
     let (seller, _) = seller.step(btc(21, Some((&redeem, 1)), None));
     assert_eq!(seller.outcome(), Some(Outcome::Swapped));
 
-    // First seen once cancelling, as one sent before the window closed.
+    // Sent before the window closed and never seen: the same.
     let (seller, redeem, cancel) = seller_redeeming();
     let (seller, actions) = seller.step(btc(19, None, None));
-    assert!(actions.is_empty());
-    let (seller, _) = seller.step(btc(19, Some((&redeem, 0)), None));
+    assert_eq!(broadcasts(&actions), std::slice::from_ref(&redeem));
     let (_, actions) = seller.step(btc(20, Some((&cancel, 0)), None));
     assert_eq!(broadcasts(&actions), std::slice::from_ref(&redeem));
 
@@ -2450,11 +2471,11 @@ fn a_wrong_buyer_cancel_signature_aborts() {
     assert_eq!(seller.outcome(), Some(Outcome::Aborted(Refusal::Signature)));
 }
 
-/// A redeem never seen may never have gone out: it is not sent against a
+/// A redeem never sent cannot have revealed `s`: it is not sent against a
 /// cancel in the mempool, then or once cancelling.
 #[test]
-fn a_redeem_never_seen_is_not_sent_against_a_pooled_cancel() {
-    let (seller, redeem, cancel) = seller_redeeming();
+fn a_redeem_never_sent_is_not_sent_against_a_pooled_cancel() {
+    let (seller, redeem, cancel) = seller_holding();
     let (seller, actions) = seller.step(btc(19, Some((&cancel, 0)), None));
     assert!(!broadcasts(&actions).contains(&redeem));
     assert!(matches!(seller, Seller::Cancelling { .. }));
@@ -2633,8 +2654,8 @@ fn an_urgent_bump_in_trouble_is_logged_at_every_block() {
 /// A refund pooled on a cancel that displaced a seen redeem comes only
 /// from a buyer racing it, who holds `s` and may have taken the NEX: the
 /// seller keeps sending its redeem, from `Redeeming` or `Cancelling`, and
-/// claims only once the cancel is in a block. A refund with no seen redeem
-/// gives `b` at once.
+/// once cancelling claims beside it, until the cancel is
+/// `btc_confirmations` deep. A refund with no seen redeem gives `b` at once.
 #[test]
 fn a_pooled_refund_does_not_end_a_seen_redeem() {
     let (seller, buyer, nex_lock) = locked().nex_locked();
@@ -2697,4 +2718,110 @@ fn a_leftover_temporary_file_is_replaced() {
     assert_eq!(mode & 0o777, 0o600);
     assert!(!leftover.exists());
     assert!(store().load::<Seller>().unwrap().is_some());
+}
+
+/// A redeem is marked sent in the state saved before it goes out: a seller
+/// offline while the buyer replaced it with cancel and refund still fights
+/// for it on restart, though no view ever showed it.
+#[test]
+fn a_sent_redeem_outlives_an_offline_seller() {
+    let (seller, buyer, redeem, cancel) = seller_holding_with(terms());
+    let (seller, _) = seller.step(btc(17, None, None));
+    assert!(matches!(seller, Seller::Redeeming { seen: true, .. }));
+    let refund = buyer_refund(buyer, &cancel);
+    let seller = restart(&seller);
+    let pooled = || btc(21, Some((&cancel, 0)), Some((&refund, 0)));
+    let (seller, actions) = seller.step(pooled());
+    assert_eq!(broadcasts(&actions), std::slice::from_ref(&redeem));
+    let (seller, _) = seller.step(btc(21, Some((&cancel, 1)), None));
+    let (seller, actions) = seller.step(pooled());
+    assert_eq!(broadcasts(&actions), std::slice::from_ref(&redeem));
+    assert!(matches!(seller, Seller::Cancelling { .. }));
+}
+
+/// The refund of a buyer that signed the redeem: once cancel is deep.
+fn buyer_refund(buyer: Buyer, cancel: &Transaction) -> Transaction {
+    let (buyer, actions) = buyer.step(btc(20, None, None));
+    assert_eq!(broadcasts(&actions).len(), 1, "cancel");
+    let (_, actions) = buyer.step(btc(30, Some((cancel, 10)), None));
+    let [refund] = &broadcasts(&actions)[..] else {
+        panic!("refund");
+    };
+    refund.clone()
+}
+
+/// With cancel 3 deep to count: a seller that sent the redeem learns `b`
+/// from a refund on a cancel only 1 deep. It claims the NEX, and still
+/// watches Bitcoin. Returns the claim, the redeem, cancel and refund.
+fn seller_claiming_beside_a_redeem() -> (Seller, swap_nexus_tx::Transaction, [Transaction; 3]) {
+    let (seller, buyer, redeem, cancel) = seller_holding_with(btc_deep());
+    let (seller, _) = seller.step(btc(17, None, None));
+    let refund = buyer_refund(buyer, &cancel);
+    let (seller, actions) = seller.step(btc(21, Some((&cancel, 1)), Some((&refund, 0))));
+    assert!(actions.is_empty());
+    assert!(matches!(seller, Seller::Cancelling { .. }));
+    let watch = seller.watch();
+    assert!(watch.bitcoin.is_some() && watch.nexus.is_some());
+    let (seller, actions) = seller.step(nexus(account(500_000, 0), None));
+    let claim = submitted(&actions);
+    (seller, claim, [redeem, cancel, refund])
+}
+
+/// A reorg that drops the 1-deep cancel lets the redeem confirm: the seller
+/// sends it again, and goes on submitting its claim.
+#[test]
+fn a_claim_goes_on_beside_a_redeem_a_reorg_can_still_confirm() {
+    let (seller, claim, [redeem, cancel, refund]) = seller_claiming_beside_a_redeem();
+    let seller = restart(&seller);
+    let (seller, actions) = seller.step(btc(21, None, None));
+    assert_eq!(broadcasts(&actions), std::slice::from_ref(&redeem));
+    let (seller, actions) = seller.step(btc(21, Some((&cancel, 0)), Some((&refund, 0))));
+    assert_eq!(broadcasts(&actions), std::slice::from_ref(&redeem));
+    let (seller, actions) = seller.step(nexus(account(500_000, 0), None));
+    assert_eq!(submitted(&actions), claim, "the same claim");
+    let (seller, actions) = seller.step(btc(22, Some((&cancel, 2)), Some((&refund, 1))));
+    assert!(actions.is_empty(), "cancel in a block again");
+    assert!(matches!(seller, Seller::Cancelling { .. }));
+}
+
+/// A redeem that wins ends the swap `Swapped` once deep, whether the buyer
+/// drained the NEX or the seller's claim landed.
+#[test]
+fn a_redeem_that_wins_beside_a_claim_ends_swapped() {
+    let (seller, claim, [redeem, ..]) = seller_claiming_beside_a_redeem();
+    let drained = seller.clone().step(nexus(account(0, 1), None));
+    let landed = seller.step(nexus(account(0, 1), mined(claim.body, 1)));
+    for (seller, actions) in [drained, landed] {
+        assert!(actions.is_empty());
+        assert_eq!(seller.outcome(), None);
+        let (seller, actions) = seller.step(btc(21, None, None));
+        assert_eq!(broadcasts(&actions), std::slice::from_ref(&redeem));
+        let (seller, _) = seller.step(btc(22, Some((&redeem, 2)), None));
+        assert_eq!(seller.outcome(), None);
+        let (seller, _) = seller.step(btc(23, Some((&redeem, 3)), None));
+        assert_eq!(seller.outcome(), Some(Outcome::Swapped));
+    }
+}
+
+/// Once the cancel is `btc_confirmations` deep only the claim is left: a
+/// claim that landed ends `Refunded`, a lock the buyer drained `Drained`.
+#[test]
+fn a_claim_beside_a_redeem_ends_once_its_cancel_is_deep() {
+    let (seller, claim, [_, cancel, refund]) = seller_claiming_beside_a_redeem();
+    let landed = || nexus(account(0, 1), mined(claim.body.clone(), 1));
+    let drained = || nexus(account(0, 1), None);
+    for (view, outcome) in [(landed(), Outcome::Refunded), (drained(), Outcome::Drained)] {
+        let (seller, _) = seller.clone().step(view);
+        let (seller, actions) = seller.step(btc(22, Some((&cancel, 2)), Some((&refund, 1))));
+        assert!(actions.is_empty());
+        assert!(matches!(seller, Seller::Cancelling { .. }));
+        let (seller, _) = seller.step(btc(23, Some((&cancel, 3)), Some((&refund, 2))));
+        assert!(matches!(seller, Seller::ClaimingNex(_)));
+        let view = match outcome {
+            Outcome::Refunded => landed(),
+            _ => drained(),
+        };
+        let (seller, _) = seller.step(view);
+        assert_eq!(seller.outcome(), Some(outcome));
+    }
 }

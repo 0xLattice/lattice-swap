@@ -181,6 +181,12 @@ fn node_accepts_transfers_and_joint_key_spends() {
     let health = node.client.health().unwrap();
     assert_eq!(health.phase, "active");
     assert_eq!(health.best_header_height, Some(health.height));
+    // A dev build may pin another genesis than mainnet's: only read here.
+    let genesis = node.client.genesis().unwrap();
+    eprintln!(
+        "node genesis {genesis}, mainnet {}",
+        swap_nexus_tx::MAINNET_GENESIS
+    );
     let fee = node.client.min_relay_fee().unwrap();
     let (a, b, c) = (random_key(), random_key(), random_key());
     let (a_addr, b_addr, c_addr) = (addr(&a), addr(&b), addr(&c));

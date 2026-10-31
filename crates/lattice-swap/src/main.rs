@@ -155,6 +155,10 @@ struct NodeArgs {
     /// The lattice-node's RPC cookie file.
     #[arg(long)]
     nexus_cookie: PathBuf,
+    /// The CID of the genesis block of the Nexus to trade on: the
+    /// lattice-node must follow that chain. Mainnet's by default.
+    #[arg(long, default_value = swap_nexus_tx::MAINNET_GENESIS)]
+    nexus_genesis: String,
 }
 
 impl NodeArgs {
@@ -197,14 +201,24 @@ impl NodeArgs {
         ))
     }
 
-    /// Refuses a lattice-node that cannot say how deep a transaction is. It
-    /// works that out from past blocks and the state after them, which a
-    /// node run with `--state tip` or `none`, or `--block-bodies none`,
-    /// does not keep: every NEX lock would look unmined, and every claim
-    /// drained. Its read of an account after the block halfway up the
-    /// chain shows whether it keeps that state; a chain too short to tell
-    /// passes.
+    /// Refuses a lattice-node on another Nexus than `--nexus-genesis`
+    /// names, where a NEX lock is worthless; then one that cannot say how
+    /// deep a transaction is. It works that out from past blocks and the
+    /// state after them, which a node run with `--state tip` or `none`, or
+    /// `--block-bodies none`, does not keep: every NEX lock would look
+    /// unmined, and every claim drained. Its read of an account after the
+    /// block halfway up the chain shows whether it keeps that state; a chain
+    /// too short to tell passes.
     fn check_nexus(&self, client: &Client) -> Result<()> {
+        let genesis = client.genesis()?;
+        if genesis != self.nexus_genesis {
+            return Err(format!(
+                "refused: the Nexus node follows the chain of genesis {genesis}, not {}, the \
+                 one --nexus-genesis names",
+                self.nexus_genesis
+            )
+            .into());
+        }
         let height = client.health()?.height;
         if height < 2 {
             return Ok(());
@@ -549,12 +563,13 @@ fn btc_fee_floor(bitcoin: &Bitcoind, fallback: Option<u64>) -> Result<u64> {
 }
 
 /// An offer the buyer takes: terms that work, the amounts it agreed to on
-/// its network, a Bitcoin fee of at least `btc_fee_floor`, and every other
-/// term within its bounds.
+/// its Bitcoin network and its Nexus, a Bitcoin fee of at least
+/// `btc_fee_floor`, and every other term within its bounds.
 fn check_offer(
     offer: &Offer,
     policy: &PolicyArgs,
     network: Network,
+    nexus_genesis: &str,
     btc_fee_floor: u64,
 ) -> std::result::Result<(), String> {
     let terms = &offer.terms;
@@ -562,6 +577,12 @@ fn check_offer(
     let refused = |why: String| Err(format!("refused: the offer {why}"));
     if offer.btc_network != network {
         return refused(format!("is on {}, not {network}", offer.btc_network));
+    }
+    if offer.nexus_genesis != nexus_genesis {
+        return refused(format!(
+            "is on the Nexus of genesis {}, not {nexus_genesis}",
+            offer.nexus_genesis
+        ));
     }
     if terms.btc_amount.to_sat() != policy.btc_amount {
         return refused(format!(
@@ -636,13 +657,18 @@ fn check_offer(
     Ok(())
 }
 
-/// What the buyer needs to take the swap: the terms, where the seller
-/// listens and its key, and the session key the seller made for the buyer,
-/// the only one it accepts. Whoever holds an offer can take it.
+/// What the buyer needs to take the swap: the terms, the Nexus the seller
+/// trades on, where the seller listens and its key, and the session key the
+/// seller made for the buyer, the only one it accepts. Whoever holds an
+/// offer can take it.
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 struct Offer {
     terms: Terms,
     btc_network: Network,
+    /// The genesis CID of the seller's Nexus. Only a courtesy: a buyer on
+    /// another refuses before it locks anything, but the buyer's safety is
+    /// its own node's check against its own `--nexus-genesis`.
+    nexus_genesis: String,
     address: SocketAddr,
     seller: String,
     #[serde(with = "hex::serde")]
@@ -759,6 +785,7 @@ fn offer(args: OfferArgs) -> Result<Outcome> {
     let offer = Offer {
         terms,
         btc_network: args.nodes.btc_network,
+        nexus_genesis: args.nodes.nexus_genesis.clone(),
         address: args.advertise.unwrap_or(listener.local_addr()?),
         seller: config.peer_key().hex(),
         buyer_session,
@@ -805,7 +832,8 @@ fn take(args: TakeArgs) -> Result<Outcome> {
     }
     let bitcoin = args.nodes.bitcoin()?;
     let floor = btc_fee_floor(&bitcoin, args.policy.min_btc_fee_rate)?;
-    check_offer(&offer, &args.policy, args.nodes.btc_network, floor)?;
+    let (network, genesis) = (args.nodes.btc_network, &args.nodes.nexus_genesis);
+    check_offer(&offer, &args.policy, network, genesis, floor)?;
     let nexus = args.nodes.nexus()?;
     args.nodes.check_nexus(&nexus)?;
     let refund = args.nodes.payout(&bitcoin)?;

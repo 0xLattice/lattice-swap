@@ -18,7 +18,7 @@ use crate::{SecretBytes, Spent};
 
 /// The format of a state file. A file of another version is refused: its
 /// signatures may be over transactions this build no longer makes.
-pub const STATE_VERSION: u32 = 3;
+pub const STATE_VERSION: u32 = 4;
 
 /// One JSON file per swap, replaced atomically: written to a temporary
 /// file, synced, then renamed over the old one. It holds the party's
