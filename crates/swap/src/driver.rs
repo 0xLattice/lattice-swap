@@ -377,7 +377,7 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
             now.refused = refused;
             if due {
                 now.retries = match last {
-                    Some(last) if last.height == height => last.retries + 1,
+                    Some(last) if last.height == height => last.retries.saturating_add(1),
                     _ => 0,
                 };
                 now.height = height;

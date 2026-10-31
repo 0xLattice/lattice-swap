@@ -371,8 +371,8 @@ impl Bitcoin for Bitcoind {
             // byte longer than the one it was sized with.
             let own = size - parent.vsize() as u64 + 1;
             let malformed = || Error(format!("mempool entry {last}: {entry}"));
-            // With its descendants: a TRUC child has none, but a replacement
-            // pays for all it evicts.
+            // With its descendants: a replacement pays for all it evicts. A
+            // TRUC child has none, so its fee and size are its own.
             let base = btc(&entry["fees"]["descendant"])?;
             let last_size = entry["vsize"].as_u64().ok_or_else(malformed)?;
             let replace = replacing(base, last_size, own, incremental).ok_or_else(malformed)?;
