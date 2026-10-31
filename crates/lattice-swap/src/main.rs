@@ -158,6 +158,7 @@ struct NodeArgs {
 }
 
 impl NodeArgs {
+    /// A client for bitcoind, which must be one a swap can rely on.
     fn bitcoin(&self) -> Result<Bitcoind> {
         let auth = match (&self.btc_cookie, &self.btc_user) {
             (Some(path), _) => read(path)?,
@@ -168,12 +169,9 @@ impl NodeArgs {
             }
             (None, None) => return Err("--btc-cookie or --btc-user is required".into()),
         };
-        Ok(Bitcoind::new(
-            &self.wallet_url(),
-            &auth,
-            self.btc_network,
-            TIMEOUT,
-        ))
+        let bitcoin = Bitcoind::new(&self.wallet_url(), &auth, self.btc_network, TIMEOUT);
+        bitcoin.check_node()?;
+        Ok(bitcoin)
     }
 
     /// The wallet's RPC URL, its name percent-escaped.
@@ -393,6 +391,9 @@ struct PolicyArgs {
     /// The fewest Nexus confirmations of the NEX lock this buyer accepts.
     #[arg(long, default_value_t = 24)]
     min_nex_confirmations: u64,
+    /// The fewest Bitcoin blocks of slack before a timelock.
+    #[arg(long, default_value_t = 6)]
+    min_margin: u16,
 }
 
 #[derive(Args)]
@@ -454,9 +455,10 @@ fn btc_amount_floor(fee: Amount) -> u64 {
     fee.to_sat().saturating_mul(2).saturating_add(dust.to_sat())
 }
 
-/// The least `btc_fee` at which every swap spend pays `per_kvb` sat/kvB:
-/// redeem pays two fees, the others one. Each is signed, with the longest
-/// timelocks and payouts as large as any standard one.
+/// The least `btc_fee` at which cancel and refund, the spends the buyer
+/// relies on, each pay `per_kvb` sat/kvB. Each is signed, with the longest
+/// timelocks; refund pays the buyer's own wallet address, at most
+/// P2WSH-sized. Redeem and punish pay the seller.
 fn btc_fee_at(per_kvb: u64) -> u64 {
     let key = |n: u8| {
         let mut bytes = [0u8; 32];
@@ -481,18 +483,17 @@ fn btc_fee_at(per_kvb: u64) -> u64 {
     })
     .expect("these parameters work");
     let lock = OutPoint::null();
-    [Spend::Redeem, Spend::Cancel, Spend::Refund, Spend::Punish]
+    [Spend::Cancel, Spend::Refund]
         .into_iter()
         .map(|spend| {
             let a = swap.sign(lock, spend, &seller);
-            let b = (spend != Spend::Punish).then(|| swap.sign(lock, spend, &buyer));
-            let tx = swap.finalize(lock, spend, &a, b.as_ref());
+            let b = swap.sign(lock, spend, &buyer);
+            let tx = swap.finalize(lock, spend, &a, Some(&b));
             let vsize = tx.expect("our own signatures").vsize() as u64;
-            let fees = swap.fee(spend).to_sat() / swap.params().fee.to_sat();
-            per_kvb.saturating_mul(vsize).div_ceil(1000 * fees)
+            per_kvb.saturating_mul(vsize).div_ceil(1000)
         })
         .max()
-        .expect("four spends")
+        .expect("two spends")
 }
 
 /// The least `btc_fee` the buyer takes, in satoshis: what bitcoind's
@@ -586,6 +587,12 @@ fn check_offer(
         return refused(format!(
             "asks {} Nexus confirmations, fewer than {}",
             terms.nex_confirmations, policy.min_nex_confirmations
+        ));
+    }
+    if terms.margin < policy.min_margin {
+        return refused(format!(
+            "has margin {}, below {}",
+            terms.margin, policy.min_margin
         ));
     }
     Ok(())
@@ -749,6 +756,13 @@ fn take(args: TakeArgs) -> Result<Outcome> {
     };
     let offer = Offer::decode(&text)?;
     check_nex_address(&args.nex_address)?;
+    let store = Store::new(&args.dir, offer.terms.swap_id);
+    if store.path().exists() {
+        return Err(resume_hint(
+            store.path(),
+            "this offer was taken already: its swap file exists".into(),
+        ));
+    }
     let bitcoin = args.nodes.bitcoin()?;
     let floor = btc_fee_floor(&bitcoin, args.policy.min_btc_fee_rate)?;
     check_offer(&offer, &args.policy, args.nodes.btc_network, floor)?;
@@ -757,7 +771,6 @@ fn take(args: TakeArgs) -> Result<Outcome> {
     let (buyer, actions) = Buyer::start(offer.terms.clone(), refund, args.nex_address)
         .map_err(|refusal| format!("refused: {refusal:?}"))?;
     fs::create_dir_all(&args.dir)?;
-    let store = Store::new(&args.dir, offer.terms.swap_id);
 
     let config = ivy::Config::new(SigningKey::from_bytes(&offer.buyer_session));
     log(&offer.describe());
@@ -844,7 +857,8 @@ fn resume_hint(swap_file: &Path, error: Box<dyn std::error::Error>) -> Box<dyn s
         return error;
     }
     format!(
-        "{error}\nto carry on, run with the same node and key flags: lattice-swap resume {}",
+        "{error}\nto carry on, run with the same flags, the node and key flags and \
+         --max-fee-rate, --fallback-fee-rate and --max-fee-fraction: lattice-swap resume {}",
         swap_file.display()
     )
     .into()

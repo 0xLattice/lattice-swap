@@ -57,6 +57,21 @@ fn a_transaction_reorged_out_and_replaced_is_gone() {
     assert!(rpc.transaction(tx1).unwrap().is_none());
 }
 
+/// A node with a synced `-txindex` passes the check; one without is
+/// refused by name.
+#[test]
+fn the_node_check_requires_a_txindex() {
+    let (_node, indexed) = regtest();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while let Err(e) = indexed.check_node() {
+        assert!(Instant::now() < deadline, "{e}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let bare = Node::from_downloaded_with_conf(&Conf::default()).expect("start bitcoind");
+    let refused = rpc(&bare, "default").check_node().unwrap_err();
+    assert!(refused.to_string().contains("-txindex"), "{refused}");
+}
+
 fn key(n: u8) -> KeyPair<EvenY> {
     let mut bytes = [0u8; 32];
     bytes[31] = n;

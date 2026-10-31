@@ -3,7 +3,7 @@
 use std::future::{poll_fn, Future};
 use std::io;
 use std::net::SocketAddr;
-use std::pin::pin;
+use std::pin::{pin, Pin};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
@@ -11,12 +11,14 @@ use ivy::{Config, Connection};
 pub use ivy_core::PeerKey;
 use tokio::net::TcpStream;
 use tokio::runtime::Runtime;
-use tokio::time::{sleep_until, timeout, timeout_at};
+use tokio::time::{sleep, sleep_until, timeout, timeout_at};
 
 use crate::TOPIC;
 
 /// The most handshakes [`Ivy::accept`] runs at once.
 pub const HANDSHAKES: usize = 16;
+/// How long [`Ivy::accept`] waits after a failed accept.
+pub const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
 
 /// An authenticated channel to the counterparty. Every call has a
 /// deadline.
@@ -59,7 +61,9 @@ impl Ivy {
     /// Takes connections on `listener` until one completes the handshake
     /// as `peer`, dropping any other. Waits at most `wait` in all, and each
     /// handshake at most `send_timeout`. Handshakes run side by side, at
-    /// most [`HANDSHAKES`] at once; a connection beyond them is dropped.
+    /// most [`HANDSHAKES`] at once; a connection beyond them evicts the
+    /// oldest. A failed accept, such as one out of file descriptors, is
+    /// logged, and accepting goes on after [`ACCEPT_PAUSE`].
     pub fn accept(
         listener: std::net::TcpListener,
         config: &Config,
@@ -73,21 +77,40 @@ impl Ivy {
             let listener = tokio::net::TcpListener::from_std(listener)?;
             let deadline = tokio::time::Instant::now() + wait;
             let mut expired = pin!(sleep_until(deadline));
+            // Oldest first.
             let mut handshakes = Vec::new();
+            let mut paused: Option<Pin<Box<tokio::time::Sleep>>> = None;
             poll_fn(|cx| {
-                while let Poll::Ready(accepted) = listener.poll_accept(cx) {
-                    let (stream, _) = accepted?;
-                    if handshakes.len() < HANDSHAKES {
-                        let cap = deadline.min(tokio::time::Instant::now() + send_timeout);
-                        let accept = ivy::accept(stream, config, move |key| *key == peer);
-                        handshakes.push(Box::pin(timeout_at(cap, accept)));
+                loop {
+                    if let Some(pause) = &mut paused {
+                        if pause.as_mut().poll(cx).is_pending() {
+                            break;
+                        }
+                        paused = None;
                     }
+                    let stream = match listener.poll_accept(cx) {
+                        Poll::Pending => break,
+                        Poll::Ready(Ok((stream, _))) => stream,
+                        // It may fail again at once, as while out of file
+                        // descriptors: pause rather than spin.
+                        Poll::Ready(Err(e)) => {
+                            eprintln!("lattice-swap: accept: {e}");
+                            paused = Some(Box::pin(sleep(ACCEPT_PAUSE)));
+                            continue;
+                        }
+                    };
+                    if handshakes.len() == HANDSHAKES {
+                        drop(handshakes.remove(0));
+                    }
+                    let cap = deadline.min(tokio::time::Instant::now() + send_timeout);
+                    let accept = ivy::accept(stream, config, move |key| *key == peer);
+                    handshakes.push(Box::pin(timeout_at(cap, accept)));
                 }
                 let mut i = 0;
                 while i < handshakes.len() {
                     match handshakes[i].as_mut().poll(cx) {
                         Poll::Ready(Ok(Ok(connection))) => return Poll::Ready(Ok(connection)),
-                        Poll::Ready(_) => drop(handshakes.swap_remove(i)),
+                        Poll::Ready(_) => drop(handshakes.remove(i)),
                         Poll::Pending => i += 1,
                     }
                 }

@@ -57,9 +57,11 @@ swap id.
 - If S never redeems, B cancels after `t1` and refunds, which reveals `b`.
   S then claims its NEX back.
 - If B never refunds, S punishes after `t2` and keeps the BTC.
-- S stops broadcasting the redeem once the lock is `t1 - margin + 1` deep,
-  so a redeem it sends has `margin - 1` blocks to confirm before cancel can
-  be broadcast.
+- S stops starting to broadcast the redeem once the lock is `t1 - margin +
+  1` deep, so a redeem it starts sending has `margin - 1` blocks to confirm
+  before cancel can be broadcast. A redeem it has seen, in the mempool or a
+  block, may have made `s` public, so S keeps broadcasting it until it is
+  `btc_confirmations` deep.
 - Before anything is at stake, a party whose counterparty goes quiet
   aborts.
 - A seller that signed a NEX lock and then learned `b` keeps waiting while

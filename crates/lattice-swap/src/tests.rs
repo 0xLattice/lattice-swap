@@ -230,7 +230,7 @@ fn take_refuses_any_term_outside_its_policy() {
     let (policy, network) = policy(&[]);
     assert_eq!(check_offer(&agreed(), &policy, network, FLOOR), Ok(()));
     type Change = (&'static str, fn(&mut Offer));
-    let changes: [Change; 13] = [
+    let changes: [Change; 14] = [
         ("network", |o| o.btc_network = Network::Testnet),
         ("more btc", |o| o.terms.btc_amount += Amount::from_sat(1)),
         ("less btc", |o| o.terms.btc_amount -= Amount::from_sat(1)),
@@ -244,6 +244,7 @@ fn take_refuses_any_term_outside_its_policy() {
         ("btc confirmations", |o| o.terms.btc_confirmations -= 1),
         ("max btc confirmations", |o| o.terms.btc_confirmations = 13),
         ("nex confirmations", |o| o.terms.nex_confirmations -= 1),
+        ("margin", |o| o.terms.margin = 5),
     ];
     for (what, change) in changes {
         let mut offer = agreed();
@@ -270,6 +271,7 @@ fn the_refund_window_defaults_to_half_a_day() {
     assert_eq!(policy.max_btc_confirmations, 12);
     assert_eq!(policy.min_refund_window, 72);
     assert_eq!(policy.min_btc_fee_rate, None);
+    assert_eq!(policy.min_margin, 6);
 }
 
 #[test]
@@ -363,7 +365,8 @@ fn a_failure_after_the_swap_file_exists_says_how_to_resume() {
     let file = tempfile::NamedTempFile::new().unwrap();
     let hinted = resume_hint(file.path(), "lost".into()).to_string();
     let hint = format!(
-        "lost\nto carry on, run with the same node and key flags: lattice-swap resume {}",
+        "lost\nto carry on, run with the same flags, the node and key flags and \
+         --max-fee-rate, --fallback-fee-rate and --max-fee-fraction: lattice-swap resume {}",
         file.path().display()
     );
     assert_eq!(hinted, hint);
@@ -442,8 +445,35 @@ fn offer_takes_the_buyer_past_idle_connections() {
     drop(idle);
 }
 
-/// Past the cap on handshakes at once a connection is dropped, and each
-/// handshake gets `send_timeout`, so the buyer gets in once idle ones end.
+/// Waits on `listener` for the buyer `buyer` in a thread, each handshake
+/// given `send_timeout`.
+fn accepting(
+    listener: TcpListener,
+    seller: ivy::Config,
+    buyer: PeerKey,
+    send_timeout: Duration,
+) -> std::thread::JoinHandle<io::Result<()>> {
+    std::thread::spawn(move || {
+        Ivy::accept(
+            listener,
+            &seller,
+            buyer,
+            Duration::from_secs(60),
+            send_timeout,
+        )
+        .map(|_| ())
+    })
+}
+
+/// Whether the seller closes `stream` within five seconds.
+fn closed(stream: &mut std::net::TcpStream) -> bool {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream.read_to_end(&mut vec![]).is_ok()
+}
+
+/// Each handshake gets `send_timeout`.
 #[test]
 fn offer_bounds_each_handshake() {
     use std::net::TcpStream;
@@ -452,24 +482,31 @@ fn offer_bounds_each_handshake() {
     let seller = ivy::Config::new(SigningKey::from_bytes(&[1; 32]));
     let buyer = ivy::Config::new(SigningKey::from_bytes(&[2; 32]));
     let (seller_key, buyer_key) = (seller.peer_key(), buyer.peer_key());
-    let accepting = std::thread::spawn(move || {
-        Ivy::accept(
-            listener,
-            &seller,
-            buyer_key,
-            Duration::from_secs(60),
-            Duration::from_secs(2),
-        )
-        .map(|_| ())
-    });
+    let accepting = accepting(listener, seller, buyer_key, Duration::from_secs(1));
+    let mut idle = TcpStream::connect(address).unwrap();
+    assert!(closed(&mut idle), "an idle handshake times out");
+    let _buyer = Ivy::connect(address, &buyer, seller_key, Duration::from_secs(5)).unwrap();
+    accepting.join().unwrap().unwrap();
+}
+
+/// Past the cap on handshakes at once a connection evicts the oldest, so
+/// the buyer gets in past any number of idle ones.
+#[test]
+fn offer_evicts_the_oldest_handshake() {
+    use std::net::TcpStream;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let seller = ivy::Config::new(SigningKey::from_bytes(&[1; 32]));
+    let buyer = ivy::Config::new(SigningKey::from_bytes(&[2; 32]));
+    let (seller_key, buyer_key) = (seller.peer_key(), buyer.peer_key());
     let start = std::time::Instant::now();
-    let idle: Vec<_> = (0..swap::transport::HANDSHAKES)
+    let accepting = accepting(listener, seller, buyer_key, Duration::from_secs(60));
+    let mut oldest = TcpStream::connect(address).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    let idle: Vec<_> = (0..2 * swap::transport::HANDSHAKES)
         .map(|_| TcpStream::connect(address).unwrap())
         .collect();
-    std::thread::sleep(Duration::from_millis(500));
-    let full = Ivy::connect(address, &buyer, seller_key, Duration::from_secs(5));
-    assert!(full.is_err(), "no room while every handshake is taken");
-    std::thread::sleep(Duration::from_secs(2));
+    assert!(closed(&mut oldest), "the oldest is evicted");
     let _buyer = Ivy::connect(address, &buyer, seller_key, Duration::from_secs(5)).unwrap();
     accepting.join().unwrap().unwrap();
     assert!(
@@ -480,8 +517,47 @@ fn offer_bounds_each_handshake() {
     drop(idle);
 }
 
-/// A bitcoind that answers every call with `result`.
+/// A handshake that ends leaves the rest in the order they came: the next
+/// eviction takes the oldest still waiting.
+#[test]
+fn an_ended_handshake_keeps_the_oldest_first() {
+    use std::net::TcpStream;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let seller = ivy::Config::new(SigningKey::from_bytes(&[1; 32]));
+    let buyer = ivy::Config::new(SigningKey::from_bytes(&[2; 32]));
+    let (seller_key, buyer_key) = (seller.peer_key(), buyer.peer_key());
+    let accepting = accepting(listener, seller, buyer_key, Duration::from_secs(60));
+    let connect = || {
+        let stream = TcpStream::connect(address).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        stream
+    };
+    let first = connect();
+    let mut second = connect();
+    let mut idle: Vec<_> = (2..swap::transport::HANDSHAKES)
+        .map(|_| connect())
+        .collect();
+    // The first ends its own handshake, leaving fifteen.
+    drop(first);
+    std::thread::sleep(Duration::from_millis(200));
+    // The sixteenth fills the cap, and the next evicts the second.
+    idle.push(connect());
+    idle.push(connect());
+    assert!(closed(&mut second), "the oldest still waiting is evicted");
+    let _buyer = Ivy::connect(address, &buyer, seller_key, Duration::from_secs(5)).unwrap();
+    accepting.join().unwrap().unwrap();
+}
+
+/// A bitcoind that passes the node check and answers every other call
+/// with `result`.
 fn bitcoind(result: Value) -> String {
+    node(json!({"txindex": {"synced": true}}), 300_200, result)
+}
+
+/// A bitcoind that answers `getindexinfo` with `index`, `getnetworkinfo`
+/// with `version`, and every other call with `result`.
+fn node(index: Value, version: u64, result: Value) -> String {
     use std::io::BufRead;
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -503,7 +579,13 @@ fn bitcoind(result: Value) -> String {
             }
             let mut body = vec![0; length];
             reader.read_exact(&mut body).unwrap();
-            let reply = json!({"result": result, "error": null}).to_string();
+            let request: Value = serde_json::from_slice(&body).unwrap();
+            let answer = match request["method"].as_str() {
+                Some("getindexinfo") => index.clone(),
+                Some("getnetworkinfo") => json!({"version": version}),
+                _ => result.clone(),
+            };
+            let reply = json!({"result": answer, "error": null}).to_string();
             let _ = write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
@@ -613,10 +695,10 @@ fn take_refuses_a_fee_below_its_nodes_estimate() {
     assert!(refused.contains("below the"), "{refused}");
 }
 
-/// At its floor every spend pays the rate, redeem two fees and the others
-/// one, and at 1 sat/vB the floor is what swap-bitcoin requires.
+/// At its floor cancel and refund each pay the rate, and at 1 sat/vB the
+/// floor is what swap-bitcoin requires.
 #[test]
-fn the_fee_floor_pays_every_spend_its_rate() {
+fn the_fee_floor_pays_cancel_and_refund_their_rate() {
     let key = |n: u8| {
         let mut bytes = [0u8; 32];
         bytes[31] = n;
@@ -640,10 +722,10 @@ fn the_fee_floor_pays_every_spend_its_rate() {
     for per_kvb in [1_000, 10_000, 12_345] {
         let swap = Swap::new(params(btc_fee_at(per_kvb))).unwrap();
         let lock = OutPoint::null();
-        for spend in [Spend::Redeem, Spend::Cancel, Spend::Refund, Spend::Punish] {
+        for spend in [Spend::Cancel, Spend::Refund] {
             let a = swap.sign(lock, spend, &seller);
-            let b = (spend != Spend::Punish).then(|| swap.sign(lock, spend, &buyer));
-            let vsize = swap.finalize(lock, spend, &a, b.as_ref()).unwrap().vsize() as u64;
+            let b = swap.sign(lock, spend, &buyer);
+            let vsize = swap.finalize(lock, spend, &a, Some(&b)).unwrap().vsize() as u64;
             assert!(
                 swap.fee(spend).to_sat() * 1000 >= per_kvb * vsize,
                 "{spend:?} at {per_kvb}"
@@ -847,7 +929,8 @@ fn resume_exits_with_the_outcome_and_needs_no_key_once_signed() {
     let (_directory, path) = swap_file(Seller::Done(Outcome::Refunded));
     let cookie = tempfile::NamedTempFile::new().unwrap();
     let cookie = cookie.path().to_str().unwrap();
-    let mut args = vec!["lattice-swap", "resume", &path];
+    let url = bitcoind(Value::Null);
+    let mut args = vec!["lattice-swap", "resume", &path, "--btc-url", &url];
     args.extend(["--btc-wallet", "w", "--btc-cookie", cookie]);
     args.extend([
         "--nexus-url",
@@ -865,4 +948,112 @@ fn resume_exits_with_the_outcome_and_needs_no_key_once_signed() {
         3,
         "a done swap names no address"
     );
+}
+
+/// A node without a synced txindex, or older than Bitcoin Core 28, is
+/// refused by name.
+#[test]
+fn a_node_a_swap_cannot_rely_on_is_refused() {
+    let check = |index: Value, version: u64| {
+        let url = node(index, version, Value::Null);
+        Bitcoind::new(&url, "u:p", Network::Regtest, TIMEOUT)
+            .check_node()
+            .map_err(|e| e.to_string())
+    };
+    let synced = || json!({"txindex": {"synced": true, "best_block_height": 7}});
+    assert_eq!(check(synced(), 280_000), Ok(()));
+    let refused = check(json!({}), 300_200).unwrap_err();
+    assert!(refused.contains("-txindex"), "{refused}");
+    let refused = check(json!({"txindex": {"synced": false}}), 300_200).unwrap_err();
+    assert!(refused.contains("still syncing"), "{refused}");
+    let refused = check(synced(), 270_000).unwrap_err();
+    assert!(refused.contains("Bitcoin Core 28 or later"), "{refused}");
+}
+
+/// `offer`, `take` and `resume` each check the node before anything else
+/// asks it.
+#[cfg(unix)]
+#[test]
+fn every_run_checks_its_node() {
+    let unindexed = || node(json!({}), 300_200, Value::Null);
+    let address = swap_nexus_tx::address(&[9; 32]);
+    let refused = take_refusal(&takeable(), &address, &[], &unindexed());
+    assert!(refused.contains("-txindex"), "{refused}");
+
+    let key = key_file(7);
+    let mut args = offer_args(&["--nex-key-file", key.path().to_str().unwrap()]);
+    args.nodes.btc_url = unindexed();
+    let cookie = tempfile::NamedTempFile::new().unwrap();
+    args.nodes.btc_cookie = Some(cookie.path().to_path_buf());
+    let refused = offer(args).unwrap_err().to_string();
+    assert!(refused.contains("-txindex"), "{refused}");
+
+    let (_directory, path) = swap_file(Seller::Done(Outcome::Swapped));
+    let refused = refusal(&["resume", &path], &unindexed());
+    assert!(refused.contains("-txindex"), "{refused}");
+    let (buyer, _) = Buyer::start(small(16), ScriptBuf::new(), "b".into()).unwrap();
+    let (_directory, path) = swap_file(buyer);
+    let refused = refusal(&["resume", &path], &unindexed());
+    assert!(refused.contains("-txindex"), "{refused}");
+}
+
+/// `take` again on an offer it took refuses before it asks a node or
+/// dials, and says how to carry on.
+#[test]
+fn take_again_points_at_resume() {
+    let offer = takeable();
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::new(directory.path(), offer.terms.swap_id);
+    fs::write(store.path(), "{}").unwrap();
+    let address = swap_nexus_tx::address(&[9; 32]);
+    let dir = ["--dir", directory.path().to_str().unwrap()];
+    let refused = take_refusal(&offer, &address, &dir, "http://127.0.0.1:1");
+    assert!(
+        refused.starts_with("this offer was taken already"),
+        "{refused}"
+    );
+    let resume = format!("lattice-swap resume {}", store.path().display());
+    assert!(refused.ends_with(&resume), "{refused}");
+}
+
+/// A claim from either side reads back as that side's.
+#[test]
+fn a_claiming_swap_file_loads_as_its_side() {
+    let payout = || ScriptBuf::new_p2wsh(&WScriptHash::all_zeros());
+    let home = SecretBytes([7; 32]).nex_address();
+    let seller = Seller::new(small(16), home, payout(), payout()).unwrap();
+    let (buyer, hello) = Buyer::start(small(16), payout(), "b".into()).unwrap();
+    let message = |actions: Vec<swap::Action>| match actions.into_iter().next() {
+        Some(swap::Action::Send(message)) => swap::Event::Message(message),
+        _ => panic!("a message to send"),
+    };
+    let (seller, hello) = seller.step(message(hello));
+    let (buyer, _) = buyer.step(message(hello));
+    for (setup, side) in [
+        (
+            serde_json::to_value(&seller).unwrap()["AwaitLockProposal"].take(),
+            "Seller",
+        ),
+        (
+            serde_json::to_value(&buyer).unwrap()["AwaitFunded"].take(),
+            "Buyer",
+        ),
+    ] {
+        assert_eq!(setup["side"], side);
+        let claim = json!({"ClaimingNex": {
+            "setup": setup,
+            "other": "07".repeat(32),
+            "lock": "Seen",
+            "claim": null,
+        }});
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::new(directory.path(), [7; 32]);
+        let file = json!({"version": swap::driver::STATE_VERSION, "state": claim});
+        fs::write(store.path(), file.to_string()).unwrap();
+        let loaded = match Saved::load(&store).unwrap() {
+            Saved::Seller(seller) => ("Seller", state_name(&seller)),
+            Saved::Buyer(buyer) => ("Buyer", state_name(&buyer)),
+        };
+        assert_eq!(loaded, (side, "ClaimingNex".to_string()));
+    }
 }

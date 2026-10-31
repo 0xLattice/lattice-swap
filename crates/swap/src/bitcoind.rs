@@ -63,10 +63,15 @@ pub trait Bitcoin {
     fn bump(&self, parent: &Transaction, fee: Amount, rate: FeeRate, max: Amount) -> Result<Txid>;
 }
 
-/// bitcoind's JSON-RPC. `transaction` reads any transaction, so the node
-/// needs `-txindex`; `spender` calls `gettxspendingprevout`, so it needs
-/// Bitcoin Core 24 or later; `fund_lock` and `bump` need a wallet, so `url`
-/// names one (`http://host:port/wallet/<name>`).
+/// The least Bitcoin Core version a swap runs against, as `getnetworkinfo`
+/// reports it: 28.0, the first to relay version 3 (TRUC) transactions,
+/// which every swap transaction is.
+pub const MIN_VERSION: u64 = 280_000;
+
+/// bitcoind's JSON-RPC, against Bitcoin Core 28 or later with `-txindex`,
+/// as [`Bitcoind::check_node`] checks: `transaction` reads any transaction,
+/// and the swap transactions are version 3. `fund_lock` and `bump` need a
+/// wallet, so `url` names one (`http://host:port/wallet/<name>`).
 pub struct Bitcoind {
     agent: ureq::Agent,
     url: String,
@@ -90,6 +95,28 @@ impl Bitcoind {
             authorization: format!("Basic {token}"),
             network,
             sized: Mutex::new(None),
+        }
+    }
+
+    /// Refuses a node a swap cannot rely on. Without a synced `-txindex`, a
+    /// confirmed transaction outside the wallet looks unseen, so a buyer
+    /// never cancels or refunds; before Bitcoin Core 28, version 3
+    /// transactions are nonstandard, so its cancel and refund are refused.
+    pub fn check_node(&self) -> Result<()> {
+        let index = self.call("getindexinfo", json!(["txindex"]))?;
+        match index["txindex"]["synced"].as_bool() {
+            Some(true) => {}
+            Some(false) => return Err(Error("the txindex is still syncing: try again".into())),
+            None => return Err(Error("the node needs -txindex: restart it with it".into())),
+        }
+        let info = self.call("getnetworkinfo", json!([]))?;
+        match info["version"].as_u64() {
+            Some(version) if version >= MIN_VERSION => Ok(()),
+            _ => Err(Error(format!(
+                "the node is version {}: the swap needs Bitcoin Core 28 or later, which \
+                 relays version 3 transactions",
+                info["version"]
+            ))),
         }
     }
 
