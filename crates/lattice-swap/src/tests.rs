@@ -228,18 +228,19 @@ fn agreed() -> Offer {
     }
 }
 
-/// The fee floor the policy tests pass: the agreed fee.
+/// The fee floors the policy tests pass: the agreed fees.
 const FLOOR: u64 = 10_000;
+const NEX_FLOOR: u64 = 1_000;
 
 #[test]
 fn take_refuses_any_term_outside_its_policy() {
     let (policy, network) = policy(&[]);
     assert_eq!(
-        check_offer(&agreed(), &policy, network, MAINNET, FLOOR),
+        check_offer(&agreed(), &policy, network, MAINNET, FLOOR, NEX_FLOOR),
         Ok(())
     );
     type Change = (&'static str, fn(&mut Offer));
-    let changes: [Change; 15] = [
+    let changes: [Change; 16] = [
         ("network", |o| o.btc_network = Network::Testnet),
         ("nexus", |o| {
             o.terms.nexus_genesis = swap_nexus_tx::cid(b"dev")
@@ -251,6 +252,7 @@ fn take_refuses_any_term_outside_its_policy() {
         ("btc fee", |o| o.terms.btc_fee += Amount::from_sat(1)),
         ("btc fee floor", |o| o.terms.btc_fee -= Amount::from_sat(1)),
         ("nex fee", |o| o.terms.nex_fee += 1),
+        ("nex fee floor", |o| o.terms.nex_fee -= 1),
         ("t1", |o| o.terms.t1 += 1),
         ("t2", |o| o.terms.t2 -= 1),
         ("btc confirmations", |o| o.terms.btc_confirmations -= 1),
@@ -262,7 +264,7 @@ fn take_refuses_any_term_outside_its_policy() {
         let mut offer = agreed();
         change(&mut offer);
         assert_eq!(check_terms(&offer.terms), Ok(()), "{what}");
-        let refused = check_offer(&offer, &policy, network, MAINNET, FLOOR).unwrap_err();
+        let refused = check_offer(&offer, &policy, network, MAINNET, FLOOR, NEX_FLOOR).unwrap_err();
         assert!(
             refused.starts_with("refused: the offer"),
             "{what}: {refused}"
@@ -271,12 +273,12 @@ fn take_refuses_any_term_outside_its_policy() {
     // The defaults leave t2 - btc_confirmations = 144 - 6.
     let (policy, network) = self::policy(&["--min-refund-window", "138"]);
     assert_eq!(
-        check_offer(&agreed(), &policy, network, MAINNET, FLOOR),
+        check_offer(&agreed(), &policy, network, MAINNET, FLOOR, NEX_FLOOR),
         Ok(())
     );
     let mut offer = agreed();
     offer.terms.btc_confirmations += 1;
-    let refused = check_offer(&offer, &policy, network, MAINNET, FLOOR).unwrap_err();
+    let refused = check_offer(&offer, &policy, network, MAINNET, FLOOR, NEX_FLOOR).unwrap_err();
     assert!(refused.contains("blocks to refund in"), "{refused}");
 }
 
@@ -295,7 +297,7 @@ fn take_refuses_terms_that_cannot_work() {
     let mut offer = agreed();
     offer.terms.t1 = 100;
     assert!(
-        check_offer(&offer, &policy, network, MAINNET, 0).is_err(),
+        check_offer(&offer, &policy, network, MAINNET, 0, 0).is_err(),
         "below the floor"
     );
 }
@@ -808,7 +810,7 @@ fn an_amount_that_cannot_pay_redeem_is_refused() {
     let (policy, network) = policy(&[]);
     let mut offer = agreed();
     offer.terms.btc_amount = Amount::from_sat(2 * 10_000 + 545);
-    let refused = check_offer(&offer, &policy, network, MAINNET, FLOOR).unwrap_err();
+    let refused = check_offer(&offer, &policy, network, MAINNET, FLOOR, NEX_FLOOR).unwrap_err();
     assert!(refused.contains("redeem pays two btc_fee"), "{refused}");
 }
 
@@ -1203,8 +1205,18 @@ fn nexus_node(height: u64, keeps_state: bool) -> String {
 
 /// [`nexus_node`], on the Nexus of `genesis`.
 fn nexus_node_on(genesis: &str, height: u64, keeps_state: bool) -> String {
+    nexus_node_with(genesis, height, keeps_state, 1)
+}
+
+/// [`nexus_node`], pooling fees from `min_relay_fee`.
+fn nexus_node_relaying(min_relay_fee: u64) -> String {
+    nexus_node_with(MAINNET, 10, true, min_relay_fee)
+}
+
+fn nexus_node_with(genesis: &str, height: u64, keeps_state: bool, min_relay_fee: u64) -> String {
     use std::io::BufRead;
     let genesis = genesis.to_string();
+    let min_relay_fee = min_relay_fee.to_string();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     std::thread::spawn(move || {
@@ -1224,7 +1236,11 @@ fn nexus_node_on(genesis: &str, height: u64, keeps_state: bool) -> String {
             let half = format!("/api/block/{}", height.div_ceil(2));
             let block = swap_nexus_tx::cid(b"half");
             let answer = if path == "/api/chain/info" {
-                Some(json!({"chain": ["Nexus"], "genesisHash": genesis}))
+                Some(json!({
+                    "chain": ["Nexus"],
+                    "genesisHash": genesis,
+                    "minRelayFee": min_relay_fee,
+                }))
             } else if path == "/health" {
                 let height = height.to_string();
                 Some(json!({"phase": "active", "height": height, "bestHeaderHeight": height}))
@@ -1486,4 +1502,67 @@ fn offer_take_and_resume_refuse_another_nexus() {
         let next = resume(&flag, &nexus_node_on(genesis, 10, false));
         assert!(next.contains("--state all"), "{next}");
     }
+}
+
+/// Each party holds `nex_fee` to `--min-nex-fee`, 1 by default, and to its
+/// Nexus node's minRelayFee if higher: a node that pools a fee of 0 does
+/// not make the network relay it.
+#[cfg(unix)]
+#[test]
+fn offer_and_take_refuse_a_nex_fee_below_the_floor() {
+    let key = key_file(7);
+    let cookie = tempfile::NamedTempFile::new().unwrap();
+    let offered = |nex_fee: u64, least: Option<u64>, relay: u64| {
+        let mut args = offer_args(&["--nex-key-file", key.path().to_str().unwrap()]);
+        args.terms.btc_fee = btc_fee_at(10_000);
+        args.terms.nex_fee = nex_fee;
+        if let Some(least) = least {
+            args.min_nex_fee = least;
+        }
+        args.nodes.btc_url = bitcoind(estimate());
+        args.nodes.btc_cookie = Some(cookie.path().to_path_buf());
+        args.nodes.nexus_cookie = cookie.path().to_path_buf();
+        args.nodes.nexus_url = nexus_node_relaying(relay);
+        offer(args).unwrap_err().to_string()
+    };
+    assert_eq!(offer_args(&[]).min_nex_fee, 1);
+    let refused = offered(0, None, 0);
+    assert!(refused.contains("nex_fee is 0, below 1"), "{refused}");
+    assert_eq!(offered(1, None, 0), PAST_THE_CHECKS);
+    assert_eq!(offered(0, Some(0), 0), PAST_THE_CHECKS);
+    let refused = offered(4, None, 5);
+    assert!(refused.contains("nex_fee is 4, below 5"), "{refused}");
+    assert_eq!(offered(5, None, 5), PAST_THE_CHECKS);
+    let refused = offered(5, Some(6), 5);
+    assert!(refused.contains("nex_fee is 5, below 6"), "{refused}");
+
+    let address = swap_nexus_tx::address(&[9; 32]);
+    let url = bitcoind(estimate());
+    let taken_with = |nex_fee: u64, extra: &[&str], node: &str| {
+        let mut offer = takeable();
+        offer.terms.nex_fee = nex_fee;
+        take_refusal_on(&offer, &address, extra, &url, node)
+    };
+    let taken = |nex_fee: u64, extra: &[&str], relay: u64| {
+        taken_with(nex_fee, extra, &nexus_node_relaying(relay))
+    };
+    assert_eq!(policy(&[]).0.min_nex_fee, 1);
+    let refused = taken(0, &[], 0);
+    assert!(refused.contains("below 1, --min-nex-fee"), "{refused}");
+    assert_eq!(taken(1, &[], 0), PAST_THE_CHECKS);
+    assert_eq!(taken(0, &["--min-nex-fee", "0"], 0), PAST_THE_CHECKS);
+    let refused = taken(4, &[], 5);
+    assert!(refused.contains("below 5, --min-nex-fee"), "{refused}");
+    assert_eq!(taken(5, &[], 5), PAST_THE_CHECKS);
+    let refused = taken(5, &["--min-nex-fee", "6"], 5);
+    assert!(refused.contains("below 6, --min-nex-fee"), "{refused}");
+
+    // A node on another Nexus is refused as that, before the floor it
+    // reports is held against the offer.
+    let elsewhere = nexus_node_with(&swap_nexus_tx::cid(b"dev"), 10, true, 5);
+    let refused = taken_with(1, &[], &elsewhere);
+    assert!(
+        refused.contains("follows the chain of genesis"),
+        "{refused}"
+    );
 }

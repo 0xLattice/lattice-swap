@@ -156,13 +156,25 @@ no estimate, as on regtest, `--min-btc-fee-rate` sat/vB. The seller refuses
 to offer such a `--btc-fee` too: cancel, which it needs to reclaim its NEX,
 pays it as signed and is never bumped, so leave headroom.
 
+The NEX lock and the buyer's claim from it each pay `--nex-fee`, and
+`--nex-amount` must exceed it. A fee one node pools may still be below what
+the rest of the network relays: then no miner sees the lock, and the swap
+waits until `t1` and refunds. So the seller refuses to offer, and the buyer
+to take, a `--nex-fee` below `--min-nex-fee`, 1 by default, the default
+relay floor, or their Nexus node's `minRelayFee` if higher. Raise
+`--min-nex-fee` to the network's floor if it is higher.
+
 While a swap transaction that pays this side waits unconfirmed (redeem and
 punish for the seller, refund for the buyer), `offer`, `take` and `resume`
 bump it by CPFP from its payout, toward bitcoind's estimate. A bump pays
 for at most `--max-fee-rate` sat/vB, 1000 by default, and at most
 `--max-fee-fraction` of the payout, from 0 to 1, 1 by default: all of it
 but dust. Where bitcoind has no estimate it aims at `--fallback-fee-rate`,
-10 sat/vB by default. Cancel is never bumped.
+10 sat/vB by default. Cancel is never bumped. The buyer's wallet funds the
+lock at the rate a bump aims at, bitcoind's estimate or else
+`--fallback-fee-rate`, or the mempool's minimum if higher; never at the
+wallet's own estimate, which a freshly synced node lacks, and without
+`-fallbackfee` funds nothing.
 
 `offer`, `take` and `resume` exit 0 only when the swap swapped: 3 when it
 refunded, 4 punished, 5 drained, 6 aborted. 1 means an error stopped the

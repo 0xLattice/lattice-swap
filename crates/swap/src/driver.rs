@@ -190,8 +190,8 @@ pub struct Driver<M, B, T> {
     /// The seller's Nexus wallet key, which signs the NEX lock: set it
     /// before running a seller. Kept here and never in the state file.
     pub nex_key: Option<SecretBytes>,
-    /// The feerate a bump pays for when the node has no estimate, as on
-    /// regtest.
+    /// The feerate a bump, and the lock funding, pays for when the node has
+    /// no estimate, as on regtest or a freshly synced node.
     pub fallback_fee_rate: FeeRate,
     /// The most a bump pays for: a higher target is clamped to it. For a
     /// small swap this binds after `max_fee_fraction` does, if at all: a
@@ -606,10 +606,14 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
                 amount,
             } => {
                 // Before anything is at stake: a wallet that cannot fund
-                // ends the swap.
+                // ends the swap. Funded at the rate a bump aims at, never
+                // the wallet's own estimate: a fresh node has none, and
+                // without `-fallbackfee` its wallet then funds nothing.
                 let funding = self
                     .bitcoin
-                    .fund_lock(&script_pubkey, amount)
+                    .fee_rate(false)
+                    .map(|estimate| estimate.unwrap_or(self.fallback_fee_rate))
+                    .and_then(|rate| self.bitcoin.fund_lock(&script_pubkey, amount, rate))
                     .map_err(io::Error::other)?;
                 self.apply(Event::Funded(funding))?;
             }

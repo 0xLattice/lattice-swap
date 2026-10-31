@@ -1358,6 +1358,8 @@ struct Node {
     /// broadcast.
     store: Option<std::path::PathBuf>,
     saved: Vec<String>,
+    /// The feerate each lock funding was asked at.
+    funded: Vec<FeeRate>,
 }
 
 #[derive(Clone, Default)]
@@ -1406,8 +1408,17 @@ impl Bitcoin for Fake {
     fn spender(&self, _: OutPoint, _: u32) -> crate::bitcoind::Result<Option<(Transaction, u32)>> {
         Ok(None)
     }
-    fn fund_lock(&self, _: &Script, _: Amount) -> crate::bitcoind::Result<Transaction> {
-        unreachable!()
+    fn fund_lock(
+        &self,
+        script: &Script,
+        amount: Amount,
+        fee_rate: FeeRate,
+    ) -> crate::bitcoind::Result<Transaction> {
+        self.0.borrow_mut().funded.push(fee_rate);
+        Ok(funding(&[Action::FundLock {
+            script_pubkey: script.into(),
+            amount,
+        }]))
     }
     fn fee_rate(&self, urgent: bool) -> crate::bitcoind::Result<Option<FeeRate>> {
         let node = self.0.borrow();
@@ -1452,7 +1463,7 @@ impl Bitcoin for Offline {
     fn spender(&self, _: OutPoint, _: u32) -> crate::bitcoind::Result<Option<(Transaction, u32)>> {
         unreachable!()
     }
-    fn fund_lock(&self, _: &Script, _: Amount) -> crate::bitcoind::Result<Transaction> {
+    fn fund_lock(&self, _: &Script, _: Amount, _: FeeRate) -> crate::bitcoind::Result<Transaction> {
         unreachable!()
     }
     fn fee_rate(&self, _: bool) -> crate::bitcoind::Result<Option<FeeRate>> {
@@ -3133,4 +3144,48 @@ fn a_sent_redeem_gone_from_the_view_goes_out_with_cancel_once_due() {
     let both = [redeem.compute_txid(), cancel.compute_txid()];
     assert_eq!(broadcast_txids(&actions), both);
     assert!(matches!(seller, Seller::Redeeming { .. }));
+}
+
+/// Hands the driver `inbox`, a message at a time, and takes whatever it
+/// sends.
+struct Inbox(Vec<Vec<u8>>);
+
+impl Transport for Inbox {
+    fn send(&mut self, _: &[u8]) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn recv(&mut self, _: Duration) -> std::io::Result<Option<Vec<u8>>> {
+        Ok(self.0.pop())
+    }
+}
+
+/// The buyer's driver funds the lock at bitcoind's estimate while it has
+/// one, and at `fallback_fee_rate`, whatever it is set to, while it has
+/// none: never at the wallet's own estimate, which a fresh node lacks.
+#[test]
+fn the_lock_is_funded_at_the_estimate_or_the_fallback_rate() {
+    let funded = |estimate: Option<u32>, fallback: u32| {
+        let seller = new_seller(terms());
+        let (buyer, actions) = Buyer::start(terms(), payout(3), BUYER_NEX.into()).unwrap();
+        let (_, actions) = seller.step(message(sent(&actions)));
+        let answer = sent(&actions).encode(terms().swap_id);
+        let node = Fake::default();
+        node.0.borrow_mut().estimate = estimate.map(FeeRate::from_sat_per_vb_u32);
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::new(directory.path(), terms().swap_id);
+        let client = Client::new("http://127.0.0.1:9", "", Duration::from_secs(1));
+        let inbox = Some(Inbox(vec![answer]));
+        let mut driver = Driver::start(buyer, vec![], node.clone(), client, inbox, store).unwrap();
+        driver.poll = Duration::from_millis(1);
+        driver.fallback_fee_rate = FeeRate::from_sat_per_vb_u32(fallback);
+        let stopped =
+            driver.run_until(|buyer| matches!(buyer, Buyer::AwaitSellerSignatures { .. }));
+        assert!(stopped.unwrap().is_none());
+        let funded = node.0.borrow().funded.clone();
+        funded
+    };
+    let rate = FeeRate::from_sat_per_vb_u32;
+    assert_eq!(funded(Some(50), 10), [rate(50)]);
+    assert_eq!(funded(None, 10), [rate(10)]);
+    assert_eq!(funded(None, 33), [rate(33)]);
 }
