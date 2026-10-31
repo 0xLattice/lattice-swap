@@ -285,7 +285,9 @@ impl Swap {
     /// `tx`, whose one input spends the cancel output, signed by the seller
     /// alone through the punish leaf. That leaf takes no other signature, so
     /// the seller can sign any such transaction, whatever it pays, and not
-    /// only the punish that [`Swap::finalize`] builds.
+    /// only the punish that [`Swap::finalize`] builds. For tests: it checks
+    /// nothing, and panics if `tx` has no input.
+    #[doc(hidden)]
     pub fn sign_punish_leaf(&self, mut tx: Transaction, key: &KeyPair<EvenY>) -> Transaction {
         let sighash = self.sighash_of(&tx, Spend::Punish);
         let signature = self.schnorr.sign(key, Message::raw(&sighash));

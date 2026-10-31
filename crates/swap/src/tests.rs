@@ -121,11 +121,15 @@ fn healthy() -> Health {
     synced_at(10)
 }
 
+/// The CID the made-up Nexus chain shows at every height: it never reorgs.
+const BLOCK: &str = "bafyblock";
+
 fn synced_at(height: u64) -> Health {
     Health {
         phase: "active".into(),
         height,
         best_header_height: Some(height),
+        tip: Some(BLOCK.into()),
     }
 }
 
@@ -152,6 +156,7 @@ fn nexus_at(
         lock,
         min_relay_fee: 0,
         watched,
+        block_at: Some(BLOCK.into()),
     })
 }
 
@@ -179,7 +184,7 @@ fn mined(body: TransactionBody, depth: u64) -> Option<(TransactionStatus, Option
         body,
         block: Some(Inclusion {
             height: 10 + 1 - depth,
-            hash: "bafyblock".into(),
+            hash: BLOCK.into(),
         }),
     };
     Some((status, Some(depth)))
@@ -1054,6 +1059,7 @@ fn a_lock_too_small_to_claim_is_not_empty() {
         lock: account(500_000, 0),
         min_relay_fee: 500_000,
         watched: None,
+        block_at: None,
     });
     let (seller, actions) = seller.step(costly);
     assert!(actions.is_empty());
@@ -1128,12 +1134,41 @@ fn a_punish_of_the_sellers_own_making_ends_punished() {
         value: Amount::from_sat(990_000),
         script_pubkey: payout(9),
     };
+    // In the mempool, a refund may still replace it.
     let (buyer, actions) = buyer.step(btc(31, Some((cancel, 11)), Some((&punish, 0))));
-    assert!(actions.is_empty(), "no refund against a spent cancel");
+    let [refund] = &broadcasts(&actions)[..] else {
+        panic!("refund");
+    };
+    assert_eq!(
+        refund.input[0].previous_output,
+        punish.input[0].previous_output
+    );
     assert_eq!(buyer.outcome(), None);
     let (buyer, actions) = buyer.step(btc(32, Some((cancel, 12)), Some((&punish, 1))));
-    assert!(actions.is_empty());
+    assert!(actions.is_empty(), "no refund once it is in a block");
     assert_eq!(buyer.outcome(), Some(Outcome::Punished));
+}
+
+/// The same from the seller's side: a punish of its own making ends it
+/// punished, and while that punish is in the mempool it broadcasts nothing
+/// that would conflict with it.
+#[test]
+fn the_seller_ends_on_a_punish_of_its_own_making() {
+    let locked = locked();
+    let (swap, lock) = locked.swap();
+    let (seller, _, _) = locked.nex_locked();
+    let (seller, actions) = seller.step(btc(20, None, None));
+    let [cancel] = &broadcasts(&actions)[..] else {
+        panic!("cancel");
+    };
+    let mut punish = swap.unsigned_tx(lock, Spend::Punish);
+    punish.output[0].script_pubkey = payout(9);
+    let (seller, actions) = seller.step(btc(31, Some((cancel, 11)), Some((&punish, 0))));
+    assert!(actions.is_empty(), "no punish against its own");
+    assert_eq!(seller.outcome(), None);
+    let (seller, actions) = seller.step(btc(32, Some((cancel, 12)), Some((&punish, 1))));
+    assert!(actions.is_empty());
+    assert_eq!(seller.outcome(), Some(Outcome::Punished));
 }
 
 /// The seller, having signed its lock at nonce 3 and learned `b`, waits
@@ -1163,10 +1198,25 @@ fn a_passed_nonce_must_hold_nex_confirmations_blocks() {
 
     let (seller, _) = seller.step(at(10, 4));
     let seller = restart(&seller);
+    assert_eq!(seller.watch().nexus.unwrap().block_at, Some(10));
     let (seller, _) = seller.step(at(12, 4));
     assert_eq!(seller.outcome(), None, "two blocks are not three");
     let (done, _) = seller.clone().step(at(13, 4));
     assert_eq!(done.outcome(), Some(Outcome::Refunded));
+
+    // A reorg between two views replaced the block at 10: even with the
+    // nonce still past, the count starts again.
+    let reorged = Event::Nexus(NexusView {
+        block_at: Some("bafyother".into()),
+        ..nexus_view(at(13, 4))
+    });
+    let (moved, _) = seller.clone().step(reorged);
+    assert_eq!(moved.outcome(), None);
+    assert_eq!(moved.watch().nexus.unwrap().block_at, Some(13));
+    let (moved, _) = moved.step(at(15, 4));
+    assert_eq!(moved.outcome(), None, "counted from 13, not 10");
+    let (moved, _) = moved.step(at(16, 4));
+    assert_eq!(moved.outcome(), Some(Outcome::Refunded));
 
     // A reorg took back what moved the nonce: the count starts again.
     let (seller, _) = seller.step(at(12, 3));

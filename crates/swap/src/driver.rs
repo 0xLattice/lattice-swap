@@ -355,11 +355,16 @@ fn nexus_view(client: &Client, watch: &NexusWatch) -> swap_nexus_tx::rpc::Result
         },
         None => None,
     };
+    let block_at = match watch.block_at {
+        Some(height) => client.block_hash(height)?,
+        None => None,
+    };
     Ok(NexusView {
         health,
         own,
         lock,
         min_relay_fee,
         watched,
+        block_at,
     })
 }

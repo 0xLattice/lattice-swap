@@ -39,7 +39,8 @@ pub trait Bitcoin {
 }
 
 /// bitcoind's JSON-RPC. `transaction` reads any transaction, so the node
-/// needs `-txindex`; `fund_lock` needs a wallet, so `url` names one
+/// needs `-txindex`; `spender` calls `gettxspendingprevout`, so it needs
+/// Bitcoin Core 24 or later; `fund_lock` needs a wallet, so `url` names one
 /// (`http://host:port/wallet/<name>`).
 pub struct Bitcoind {
     agent: ureq::Agent,
