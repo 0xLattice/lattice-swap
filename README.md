@@ -40,9 +40,11 @@ no Nexus consensus change is required.
 
 ## Usage
 
-Each party runs its own bitcoind, Bitcoin Core 28 or later with `-txindex` and
-a wallet, and its own lattice-node; `offer`, `take` and `resume` refuse any
-other bitcoind. The two agree on the terms off-tool. The seller, who has NEX,
+Each party runs its own bitcoind with `-txindex` and a wallet, and its own
+lattice-node. Before anything else, `offer`, `take` and `resume` check the
+bitcoind: Bitcoin Core 28 or later, its txindex synced, not in initial block
+download, on the chain `--btc-network` names, and `--btc-wallet` loaded with
+private keys, so it can sign. The two agree on the terms off-tool. The seller, who has NEX,
 makes an offer and waits for the buyer to dial:
 
 ```sh

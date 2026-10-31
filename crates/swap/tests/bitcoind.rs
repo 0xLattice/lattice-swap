@@ -57,16 +57,28 @@ fn a_transaction_reorged_out_and_replaced_is_gone() {
     assert!(rpc.transaction(tx1).unwrap().is_none());
 }
 
-/// A node with a synced `-txindex` passes the check; one without is
-/// refused by name.
+/// A node with a synced `-txindex`, on the client's chain, with a wallet
+/// that signs, passes the check; any other is refused by name.
 #[test]
 fn the_node_check_requires_a_txindex() {
-    let (_node, indexed) = regtest();
+    let (node, indexed) = regtest();
     let deadline = Instant::now() + Duration::from_secs(30);
     while let Err(e) = indexed.check_node() {
         assert!(Instant::now() < deadline, "{e}");
         std::thread::sleep(Duration::from_millis(100));
     }
+    let cookie = std::fs::read_to_string(&node.params.cookie_file).unwrap();
+    let url = node.rpc_url_with_wallet("default");
+    let mainnet = Bitcoind::new(&url, &cookie, Network::Bitcoin, Duration::from_secs(10));
+    let refused = mainnet.check_node().unwrap_err();
+    assert!(refused.to_string().contains("not main"), "{refused}");
+    let refused = rpc(&node, "absent").check_node().unwrap_err();
+    assert!(refused.to_string().contains("no such wallet"), "{refused}");
+    indexed
+        .call("createwallet", json!(["watching", true]))
+        .unwrap();
+    let refused = rpc(&node, "watching").check_node().unwrap_err();
+    assert!(refused.to_string().contains("cannot sign"), "{refused}");
     let bare = Node::from_downloaded_with_conf(&Conf::default()).expect("start bitcoind");
     let refused = rpc(&bare, "default").check_node().unwrap_err();
     assert!(refused.to_string().contains("-txindex"), "{refused}");

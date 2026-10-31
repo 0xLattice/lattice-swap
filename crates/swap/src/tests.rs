@@ -1967,3 +1967,52 @@ fn a_redeem_never_seen_is_abandoned_when_the_window_closes() {
     assert!(broadcasts(&actions).is_empty());
     assert!(matches!(seller, Seller::Cancelling { .. }));
 }
+
+/// A source is an IPv4 address or an IPv6 /64, an IPv4 address mapped
+/// into IPv6 being its IPv4 one.
+#[test]
+fn a_handshake_source_is_an_address_or_a_64() {
+    use crate::transport::source;
+    let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+    assert_eq!(source(ip("192.0.2.1")), ip("192.0.2.1"));
+    assert_ne!(source(ip("192.0.2.1")), source(ip("192.0.2.2")));
+    assert_eq!(source(ip("::ffff:192.0.2.1")), ip("192.0.2.1"));
+    assert_eq!(source(ip("2001:db8:1:2:aaaa::1")), ip("2001:db8:1:2::"));
+    assert_eq!(
+        source(ip("2001:db8:1:2::1")),
+        source(ip("2001:db8:1:2:ffff:ffff:ffff:ffff"))
+    );
+    assert_ne!(source(ip("2001:db8:1:2::1")), source(ip("2001:db8:1:3::1")));
+}
+
+/// A flood from one source evicts only its own handshakes; past the cap
+/// in all, the oldest of any goes.
+#[test]
+fn a_flood_from_one_source_evicts_only_its_own() {
+    use crate::transport::{evicted, HANDSHAKES, PER_SOURCE};
+    let (buyer, flood) = ([192, 0, 2, 1].into(), [198, 51, 100, 7].into());
+    let mut sources = vec![buyer];
+    for _ in 0..10 * PER_SOURCE {
+        if let Some(i) = evicted(&sources, flood) {
+            assert_eq!(sources[i], flood, "only the flood's own");
+            sources.remove(i);
+        }
+        sources.push(flood);
+    }
+    assert_eq!(sources[0], buyer, "the buyer's handshake stays");
+    assert_eq!(sources.len(), 1 + PER_SOURCE);
+
+    // Its own oldest, not the oldest of all.
+    let mut sources = vec![buyer];
+    sources.extend([flood; PER_SOURCE]);
+    assert_eq!(evicted(&sources, flood), Some(1));
+    assert_eq!(evicted(&sources[..PER_SOURCE], flood), None);
+    assert_eq!(evicted(&sources, buyer), None);
+
+    // Past the cap in all, from sources each under their own.
+    let many: Vec<std::net::IpAddr> = (0..HANDSHAKES)
+        .map(|i| [10, 0, (i / 256) as u8, i as u8].into())
+        .collect();
+    assert_eq!(evicted(&many[..HANDSHAKES - 1], buyer), None);
+    assert_eq!(evicted(&many, buyer), Some(0));
+}

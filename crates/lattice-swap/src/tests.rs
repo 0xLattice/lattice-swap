@@ -489,8 +489,8 @@ fn offer_bounds_each_handshake() {
     accepting.join().unwrap().unwrap();
 }
 
-/// Past the cap on handshakes at once a connection evicts the oldest, so
-/// the buyer gets in past any number of idle ones.
+/// Past the cap on handshakes from one source a connection evicts that
+/// source's oldest, so the buyer gets in past any number of idle ones.
 #[test]
 fn offer_evicts_the_oldest_handshake() {
     use std::net::TcpStream;
@@ -535,13 +535,14 @@ fn an_ended_handshake_keeps_the_oldest_first() {
     };
     let first = connect();
     let mut second = connect();
-    let mut idle: Vec<_> = (2..swap::transport::HANDSHAKES)
+    let mut idle: Vec<_> = (2..swap::transport::PER_SOURCE)
         .map(|_| connect())
         .collect();
-    // The first ends its own handshake, leaving fifteen.
+    // The first ends its own handshake, leaving one under the cap of one
+    // source, which all of these are.
     drop(first);
     std::thread::sleep(Duration::from_millis(200));
-    // The sixteenth fills the cap, and the next evicts the second.
+    // The next fills the cap, and the one after evicts the second.
     idle.push(connect());
     idle.push(connect());
     assert!(closed(&mut second), "the oldest still waiting is evicted");
@@ -552,12 +553,13 @@ fn an_ended_handshake_keeps_the_oldest_first() {
 /// A bitcoind that passes the node check and answers every other call
 /// with `result`.
 fn bitcoind(result: Value) -> String {
-    node(json!({"txindex": {"synced": true}}), 300_200, result)
+    node(json!({}), result)
 }
 
-/// A bitcoind that answers `getindexinfo` with `index`, `getnetworkinfo`
-/// with `version`, and every other call with `result`.
-fn node(index: Value, version: u64, result: Value) -> String {
+/// A bitcoind on mainnet that passes the node check, but where `replies`
+/// names a method and the reply to it, and that answers every other call
+/// with `result`.
+fn node(replies: Value, result: Value) -> String {
     use std::io::BufRead;
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -580,12 +582,19 @@ fn node(index: Value, version: u64, result: Value) -> String {
             let mut body = vec![0; length];
             reader.read_exact(&mut body).unwrap();
             let request: Value = serde_json::from_slice(&body).unwrap();
-            let answer = match request["method"].as_str() {
-                Some("getindexinfo") => index.clone(),
-                Some("getnetworkinfo") => json!({"version": version}),
+            let method = request["method"].as_str().unwrap();
+            let answer = match method {
+                "getindexinfo" => json!({"txindex": {"synced": true}}),
+                "getnetworkinfo" => json!({"version": 300_200}),
+                "getblockchaininfo" => json!({"chain": "main", "initialblockdownload": false}),
+                "getwalletinfo" => json!({"private_keys_enabled": true}),
                 _ => result.clone(),
             };
-            let reply = json!({"result": answer, "error": null}).to_string();
+            let reply = match &replies[method] {
+                Value::Null => json!({"result": answer, "error": null}),
+                reply => reply.clone(),
+            }
+            .to_string();
             let _ = write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
@@ -950,24 +959,65 @@ fn resume_exits_with_the_outcome_and_needs_no_key_once_signed() {
     );
 }
 
-/// A node without a synced txindex, or older than Bitcoin Core 28, is
-/// refused by name.
+/// A node without a synced txindex, older than Bitcoin Core 28, on
+/// another chain, in initial block download, or without a wallet that
+/// signs is refused by name.
 #[test]
 fn a_node_a_swap_cannot_rely_on_is_refused() {
-    let check = |index: Value, version: u64| {
-        let url = node(index, version, Value::Null);
-        Bitcoind::new(&url, "u:p", Network::Regtest, TIMEOUT)
+    let check_on = |network: Network, method: &str, result: Value| {
+        let url = node(json!({ method: {"result": result} }), Value::Null);
+        Bitcoind::new(&url, "u:p", network, TIMEOUT)
             .check_node()
             .map_err(|e| e.to_string())
     };
-    let synced = || json!({"txindex": {"synced": true, "best_block_height": 7}});
-    assert_eq!(check(synced(), 280_000), Ok(()));
-    let refused = check(json!({}), 300_200).unwrap_err();
+    let check = |method: &str, result: Value| check_on(Network::Bitcoin, method, result);
+    let synced = json!({"txindex": {"synced": true, "best_block_height": 7}});
+    assert_eq!(check("getindexinfo", synced), Ok(()));
+    assert_eq!(check("getnetworkinfo", json!({"version": 280_000})), Ok(()));
+    let refused = check("getindexinfo", json!({})).unwrap_err();
     assert!(refused.contains("-txindex"), "{refused}");
-    let refused = check(json!({"txindex": {"synced": false}}), 300_200).unwrap_err();
+    let refused = check("getindexinfo", json!({"txindex": {"synced": false}})).unwrap_err();
     assert!(refused.contains("still syncing"), "{refused}");
-    let refused = check(synced(), 270_000).unwrap_err();
+    let refused = check("getnetworkinfo", json!({"version": 270_000})).unwrap_err();
     assert!(refused.contains("Bitcoin Core 28 or later"), "{refused}");
+
+    let on = |chain: &str| json!({"chain": chain, "initialblockdownload": false});
+    for (network, chain) in [
+        (Network::Bitcoin, "signet"),
+        (Network::Testnet, "testnet4"),
+        (Network::Testnet4, "test"),
+        (Network::Signet, "regtest"),
+    ] {
+        let refused = check_on(network, "getblockchaininfo", on(chain)).unwrap_err();
+        let expected = format!("on chain \"{chain}\", not {}", network.to_core_arg());
+        assert!(refused.contains(&expected), "{refused}");
+    }
+    assert_eq!(
+        check_on(Network::Signet, "getblockchaininfo", on("signet")),
+        Ok(())
+    );
+    let downloading = json!({"chain": "main", "initialblockdownload": true});
+    let refused = check("getblockchaininfo", downloading).unwrap_err();
+    assert!(refused.contains("initial block download"), "{refused}");
+
+    let watching = json!({"private_keys_enabled": false});
+    let refused = check("getwalletinfo", watching).unwrap_err();
+    assert!(refused.contains("the wallet cannot sign"), "{refused}");
+    let url = node(
+        json!({"getwalletinfo": {"result": null, "error": {
+            "code": -18,
+            "message": "Requested wallet does not exist or is not loaded",
+        }}}),
+        Value::Null,
+    );
+    let refused = Bitcoind::new(&url, "u:p", Network::Bitcoin, TIMEOUT)
+        .check_node()
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refused.contains("no such wallet loaded") && refused.contains("not loaded"),
+        "{refused}"
+    );
 }
 
 /// `offer`, `take` and `resume` each check the node before anything else
@@ -975,7 +1025,7 @@ fn a_node_a_swap_cannot_rely_on_is_refused() {
 #[cfg(unix)]
 #[test]
 fn every_run_checks_its_node() {
-    let unindexed = || node(json!({}), 300_200, Value::Null);
+    let unindexed = || node(json!({"getindexinfo": {"result": {}}}), Value::Null);
     let address = swap_nexus_tx::address(&[9; 32]);
     let refused = take_refusal(&takeable(), &address, &[], &unindexed());
     assert!(refused.contains("-txindex"), "{refused}");
@@ -995,6 +1045,14 @@ fn every_run_checks_its_node() {
     let (_directory, path) = swap_file(buyer);
     let refused = refusal(&["resume", &path], &unindexed());
     assert!(refused.contains("-txindex"), "{refused}");
+    // A mainnet buyer resuming against a signet node.
+    let signet = json!({"chain": "signet", "initialblockdownload": false});
+    let signet = node(
+        json!({"getblockchaininfo": {"result": signet}}),
+        Value::Null,
+    );
+    let refused = refusal(&["resume", &path], &signet);
+    assert!(refused.contains("not main"), "{refused}");
 }
 
 /// `take` again on an offer it took refuses before it asks a node or

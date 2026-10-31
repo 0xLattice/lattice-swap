@@ -2,7 +2,7 @@
 
 use std::future::{poll_fn, Future};
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::{pin, Pin};
 use std::task::Poll;
 use std::time::{Duration, Instant};
@@ -11,12 +11,14 @@ use ivy::{Config, Connection};
 pub use ivy_core::PeerKey;
 use tokio::net::TcpStream;
 use tokio::runtime::Runtime;
-use tokio::time::{sleep, sleep_until, timeout, timeout_at};
+use tokio::time::{sleep, timeout};
 
 use crate::TOPIC;
 
 /// The most handshakes [`Ivy::accept`] runs at once.
-pub const HANDSHAKES: usize = 16;
+pub const HANDSHAKES: usize = 64;
+/// The most of them from one [`source`].
+pub const PER_SOURCE: usize = 4;
 /// How long [`Ivy::accept`] waits after a failed accept.
 pub const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
 
@@ -61,8 +63,10 @@ impl Ivy {
     /// Takes connections on `listener` until one completes the handshake
     /// as `peer`, dropping any other. Waits at most `wait` in all, and each
     /// handshake at most `send_timeout`. Handshakes run side by side, at
-    /// most [`HANDSHAKES`] at once; a connection beyond them evicts the
-    /// oldest. A failed accept, such as one out of file descriptors, is
+    /// most [`PER_SOURCE`] from one source and [`HANDSHAKES`] in all; a
+    /// connection beyond them evicts the oldest, from its own source while
+    /// that one is full, so a flood from one source cannot push out
+    /// another's. A failed accept, such as one out of file descriptors, is
     /// logged, and accepting goes on after [`ACCEPT_PAUSE`].
     pub fn accept(
         listener: std::net::TcpListener,
@@ -75,9 +79,9 @@ impl Ivy {
         listener.set_nonblocking(true)?;
         let connection = runtime.block_on(async {
             let listener = tokio::net::TcpListener::from_std(listener)?;
-            let deadline = tokio::time::Instant::now() + wait;
-            let mut expired = pin!(sleep_until(deadline));
-            // Oldest first.
+            let mut expired = pin!(sleep(wait));
+            // Oldest first, with their sources.
+            let mut sources = Vec::new();
             let mut handshakes = Vec::new();
             let mut paused: Option<Pin<Box<tokio::time::Sleep>>> = None;
             poll_fn(|cx| {
@@ -88,9 +92,9 @@ impl Ivy {
                         }
                         paused = None;
                     }
-                    let stream = match listener.poll_accept(cx) {
+                    let (stream, from) = match listener.poll_accept(cx) {
                         Poll::Pending => break,
-                        Poll::Ready(Ok((stream, _))) => stream,
+                        Poll::Ready(Ok(accepted)) => accepted,
                         // It may fail again at once, as while out of file
                         // descriptors: pause rather than spin.
                         Poll::Ready(Err(e)) => {
@@ -99,18 +103,23 @@ impl Ivy {
                             continue;
                         }
                     };
-                    if handshakes.len() == HANDSHAKES {
-                        drop(handshakes.remove(0));
+                    let from = source(from.ip());
+                    if let Some(i) = evicted(&sources, from) {
+                        sources.remove(i);
+                        drop(handshakes.remove(i));
                     }
-                    let cap = deadline.min(tokio::time::Instant::now() + send_timeout);
                     let accept = ivy::accept(stream, config, move |key| *key == peer);
-                    handshakes.push(Box::pin(timeout_at(cap, accept)));
+                    sources.push(from);
+                    handshakes.push(Box::pin(timeout(send_timeout, accept)));
                 }
                 let mut i = 0;
                 while i < handshakes.len() {
                     match handshakes[i].as_mut().poll(cx) {
                         Poll::Ready(Ok(Ok(connection))) => return Poll::Ready(Ok(connection)),
-                        Poll::Ready(_) => drop(handshakes.remove(i)),
+                        Poll::Ready(_) => {
+                            sources.remove(i);
+                            drop(handshakes.remove(i));
+                        }
                         Poll::Pending => i += 1,
                     }
                 }
@@ -127,6 +136,25 @@ impl Ivy {
             send_timeout,
         })
     }
+}
+
+/// Where a connection comes from, for [`PER_SOURCE`]: its IPv4 address,
+/// or its IPv6 /64, which one host commonly holds whole.
+pub(crate) fn source(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V6(ip) => IpAddr::V6((u128::from(ip) & !(u128::MAX >> 64)).into()),
+        ip => ip,
+    }
+}
+
+/// Which pending handshake, of `sources` oldest first, a new one from
+/// `from` evicts: the oldest from `from` if it has [`PER_SOURCE`], or else
+/// the oldest of all if there are [`HANDSHAKES`].
+pub(crate) fn evicted(sources: &[IpAddr], from: IpAddr) -> Option<usize> {
+    if sources.iter().filter(|s| **s == from).count() >= PER_SOURCE {
+        return sources.iter().position(|s| *s == from);
+    }
+    (sources.len() >= HANDSHAKES).then_some(0)
 }
 
 fn runtime() -> io::Result<Runtime> {

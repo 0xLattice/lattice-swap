@@ -102,6 +102,9 @@ impl Bitcoind {
     /// confirmed transaction outside the wallet looks unseen, so a buyer
     /// never cancels or refunds; before Bitcoin Core 28, version 3
     /// transactions are nonstandard, so its cancel and refund are refused.
+    /// On another chain than this client's network, or still in initial
+    /// block download, the node never shows the swap's transactions; and a
+    /// wallet that cannot sign makes every fee bump fail.
     pub fn check_node(&self) -> Result<()> {
         let index = self.call("getindexinfo", json!(["txindex"]))?;
         match index["txindex"]["synced"].as_bool() {
@@ -111,13 +114,37 @@ impl Bitcoind {
         }
         let info = self.call("getnetworkinfo", json!([]))?;
         match info["version"].as_u64() {
-            Some(version) if version >= MIN_VERSION => Ok(()),
-            _ => Err(Error(format!(
-                "the node is version {}: the swap needs Bitcoin Core 28 or later, which \
-                 relays version 3 transactions",
-                info["version"]
-            ))),
+            Some(version) if version >= MIN_VERSION => {}
+            _ => {
+                return Err(Error(format!(
+                    "the node is version {}: the swap needs Bitcoin Core 28 or later, which \
+                     relays version 3 transactions",
+                    info["version"]
+                )))
+            }
         }
+        let chain = self.call("getblockchaininfo", json!([]))?;
+        let expected = self.network.to_core_arg();
+        if chain["chain"] != expected {
+            return Err(Error(format!(
+                "the node is on chain {}, not {expected}",
+                chain["chain"]
+            )));
+        }
+        if chain["initialblockdownload"] != false {
+            return Err(Error(
+                "the node is in initial block download: try again once it is synced".into(),
+            ));
+        }
+        let wallet = self
+            .call("getwalletinfo", json!([]))
+            .map_err(|e| Error(format!("the node has no such wallet loaded: {}", e.0)))?;
+        if wallet["private_keys_enabled"] != true {
+            return Err(Error(
+                "the wallet cannot sign: the swap needs one with private keys".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn call(&self, method: &str, params: Value) -> Result<Value> {

@@ -34,6 +34,8 @@ const BTC_FEE: Amount = Amount::from_sat(1_000);
 /// costs exactly `BTC_FEE`, but redeem, which pays two.
 const NO_BUMP: [&str; 4] = ["--fallback-fee-rate", "1", "--max-fee-rate", "1"];
 const NEX_AMOUNT: u64 = 1_000_000;
+/// What the buyer's wallet holds before a swap.
+const BUYER_BTC: Amount = Amount::from_sat(100_000_000);
 
 fn random32() -> [u8; 32] {
     let mut bytes = [0u8; 32];
@@ -193,6 +195,20 @@ fn wallet_client(node: &Node, wallet: &str) -> Bitcoind {
     Bitcoind::new(&url, &cookie, Network::Regtest, TIMEOUT)
 }
 
+/// The fee the buyer's wallet paid to fund the lock: its one payment.
+fn funding_fee(buyer: &Bitcoind) -> Amount {
+    let sends = buyer.call("listtransactions", json!(["*", 100])).unwrap();
+    let fees: Vec<f64> = sends
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|tx| tx["category"] == "send")
+        .map(|tx| tx["fee"].as_f64().unwrap())
+        .collect();
+    assert_eq!(fees.len(), 1, "one payment: the funding transaction");
+    Amount::from_float_in(-fees[0], Denomination::Bitcoin).unwrap()
+}
+
 /// The wallet's confirmed balance.
 fn btc_balance(wallet: &Bitcoind) -> Amount {
     let balances = wallet.call("getbalances", json!([])).unwrap();
@@ -253,12 +269,12 @@ impl World {
             .call("getnewaddress", json!([]))
             .unwrap();
         wallet_client(&bitcoind, "default")
-            .call("sendtoaddress", json!([buyer_btc, 1.0]))
+            .call("sendtoaddress", json!([buyer_btc, BUYER_BTC.to_btc()]))
             .unwrap();
         bitcoind.client.generate_to_address(1, &miner).unwrap();
         // The parties refuse a node whose index is still catching up.
         wait_for("the txindex", || {
-            wallet_client(&bitcoind, "").check_node().ok()
+            wallet_client(&bitcoind, "buyer").check_node().ok()
         });
 
         let nexus = Nexus::start();
@@ -504,6 +520,11 @@ fn happy_path_through_the_binary() {
     // Redeem pays two fees.
     let seller_wallet = wallet_client(&world.bitcoind, "seller");
     assert_eq!(btc_balance(&seller_wallet), BTC_AMOUNT - BTC_FEE * 2);
+    let buyer_wallet = wallet_client(&world.bitcoind, "buyer");
+    assert_eq!(
+        btc_balance(&buyer_wallet),
+        BUYER_BTC - BTC_AMOUNT - funding_fee(&buyer_wallet)
+    );
 
     // `status` reads each swap file and asks no node.
     for side in ["seller", "buyer"] {
@@ -560,6 +581,12 @@ fn killed_before_the_redeem_both_resume_to_a_refund() {
     );
     let seller_wallet = wallet_client(&world.bitcoind, "seller");
     assert_eq!(btc_balance(&seller_wallet), Amount::ZERO);
+    // Back but for the fees of the funding, the cancel and the refund.
+    let buyer_wallet = wallet_client(&world.bitcoind, "buyer");
+    assert_eq!(
+        btc_balance(&buyer_wallet),
+        BUYER_BTC - funding_fee(&buyer_wallet) - BTC_FEE * 2
+    );
 }
 
 /// The buyer killed once it has seen the redeem and is claiming the NEX:
