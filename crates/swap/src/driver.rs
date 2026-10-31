@@ -357,7 +357,12 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
                 continue;
             }
             let last = self.waiting.get(&txid).copied();
-            let due = last.is_none_or(|last| height > last.height || refused && !last.refused);
+            let urgent = urgent.contains(&spend);
+            // A failure is tried again at the next block, or at the next poll
+            // once a deadline is near: a block may be all that is left.
+            let due = last.is_none_or(|last| {
+                height > last.height || refused && !last.refused || last.failed && urgent
+            });
             let mut now = last.unwrap_or(Waiting {
                 height,
                 refused,
@@ -369,7 +374,6 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
             if due {
                 now.height = height;
                 let fee = swap.fee(spend);
-                let urgent = urgent.contains(&spend);
                 let result = match self.target(&tx, fee, refused, urgent, &mut now.clamped) {
                     Ok(Some(rate)) if rate > now.rate => match self.bitcoin.package_rate(&tx) {
                         Ok(Some(pooled)) if pooled >= rate => Ok(pooled),

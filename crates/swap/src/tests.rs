@@ -1690,7 +1690,7 @@ fn a_state_file_of_another_version_is_refused() {
 }
 
 /// A bump that fails records nothing: the spend is bumped again at the
-/// next block, not at every poll.
+/// next block, not at every poll, unless its deadline is near.
 #[test]
 fn a_failed_bump_is_tried_again_at_the_next_block() {
     let locked = locked();
@@ -1707,6 +1707,33 @@ fn a_failed_bump_is_tried_again_at_the_next_block() {
         .map(|(_, height, rate, _)| (height, rate.to_sat_per_vb_ceil()))
         .collect();
     assert_eq!(bumps, [(105, 50), (106, 50)]);
+}
+
+/// A replacing child pays the old fee and its own relay, and also a feerate
+/// above the old child's when it is a vbyte larger.
+#[test]
+fn a_replacing_child_pays_a_higher_feerate() {
+    let incremental = FeeRate::from_sat_per_kwu(25);
+    // A 109 vB child paying 1300 sat, replaced by one of 111 vB: the fee and
+    // relay come to 1312, but 1312 / 111 is below 1300 / 109.
+    let fee = crate::bitcoind::replacing(Amount::from_sat(1300), 109, 111, incremental).unwrap();
+    assert!(fee.to_sat() * 109 > 1300 * 111, "{fee}");
+    // A larger old child leaves the relay rule binding.
+    let fee = crate::bitcoind::replacing(Amount::from_sat(1300), 400, 111, incremental).unwrap();
+    assert_eq!(fee, Amount::from_sat(1312));
+}
+
+/// Near its deadline a failed bump is tried again at the next poll: a
+/// block may be all that is left.
+#[test]
+fn a_failed_urgent_bump_is_tried_again_at_the_next_poll() {
+    let locked = locked();
+    let node = pooled(&locked, &[Spend::Redeem], 50);
+    node.0.borrow_mut().failing = 1;
+    // t1 = 20, margin = 3: at 117 the lock is 17 deep, 3 blocks short.
+    let bumps = bumps(seller_watching(&locked, None), &node, &[117, 117], |_| {});
+    let heights: Vec<_> = bumps.into_iter().map(|(_, height, ..)| height).collect();
+    assert_eq!(heights, [117, 117]);
 }
 
 /// Redeem pays two fees: a target its feerate meets with both, though not

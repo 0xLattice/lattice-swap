@@ -364,13 +364,13 @@ impl Bitcoin for Bitcoind {
             let entry = self.call("getmempoolentry", json!([last]))?;
             let mempool = self.call("getmempoolinfo", json!([]))?;
             let incremental = per_kvb(&mempool["incrementalrelayfee"])?;
-            // A vbyte over the sized child's, whose signature may be a byte
-            // shorter than this one's.
+            // A vbyte over the sized child's: a signature can come out a
+            // byte longer than the one it was sized with.
             let own = size - parent.vsize() as u64 + 1;
-            let replace = incremental
-                .fee_vb(own)
-                .and_then(|more| btc(&entry["fees"]["base"]).ok()?.checked_add(more))
-                .ok_or_else(|| Error(format!("mempool entry {last}: {entry}")))?;
+            let malformed = || Error(format!("mempool entry {last}: {entry}"));
+            let base = btc(&entry["fees"]["base"])?;
+            let last_size = entry["vsize"].as_u64().ok_or_else(malformed)?;
+            let replace = replacing(base, last_size, own, incremental).ok_or_else(malformed)?;
             fee = fee.max(replace);
         }
         let spendable = parent.output[0]
@@ -389,4 +389,18 @@ impl Bitcoin for Bitcoind {
         }
         Ok(signed.compute_txid())
     }
+}
+
+/// The least a child of `own` vbytes pays to replace one of `last_size`
+/// that paid `base`: Core takes a replacement that pays the old fee and its
+/// own relay at the incremental rate, at a feerate above the old one.
+pub(crate) fn replacing(
+    base: Amount,
+    last_size: u64,
+    own: u64,
+    incremental: FeeRate,
+) -> Option<Amount> {
+    let more = base.checked_add(incremental.fee_vb(own)?)?;
+    let above = (1000 * base.to_sat() / last_size.max(1) + 1).div_ceil(4);
+    Some(more.max(FeeRate::from_sat_per_kwu(above).fee_vb(own)?))
 }
