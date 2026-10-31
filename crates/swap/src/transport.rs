@@ -80,9 +80,8 @@ impl Ivy {
         let connection = runtime.block_on(async {
             let listener = tokio::net::TcpListener::from_std(listener)?;
             let mut expired = pin!(sleep(wait));
-            // Oldest first, with their sources.
-            let mut sources = Vec::new();
-            let mut handshakes = Vec::new();
+            // Oldest first, each with its source.
+            let mut handshakes: Vec<(IpAddr, Pin<Box<_>>)> = Vec::new();
             let mut paused: Option<Pin<Box<tokio::time::Sleep>>> = None;
             poll_fn(|cx| {
                 loop {
@@ -104,22 +103,18 @@ impl Ivy {
                         }
                     };
                     let from = source(from.ip());
+                    let sources: Vec<_> = handshakes.iter().map(|(from, _)| *from).collect();
                     if let Some(i) = evicted(&sources, from) {
-                        sources.remove(i);
                         drop(handshakes.remove(i));
                     }
                     let accept = ivy::accept(stream, config, move |key| *key == peer);
-                    sources.push(from);
-                    handshakes.push(Box::pin(timeout(send_timeout, accept)));
+                    handshakes.push((from, Box::pin(timeout(send_timeout, accept))));
                 }
                 let mut i = 0;
                 while i < handshakes.len() {
-                    match handshakes[i].as_mut().poll(cx) {
+                    match handshakes[i].1.as_mut().poll(cx) {
                         Poll::Ready(Ok(Ok(connection))) => return Poll::Ready(Ok(connection)),
-                        Poll::Ready(_) => {
-                            sources.remove(i);
-                            drop(handshakes.remove(i));
-                        }
+                        Poll::Ready(_) => drop(handshakes.remove(i)),
                         Poll::Pending => i += 1,
                     }
                 }

@@ -144,6 +144,12 @@ impl Bitcoind {
                 "the wallet cannot sign: the swap needs one with private keys".into(),
             ));
         }
+        // Only an encrypted wallet has it; 0 is locked.
+        if wallet["unlocked_until"] == 0 {
+            return Err(Error(
+                "the wallet is locked: unlock it for longer than the swap may take".into(),
+            ));
+        }
         Ok(())
     }
 

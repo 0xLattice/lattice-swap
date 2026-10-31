@@ -146,7 +146,7 @@ struct NodeArgs {
     /// LATTICE_SWAP_BTC_PASSWORD.
     #[arg(long, conflicts_with = "btc_cookie")]
     btc_user: Option<String>,
-    /// bitcoin, testnet, signet or regtest.
+    /// bitcoin, testnet, testnet4, signet or regtest.
     #[arg(long, default_value_t = Network::Bitcoin)]
     btc_network: Network,
     /// The lattice-node's RPC base URL.

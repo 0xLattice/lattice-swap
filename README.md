@@ -44,8 +44,10 @@ Each party runs its own bitcoind with `-txindex` and a wallet, and its own
 lattice-node. Before anything else, `offer`, `take` and `resume` check the
 bitcoind: Bitcoin Core 28 or later, its txindex synced, not in initial block
 download, on the chain `--btc-network` names, and `--btc-wallet` loaded with
-private keys, so it can sign. The two agree on the terms off-tool. The seller, who has NEX,
-makes an offer and waits for the buyer to dial:
+private keys and, if encrypted, unlocked; an unlock that times out mid-swap
+stops its bumps. Nothing checks which Nexus the lattice-node follows: point it
+at the one you mean to trade on. The two agree on the terms off-tool. The
+seller, who has NEX, makes an offer and waits for the buyer to dial:
 
 ```sh
 lattice-swap offer --nex-key-file ~/.lattice-swap/nex.key \

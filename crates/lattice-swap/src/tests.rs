@@ -1003,6 +1003,11 @@ fn a_node_a_swap_cannot_rely_on_is_refused() {
     let watching = json!({"private_keys_enabled": false});
     let refused = check("getwalletinfo", watching).unwrap_err();
     assert!(refused.contains("the wallet cannot sign"), "{refused}");
+    let locked = json!({"private_keys_enabled": true, "unlocked_until": 0});
+    let refused = check("getwalletinfo", locked).unwrap_err();
+    assert!(refused.contains("the wallet is locked"), "{refused}");
+    let unlocked = json!({"private_keys_enabled": true, "unlocked_until": 1_900_000_000});
+    assert_eq!(check("getwalletinfo", unlocked), Ok(()));
     let url = node(
         json!({"getwalletinfo": {"result": null, "error": {
             "code": -18,
