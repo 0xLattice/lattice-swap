@@ -95,8 +95,8 @@ impl Seller {
 }
 
 impl Seller {
-    /// The Nexus address the NEX is sold from, whose key the driver must
-    /// hold, until the swap ends.
+    /// The Nexus address the NEX is sold from, until the swap ends. The
+    /// driver needs its key while [`Seller::signs_nex`].
     pub fn nex_address(&self) -> Option<&str> {
         use Seller::*;
         match self {
@@ -112,6 +112,20 @@ impl Seller {
             ClaimingNex(claim) => Some(&claim.setup.nex_address),
             Done(_) => None,
         }
+    }
+
+    /// Whether the swap may still ask the driver to sign the NEX lock:
+    /// only until it is signed.
+    pub fn signs_nex(&self) -> bool {
+        use Seller::*;
+        matches!(
+            self,
+            AwaitBuyerHello(_)
+                | AwaitLockProposal(_)
+                | AwaitBuyerSignatures { .. }
+                | AwaitFunding { .. }
+                | LockingNex { nex_lock: None, .. }
+        )
     }
 }
 

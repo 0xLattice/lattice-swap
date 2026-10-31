@@ -16,7 +16,8 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use bitcoin::address::NetworkUnchecked;
-use bitcoin::{Address, Amount, Network, ScriptBuf};
+use bitcoin::hashes::Hash;
+use bitcoin::{Address, Amount, Network, OutPoint, ScriptBuf, WScriptHash};
 use clap::{Args, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use rand_core::{OsRng, RngCore};
@@ -26,6 +27,7 @@ use swap::bitcoind::{Bitcoin, Bitcoind};
 use swap::driver::{Driver, Store};
 use swap::transport::{Ivy, PeerKey, Transport};
 use swap::{Buyer, Machine, Outcome, SecretBytes, Seller, Terms};
+use swap_bitcoin::{KeyPair, Params, Scalar, Spend, Swap};
 use swap_nexus_tx::rpc::Client;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -38,6 +40,10 @@ const NEX_KEY_ENV: &str = "LATTICE_SWAP_NEX_KEY";
 const BTC_PASSWORD_ENV: &str = "LATTICE_SWAP_BTC_PASSWORD";
 /// A Nexus block is about this many Bitcoin blocks.
 const BTC_BLOCKS_PER_NEXUS_BLOCK: u64 = 6;
+/// The blocks the buyer's fee estimate aims to confirm in.
+const FEE_TARGET: u16 = 6;
+/// What a seller is told without its Nexus key.
+const NO_KEY: &str = "the seller needs its Nexus key: --nex-key-file or LATTICE_SWAP_NEX_KEY";
 
 #[derive(Parser)]
 #[command(
@@ -45,8 +51,9 @@ const BTC_BLOCKS_PER_NEXUS_BLOCK: u64 = 6;
     version,
     about = "Atomic swaps between NEX and BTC",
     after_help = "Exit status of offer, take and resume: 0 Swapped, 3 Refunded, 4 Punished, \
-                  5 Drained, 6 Aborted; 1 an error stopped the tool before the swap ended, \
-                  so resume it; 2 bad arguments. status exits 0 once it reads the swap file."
+                  5 Drained, 6 Aborted; 1 an error stopped the tool before the swap ended, and \
+                  if the swap file exists it prints how to resume; 2 bad arguments. status \
+                  exits 0 once it reads the swap file."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -214,19 +221,25 @@ struct NexKeyArgs {
 
 impl NexKeyArgs {
     fn load(&self) -> Result<SecretBytes> {
+        Ok(self.given()?.ok_or(NO_KEY)?)
+    }
+
+    /// The key, if one is given.
+    fn given(&self) -> Result<Option<SecretBytes>> {
         let hex = match &self.nex_key_file {
             Some(path) => {
                 owner_only(path)?;
                 read(path)?
             }
-            None => std::env::var(NEX_KEY_ENV).map_err(|_| {
-                format!("the seller needs its Nexus key: --nex-key-file or {NEX_KEY_ENV}")
-            })?,
+            None => match std::env::var(NEX_KEY_ENV) {
+                Ok(hex) => hex,
+                Err(_) => return Ok(None),
+            },
         };
         let mut seed = [0u8; 32];
         hex::decode_to_slice(hex.trim(), &mut seed)
             .map_err(|_| "the Nexus key is not 32 bytes of hex")?;
-        Ok(SecretBytes(seed))
+        Ok(Some(SecretBytes(seed)))
     }
 }
 
@@ -312,12 +325,27 @@ struct PolicyArgs {
     /// The most Bitcoin blocks the BTC stays locked before cancel.
     #[arg(long, default_value_t = 288)]
     max_t1: u16,
-    /// The fewest Bitcoin blocks after cancel to refund in, before punish.
+    /// The fewest Bitcoin blocks after cancel confirms before punish is
+    /// valid.
     #[arg(long, default_value_t = 144)]
     min_t2: u16,
     /// The fewest Bitcoin confirmations the offer may ask.
     #[arg(long, default_value_t = 6)]
     min_btc_confirmations: u32,
+    /// The most Bitcoin confirmations the offer may ask. Once it has signed
+    /// the redeem, the buyer refunds only when cancel is this deep.
+    #[arg(long, default_value_t = 12)]
+    max_btc_confirmations: u32,
+    /// The fewest Bitcoin blocks the refund has to confirm in before punish
+    /// is valid, once the buyer has signed the redeem: t2 -
+    /// btc-confirmations.
+    #[arg(long, default_value_t = 72)]
+    min_refund_window: u16,
+    /// The fee rate, in sat/vB, that each Bitcoin swap transaction must pay
+    /// when bitcoind has no fee estimate, as on regtest. Otherwise its
+    /// conservative estimate for 6 blocks is the floor.
+    #[arg(long)]
+    min_btc_fee_rate: Option<u64>,
     /// The fewest Nexus confirmations of the NEX lock this buyer accepts.
     #[arg(long, default_value_t = 24)]
     min_nex_confirmations: u64,
@@ -364,12 +392,66 @@ fn check_terms(terms: &Terms) -> std::result::Result<(), String> {
     Ok(())
 }
 
+/// The vsize of the largest of the four swap spends, signed, with the
+/// longest timelocks and payouts as large as any standard one.
+fn largest_spend_vsize() -> u64 {
+    let key = |n: u8| {
+        let mut bytes = [0u8; 32];
+        bytes[31] = n;
+        let secret = Scalar::from_bytes(bytes).and_then(|s| s.non_zero());
+        KeyPair::new_xonly(secret.expect("a nonzero scalar"))
+    };
+    let (seller, buyer) = (key(1), key(2));
+    let payout = ScriptBuf::new_p2wsh(&WScriptHash::all_zeros());
+    let swap = Swap::new(Params {
+        seller: seller.public_key(),
+        buyer: buyer.public_key(),
+        seller_share: key(3).public_key().normalize(),
+        buyer_share: key(4).public_key().normalize(),
+        amount: Amount::ONE_BTC,
+        fee: Amount::from_sat(100_000),
+        t1: u16::MAX,
+        t2: u16::MAX,
+        redeem_payout: payout.clone(),
+        refund_payout: payout.clone(),
+        punish_payout: payout,
+    })
+    .expect("these parameters work");
+    let lock = OutPoint::null();
+    [Spend::Redeem, Spend::Cancel, Spend::Refund, Spend::Punish]
+        .into_iter()
+        .map(|spend| {
+            let a = swap.sign(lock, spend, &seller);
+            let b = (spend != Spend::Punish).then(|| swap.sign(lock, spend, &buyer));
+            let tx = swap.finalize(lock, spend, &a, b.as_ref());
+            tx.expect("our own signatures").vsize() as u64
+        })
+        .max()
+        .expect("four spends")
+}
+
+/// The least `btc_fee` the buyer takes, in satoshis: what bitcoind's
+/// conservative estimate, or else `fallback` sat/vB, asks of the largest
+/// swap spend.
+fn btc_fee_floor(bitcoin: &Bitcoind, fallback: Option<u64>) -> Result<u64> {
+    let estimate = bitcoin.call("estimatesmartfee", json!([FEE_TARGET, "CONSERVATIVE"]))?;
+    let per_kvb = match estimate["feerate"].as_f64() {
+        Some(btc) => Amount::from_btc(btc)?.to_sat(),
+        None => fallback
+            .ok_or("bitcoind has no fee estimate: give --min-btc-fee-rate")?
+            .saturating_mul(1000),
+    };
+    Ok(per_kvb.saturating_mul(largest_spend_vsize()).div_ceil(1000))
+}
+
 /// An offer the buyer takes: terms that work, the amounts it agreed to on
-/// its network, and every other term within its bounds.
+/// its network, a Bitcoin fee of at least `btc_fee_floor`, and every other
+/// term within its bounds.
 fn check_offer(
     offer: &Offer,
     policy: &PolicyArgs,
     network: Network,
+    btc_fee_floor: u64,
 ) -> std::result::Result<(), String> {
     let terms = &offer.terms;
     check_terms(terms)?;
@@ -397,6 +479,13 @@ fn check_offer(
             policy.max_btc_fee
         ));
     }
+    if terms.btc_fee.to_sat() < btc_fee_floor {
+        return refused(format!(
+            "pays {} sat a Bitcoin transaction, below the {btc_fee_floor} sat its node's fee \
+             rate asks",
+            terms.btc_fee.to_sat()
+        ));
+    }
     if terms.nex_fee > policy.max_nex_fee {
         return refused(format!(
             "pays {} NEX a Nexus transaction, above {}",
@@ -413,6 +502,19 @@ fn check_offer(
         return refused(format!(
             "asks {} Bitcoin confirmations, fewer than {}",
             terms.btc_confirmations, policy.min_btc_confirmations
+        ));
+    }
+    if terms.btc_confirmations > policy.max_btc_confirmations {
+        return refused(format!(
+            "asks {} Bitcoin confirmations, more than {}",
+            terms.btc_confirmations, policy.max_btc_confirmations
+        ));
+    }
+    let window = u64::from(terms.t2).saturating_sub(u64::from(terms.btc_confirmations));
+    if window < u64::from(policy.min_refund_window) {
+        return refused(format!(
+            "leaves {window} blocks to refund in, t2 - btc_confirmations, fewer than {}",
+            policy.min_refund_window
         ));
     }
     if terms.nex_confirmations < policy.min_nex_confirmations {
@@ -491,25 +593,36 @@ fn check_nex_address(text: &str) -> Result<()> {
     }
 }
 
-/// Refuses a listen address the buyer cannot dial unless `--advertise`
-/// names one.
+/// Refuses an address the buyer cannot dial: an unspecified `--advertise`,
+/// or an unspecified `--listen` without one.
 fn check_listen(listen: SocketAddr, advertise: Option<SocketAddr>) -> Result<()> {
-    if advertise.is_none() && listen.ip().is_unspecified() {
-        return Err(format!("--listen {listen} is no address to dial: give --advertise").into());
+    match advertise {
+        Some(advertise) if advertise.ip().is_unspecified() => {
+            Err(format!("--advertise {advertise} is no address to dial").into())
+        }
+        None if listen.ip().is_unspecified() => {
+            Err(format!("--listen {listen} is no address to dial: give --advertise").into())
+        }
+        _ => Ok(()),
     }
-    Ok(())
 }
 
-/// The key, if it is the one the swap sells from: the NEX lock signed with
-/// any other never verifies.
-fn seller_key(seller: &Seller, key: SecretBytes) -> Result<SecretBytes> {
-    match seller.nex_address() {
-        Some(address) if address != key.nex_address() => Err(format!(
+/// The key resume runs with: required while the swap `signs` the NEX lock,
+/// and, if given, the key of `address`, which the swap sells from: a lock
+/// signed with any other never verifies.
+fn seller_key(
+    address: Option<&str>,
+    signs: bool,
+    key: Option<SecretBytes>,
+) -> Result<Option<SecretBytes>> {
+    match (address, key) {
+        (Some(address), Some(key)) if address != key.nex_address() => Err(format!(
             "the Nexus key is for {}, but the swap sells from {address}",
             key.nex_address()
         )
         .into()),
-        _ => Ok(key),
+        (_, None) if signs => Err(NO_KEY.into()),
+        (_, key) => Ok(key),
     }
 }
 
@@ -569,9 +682,10 @@ fn take(args: TakeArgs) -> Result<Outcome> {
         read(&args.offer)?
     };
     let offer = Offer::decode(&text)?;
-    check_offer(&offer, &args.policy, args.nodes.btc_network)?;
     check_nex_address(&args.nex_address)?;
     let bitcoin = args.nodes.bitcoin()?;
+    let floor = btc_fee_floor(&bitcoin, args.policy.min_btc_fee_rate)?;
+    check_offer(&offer, &args.policy, args.nodes.btc_network, floor)?;
     let nexus = args.nodes.nexus()?;
     let refund = args.nodes.payout(&bitcoin)?;
     let (buyer, actions) = Buyer::start(offer.terms.clone(), refund, args.nex_address)
@@ -591,14 +705,12 @@ fn take(args: TakeArgs) -> Result<Outcome> {
 fn resume(args: SwapFileArgs) -> Result<Outcome> {
     let store = swap_store(&args.swap_file)?;
     let swap_file = store.path().to_path_buf();
-    let bitcoin = args.nodes.bitcoin()?;
-    let nexus = args.nodes.nexus()?;
     match Saved::load(&swap_file)? {
         Saved::Seller(seller) => {
-            let key = match seller.outcome() {
-                Some(_) => None,
-                None => Some(seller_key(&seller, args.key.load()?)?),
-            };
+            let given = args.key.given()?;
+            let key = seller_key(seller.nex_address(), seller.signs_nex(), given)?;
+            let bitcoin = args.nodes.bitcoin()?;
+            let nexus = args.nodes.nexus()?;
             let driver = Driver::<Seller, _, Ivy>::resume(bitcoin, nexus, None, store);
             run(
                 &swap_file,
@@ -608,10 +720,14 @@ fn resume(args: SwapFileArgs) -> Result<Outcome> {
                 }),
             )
         }
-        Saved::Buyer(_) => run(
-            &swap_file,
-            Driver::<Buyer, _, Ivy>::resume(bitcoin, nexus, None, store),
-        ),
+        Saved::Buyer(_) => {
+            let bitcoin = args.nodes.bitcoin()?;
+            let nexus = args.nodes.nexus()?;
+            run(
+                &swap_file,
+                Driver::<Buyer, _, Ivy>::resume(bitcoin, nexus, None, store),
+            )
+        }
     }
 }
 
@@ -659,7 +775,7 @@ fn resume_hint(swap_file: &Path, error: Box<dyn std::error::Error>) -> Box<dyn s
         return error;
     }
     format!(
-        "{error}\nresume with: lattice-swap resume {}",
+        "{error}\nto carry on, run with the same node and key flags: lattice-swap resume {}",
         swap_file.display()
     )
     .into()
@@ -736,14 +852,18 @@ fn log(what: &str) {
     eprintln!("lattice-swap: {what}");
 }
 
-fn main() -> ExitCode {
-    let result = match Cli::parse().command {
+/// Runs the command, to its exit status.
+fn exit_status(command: Command) -> Result<u8> {
+    match command {
         Command::Offer(args) => offer(args).map(exit_code),
         Command::Take(args) => take(args).map(exit_code),
         Command::Resume(args) => resume(args).map(exit_code),
         Command::Status { swap_file } => status(&swap_file).map(|()| 0),
-    };
-    match result {
+    }
+}
+
+fn main() -> ExitCode {
+    match exit_status(Cli::parse().command) {
         Ok(code) => ExitCode::from(code),
         Err(e) => {
             log(&e.to_string());

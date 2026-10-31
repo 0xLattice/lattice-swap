@@ -853,6 +853,7 @@ dependencies = [
  "serde",
  "serde_json",
  "swap",
+ "swap-bitcoin",
  "swap-nexus-tx",
  "tempfile",
  "ureq",

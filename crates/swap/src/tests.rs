@@ -914,6 +914,58 @@ fn the_seller_state_never_holds_its_nexus_key() {
     assert!(unsaved(&seller));
 }
 
+/// Every seller state names the address it sells from until it is done,
+/// and asks for its key only until the NEX lock is signed.
+#[test]
+fn the_seller_needs_its_nexus_key_only_until_the_lock_is_signed() {
+    let funding = locked().seller;
+    let (locking, _) = funding.clone().step(btc(2, None, None));
+    let (signed, _, _) = locked().nex_signed();
+    let (awaiting, buyer, nex_lock) = locked().nex_locked();
+    let (_, actions) = buyer
+        .clone()
+        .step(nexus(account(500_000, 0), mined(nex_lock.body, 1)));
+    let (redeeming, _) = awaiting.clone().step(message(sent(&actions)));
+    let (cancelling, _) = awaiting.clone().step(btc(18, None, None));
+    let (cancel, refund) = cancel_and_refund(buyer);
+    let (claiming, _) = cancelling
+        .clone()
+        .step(btc(21, Some((&cancel, 1)), Some((&refund, 0))));
+    let states = [
+        (new_seller(terms()), true),
+        (hellos().0, true),
+        (proposal_answer(|_| {}), true),
+        (funding, true),
+        (locking, true),
+        (signed, false),
+        (awaiting, false),
+        (redeeming, false),
+        (cancelling, false),
+        (claiming, false),
+    ];
+    let names = [
+        "AwaitBuyerHello",
+        "AwaitLockProposal",
+        "AwaitBuyerSignatures",
+        "AwaitFunding",
+        "LockingNex",
+        "LockingNex",
+        "AwaitRedeemSignature",
+        "Redeeming",
+        "Cancelling",
+        "ClaimingNex",
+    ];
+    for ((seller, signs), name) in states.iter().zip(names) {
+        let json = serde_json::to_value(seller).unwrap();
+        assert!(json.get(name).is_some(), "{name}");
+        let home = SELLER_NEX.nex_address();
+        assert_eq!(seller.nex_address(), Some(&home[..]), "{name}");
+        assert_eq!(seller.signs_nex(), *signs, "{name}");
+    }
+    let done = Seller::Done(Outcome::Swapped);
+    assert_eq!((done.nex_address(), done.signs_nex()), (None, false));
+}
+
 /// A wallet that answers with another transaction than the lock is not
 /// submitted.
 #[test]

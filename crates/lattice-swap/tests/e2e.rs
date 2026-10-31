@@ -328,7 +328,16 @@ fn happy_path_through_the_binary() {
             .args(["--nex-amount", &NEX_AMOUNT.to_string()])
             .args(["--max-btc-fee", &BTC_FEE.to_sat().to_string()])
             .args(["--max-nex-fee", &nex_fee.to_string()])
-            .args(["--max-t1", "20", "--min-t2", "10"])
+            .args([
+                "--max-t1",
+                "20",
+                "--min-t2",
+                "10",
+                "--min-refund-window",
+                "9",
+            ])
+            // Regtest has no fee estimate.
+            .args(["--min-btc-fee-rate", "1"])
             .args([
                 "--min-btc-confirmations",
                 "1",

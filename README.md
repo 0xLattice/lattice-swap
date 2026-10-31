@@ -71,8 +71,10 @@ argument. The seller gives `--advertise` when it listens on an unspecified
 address such as `0.0.0.0`.
 
 - `lattice-swap resume <swap file>` carries on after a restart, from the
-  chains alone, with the same Nexus key. `refund` is the same command: a
-  swap cancels and refunds by itself once its timelocks allow.
+  chains alone, with the same node flags. A seller also needs its Nexus key
+  until the NEX lock is signed; a key given later must still be the swap's.
+  `refund` is the same command: a swap cancels and refunds by itself once
+  its timelocks allow.
 - `lattice-swap status <swap file>` prints the state and outcome, and asks
   no node.
 
@@ -83,12 +85,20 @@ blocks, so the tool refuses any `t1` below `btc-confirmations + 6 ×
 `--btc-network`, or for other amounts than its `--btc-amount` and
 `--nex-amount`, and prints the terms before it dials. It also refuses one
 outside its bounds: `--max-btc-fee` 10000 sat, `--max-nex-fee` 1000,
-`--max-t1` 288, `--min-t2` 144, `--min-btc-confirmations` 6 and
-`--min-nex-confirmations` 24 by default.
+`--max-t1` 288, `--min-t2` 144, `--min-btc-confirmations` 6,
+`--max-btc-confirmations` 12, `--min-refund-window` 72 and
+`--min-nex-confirmations` 24 by default. Once the buyer has signed the
+redeem, it refunds only when cancel is `btc-confirmations` deep, and the
+seller can punish once cancel is `t2` deep: the refund window is `t2 -
+btc-confirmations` blocks. The buyer also refuses a `--btc-fee` below what
+its bitcoind's conservative fee estimate for 6 blocks asks of the largest
+swap transaction, or, where bitcoind has no estimate, as on regtest,
+`--min-btc-fee-rate` sat/vB.
 
 `offer`, `take` and `resume` exit 0 only when the swap swapped: 3 when it
 refunded, 4 punished, 5 drained, 6 aborted. 1 means an error stopped the
-tool before the swap ended; it then prints the `resume` command to carry on.
+tool before the swap ended; if the swap file exists by then, it prints the
+`resume` command to carry on with, given the same node and key flags.
 `docs/protocol.md` describes the protocol.
 
 ## License

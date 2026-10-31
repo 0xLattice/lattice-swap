@@ -1,16 +1,22 @@
 //! How the parties talk: any [`Transport`], here an ivy session.
 
+use std::future::{poll_fn, Future};
 use std::io;
 use std::net::SocketAddr;
+use std::pin::pin;
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use ivy::{Config, Connection};
 pub use ivy_core::PeerKey;
 use tokio::net::TcpStream;
 use tokio::runtime::Runtime;
-use tokio::time::{timeout, timeout_at};
+use tokio::time::{sleep_until, timeout, timeout_at};
 
 use crate::TOPIC;
+
+/// The most handshakes [`Ivy::accept`] runs at once.
+pub const HANDSHAKES: usize = 16;
 
 /// An authenticated channel to the counterparty. Every call has a
 /// deadline.
@@ -52,7 +58,8 @@ impl Ivy {
 
     /// Takes connections on `listener` until one completes the handshake
     /// as `peer`, dropping any other. Waits at most `wait` in all, and each
-    /// handshake at most `send_timeout`.
+    /// handshake at most `send_timeout`. Handshakes run side by side, at
+    /// most [`HANDSHAKES`] at once; a connection beyond them is dropped.
     pub fn accept(
         listener: std::net::TcpListener,
         config: &Config,
@@ -65,17 +72,31 @@ impl Ivy {
         let connection = runtime.block_on(async {
             let listener = tokio::net::TcpListener::from_std(listener)?;
             let deadline = tokio::time::Instant::now() + wait;
-            let no_peer = || io::Error::new(io::ErrorKind::TimedOut, "no peer dialed");
-            loop {
-                let (stream, _) = timeout_at(deadline, listener.accept())
-                    .await
-                    .map_err(|_| no_peer())??;
-                let handshake = deadline.min(tokio::time::Instant::now() + send_timeout);
-                let accept = ivy::accept(stream, config, |key| *key == peer);
-                if let Ok(Ok(connection)) = timeout_at(handshake, accept).await {
-                    return Ok::<_, io::Error>(connection);
+            let mut expired = pin!(sleep_until(deadline));
+            let mut handshakes = Vec::new();
+            poll_fn(|cx| {
+                while let Poll::Ready(accepted) = listener.poll_accept(cx) {
+                    let (stream, _) = accepted?;
+                    if handshakes.len() < HANDSHAKES {
+                        let cap = deadline.min(tokio::time::Instant::now() + send_timeout);
+                        let accept = ivy::accept(stream, config, move |key| *key == peer);
+                        handshakes.push(Box::pin(timeout_at(cap, accept)));
+                    }
                 }
-            }
+                let mut i = 0;
+                while i < handshakes.len() {
+                    match handshakes[i].as_mut().poll(cx) {
+                        Poll::Ready(Ok(Ok(connection))) => return Poll::Ready(Ok(connection)),
+                        Poll::Ready(_) => drop(handshakes.swap_remove(i)),
+                        Poll::Pending => i += 1,
+                    }
+                }
+                expired
+                    .as_mut()
+                    .poll(cx)
+                    .map(|()| Err(io::Error::new(io::ErrorKind::TimedOut, "no peer dialed")))
+            })
+            .await
         })?;
         Ok(Self {
             runtime,

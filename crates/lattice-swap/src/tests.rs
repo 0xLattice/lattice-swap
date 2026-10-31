@@ -222,34 +222,54 @@ fn agreed() -> Offer {
     }
 }
 
+/// The fee floor the policy tests pass: the agreed fee.
+const FLOOR: u64 = 10_000;
+
 #[test]
 fn take_refuses_any_term_outside_its_policy() {
     let (policy, network) = policy(&[]);
-    assert_eq!(check_offer(&agreed(), &policy, network), Ok(()));
+    assert_eq!(check_offer(&agreed(), &policy, network, FLOOR), Ok(()));
     type Change = (&'static str, fn(&mut Offer));
-    let changes: [Change; 11] = [
+    let changes: [Change; 13] = [
         ("network", |o| o.btc_network = Network::Testnet),
         ("more btc", |o| o.terms.btc_amount += Amount::from_sat(1)),
         ("less btc", |o| o.terms.btc_amount -= Amount::from_sat(1)),
         ("more nex", |o| o.terms.nex_amount += 1),
         ("less nex", |o| o.terms.nex_amount -= 1),
         ("btc fee", |o| o.terms.btc_fee += Amount::from_sat(1)),
+        ("btc fee floor", |o| o.terms.btc_fee -= Amount::from_sat(1)),
         ("nex fee", |o| o.terms.nex_fee += 1),
         ("t1", |o| o.terms.t1 += 1),
         ("t2", |o| o.terms.t2 -= 1),
         ("btc confirmations", |o| o.terms.btc_confirmations -= 1),
+        ("max btc confirmations", |o| o.terms.btc_confirmations = 13),
         ("nex confirmations", |o| o.terms.nex_confirmations -= 1),
     ];
     for (what, change) in changes {
         let mut offer = agreed();
         change(&mut offer);
         assert_eq!(check_terms(&offer.terms), Ok(()), "{what}");
-        let refused = check_offer(&offer, &policy, network).unwrap_err();
+        let refused = check_offer(&offer, &policy, network, FLOOR).unwrap_err();
         assert!(
             refused.starts_with("refused: the offer"),
             "{what}: {refused}"
         );
     }
+    // The defaults leave t2 - btc_confirmations = 144 - 6.
+    let (policy, network) = self::policy(&["--min-refund-window", "138"]);
+    assert_eq!(check_offer(&agreed(), &policy, network, FLOOR), Ok(()));
+    let mut offer = agreed();
+    offer.terms.btc_confirmations += 1;
+    let refused = check_offer(&offer, &policy, network, FLOOR).unwrap_err();
+    assert!(refused.contains("blocks to refund in"), "{refused}");
+}
+
+#[test]
+fn the_refund_window_defaults_to_half_a_day() {
+    let (policy, _) = policy(&[]);
+    assert_eq!(policy.max_btc_confirmations, 12);
+    assert_eq!(policy.min_refund_window, 72);
+    assert_eq!(policy.min_btc_fee_rate, None);
 }
 
 #[test]
@@ -258,7 +278,7 @@ fn take_refuses_terms_that_cannot_work() {
     let mut offer = agreed();
     offer.terms.t1 = 100;
     assert!(
-        check_offer(&offer, &policy, network).is_err(),
+        check_offer(&offer, &policy, network, 0).is_err(),
         "below the floor"
     );
 }
@@ -280,6 +300,8 @@ fn an_unspecified_listen_address_needs_an_advertised_one() {
     assert!(check_listen(any6, None).is_err());
     assert!(check_listen(any, public).is_ok());
     assert!(check_listen("127.0.0.1:0".parse().unwrap(), None).is_ok());
+    assert!(check_listen(any, Some(any)).is_err());
+    assert!(check_listen("127.0.0.1:0".parse().unwrap(), Some(any6)).is_err());
 }
 
 #[cfg(unix)]
@@ -301,16 +323,20 @@ fn a_key_file_others_can_open_is_refused() {
 
 #[test]
 fn a_seller_resumes_only_with_its_own_key() {
-    let key = SecretBytes([7; 32]);
-    let seller = Seller::new(
-        small(16),
-        key.nex_address(),
-        ScriptBuf::new(),
-        ScriptBuf::new(),
-    )
-    .unwrap();
-    assert!(seller_key(&seller, SecretBytes([8; 32])).is_err());
-    assert_eq!(seller_key(&seller, key).unwrap().0, [7; 32]);
+    let key = || SecretBytes([7; 32]);
+    let address = key().nex_address();
+    let other = || Some(SecretBytes([8; 32]));
+    for signs in [true, false] {
+        let home = Some(&address[..]);
+        assert!(seller_key(home, signs, other()).is_err(), "{signs}");
+        let ours = seller_key(home, signs, Some(key())).unwrap();
+        assert_eq!(ours.unwrap().0, [7; 32], "{signs}");
+    }
+    let home = Some(&address[..]);
+    let refused = seller_key(home, true, None).map(|_| ()).unwrap_err();
+    assert_eq!(refused.to_string(), NO_KEY);
+    assert!(seller_key(home, false, None).unwrap().is_none());
+    assert!(seller_key(None, false, other()).unwrap().is_some());
 }
 
 #[test]
@@ -337,7 +363,7 @@ fn a_failure_after_the_swap_file_exists_says_how_to_resume() {
     let file = tempfile::NamedTempFile::new().unwrap();
     let hinted = resume_hint(file.path(), "lost".into()).to_string();
     let hint = format!(
-        "lost\nresume with: lattice-swap resume {}",
+        "lost\nto carry on, run with the same node and key flags: lattice-swap resume {}",
         file.path().display()
     );
     assert_eq!(hinted, hint);
@@ -381,4 +407,314 @@ fn offer_waits_past_a_failed_handshake() {
     let _ = Ivy::connect(address, &stranger, seller_key, Duration::from_secs(5));
     let _buyer = Ivy::connect(address, &buyer, seller_key, Duration::from_secs(5)).unwrap();
     accepting.join().unwrap().unwrap();
+}
+
+/// Idle connections do not hold up the buyer: handshakes run side by side.
+#[test]
+fn offer_takes_the_buyer_past_idle_connections() {
+    use std::net::TcpStream;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let seller = ivy::Config::new(SigningKey::from_bytes(&[1; 32]));
+    let buyer = ivy::Config::new(SigningKey::from_bytes(&[2; 32]));
+    let (seller_key, buyer_key) = (seller.peer_key(), buyer.peer_key());
+    let start = std::time::Instant::now();
+    let accepting = std::thread::spawn(move || {
+        Ivy::accept(
+            listener,
+            &seller,
+            buyer_key,
+            Duration::from_secs(60),
+            Duration::from_secs(20),
+        )
+        .map(|_| ())
+    });
+    let idle: Vec<_> = (0..8)
+        .map(|_| TcpStream::connect(address).unwrap())
+        .collect();
+    let _buyer = Ivy::connect(address, &buyer, seller_key, Duration::from_secs(5)).unwrap();
+    accepting.join().unwrap().unwrap();
+    assert!(
+        start.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        start.elapsed()
+    );
+    drop(idle);
+}
+
+/// Past the cap on handshakes at once a connection is dropped, and each
+/// handshake gets `send_timeout`, so the buyer gets in once idle ones end.
+#[test]
+fn offer_bounds_each_handshake() {
+    use std::net::TcpStream;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let seller = ivy::Config::new(SigningKey::from_bytes(&[1; 32]));
+    let buyer = ivy::Config::new(SigningKey::from_bytes(&[2; 32]));
+    let (seller_key, buyer_key) = (seller.peer_key(), buyer.peer_key());
+    let accepting = std::thread::spawn(move || {
+        Ivy::accept(
+            listener,
+            &seller,
+            buyer_key,
+            Duration::from_secs(60),
+            Duration::from_secs(2),
+        )
+        .map(|_| ())
+    });
+    let start = std::time::Instant::now();
+    let idle: Vec<_> = (0..swap::transport::HANDSHAKES)
+        .map(|_| TcpStream::connect(address).unwrap())
+        .collect();
+    std::thread::sleep(Duration::from_millis(500));
+    let full = Ivy::connect(address, &buyer, seller_key, Duration::from_secs(5));
+    assert!(full.is_err(), "no room while every handshake is taken");
+    std::thread::sleep(Duration::from_secs(2));
+    let _buyer = Ivy::connect(address, &buyer, seller_key, Duration::from_secs(5)).unwrap();
+    accepting.join().unwrap().unwrap();
+    assert!(
+        start.elapsed() < Duration::from_secs(20),
+        "{:?}",
+        start.elapsed()
+    );
+    drop(idle);
+}
+
+/// A bitcoind that answers every call with `result`.
+fn bitcoind(result: Value) -> String {
+    use std::io::BufRead;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let mut reader = io::BufReader::new(stream.try_clone().unwrap());
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let header = line.to_ascii_lowercase();
+                if let Some(value) = header.strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let reply = json!({"result": result, "error": null}).to_string();
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+        }
+    });
+    url
+}
+
+/// 10 sat/vB.
+fn estimate() -> Value {
+    json!({"feerate": 0.0001, "blocks": 6})
+}
+
+/// What `lattice-swap` says when `args` stop it, run with the other
+/// flags it needs: node files that exist, and a bitcoind at `btc_url`.
+fn refusal(args: &[&str], btc_url: &str) -> String {
+    let cookie = tempfile::NamedTempFile::new().unwrap();
+    fs::write(cookie.path(), "user:password").unwrap();
+    let cookie = cookie.path().to_str().unwrap();
+    let nodes = [
+        "--btc-url",
+        btc_url,
+        "--btc-wallet",
+        "w",
+        "--btc-cookie",
+        cookie,
+        "--nexus-url",
+        "http://127.0.0.1:1",
+        "--nexus-cookie",
+        cookie,
+    ];
+    let cli = Cli::try_parse_from(["lattice-swap"].iter().chain(args).chain(&nodes)).unwrap();
+    exit_status(cli.command).unwrap_err().to_string()
+}
+
+/// `take` on `offer`, paying `address`.
+fn take_refusal(offer: &Offer, address: &str, extra: &[&str], btc_url: &str) -> String {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    fs::write(file.path(), offer.encode()).unwrap();
+    let path = file.path().to_str().unwrap();
+    let mut args = vec!["take", path, "--nex-address", address];
+    args.extend(["--btc-amount", "50000000", "--nex-amount", "1000000"]);
+    args.extend(extra);
+    refusal(&args, btc_url)
+}
+
+/// The agreed offer, with a seller key that is one.
+fn takeable() -> Offer {
+    let mut offer = agreed();
+    offer.seller = ivy::Config::new(SigningKey::from_bytes(&[1; 32]))
+        .peer_key()
+        .hex();
+    offer
+}
+
+/// Past every check, `take` asks its wallet for an address, which this
+/// bitcoind answers with no address.
+const PAST_THE_CHECKS: &str = "getnewaddress returned no address";
+
+#[test]
+fn take_holds_the_offer_to_its_policy() {
+    let address = swap_nexus_tx::address(&[9; 32]);
+    let url = bitcoind(estimate());
+    assert_eq!(
+        take_refusal(&takeable(), &address, &[], &url),
+        PAST_THE_CHECKS
+    );
+    let mut offer = takeable();
+    offer.btc_network = Network::Testnet;
+    let refused = take_refusal(&offer, &address, &[], &url);
+    assert!(refused.starts_with("refused: the offer is on"), "{refused}");
+}
+
+#[test]
+fn take_pays_only_a_nexus_address() {
+    // No bitcoind: the address is checked before any node is asked.
+    let refused = take_refusal(&takeable(), "bc1qexample", &[], "http://127.0.0.1:1");
+    assert_eq!(refused, "bc1qexample is not a Nexus address");
+}
+
+#[test]
+fn take_refuses_a_fee_below_its_nodes_estimate() {
+    let address = swap_nexus_tx::address(&[9; 32]);
+    let vsize = largest_spend_vsize();
+    let mut offer = takeable();
+    offer.terms.btc_fee = Amount::from_sat(10 * vsize - 1);
+    let refused = take_refusal(&offer, &address, &[], &bitcoind(estimate()));
+    assert!(refused.contains("below the"), "{refused}");
+    offer.terms.btc_fee = Amount::from_sat(10 * vsize);
+    let taken = take_refusal(&offer, &address, &[], &bitcoind(estimate()));
+    assert_eq!(taken, PAST_THE_CHECKS);
+
+    // With no estimate, as on regtest, the operator names the rate.
+    let none = || bitcoind(json!({"errors": ["Insufficient data"], "blocks": 0}));
+    let refused = take_refusal(&offer, &address, &[], &none());
+    assert!(refused.contains("--min-btc-fee-rate"), "{refused}");
+    let rate = ["--min-btc-fee-rate", "10"];
+    assert_eq!(
+        take_refusal(&offer, &address, &rate, &none()),
+        PAST_THE_CHECKS
+    );
+    let rate = ["--min-btc-fee-rate", "11"];
+    let refused = take_refusal(&offer, &address, &rate, &none());
+    assert!(refused.contains("below the"), "{refused}");
+}
+
+/// The floor is at least what swap-bitcoin requires at 1 sat/vB.
+#[test]
+fn the_largest_spend_is_sized_as_swap_bitcoin_sizes_it() {
+    let vsize = largest_spend_vsize();
+    let key = |n: u8| {
+        let mut bytes = [0u8; 32];
+        bytes[31] = n;
+        KeyPair::new_xonly(Scalar::from_bytes(bytes).unwrap().non_zero().unwrap())
+    };
+    let payout = ScriptBuf::new_p2wsh(&WScriptHash::all_zeros());
+    let params = |fee: u64| Params {
+        seller: key(5).public_key(),
+        buyer: key(6).public_key(),
+        seller_share: key(7).public_key().normalize(),
+        buyer_share: key(8).public_key().normalize(),
+        amount: Amount::from_sat(50_000_000),
+        fee: Amount::from_sat(fee),
+        t1: 288,
+        t2: 144,
+        redeem_payout: payout.clone(),
+        refund_payout: payout.clone(),
+        punish_payout: payout.clone(),
+    };
+    // The least fee swap-bitcoin takes is 1 sat/vB of its largest spend;
+    // the floor's longer timelocks add at most a byte to it.
+    let least = (1..=vsize).find(|&fee| Swap::new(params(fee)).is_ok());
+    assert!(
+        least.is_some_and(|least| vsize - least <= 1),
+        "{least:?} {vsize}"
+    );
+}
+
+#[test]
+fn offer_refuses_an_address_nobody_can_dial() {
+    let mut args = offer_args(&[]);
+    args.listen = "0.0.0.0:7400".parse().unwrap();
+    let refused = offer(args).unwrap_err().to_string();
+    assert!(refused.contains("is no address to dial"), "{refused}");
+}
+
+/// A seller swap file in `state`, in a directory of its own.
+#[cfg(unix)]
+fn seller_file(state: &Seller) -> (tempfile::TempDir, String) {
+    let directory = tempfile::tempdir().unwrap();
+    let path = Store::new(directory.path(), [7; 32]).path().to_path_buf();
+    fs::write(&path, serde_json::to_string(state).unwrap()).unwrap();
+    (directory, path.to_str().unwrap().to_string())
+}
+
+#[cfg(unix)]
+fn key_file(seed: u8) -> tempfile::NamedTempFile {
+    use std::os::unix::fs::PermissionsExt;
+    let file = tempfile::NamedTempFile::new().unwrap();
+    fs::write(file.path(), hex::encode([seed; 32])).unwrap();
+    fs::set_permissions(file.path(), fs::Permissions::from_mode(0o600)).unwrap();
+    file
+}
+
+#[cfg(unix)]
+#[test]
+fn resume_signs_only_with_the_swaps_own_key() {
+    let home = SecretBytes([7; 32]).nex_address();
+    let seller = Seller::new(small(16), home, ScriptBuf::new(), ScriptBuf::new()).unwrap();
+    assert!(seller.signs_nex());
+    let (_directory, path) = seller_file(&seller);
+    let unreachable = "http://127.0.0.1:1";
+    let wrong = key_file(8);
+    let args = [
+        "resume",
+        &path,
+        "--nex-key-file",
+        wrong.path().to_str().unwrap(),
+    ];
+    let refused = refusal(&args, unreachable);
+    assert!(refused.starts_with("the Nexus key is for"), "{refused}");
+    assert_eq!(refusal(&["resume", &path], unreachable), NO_KEY);
+}
+
+/// A swap that no longer signs resumes without the key, and exits with
+/// its outcome.
+#[cfg(unix)]
+#[test]
+fn resume_exits_with_the_outcome_and_needs_no_key_once_signed() {
+    let (_directory, path) = seller_file(&Seller::Done(Outcome::Refunded));
+    let cookie = tempfile::NamedTempFile::new().unwrap();
+    let cookie = cookie.path().to_str().unwrap();
+    let mut args = vec!["lattice-swap", "resume", &path];
+    args.extend(["--btc-wallet", "w", "--btc-cookie", cookie]);
+    args.extend([
+        "--nexus-url",
+        "http://127.0.0.1:1",
+        "--nexus-cookie",
+        cookie,
+    ]);
+    let cli = Cli::try_parse_from(&args).unwrap();
+    assert_eq!(exit_status(cli.command).unwrap(), 3);
+    let key = key_file(8);
+    args.extend(["--nex-key-file", key.path().to_str().unwrap()]);
+    let cli = Cli::try_parse_from(&args).unwrap();
+    assert_eq!(
+        exit_status(cli.command).unwrap(),
+        3,
+        "a done swap names no address"
+    );
 }
