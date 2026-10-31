@@ -16,7 +16,8 @@
 //!   blocks, if the buyer never refunds.
 //!
 //! Every output uses the BIP341 NUMS point as its internal key, so every spend
-//! is a script-path spend. Each transaction pays one fixed absolute fee.
+//! is a script-path spend. Each transaction pays one fixed absolute fee,
+//! but redeem, which pays two (see below).
 //!
 //! The fee is fixed when the swap is set up. Each spend has exactly one
 //! output, so the party it pays raises its feerate by CPFP: a child that
@@ -34,18 +35,25 @@
 //!   only both parties together, or the seller after `t2` blocks, can spend.
 //!   A cancel that sits unconfirmed only delays the swap, since `t2` counts
 //!   from cancel's confirmation.
-//! - A pending redeem cannot be displaced by the buyer. After `t1` the
-//!   buyer's only spends of the lock are cancel alone, which pays exactly
-//!   redeem's fee where a replacement must pay more, and cancel with refund
-//!   as one package, which [`Swap::new`] keeps strictly below redeem's
-//!   feerate ([`Error::Outbid`]). No larger package exists: refund's child
-//!   would be a grandchild of an unconfirmed cancel, which TRUC forbids, and
-//!   punish needs cancel `t2` deep, so it never joins a cancel package. Once
-//!   redeem is bumped it is only further ahead.
-//! - A pending refund can be displaced only by punish, once cancel is `t2`
-//!   deep: nothing else spends the cancel output but the 2-of-2.
-//! - After `t2`, refund and punish both spend the cancel output, and each
-//!   party bumps its own: a fee race between the two owners.
+//! - A pending redeem cannot be displaced by the buyer. Redeem pays two
+//!   fees, from the seller's payout. After `t1` the buyer's only spends of
+//!   the lock are cancel alone, which pays one fee, and cancel with refund
+//!   as one package, which pays exactly two. A replacement must pay more
+//!   than all it replaces, by the incremental feerate on its own size, so
+//!   neither replaces redeem, whatever the payouts weigh. No larger package
+//!   exists: refund's child would be a grandchild of an unconfirmed cancel,
+//!   which TRUC forbids, and punish needs cancel `t2` deep, so it never
+//!   joins a cancel package. Once redeem is bumped it is only further ahead.
+//! - A pending refund can be displaced only by a spend through the punish
+//!   leaf, once cancel is `t2` deep: nothing else spends the cancel output
+//!   but the 2-of-2.
+//! - So the buyer is safe only while its refund confirms before `t2`. The
+//!   punish leaf takes the seller's signature alone, so after `t2` the
+//!   seller can spend the cancel output with a transaction of any shape: a
+//!   version 2 one with two children pins the refund outright, since Bitcoin
+//!   Core replaces by package only a conflict with no more than one
+//!   descendant, so no refund fee wins. Contesting a punish after `t2` is
+//!   best effort.
 //! - A TRUC transaction spends no unconfirmed non-TRUC output. Redeem and
 //!   cancel spend the lock, which is confirmed before either is sent.
 //!
@@ -105,7 +113,7 @@ pub struct Params {
     pub buyer_share: Point,
     /// Value of the lock output.
     pub amount: Amount,
-    /// Absolute fee paid by each transaction.
+    /// Absolute fee paid by each transaction, twice by redeem.
     pub fee: Amount,
     /// Blocks after the lock confirms before cancel is valid.
     pub t1: u16,
@@ -141,9 +149,6 @@ pub enum Error {
     Amount,
     /// The fee is below 1 sat/vB for the largest of the four spends.
     Fee,
-    /// Cancel and refund together would pay at least redeem's feerate, so
-    /// the buyer could replace a pending redeem after `t1` with them.
-    Outbid,
     /// `A == B` or `S == T_b`.
     Keys,
     /// This party's signature does not verify.
@@ -162,10 +167,6 @@ impl std::fmt::Display for Error {
             Error::Timelock => write!(f, "timelocks must be at least one block"),
             Error::Amount => write!(f, "amount does not cover fees above dust"),
             Error::Fee => write!(f, "fee is below the minimum relay fee"),
-            Error::Outbid => write!(
-                f,
-                "cancel and refund would outbid redeem: the refund payout is too short"
-            ),
             Error::Keys => write!(f, "the two parties' keys or shares are equal"),
             Error::Signature(party) => write!(f, "{party:?} signature does not verify"),
             Error::Signatures => write!(f, "wrong set of signatures for this spend"),
@@ -192,8 +193,7 @@ pub struct Swap {
 impl Swap {
     /// Fails if the parties' keys or shares coincide, a timelock is zero, any
     /// payout would be dust after fees, the fee is below 1 sat/vB for any
-    /// spend (a refund that cannot relay would strand the BTC), or cancel
-    /// and refund would outbid redeem (see [`Error::Outbid`]).
+    /// spend (a refund that cannot relay would strand the BTC).
     pub fn new(params: Params) -> Result<Self, Error> {
         if params.seller == params.buyer || params.seller_share == params.buyer_share {
             return Err(Error::Keys);
@@ -265,17 +265,6 @@ impl Swap {
         if swap.params.fee < Amount::from_sat(largest) {
             return Err(Error::Fee);
         }
-        // Refund has no timelock, so after `t1` the buyer can send cancel
-        // and refund as one package, paying two fees, against a redeem still
-        // pending, whose `s` it has already read. Bitcoin Core takes the
-        // package if it improves the mempool's feerate diagram, which it
-        // does at an equal feerate too: it pays more in total, and the
-        // diagram it replaces is flat past redeem. So the package's feerate,
-        // 2·fee/(cancel + refund), must be strictly below redeem's,
-        // fee/redeem. Core's feerates are over these same integer vsizes.
-        if cancel + refund <= 2 * redeem {
-            return Err(Error::Outbid);
-        }
         Ok(swap)
     }
 
@@ -316,9 +305,21 @@ impl Swap {
                 witness: Witness::new(),
             }],
             output: vec![TxOut {
-                value: self.spent_value(spend) - p.fee,
+                value: self.spent_value(spend) - self.fee(spend),
                 script_pubkey: payout,
             }],
+        }
+    }
+
+    /// The absolute fee the spend pays: two fees for redeem, one for the
+    /// others. Refund has no timelock, so after `t1` the buyer can send
+    /// cancel and refund as one package, paying two fees, against a redeem
+    /// still pending, whose `s` it has already read. Redeem paying as much
+    /// keeps that package from replacing it.
+    pub fn fee(&self, spend: Spend) -> Amount {
+        match spend {
+            Spend::Redeem => self.params.fee * 2,
+            Spend::Cancel | Spend::Refund | Spend::Punish => self.params.fee,
         }
     }
 
@@ -672,7 +673,10 @@ mod tests {
             assert_eq!(tx.version, Version::non_standard(3));
             assert_eq!(tx.output.len(), 1, "{spend:?}");
             assert_eq!(tx.output[0].script_pubkey, payout, "{spend:?}");
-            assert_eq!(swap.spent_value(spend) - tx.output[0].value, params().fee);
+            assert_eq!(
+                swap.spent_value(spend) - tx.output[0].value,
+                swap.fee(spend)
+            );
         }
         // The cancel output has no key path, and its leaves are the 2-of-2
         // and punish, which waits `t2` blocks: no unconfirmed cancel has a
@@ -757,51 +761,27 @@ mod tests {
         assert!(Swap::new(with(largest)).is_ok());
     }
 
-    /// Accepted exactly when cancel and refund, signed, weigh more than two
-    /// redeems: then their package pays a lower feerate than redeem alone.
+    /// Redeem pays exactly what cancel and refund pay together, whatever
+    /// the payouts: a package of them cannot pay more than it replaces.
     #[test]
-    fn cancel_and_refund_must_pay_below_redeems_feerate() {
+    fn redeem_pays_what_cancel_and_refund_pay_together() {
         let p2tr = |n| {
             let key = bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(xonly(
                 &key(n).public_key(),
             ));
             ScriptBuf::new_p2tr_tweaked(key)
         };
-        // A witness v2 program two bytes shorter than P2TR: at t1 = 288 it
-        // makes cancel and refund exactly two redeems.
-        let short = ScriptBuf::from_bytes([[0x52, 30].as_slice(), &[1; 30]].concat());
-        // Cancel plus refund, less two redeems, in vbytes.
-        let cases = [
-            (payout(), payout(), 14),
-            (p2tr(9), p2tr(10), 2),
-            (payout(), p2tr(9), 26),
-            (p2tr(9), payout(), -10),
-            (p2tr(9), short, 0),
-        ];
-        let (seller, buyer) = (key(1), key(2));
-        for (redeem_payout, refund_payout, margin) in cases {
-            let p = Params {
+        for (redeem_payout, refund_payout) in [(payout(), p2tr(9)), (p2tr(9), payout())] {
+            let swap = Swap::new(Params {
                 redeem_payout,
                 refund_payout,
                 ..params()
-            };
-            // Payouts are in no script, so a swap with these params signs
-            // as one that `new` would build.
-            let vsize = |spend| {
-                let swap = Swap {
-                    params: p.clone(),
-                    ..Swap::new(params()).unwrap()
-                };
-                let a = swap.sign(lock(), spend, &seller);
-                let b = swap.sign(lock(), spend, &buyer);
-                swap.finalize(lock(), spend, &a, Some(&b)).unwrap().vsize() as i64
-            };
-            let signed = vsize(Spend::Cancel) + vsize(Spend::Refund) - 2 * vsize(Spend::Redeem);
-            assert_eq!(signed, margin, "{p:?}");
-            match Swap::new(p) {
-                Ok(_) => assert!(margin > 0),
-                Err(e) => assert_eq!((e, margin > 0), (Error::Outbid, false)),
-            }
+            })
+            .unwrap();
+            let fee =
+                |spend| swap.spent_value(spend) - swap.unsigned_tx(lock(), spend).output[0].value;
+            assert_eq!(fee(Spend::Redeem), params().fee * 2);
+            assert_eq!(fee(Spend::Redeem), fee(Spend::Cancel) + fee(Spend::Refund));
         }
     }
 

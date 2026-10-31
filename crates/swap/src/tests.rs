@@ -515,21 +515,6 @@ fn a_bad_share_proof_aborts() {
     assert!(actions.is_empty());
 }
 
-/// A refund payout short enough that cancel and refund would outbid a
-/// pending redeem: the seller refuses it before anything is at stake.
-#[test]
-fn a_refund_payout_that_would_outbid_redeem_aborts() {
-    let p2tr = ScriptBuf::from_bytes([[0x51, 32].as_slice(), &[1; 32]].concat());
-    let seller = Seller::new(terms(), SELLER_NEX.nex_address(), p2tr, payout(2)).unwrap();
-    let (_, actions) = Buyer::start(terms(), payout(3), BUYER_NEX.into()).unwrap();
-    let (seller, actions) = seller.step(message(sent(&actions)));
-    assert_eq!(
-        seller.outcome(),
-        Some(Outcome::Aborted(Refusal::Parameters))
-    );
-    assert!(actions.is_empty());
-}
-
 #[test]
 fn a_mirrored_share_aborts() {
     let (buyer, actions) = Buyer::start(terms(), payout(3), BUYER_NEX.into()).unwrap();
@@ -1255,13 +1240,20 @@ struct Node {
     height: u32,
     lock: Option<Txid>,
     mempool: Vec<Transaction>,
+    /// Transactions in blocks, with the height of each block.
+    mined: Vec<(Transaction, u32)>,
     estimate: Option<FeeRate>,
+    /// The conservative estimate for a spend near its deadline, if not
+    /// `estimate`.
+    urgent: Option<FeeRate>,
     /// What [`Bitcoin::floor`] answers, in sat/vB.
     floor: u32,
     /// Refuse every broadcast, as a mempool holding a better conflict does.
     refuse: bool,
-    /// Each bump asked of the node: the parent, the height, the feerate and
-    /// the most the child may pay.
+    /// How many of the next bumps fail.
+    failing: u32,
+    /// Each bump asked of the node, whether it failed or not: the parent,
+    /// the height, the feerate and the most the child may pay.
     bumps: Vec<(Txid, u32, FeeRate, Amount)>,
 }
 
@@ -1285,6 +1277,9 @@ impl Bitcoin for Fake {
         if node.lock == Some(txid) {
             return Ok(Some((node.mempool[0].clone(), node.height - 100)));
         }
+        if let Some((tx, at)) = node.mined.iter().find(|(tx, _)| tx.compute_txid() == txid) {
+            return Ok(Some((tx.clone(), node.height + 1 - at)));
+        }
         let pooled = node.mempool.iter().find(|tx| tx.compute_txid() == txid);
         Ok(pooled.map(|tx| (tx.clone(), 0)))
     }
@@ -1294,8 +1289,9 @@ impl Bitcoin for Fake {
     fn fund_lock(&self, _: &Script, _: Amount) -> crate::bitcoind::Result<Transaction> {
         unreachable!()
     }
-    fn fee_rate(&self) -> crate::bitcoind::Result<Option<FeeRate>> {
-        Ok(self.0.borrow().estimate)
+    fn fee_rate(&self, urgent: bool) -> crate::bitcoind::Result<Option<FeeRate>> {
+        let node = self.0.borrow();
+        Ok(node.urgent.filter(|_| urgent).or(node.estimate))
     }
     fn floor(&self, _: &Transaction) -> crate::bitcoind::Result<FeeRate> {
         Ok(FeeRate::from_sat_per_vb_u32(self.0.borrow().floor))
@@ -1310,6 +1306,10 @@ impl Bitcoin for Fake {
         let mut node = self.0.borrow_mut();
         let height = node.height;
         node.bumps.push((parent.compute_txid(), height, rate, max));
+        if node.failing > 0 {
+            node.failing -= 1;
+            return Err(crate::bitcoind::Error("wallet locked".into()));
+        }
         Ok(Txid::all_zeros())
     }
 }
@@ -1332,7 +1332,7 @@ impl Bitcoin for Offline {
     fn fund_lock(&self, _: &Script, _: Amount) -> crate::bitcoind::Result<Transaction> {
         unreachable!()
     }
-    fn fee_rate(&self) -> crate::bitcoind::Result<Option<FeeRate>> {
+    fn fee_rate(&self, _: bool) -> crate::bitcoind::Result<Option<FeeRate>> {
         unreachable!()
     }
     fn floor(&self, _: &Transaction) -> crate::bitcoind::Result<FeeRate> {
@@ -1382,9 +1382,11 @@ impl<R: Machine> Machine for Watching<R> {
         false
     }
     fn watch(&self) -> Watch {
+        let watch = self.watcher.watch();
         Watch {
-            bitcoin: self.watcher.watch().bitcoin,
+            bitcoin: watch.bitcoin,
             nexus: None,
+            margin: watch.margin,
         }
     }
     fn own_spends(&self) -> &'static [Spend] {
@@ -1605,9 +1607,9 @@ fn a_bump_pays_the_estimate_up_to_the_caps() {
     assert_eq!(bumped(50, &|_| {}), [(50, payout)]);
     assert_eq!(bumped(5_000, &|_| {}), [(1_000, payout)], "the default cap");
     let rate = |driver: &mut Driver<_, Fake, Offline>| {
-        driver.max_fee_rate = FeeRate::from_sat_per_vb_u32(20);
+        driver.max_fee_rate = FeeRate::from_sat_per_vb_u32(30);
     };
-    assert_eq!(bumped(50, &rate), [(20, payout)]);
+    assert_eq!(bumped(50, &rate), [(30, payout)]);
     let quarter = |driver: &mut Driver<_, Fake, Offline>| driver.max_fee_fraction = 0.25;
     assert_eq!(bumped(50, &quarter), [(50, payout / 4)]);
     // The redeem alone pays more than 1 sat/vB.
@@ -1679,4 +1681,168 @@ fn a_state_file_of_another_version_is_refused() {
     std::fs::write(store.path(), serde_json::to_vec(&saved["state"]).unwrap()).unwrap();
     assert!(store.load::<Seller>().is_err());
     assert!(store.load_value().is_err());
+}
+
+/// A bump that fails records nothing: the spend stays due and is bumped
+/// again at the next poll, without waiting for a block.
+#[test]
+fn a_failed_bump_is_tried_again_at_the_next_poll() {
+    let locked = locked();
+    let node = pooled(&locked, &[Spend::Redeem], 50);
+    node.0.borrow_mut().failing = 1;
+    let bumps = bumps(
+        seller_watching(&locked, None),
+        &node,
+        &[105, 105, 105],
+        |_| {},
+    );
+    let bumps: Vec<_> = bumps
+        .into_iter()
+        .map(|(_, height, rate, _)| (height, rate.to_sat_per_vb_ceil()))
+        .collect();
+    assert_eq!(bumps, [(105, 50), (105, 50)]);
+}
+
+/// Within `margin` blocks of its deadline a spend is bumped to the
+/// conservative estimate: redeem as the lock nears `t1`, refund as cancel
+/// nears `t2`.
+#[test]
+fn the_target_rises_near_the_deadline() {
+    let locked = locked();
+    let (swap, lock) = locked.swap();
+    let urgent = |node: &Fake| {
+        let mut node = node.0.borrow_mut();
+        node.urgent = Some(FeeRate::from_sat_per_vb_u32(80));
+    };
+    let rates = |bumps: Vec<(Txid, u32, FeeRate, Amount)>| -> Vec<(u32, u64)> {
+        bumps
+            .into_iter()
+            .map(|(_, height, rate, _)| (height, rate.to_sat_per_vb_ceil()))
+            .collect()
+    };
+
+    // t1 = 20, margin = 3: the lock 17 deep, at 117, is 3 blocks short.
+    let node = pooled(&locked, &[Spend::Redeem], 50);
+    urgent(&node);
+    let got = bumps(
+        seller_watching(&locked, None),
+        &node,
+        &[115, 116, 117],
+        |_| {},
+    );
+    assert_eq!(rates(got), [(115, 50), (117, 80)]);
+
+    // t2 = 10: cancel, mined at 121, is 7 deep at 127.
+    let node = pooled(&locked, &[Spend::Refund], 50);
+    urgent(&node);
+    let cancel = swap.unsigned_tx(lock, Spend::Cancel);
+    node.0.borrow_mut().mined.push((cancel, 121));
+    let watching = Watching {
+        watcher: locked.buyer.clone(),
+        role: locked.buyer.clone(),
+        broadcast: None,
+    };
+    let got = bumps(watching, &node, &[125, 126, 127], |_| {});
+    assert_eq!(rates(got), [(125, 50), (127, 80)]);
+}
+
+/// A refused spend needs a package, as against a conflict, even when the
+/// target is below what it pays alone.
+#[test]
+fn a_refused_spend_is_bumped_below_its_own_feerate() {
+    let locked = locked();
+    let (swap, lock) = locked.swap();
+    let refund = swap.unsigned_tx(lock, Spend::Refund);
+    let own = swap.fee(Spend::Refund).to_sat() / refund.vsize() as u64;
+    assert!(own > 2, "{own} sat/vB");
+    let node = pooled(&locked, &[Spend::Cancel], 1);
+    {
+        let mut node = node.0.borrow_mut();
+        node.refuse = true;
+        node.floor = 2;
+    }
+    let watching = Watching {
+        watcher: locked.buyer.clone(),
+        role: locked.buyer.clone(),
+        broadcast: Some(refund.clone()),
+    };
+    let bumps = bumps(watching, &node, &[105], |_| {});
+    let bumps: Vec<_> = bumps
+        .into_iter()
+        .map(|(txid, _, rate, _)| (txid, rate.to_sat_per_vb_ceil()))
+        .collect();
+    assert_eq!(bumps, [(refund.compute_txid(), 2)]);
+}
+
+/// A child may pay a share of the payout from 0 to 1, nothing else.
+#[test]
+fn a_fee_fraction_outside_zero_to_one_is_refused() {
+    for fraction in [f64::NAN, -0.1, 1.5] {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::new(directory.path(), terms().swap_id);
+        let client = Client::new("http://127.0.0.1:9", "", Duration::from_secs(1));
+        let seller = new_seller(terms());
+        let mut driver =
+            Driver::<_, _, Offline>::start(seller, vec![], Offline, client, None, store).unwrap();
+        driver.max_fee_fraction = fraction;
+        let refused = driver.run_until(|_| true).expect_err("refused");
+        assert_eq!(
+            refused.kind(),
+            std::io::ErrorKind::InvalidInput,
+            "{fraction}"
+        );
+    }
+}
+
+/// The seller holding the redeem at the last open block, and the redeem.
+fn seller_redeeming() -> (Seller, Transaction, Transaction) {
+    let (seller, buyer, nex_lock) = locked().nex_locked();
+    let (swap, lock) = seller.watch().bitcoin.unwrap();
+    let (_, actions) = buyer.step(nexus(account(500_000, 0), mined(nex_lock.body, 1)));
+    let (seller, _) = seller.step(btc(17, None, None));
+    let (seller, _) = seller.step(message(sent(&actions)));
+    let (seller, actions) = seller.step(btc(17, None, None));
+    let [redeem] = &broadcasts(&actions)[..] else {
+        panic!("the seller redeems");
+    };
+    (
+        seller,
+        redeem.clone(),
+        swap.unsigned_tx(lock, Spend::Cancel),
+    )
+}
+
+/// A redeem the seller once saw may have revealed `s`: when it vanishes
+/// after the window closed, as on a reorg, it is sent again, even against
+/// a cancel in the mempool, and the seller gives up on it only once a
+/// cancel is in a block.
+#[test]
+fn a_redeem_once_seen_is_never_abandoned() {
+    let (seller, redeem, cancel) = seller_redeeming();
+    let (seller, none) = seller.step(btc(17, Some((&redeem, 0)), None));
+    assert!(none.is_empty());
+    let seller = restart(&seller);
+    let (seller, actions) = seller.step(btc(19, None, None));
+    assert_eq!(broadcasts(&actions), std::slice::from_ref(&redeem));
+    assert!(matches!(seller, Seller::Redeeming { .. }));
+    let (seller, actions) = seller.step(btc(20, Some((&cancel, 0)), None));
+    assert_eq!(broadcasts(&actions), std::slice::from_ref(&redeem));
+    assert!(matches!(seller, Seller::Redeeming { .. }));
+    let (seller, _) = seller.step(btc(21, Some((&cancel, 1)), None));
+    assert!(matches!(seller, Seller::Cancelling { .. }));
+}
+
+/// A redeem never seen may never have gone out: once the window closes,
+/// the seller cancels instead.
+#[test]
+fn a_redeem_never_seen_is_abandoned_when_the_window_closes() {
+    let (seller, _, _) = seller_redeeming();
+    // As saved before `seen` existed: the field is missing, and false.
+    let mut saved = serde_json::to_value(&seller).unwrap();
+    let fields = saved["Redeeming"].as_object_mut().unwrap();
+    assert_eq!(fields.remove("seen"), Some(json!(false)));
+    let seller: Seller = serde_json::from_value(saved).unwrap();
+    let (seller, actions) = seller.step(btc(19, None, None));
+    assert!(broadcasts(&actions).is_empty());
+    assert!(matches!(seller, Seller::Cancelling { .. }));
 }

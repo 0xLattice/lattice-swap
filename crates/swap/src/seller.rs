@@ -30,12 +30,17 @@ pub enum Seller {
         nex_lock: swap_nexus_tx::Transaction,
     },
     /// Holds the redeem; broadcasts it on every view that shows the redeem
-    /// window open, until it confirms.
+    /// window open, until it confirms. Once a view has shown it, in the
+    /// mempool or a block, `s` may be public: it is broadcast on every
+    /// view it is missing from, window or not, until it is
+    /// `btc_confirmations` deep or a cancel in a block spent the lock.
     Redeeming {
         locked: SellerLocked,
         nex_lock: swap_nexus_tx::Transaction,
         #[serde(with = "hex_tx")]
         redeem: Transaction,
+        #[serde(default)]
+        seen: bool,
     },
     /// No longer redeems: cancels, then claims the NEX back if the buyer
     /// refunds, or punishes if it does not. `nex_lock` is the NEX lock, if
@@ -269,6 +274,7 @@ impl Machine for Seller {
                         locked,
                         nex_lock,
                         redeem,
+                        seen: false,
                     },
                     vec![],
                 ),
@@ -279,6 +285,7 @@ impl Machine for Seller {
                     locked,
                     nex_lock,
                     redeem,
+                    seen,
                 },
                 Event::Bitcoin(view),
             ) => {
@@ -292,17 +299,31 @@ impl Machine for Seller {
                             locked,
                             nex_lock,
                             redeem,
+                            seen: true,
                         },
                         vec![],
                     ),
                     // Not seen, perhaps never sent: send it, but only while
-                    // the window is open.
-                    None if !terms.redeem_closed(&view) => {
+                    // the window is open. Seen once, it is sent whatever
+                    // the window, and against a cancel still in the mempool,
+                    // which a bump of it can replace.
+                    None if seen || !terms.redeem_closed(&view) => {
                         let actions = vec![Action::Broadcast(redeem.clone())];
                         let state = Redeeming {
                             locked,
                             nex_lock,
                             redeem,
+                            seen,
+                        };
+                        (state, actions)
+                    }
+                    Some((Spend::Cancel, 0)) if seen => {
+                        let actions = vec![Action::Broadcast(redeem.clone())];
+                        let state = Redeeming {
+                            locked,
+                            nex_lock,
+                            redeem,
+                            seen,
                         };
                         (state, actions)
                     }
@@ -358,16 +379,19 @@ impl Machine for Seller {
             | Cancelling { locked, .. } => Watch {
                 bitcoin: bitcoin(locked),
                 nexus: None,
+                margin: locked.setup.terms.margin,
             },
             LockingNex { locked, nex_lock } => Watch {
                 bitcoin: bitcoin(locked),
                 nexus: locked.setup.watch_nexus(nex_lock.as_ref().map(|t| t.cid())),
+                margin: locked.setup.terms.margin,
             },
             ClaimingNex(claim) => claim.watch(),
             AwaitBuyerHello(_) | AwaitLockProposal(_) | AwaitBuyerSignatures { .. } | Done(_) => {
                 Watch {
                     bitcoin: None,
                     nexus: None,
+                    margin: 0,
                 }
             }
         }

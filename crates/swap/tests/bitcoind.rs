@@ -247,6 +247,7 @@ impl Machine for Redeems {
         Watch {
             bitcoin: Some((self.swap(), self.lock)),
             nexus: None,
+            margin: 0,
         }
     }
 
@@ -302,16 +303,17 @@ fn empty_wallet(node: &Node, name: &str) -> (Bitcoind, ScriptBuf) {
     (wallet, address.assume_checked().script_pubkey())
 }
 
-/// Miners here skip anything below 8 sat/vB, which the agreed fee is not:
-/// redeem waits in the mempool until the driver bumps it, from the payout,
-/// into a wallet that had no coins.
+/// Miners here skip anything below 20 sat/vB, which redeem's two fees are
+/// not: redeem waits in the mempool until the driver bumps it, from the
+/// payout, into a wallet that had no coins. The node's wallet funds the
+/// lock at 50 sat/vB, so the lock is mined.
 #[test]
 fn the_driver_bumps_a_stalled_redeem_from_its_payout() {
-    let node = start(&["-blockmintxfee=0.00008"]);
+    let node = start(&["-blockmintxfee=0.0002", "-fallbackfee=0.0005"]);
     let (_, payout) = empty_wallet(&node, "seller");
     let (machine, _) = Redeems::funded(&node, payout);
     let redeem = machine.redeem.compute_txid();
-    assert!(Amount::from_sat(1_000) < Amount::from_sat(8 * machine.redeem.vsize() as u64));
+    assert!(Amount::from_sat(2_000) < Amount::from_sat(20 * machine.redeem.vsize() as u64));
 
     let nexus = Client::new("http://127.0.0.1:9", "", Duration::from_secs(1));
     let directory = tempfile::tempdir().unwrap();
@@ -342,13 +344,13 @@ fn the_driver_bumps_a_stalled_redeem_from_its_payout() {
 /// redeem's own feerate, and it confirms.
 #[test]
 fn the_driver_raises_a_refused_redeem_to_the_mempool_minimum() {
-    let node = start(&["-minrelaytxfee=0.0001"]);
+    let node = start(&["-minrelaytxfee=0.0002"]);
     let (seller, payout) = empty_wallet(&node, "seller");
     let (machine, _) = Redeems::funded(&node, payout);
     let refused = seller.broadcast(&machine.redeem).unwrap_err().to_string();
     assert!(refused.contains("min relay fee not met"), "{refused}");
     let low = FeeRate::from_sat_per_vb_u32(2);
-    assert!(low.fee_vb(machine.redeem.vsize() as u64).unwrap() < Amount::from_sat(1_000));
+    assert!(low.fee_vb(machine.redeem.vsize() as u64).unwrap() < Amount::from_sat(2_000));
 
     let nexus = Client::new("http://127.0.0.1:9", "", Duration::from_secs(1));
     let directory = tempfile::tempdir().unwrap();
@@ -375,7 +377,7 @@ fn a_rebump_replaces_the_child_from_a_wallet_with_no_coins() {
     let (seller, payout) = empty_wallet(&node, "seller");
     let (machine, _) = Redeems::funded(&node, payout);
     let redeem = machine.redeem;
-    let fee = Amount::from_sat(1_000);
+    let fee = Amount::from_sat(2_000);
     seller.broadcast(&redeem).unwrap();
 
     let all = redeem.output[0].value;
@@ -429,7 +431,7 @@ fn a_bump_past_the_payout_leaves_dust_and_keeps_to_its_cap() {
     let (seller, payout) = empty_wallet(&node, "seller");
     let (machine, _) = Redeems::funded_with(&node, payout, Amount::from_sat(20_000));
     let redeem = machine.redeem;
-    let (fee, value) = (Amount::from_sat(1_000), redeem.output[0].value);
+    let (fee, value) = (Amount::from_sat(2_000), redeem.output[0].value);
     seller.broadcast(&redeem).unwrap();
     let rate = FeeRate::from_sat_per_vb_u32(500);
     assert!(rate.fee_vb(250).unwrap() > value, "more than the payout");
@@ -446,6 +448,97 @@ fn a_bump_past_the_payout_leaves_dust_and_keeps_to_its_cap() {
     let left = change(all);
     assert_eq!(left.value, left.script_pubkey.minimal_non_dust());
     assert!(pooled(&seller, all) && !pooled(&seller, capped));
+}
+
+/// Bitcoin Core takes both targets the driver asks for.
+#[test]
+fn the_node_takes_both_estimate_targets() {
+    let (_node, rpc) = regtest();
+    assert!(
+        rpc.fee_rate(false).unwrap().is_none(),
+        "regtest has no data"
+    );
+    assert!(rpc.fee_rate(true).unwrap().is_none(), "regtest has no data");
+}
+
+/// Fails its first bump, as a wallet still locked would, and passes the
+/// rest to bitcoind.
+struct Flaky {
+    inner: Bitcoind,
+    failed: std::cell::Cell<bool>,
+}
+
+impl Bitcoin for Flaky {
+    fn broadcast(&self, tx: &Transaction) -> swap::bitcoind::Result<()> {
+        self.inner.broadcast(tx)
+    }
+    fn height(&self) -> swap::bitcoind::Result<u32> {
+        self.inner.height()
+    }
+    fn transaction(&self, txid: Txid) -> swap::bitcoind::Result<Option<(Transaction, u32)>> {
+        self.inner.transaction(txid)
+    }
+    fn spender(
+        &self,
+        outpoint: OutPoint,
+        from: u32,
+    ) -> swap::bitcoind::Result<Option<(Transaction, u32)>> {
+        self.inner.spender(outpoint, from)
+    }
+    fn fund_lock(
+        &self,
+        script: &bitcoin::Script,
+        amount: Amount,
+    ) -> swap::bitcoind::Result<Transaction> {
+        self.inner.fund_lock(script, amount)
+    }
+    fn fee_rate(&self, urgent: bool) -> swap::bitcoind::Result<Option<FeeRate>> {
+        self.inner.fee_rate(urgent)
+    }
+    fn floor(&self, parent: &Transaction) -> swap::bitcoind::Result<FeeRate> {
+        self.inner.floor(parent)
+    }
+    fn bump(
+        &self,
+        parent: &Transaction,
+        fee: Amount,
+        rate: FeeRate,
+        max: Amount,
+    ) -> swap::bitcoind::Result<Txid> {
+        if !self.failed.replace(true) {
+            return Err(swap::bitcoind::Error("wallet locked".into()));
+        }
+        self.inner.bump(parent, fee, rate, max)
+    }
+}
+
+/// A redeem the mempool refuses alone, whose first bump fails: the driver
+/// tries again, and it confirms.
+#[test]
+fn a_transient_bump_failure_is_retried() {
+    let node = start(&["-minrelaytxfee=0.0002"]);
+    let (seller, payout) = empty_wallet(&node, "seller");
+    let (machine, _) = Redeems::funded(&node, payout);
+    assert!(seller.broadcast(&machine.redeem).is_err(), "refused alone");
+    let nexus = Client::new("http://127.0.0.1:9", "", Duration::from_secs(1));
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::new(directory.path(), [7; 32]);
+    let flaky = Flaky {
+        inner: seller,
+        failed: std::cell::Cell::new(false),
+    };
+    let mut driver =
+        Driver::<_, _, Ivy>::start(machine, vec![], flaky, nexus, None, store).unwrap();
+    driver.fallback_fee_rate = FeeRate::from_sat_per_vb_u32(2);
+    let party = std::thread::spawn(move || driver.run().unwrap());
+    let miner = node.client.new_address().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !party.is_finished() {
+        assert!(Instant::now() < deadline, "redeem never confirmed");
+        std::thread::sleep(Duration::from_millis(500));
+        node.client.generate_to_address(1, &miner).unwrap();
+    }
+    assert_eq!(party.join().unwrap(), Outcome::Swapped);
 }
 
 fn sent(actions: &[Action]) -> swap::Message {

@@ -16,8 +16,11 @@ no Nexus consensus change is required.
 - `swap-bitcoin`: the Taproot lock, with cancel, refund and punish paths
   using adaptor signatures. Each swap transaction has one output; redeem,
   refund and punish pay a party, who alone can raise its fee by CPFP from
-  that payout. Cancel cannot be bumped, and after `t2` refund and punish are
-  a fee race between the two parties.
+  that payout. Redeem pays two fees, so cancel and refund together cannot
+  replace it. Cancel cannot be bumped. The buyer is safe only if its refund
+  confirms before `t2`: after it, the seller can spend the cancel output
+  through the punish leaf in a shape no refund can replace, and contesting
+  it is best effort.
 - `swap-nexus`: the joint key, `(s + b)·G`, and Ed25519 signing with it.
 - `swap-nexus-tx`: Nexus transfers encoded and signed exactly as Lattice
   54.2.1 does, checked against Lattice's conformance vectors, and a small

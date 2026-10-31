@@ -82,7 +82,7 @@ pub struct Terms {
     pub swap_id: [u8; 32],
     #[serde(with = "bitcoin::amount::serde::as_sat")]
     pub btc_amount: Amount,
-    /// Paid by each Bitcoin swap transaction.
+    /// Paid by each Bitcoin swap transaction, twice by redeem.
     #[serde(with = "bitcoin::amount::serde::as_sat")]
     pub btc_fee: Amount,
     pub nex_amount: u64,
@@ -698,6 +698,7 @@ impl Claim {
         Watch {
             bitcoin: None,
             nexus,
+            margin: self.setup.terms.margin,
         }
     }
 }
@@ -723,6 +724,9 @@ pub struct Watch {
     /// The swap and its lock output, once the lock is agreed.
     pub bitcoin: Option<(Swap, OutPoint)>,
     pub nexus: Option<NexusWatch>,
+    /// [`Terms::margin`]: within this many blocks of its deadline a spend
+    /// is bumped to a conservative estimate.
+    pub margin: u16,
 }
 
 pub struct NexusWatch {

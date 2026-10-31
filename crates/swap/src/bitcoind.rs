@@ -1,6 +1,7 @@
 //! What a party needs from Bitcoin, and a bitcoind JSON-RPC client for it.
 
 use std::fmt;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use base64::Engine;
@@ -41,8 +42,8 @@ pub trait Bitcoin {
     /// not broadcast.
     fn fund_lock(&self, script: &Script, amount: Amount) -> Result<Transaction>;
     /// A feerate to confirm within a couple of blocks, if the node has an
-    /// estimate.
-    fn fee_rate(&self) -> Result<Option<FeeRate>>;
+    /// estimate; a conservative one for the next block if `urgent`.
+    fn fee_rate(&self, urgent: bool) -> Result<Option<FeeRate>>;
     /// The lowest package feerate at which `parent`, which the mempool
     /// refused, would enter it with a child spending its payout: the
     /// mempool's minimum, and if another transaction spends `parent`'s input
@@ -66,6 +67,11 @@ pub struct Bitcoind {
     url: String,
     authorization: String,
     network: Network,
+    /// The last parent sized for a child: its txid, the change script the
+    /// child pays, and the package's vsize. `floor` and `bump`, and every
+    /// rebump, reuse them rather than ask for another change address and
+    /// sign again.
+    sized: Mutex<Option<(Txid, ScriptBuf, u64)>>,
 }
 
 impl Bitcoind {
@@ -78,6 +84,7 @@ impl Bitcoind {
             url: url.into(),
             authorization: format!("Basic {token}"),
             network,
+            sized: Mutex::new(None),
         }
     }
 
@@ -101,6 +108,22 @@ impl Bitcoind {
             return Err(Error(format!("{method}: {}", body["error"])));
         }
         Ok(body["result"].clone())
+    }
+
+    /// A change script of the wallet for a child of `parent`, and the
+    /// package's vsize with that child signed: worked out once per parent.
+    fn sized(&self, parent: &Transaction) -> Result<(ScriptBuf, u64)> {
+        let txid = parent.compute_txid();
+        let mut sized = self.sized.lock().expect("not poisoned");
+        if let Some((sized, change, size)) = &*sized {
+            if *sized == txid {
+                return Ok((change.clone(), *size));
+            }
+        }
+        let change = self.change_for(parent)?;
+        let size = self.package_vsize(parent, change.clone())?;
+        *sized = Some((txid, change.clone(), size));
+        Ok((change, size))
     }
 
     /// The script of a new change address of the wallet, if the wallet can
@@ -255,8 +278,14 @@ impl Bitcoin for Bitcoind {
         decode(&signed["hex"])
     }
 
-    fn fee_rate(&self) -> Result<Option<FeeRate>> {
-        let estimate = self.call("estimatesmartfee", json!([2]))?;
+    fn fee_rate(&self, urgent: bool) -> Result<Option<FeeRate>> {
+        // Bitcoin Core takes targets from 1 block, which it reads as 2, and
+        // estimates economically unless asked otherwise.
+        let target = match urgent {
+            true => json!([1, "conservative"]),
+            false => json!([2]),
+        };
+        let estimate = self.call("estimatesmartfee", target)?;
         // BTC per kvB; absent while the node has too little data.
         if estimate["feerate"].is_null() {
             return Ok(None);
@@ -280,6 +309,8 @@ impl Bitcoin for Bitcoind {
         // that also pays all of its fees and the incremental feerate on its
         // own size. A low-feerate child of up to 1000 vB under the other
         // spend raises that: the whole fee spread over our smaller package.
+        // Best effort: a non-TRUC conflict with two children, which the
+        // punish leaf lets the seller make, cannot be replaced at all.
         let entry = self.call("getmempoolentry", json!([other]))?;
         let size = |key: &str| {
             entry[key]
@@ -290,7 +321,7 @@ impl Bitcoin for Bitcoind {
             btc(&entry["fees"]["base"])?,
             btc(&entry["fees"]["descendant"])?,
         );
-        let ours = self.package_vsize(parent, self.change_for(parent)?)?;
+        let (_, ours) = self.sized(parent)?;
         let beat = over(own, size("vsize")?)
             .max(over(all, size("descendantsize")?))
             .max(over(all, ours));
@@ -300,10 +331,9 @@ impl Bitcoin for Bitcoind {
     }
 
     fn bump(&self, parent: &Transaction, fee: Amount, rate: FeeRate, max: Amount) -> Result<Txid> {
-        let change = self.change_for(parent)?;
-        // Signed once to learn its size, then again paying for it: all the
-        // package needs but `fee`, short of `max` and of leaving dust.
-        let size = self.package_vsize(parent, change.clone())?;
+        // The child pays all the package needs but `fee`, short of `max` and
+        // of leaving dust.
+        let (change, size) = self.sized(parent)?;
         let fee = rate
             .fee_vb(size)
             .and_then(|package| package.checked_sub(fee))

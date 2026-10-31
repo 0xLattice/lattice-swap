@@ -362,7 +362,7 @@ fn cancel_then_punish_after_t2() {
 /// confirms in a package with a child that pays for both.
 #[test]
 fn a_spend_below_the_relay_feerate_relays_as_a_package() {
-    let (chain, parties, swap, lock) = funded_on(Chain::start_with(&["-minrelaytxfee=0.0001"]));
+    let (chain, parties, swap, lock) = funded_on(Chain::start_with(&["-minrelaytxfee=0.0002"]));
     let encrypted = swap
         .encrypted_sign(lock, Spend::Redeem, &parties.buyer)
         .unwrap();
@@ -393,25 +393,17 @@ fn wallet_script(chain: &Chain, address_type: &str) -> ScriptBuf {
 }
 
 /// After `t1` the buyer holds everything to send cancel and refund as one
-/// package against a redeem still pending. With a P2WPKH refund against a
-/// P2TR redeem that package pays a higher feerate than redeem and would
-/// replace it, so `Swap::new` refuses those payouts. With the tightest
-/// payouts it accepts, P2TR both, the package is one vbyte too heavy and
-/// the redeem stays.
+/// package against a redeem still pending. A P2WPKH refund against a P2TR
+/// redeem makes that package lighter than two redeems, so at equal fees it
+/// would pay a higher feerate; but redeem pays both packages' fees, and a
+/// replacement must pay more than it replaces, so the redeem stays.
 #[test]
 fn cancel_and_refund_cannot_displace_a_pending_redeem() {
     let chain = Chain::start();
     let parties = Parties::random();
-    let refused = Params {
-        redeem_payout: wallet_script(&chain, "bech32m"),
-        refund_payout: wallet_script(&chain, "bech32"),
-        ..parties.params(chain.script())
-    };
-    assert_eq!(Swap::new(refused).err(), Some(Error::Outbid));
-
     let swap = Swap::new(Params {
         redeem_payout: wallet_script(&chain, "bech32m"),
-        refund_payout: wallet_script(&chain, "bech32m"),
+        refund_payout: wallet_script(&chain, "bech32"),
         ..parties.params(chain.script())
     })
     .unwrap();
@@ -426,7 +418,7 @@ fn cancel_and_refund_cannot_displace_a_pending_redeem() {
         both(Spend::Cancel),
         both(Spend::Refund),
     );
-    assert_eq!(cancel.vsize() + refund.vsize(), 2 * redeem.vsize() + 1);
+    assert!(cancel.vsize() + refund.vsize() < 2 * redeem.vsize());
     let redeem = chain.broadcast(&redeem).unwrap();
     for _ in 0..T1 {
         let empty = Value::from(Vec::<String>::new());
@@ -446,6 +438,84 @@ fn cancel_and_refund_cannot_displace_a_pending_redeem() {
     );
     chain.mine(1);
     assert_eq!(chain.confirmations(redeem), 1);
+}
+
+/// A limit, not a fix: after `t2` the punish leaf lets the seller spend
+/// the cancel output with a version 2 transaction of any shape. With two
+/// children it pins the refund: Bitcoin Core replaces by package only a
+/// conflict with no more than one descendant, so the refund cannot get in
+/// at any fee.
+#[test]
+fn a_v2_punish_with_two_children_pins_the_refund() {
+    use swap_bitcoin::bitcoin::absolute::LockTime;
+    use swap_bitcoin::bitcoin::transaction::Version;
+    use swap_bitcoin::bitcoin::{TxIn, Witness};
+    let (chain, parties, swap, lock) = funded();
+    let cancel_tx = cancel(&chain, &parties, &swap, lock);
+    chain.mine(T2 as usize - 1);
+    let spend = |previous_output, sequence, output| Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output,
+            script_sig: ScriptBuf::new(),
+            sequence,
+            witness: Witness::new(),
+        }],
+        output,
+    };
+    let half = (cancel_tx.output[0].value - Amount::from_sat(1_500)) / 2;
+    let out = |value| TxOut {
+        value,
+        script_pubkey: chain.script(),
+    };
+    let pin = spend(
+        OutPoint::new(cancel_tx.compute_txid(), 0),
+        Sequence::from_height(T2),
+        vec![out(half), out(half)],
+    );
+    let pin = swap.sign_punish_leaf(pin, &parties.seller);
+    chain.broadcast(&pin).unwrap();
+    for vout in 0..2 {
+        let child = spend(
+            OutPoint::new(pin.compute_txid(), vout),
+            Sequence::MAX,
+            vec![out(half - Amount::from_sat(200))],
+        );
+        let prevtxs = Value::from(vec![corepc_node::serde_json::json!({
+            "txid": pin.compute_txid().to_string(),
+            "vout": vout,
+            "scriptPubKey": pin.output[vout as usize].script_pubkey.to_hex_string(),
+            "amount": half.to_string_in(Denomination::Bitcoin),
+        })]);
+        let signed: Value = chain
+            .node
+            .client
+            .call(
+                "signrawtransactionwithwallet",
+                &[serialize_hex(&child).into(), prevtxs],
+            )
+            .unwrap();
+        let child: Transaction = deserialize_hex(signed["hex"].as_str().unwrap()).unwrap();
+        chain.broadcast(&child).unwrap();
+    }
+
+    let encrypted = swap
+        .encrypted_sign(lock, Spend::Refund, &parties.seller)
+        .unwrap();
+    let seller_sig = swap.decrypt(&parties.b, &encrypted);
+    let buyer_sig = swap.sign(lock, Spend::Refund, &parties.buyer);
+    let refund = swap
+        .finalize(lock, Spend::Refund, &seller_sig, Some(&buyer_sig))
+        .unwrap();
+    assert!(chain.broadcast(&refund).is_err());
+    // About 400 sat/vB over the package, far above the pin's.
+    let child = chain.child(&refund, Amount::from_sat(100_000));
+    let result = chain.submit_package(&refund, &child);
+    assert_ne!(result["package_msg"], "success", "{result}");
+    assert_eq!(chain.confirmations(pin.compute_txid()), 0, "still pooled");
+    chain.mine(1);
+    assert_eq!(chain.confirmations(pin.compute_txid()), 1);
 }
 
 #[test]

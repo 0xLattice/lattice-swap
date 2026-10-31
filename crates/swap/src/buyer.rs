@@ -278,10 +278,12 @@ impl Machine for Buyer {
                 nexus: cid
                     .as_ref()
                     .and_then(|cid| locked.setup.watch_nexus(Some(cid.clone()))),
+                margin: locked.setup.terms.margin,
             },
             AwaitRedeem { locked, .. } | Cancelling { locked, .. } => Watch {
                 bitcoin: bitcoin(locked),
                 nexus: None,
+                margin: locked.setup.terms.margin,
             },
             ClaimingNex(claim) => claim.watch(),
             AwaitSellerHello(_)
@@ -291,6 +293,7 @@ impl Machine for Buyer {
             | Done(_) => Watch {
                 bitcoin: None,
                 nexus: None,
+                margin: 0,
             },
         }
     }

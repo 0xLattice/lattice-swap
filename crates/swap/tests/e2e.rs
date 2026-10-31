@@ -37,7 +37,7 @@ const BUYER_BTC: Amount = Amount::ONE_BTC;
 
 /// Below every swap transaction's own feerate, as the fallback for
 /// regtest's missing estimate and as the cap: nothing is bumped, and each
-/// costs exactly `BTC_FEE`.
+/// costs exactly `BTC_FEE`, but redeem, which pays two.
 const NO_BUMP: FeeRate = FeeRate::from_sat_per_vb_u32(1);
 
 fn random32() -> [u8; 32] {
@@ -518,7 +518,7 @@ fn happy_path() {
         2 * REWARD - NEX_AMOUNT - fee
     );
     assert_eq!(n.balance(&lock_address(&lock)), 0);
-    assert_eq!(btc_balance(&world.seller_wallet), BTC_AMOUNT - BTC_FEE);
+    assert_eq!(btc_balance(&world.seller_wallet), BTC_AMOUNT - BTC_FEE * 2);
     assert_eq!(
         btc_balance(&world.buyer_wallet),
         BUYER_BTC - BTC_AMOUNT - world.funding_fee()
@@ -650,7 +650,7 @@ fn buyer_restarts_from_its_state_file() {
         2 * REWARD - NEX_AMOUNT - fee
     );
     assert_eq!(n.balance(&lock_address(&lock)), 0);
-    assert_eq!(btc_balance(&world.seller_wallet), BTC_AMOUNT - BTC_FEE);
+    assert_eq!(btc_balance(&world.seller_wallet), BTC_AMOUNT - BTC_FEE * 2);
     assert_eq!(
         btc_balance(&world.buyer_wallet),
         BUYER_BTC - BTC_AMOUNT - world.funding_fee()
