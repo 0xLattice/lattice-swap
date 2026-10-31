@@ -5,7 +5,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::mem::discriminant;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bitcoin::{Amount, FeeRate, OutPoint, Transaction, Txid};
 use swap_bitcoin::{Spend, Swap};
@@ -18,11 +18,12 @@ use crate::{SecretBytes, Spent};
 
 /// The format of a state file. A file of another version is refused: its
 /// signatures may be over transactions this build no longer makes.
-pub const STATE_VERSION: u32 = 2;
+pub const STATE_VERSION: u32 = 3;
 
 /// One JSON file per swap, replaced atomically: written to a temporary
 /// file, synced, then renamed over the old one. It holds the party's
-/// secrets, and [`STATE_VERSION`].
+/// secrets, and [`STATE_VERSION`]. A driver holds an exclusive lock on a
+/// sibling `.lock` file for as long as it runs, so no two run one swap.
 pub struct Store {
     path: PathBuf,
     swap_id: [u8; 32],
@@ -36,6 +37,28 @@ impl Store {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Locks the swap for this process until the file returned is dropped;
+    /// fails if another holds it.
+    fn lock(&self) -> io::Result<File> {
+        let path = self.path.with_extension("lock");
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let file = options.open(&path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(file),
+            Err(fs::TryLockError::WouldBlock) => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "{} is in use: another lattice-swap runs this swap",
+                    self.path.display()
+                ),
+            )),
+            Err(fs::TryLockError::Error(e)) => Err(e),
+        }
     }
 
     /// Saves the state of a new swap; fails if the file exists, so a swap
@@ -94,8 +117,15 @@ impl Store {
 
     fn write_temporary<M: Machine>(&self, state: &M) -> io::Result<PathBuf> {
         let temporary = self.path.with_extension("json.tmp");
+        // Left by a crash, or planted: removed, never followed. A new file,
+        // made here, is the only one written; anything put back in between
+        // fails the save.
+        match fs::remove_file(&temporary) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
         let mut options = OpenOptions::new();
-        options.write(true).create(true).truncate(true);
+        options.write(true).create_new(true);
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
         let mut file = options.open(&temporary)?;
@@ -176,11 +206,21 @@ pub struct Driver<M, B, T> {
     /// shows, when the buyer is away and the NEX it locked is out of reach
     /// anyway. Any BTC kept beats none.
     pub max_fee_fraction: f64,
+    /// The oldest a Bitcoin tip may be, by its block time against this
+    /// machine's clock, for a view to be acted on. A node that stalled, or
+    /// that someone cut off from the network, shows a window still open
+    /// and a deadline still far: no machine sees its views, and the driver
+    /// warns, again every [`WARN_AGAIN`], until the node catches up.
+    pub max_tip_age: Duration,
     /// Our swap transactions waiting unconfirmed, by txid.
     waiting: HashMap<Txid, Waiting>,
     /// Transactions broadcast since the last Bitcoin view, and whether the
     /// node refused each.
     broadcast: Vec<(Transaction, bool)>,
+    /// The last failure to read a Bitcoin view, and when it was logged.
+    view_failed: Option<(String, Instant)>,
+    /// Held while the driver lives: see [`Store`].
+    _lock: File,
 }
 
 impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
@@ -194,8 +234,9 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
         transport: Option<T>,
         store: Store,
     ) -> io::Result<Self> {
+        let lock = store.lock()?;
         store.create(&state)?;
-        let mut driver = Self::with(state, bitcoin, nexus, transport, store);
+        let mut driver = Self::with(state, bitcoin, nexus, transport, store, lock);
         for action in actions {
             driver.act(action)?;
         }
@@ -209,13 +250,21 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
         transport: Option<T>,
         store: Store,
     ) -> io::Result<Self> {
+        let lock = store.lock()?;
         let state = store
             .load()?
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no saved swap"))?;
-        Ok(Self::with(state, bitcoin, nexus, transport, store))
+        Ok(Self::with(state, bitcoin, nexus, transport, store, lock))
     }
 
-    fn with(state: M, bitcoin: B, nexus: Client, transport: Option<T>, store: Store) -> Self {
+    fn with(
+        state: M,
+        bitcoin: B,
+        nexus: Client,
+        transport: Option<T>,
+        store: Store,
+        lock: File,
+    ) -> Self {
         Self {
             state,
             bitcoin,
@@ -228,8 +277,11 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
             fallback_fee_rate: FeeRate::from_sat_per_vb_u32(10),
             max_fee_rate: FeeRate::from_sat_per_vb_u32(1_000),
             max_fee_fraction: 1.0,
+            max_tip_age: Duration::from_secs(90 * 60),
             waiting: HashMap::new(),
             broadcast: vec![],
+            view_failed: None,
+            _lock: lock,
         }
     }
 
@@ -306,8 +358,9 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
         let Some((swap, lock)) = watch.bitcoin else {
             return Ok(());
         };
-        match bitcoin_view(&self.bitcoin, &swap, lock) {
+        match bitcoin_view(&self.bitcoin, &swap, lock, self.max_tip_age) {
             Ok(view) => {
+                self.view_failed = None;
                 let height = view.height;
                 let urgent = urgent(&swap, lock, &view, watch.margin);
                 let mut waiting: Vec<(Transaction, bool)> = [&view.lock_spend, &view.cancel_spend]
@@ -322,8 +375,17 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
                 self.bump(&swap, lock, height, &urgent, waiting);
                 Ok(())
             }
+            // Logged when it changes, and again while it lasts.
             Err(e) => {
-                warn(&e.to_string());
+                let e = e.to_string();
+                let again = self
+                    .view_failed
+                    .as_ref()
+                    .is_none_or(|(last, at)| *last != e || at.elapsed() >= WARN_AGAIN);
+                if again {
+                    warn(&e);
+                    self.view_failed = Some((e, Instant::now()));
+                }
                 Ok(())
             }
         }
@@ -358,6 +420,9 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
             }
             let last = self.waiting.get(&txid).copied();
             let urgent = urgent.contains(&spend);
+            // Near its deadline, a failure or a clamp is logged again at
+            // every block, not only once.
+            let again = urgent && last.is_none_or(|last| height > last.height);
             // A failure is tried again at the next block, or, a few times, at
             // the next poll once a deadline is near: a block may be all that
             // is left.
@@ -382,7 +447,8 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
                 };
                 now.height = height;
                 let fee = swap.fee(spend);
-                let result = match self.target(&tx, fee, refused, urgent, &mut now.clamped) {
+                let clamped = &mut now.clamped;
+                let result = match self.target(&tx, fee, refused, urgent, again, clamped) {
                     Ok(Some(rate)) if rate > now.rate => match self.bitcoin.package_rate(&tx) {
                         Ok(Some(pooled)) if pooled >= rate => Ok(pooled),
                         Ok(_) => self.bump_one(&tx, fee, rate).map(|()| rate),
@@ -396,9 +462,10 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
                         now.rate = rate;
                         now.failed = false;
                     }
-                    // Logged once, then tried again quietly at every block.
+                    // Logged once, then tried again quietly at every block
+                    // until the deadline nears.
                     Err(e) => {
-                        if !now.failed {
+                        if !now.failed || again {
                             warn(&format!("bump {txid}: {e}"));
                         }
                         now.failed = true;
@@ -413,13 +480,14 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
     /// The feerate to raise `tx`, which pays `fee`, to, clamped to
     /// `max_fee_rate`; `None` if `tx` is in the mempool and already pays it
     /// alone. A refused `tx` needs a package whatever it pays. A clamp is
-    /// logged once per target, the last kept in `clamped`.
+    /// logged once per target, the last kept in `clamped`, and `again`.
     fn target(
         &self,
         tx: &Transaction,
         fee: Amount,
         refused: bool,
         urgent: bool,
+        again: bool,
         clamped: &mut Option<FeeRate>,
     ) -> bitcoind::Result<Option<FeeRate>> {
         let mut rate = self
@@ -430,7 +498,7 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
             rate = rate.max(self.bitcoin.floor(tx)?);
         }
         if rate > self.max_fee_rate {
-            if *clamped != Some(rate) {
+            if *clamped != Some(rate) || again {
                 warn(&format!(
                     "bump {}: target {rate} clamped to max_fee_rate {}",
                     tx.compute_txid(),
@@ -538,6 +606,9 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
 /// block, a poll apart.
 pub(crate) const URGENT_RETRIES: u8 = 8;
 
+/// How often a failure to read a Bitcoin view that lasts is logged again.
+const WARN_AGAIN: Duration = Duration::from_secs(60);
+
 /// A swap transaction of ours waiting unconfirmed.
 #[derive(Clone, Copy)]
 struct Waiting {
@@ -559,7 +630,7 @@ struct Waiting {
 /// lock is `t1 - margin` deep, refund once cancel is `t2 - margin` deep.
 fn urgent(swap: &Swap, lock: OutPoint, view: &BitcoinView, margin: u16) -> Vec<Spend> {
     let near = |depth: Option<u32>, deadline: u16| {
-        depth.is_some_and(|depth| depth + u32::from(margin) >= u32::from(deadline))
+        depth.is_some_and(|depth| depth.saturating_add(margin.into()) >= u32::from(deadline))
     };
     let cancel = swap.unsigned_tx(lock, Spend::Cancel).compute_txid();
     let cancel_depth = view
@@ -578,7 +649,17 @@ fn urgent(swap: &Swap, lock: OutPoint, view: &BitcoinView, margin: u16) -> Vec<S
 }
 
 fn warn(what: &str) {
+    #[cfg(test)]
+    WARNINGS.with(|warnings| warnings.borrow_mut().push(what.into()));
     eprintln!("lattice-swap: {what}");
+}
+
+#[cfg(test)]
+thread_local! {
+    /// What this thread's drivers warned, for the tests.
+    pub(crate) static WARNINGS: std::cell::RefCell<Vec<String>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
 }
 
 /// Only the swap's own transactions can spend the lock output, and their
@@ -588,12 +669,37 @@ fn warn(what: &str) {
 /// transaction. Only when cancel is in a block, neither refund nor punish
 /// shows, and the cancel output is spent anyway, is the spender searched
 /// for.
+///
+/// Fails unless the node has every block of the best chain it knows, and
+/// the tip's block time is at most `max_tip_age` behind this machine's
+/// clock: a node that stalled, or is fed by someone who cut it off, would
+/// show the redeem window still open and the deadlines still far.
 pub fn bitcoin_view(
     bitcoin: &impl Bitcoin,
     swap: &Swap,
     lock: OutPoint,
+    max_tip_age: Duration,
 ) -> bitcoind::Result<BitcoinView> {
-    let height = bitcoin.height()?;
+    let tip = bitcoin.tip()?;
+    if tip.headers != tip.height {
+        return Err(bitcoind::Error(format!(
+            "the node has blocks to {} of headers to {}: not acting until it catches up",
+            tip.height, tip.headers
+        )));
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |now| now.as_secs());
+    let age = now.saturating_sub(tip.time);
+    if age > max_tip_age.as_secs() {
+        return Err(bitcoind::Error(format!(
+            "the node's tip, block {}, is {} minutes old: not acting until it has a fresh one, \
+             since a stalled or cut-off node hides the swap's deadlines",
+            tip.height,
+            age / 60
+        )));
+    }
+    let height = tip.height;
     let funding = bitcoin.transaction(lock.txid)?.map(|(_, depth)| depth);
     let spent = |spends: [Spend; 2]| -> bitcoind::Result<Option<Spent>> {
         for spend in spends {
@@ -611,7 +717,7 @@ pub fn bitcoin_view(
         if cancel_spend.is_none() && *confirmations > 0 && tx.compute_txid() == cancel {
             // Punish can be mined no earlier than `t2` blocks after cancel.
             let mined = (height + 1).saturating_sub(*confirmations);
-            let from = mined + u32::from(swap.params().t2);
+            let from = mined.saturating_add(swap.params().t2.into());
             cancel_spend = bitcoin
                 .spender(OutPoint::new(cancel, 0), from)?
                 .map(|(tx, confirmations)| Spent { tx, confirmations });

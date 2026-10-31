@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
+use base64::Engine;
 use bitcoin::address::NetworkUnchecked;
 use bitcoin::hashes::Hash;
 use bitcoin::{Address, Amount, FeeRate, Network, OutPoint, PubkeyHash, ScriptBuf, WScriptHash};
@@ -197,6 +198,44 @@ impl NodeArgs {
         ))
     }
 
+    /// Refuses a lattice-node that cannot say how deep a transaction is. It
+    /// works that out from the state after past blocks, which a node run
+    /// with `--state tip` or `none` does not keep: every NEX lock would
+    /// look unmined, and every claim drained. Its operator read of an
+    /// account after the block halfway up the chain shows whether it keeps
+    /// them; a chain too short to tell passes.
+    fn check_nexus(&self, client: &Client) -> Result<()> {
+        let height = client.health()?.height;
+        if height < 2 {
+            return Ok(());
+        }
+        let block = client
+            .block_hash(height.div_ceil(2))?
+            .ok_or("the Nexus node has no block halfway up its chain")?;
+        let token =
+            base64::engine::general_purpose::STANDARD.encode(read(&self.nexus_cookie)?.trim());
+        let url = format!(
+            "{}/accounts/{}?block={block}",
+            self.nexus_url.trim_end_matches('/'),
+            swap_nexus_tx::address(&[0; 32])
+        );
+        let answer = ureq::AgentBuilder::new()
+            .timeout(TIMEOUT)
+            .build()
+            .get(&url)
+            .set("Authorization", &format!("Basic {token}"))
+            .call();
+        match answer {
+            Ok(_) => Ok(()),
+            Err(ureq::Error::Status(404, _)) => Err(
+                "the Nexus node keeps no state of past blocks, so it cannot tell how deep a \
+                 transaction is: run it with --state all"
+                    .into(),
+            ),
+            Err(e) => Err(format!("nexus: {e}").into()),
+        }
+    }
+
     /// A fresh address from the wallet, as the script that pays it.
     fn payout(&self, bitcoin: &Bitcoind) -> Result<ScriptBuf> {
         let address = bitcoin.call("getnewaddress", json!([]))?;
@@ -319,6 +358,12 @@ struct OfferArgs {
     /// Seconds to wait for the buyer to dial.
     #[arg(long, default_value_t = 600)]
     wait: u64,
+    /// The fee rate, in sat/vB, that each Bitcoin swap transaction must pay
+    /// when bitcoind has no fee estimate, as on regtest. Otherwise its
+    /// conservative estimate for 6 blocks is the floor: cancel, which the
+    /// seller needs to reclaim its NEX, pays btc-fee and is never bumped.
+    #[arg(long)]
+    min_btc_fee_rate: Option<u64>,
     /// The directory the swap file goes in.
     #[arg(long, default_value = ".")]
     dir: PathBuf,
@@ -704,9 +749,19 @@ fn offer(args: OfferArgs) -> Result<Outcome> {
     check_terms(&terms)?;
     let key = args.key.load()?;
     let bitcoin = args.nodes.bitcoin()?;
+    let floor = btc_fee_floor(&bitcoin, args.min_btc_fee_rate)?;
+    if terms.btc_fee.to_sat() < floor {
+        return Err(format!(
+            "btc_fee is {} sat, below the {floor} sat the node's fee rate asks of cancel and \
+             refund",
+            terms.btc_fee.to_sat()
+        )
+        .into());
+    }
     let nexus = args.nodes.nexus()?;
     let redeem = args.nodes.payout(&bitcoin)?;
     let punish = args.nodes.payout(&bitcoin)?;
+    args.nodes.check_nexus(&nexus)?;
     let seller = Seller::new(terms.clone(), key.nex_address(), redeem, punish)
         .map_err(|refusal| format!("refused: {refusal:?}"))?;
     fs::create_dir_all(&args.dir)?;
@@ -768,6 +823,7 @@ fn take(args: TakeArgs) -> Result<Outcome> {
     check_offer(&offer, &args.policy, args.nodes.btc_network, floor)?;
     let nexus = args.nodes.nexus()?;
     let refund = args.nodes.payout(&bitcoin)?;
+    args.nodes.check_nexus(&nexus)?;
     let (buyer, actions) = Buyer::start(offer.terms.clone(), refund, args.nex_address)
         .map_err(|refusal| format!("refused: {refusal:?}"))?;
     fs::create_dir_all(&args.dir)?;
@@ -790,6 +846,9 @@ fn resume(args: SwapFileArgs) -> Result<Outcome> {
             let key = seller_key(seller.nex_address(), seller.signs_nex(), given)?;
             let bitcoin = args.nodes.bitcoin()?;
             let nexus = args.nodes.nexus()?;
+            if seller.outcome().is_none() {
+                args.nodes.check_nexus(&nexus)?;
+            }
             let driver = Driver::<Seller, _, Ivy>::resume(bitcoin, nexus, None, store);
             run(
                 &swap_file,
@@ -800,9 +859,12 @@ fn resume(args: SwapFileArgs) -> Result<Outcome> {
                 &args.bump,
             )
         }
-        Saved::Buyer(_) => {
+        Saved::Buyer(buyer) => {
             let bitcoin = args.nodes.bitcoin()?;
             let nexus = args.nodes.nexus()?;
+            if buyer.outcome().is_none() {
+                args.nodes.check_nexus(&nexus)?;
+            }
             run(
                 &swap_file,
                 Driver::<Buyer, _, Ivy>::resume(bitcoin, nexus, None, store),

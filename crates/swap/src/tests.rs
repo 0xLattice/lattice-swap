@@ -819,8 +819,13 @@ fn nexus_view(event: Event) -> NexusView {
 
 /// The buyer, having seen the redeem, about to claim.
 fn buyer_claiming() -> Buyer {
-    let (seller, buyer, nex_lock) = locked().nex_locked();
-    let (buyer, actions) = buyer.step(nexus(account(500_000, 0), mined(nex_lock.body, 1)));
+    buyer_claiming_with(terms())
+}
+
+fn buyer_claiming_with(terms: Terms) -> Buyer {
+    let depth = terms.nex_confirmations;
+    let (seller, buyer, nex_lock) = locked_with(terms).nex_locked();
+    let (buyer, actions) = buyer.step(nexus(account(500_000, 0), mined(nex_lock.body, depth)));
     let (seller, _) = seller.step(message(sent(&actions)));
     let (_, actions) = seller.step(btc(2, None, None));
     let redeem = &broadcasts(&actions)[0];
@@ -1312,6 +1317,14 @@ struct Node {
     /// Each bump asked of the node, whether it failed or not: the parent,
     /// the height, the feerate and the most the child may pay.
     bumps: Vec<(Txid, u32, FeeRate, Amount)>,
+    /// How many headers the node knows past its tip.
+    headers_ahead: u32,
+    /// How old the tip's block is, in seconds.
+    tip_age: u64,
+    /// A swap file, whose state's name is read into `saved` at every
+    /// broadcast.
+    store: Option<std::path::PathBuf>,
+    saved: Vec<String>,
 }
 
 #[derive(Clone, Default)]
@@ -1320,14 +1333,29 @@ struct Fake(Rc<RefCell<Node>>);
 impl Bitcoin for Fake {
     fn broadcast(&self, tx: &Transaction) -> crate::bitcoind::Result<()> {
         let mut node = self.0.borrow_mut();
+        if let Some(path) = &node.store {
+            let file: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            let name = file["state"].as_object().unwrap().keys().next().unwrap();
+            let name = name.clone();
+            node.saved.push(name);
+        }
         if node.refuse {
             return Err(crate::bitcoind::Error("insufficient fee".into()));
         }
         node.mempool.push(tx.clone());
         Ok(())
     }
-    fn height(&self) -> crate::bitcoind::Result<u32> {
-        Ok(self.0.borrow().height)
+    fn tip(&self) -> crate::bitcoind::Result<crate::bitcoind::Tip> {
+        let node = self.0.borrow();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        Ok(crate::bitcoind::Tip {
+            height: node.height,
+            headers: node.height + node.headers_ahead,
+            time: now.as_secs() - node.tip_age,
+        })
     }
     fn transaction(&self, txid: Txid) -> crate::bitcoind::Result<Option<(Transaction, u32)>> {
         let node = self.0.borrow();
@@ -1380,7 +1408,7 @@ impl Bitcoin for Offline {
     fn broadcast(&self, _: &Transaction) -> crate::bitcoind::Result<()> {
         unreachable!()
     }
-    fn height(&self) -> crate::bitcoind::Result<u32> {
+    fn tip(&self) -> crate::bitcoind::Result<crate::bitcoind::Tip> {
         unreachable!()
     }
     fn transaction(&self, _: Txid) -> crate::bitcoind::Result<Option<(Transaction, u32)>> {
@@ -2015,4 +2043,368 @@ fn a_flood_from_one_source_evicts_only_its_own() {
         .collect();
     assert_eq!(evicted(&many[..HANDSHAKES - 1], buyer), None);
     assert_eq!(evicted(&many, buyer), Some(0));
+}
+
+// The mainnet audit's findings, each pinned.
+
+/// Bitcoin swap transactions three blocks deep: deep enough to tell a
+/// transaction in a block from one deep enough.
+fn btc_deep() -> Terms {
+    Terms {
+        btc_confirmations: 3,
+        ..terms()
+    }
+}
+
+/// A node holding a locked swap's funding, mined at height 101, at
+/// `height`.
+fn funded_node(lock: OutPoint, height: u32) -> Fake {
+    let funding = Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![],
+        output: vec![],
+    };
+    Fake(Rc::new(RefCell::new(Node {
+        height,
+        lock: Some(lock.txid),
+        mempool: vec![funding],
+        ..Node::default()
+    })))
+}
+
+fn warnings(containing: &str) -> usize {
+    crate::driver::WARNINGS.with(|w| w.borrow().iter().filter(|w| w.contains(containing)).count())
+}
+
+fn clear_warnings() {
+    crate::driver::WARNINGS.with(|w| w.borrow_mut().clear());
+}
+
+/// A node that lags its own headers, or whose tip is older than
+/// `max_tip_age`, would show the redeem window open after cancel: no
+/// machine sees its views, and the driver warns, once while it lasts.
+#[test]
+fn a_stale_or_lagging_node_shows_no_view() {
+    let (seller, redeem, _) = seller_redeeming();
+    let (_, lock) = seller.watch().bitcoin.unwrap();
+    let redeemed = |set: fn(&mut Node)| {
+        // The window is open: the lock 17 deep.
+        let node = funded_node(lock, 117);
+        set(&mut node.0.borrow_mut());
+        bumps(seller.clone(), &node, &[117, 117, 117], |_| {});
+        let txid = redeem.compute_txid();
+        let node = node.0.borrow();
+        node.mempool.iter().any(|tx| tx.compute_txid() == txid)
+    };
+    assert!(redeemed(|_| {}));
+    assert!(redeemed(|node| node.tip_age = 60 * 60), "an hour is fresh");
+    clear_warnings();
+    assert!(!redeemed(|node| node.tip_age = 91 * 60));
+    assert_eq!(warnings("minutes old"), 1);
+    assert!(!redeemed(|node| node.headers_ahead = 1));
+    assert_eq!(warnings("headers to 118"), 1);
+}
+
+/// A redeem the seller saw outlives a cancel that a reorg put back in the
+/// mempool and that evicted the redeem: `s` may be public, and the redeem,
+/// bumped, can replace the cancel.
+#[test]
+fn a_seen_redeem_is_sent_again_when_cancel_leaves_its_block() {
+    let (seller, redeem, cancel) = seller_redeeming();
+    let (seller, _) = seller.step(btc(17, Some((&redeem, 0)), None));
+    let (seller, actions) = seller.step(btc(20, Some((&cancel, 1)), None));
+    assert!(actions.is_empty());
+    assert!(matches!(seller, Seller::Cancelling { .. }));
+    let seller = restart(&seller);
+    let (seller, actions) = seller.step(btc(20, Some((&cancel, 0)), None));
+    assert_eq!(broadcasts(&actions), std::slice::from_ref(&redeem));
+    // Gone from the node altogether: the redeem, never cancel.
+    let (seller, actions) = seller.step(btc(20, None, None));
+    assert_eq!(broadcasts(&actions), std::slice::from_ref(&redeem));
+    let (seller, actions) = seller.step(btc(21, Some((&cancel, 1)), None));
+    assert!(actions.is_empty(), "cancel in a block again");
+    let (seller, _) = seller.step(btc(21, Some((&redeem, 1)), None));
+    assert_eq!(seller.outcome(), Some(Outcome::Swapped));
+
+    // First seen once cancelling, as one sent before the window closed.
+    let (seller, redeem, cancel) = seller_redeeming();
+    let (seller, actions) = seller.step(btc(19, None, None));
+    assert!(actions.is_empty());
+    let (seller, _) = seller.step(btc(19, Some((&redeem, 0)), None));
+    let (_, actions) = seller.step(btc(20, Some((&cancel, 0)), None));
+    assert_eq!(broadcasts(&actions), std::slice::from_ref(&redeem));
+
+    // The driver bumps it past the pooled cancel.
+    let (seller, redeem, cancel) = seller_redeeming();
+    let (seller, _) = seller.step(btc(17, Some((&redeem, 0)), None));
+    let (seller, _) = seller.step(btc(20, Some((&cancel, 1)), None));
+    let (_, lock) = seller.watch().bitcoin.unwrap();
+    let node = funded_node(lock, 120);
+    {
+        let mut node = node.0.borrow_mut();
+        node.mempool.push(cancel);
+        node.refuse = true;
+        node.floor = 30;
+    }
+    let bumps = bumps(seller, &node, &[120], |_| {});
+    let redeem = redeem.compute_txid();
+    let bumps: Vec<_> = bumps
+        .into_iter()
+        .map(|(txid, _, rate, _)| (txid, rate.to_sat_per_vb_ceil()))
+        .collect();
+    assert_eq!(bumps, [(redeem, 30)]);
+}
+
+/// The state is on disk before any action of the step that made it, so a
+/// crash between the two leaves a state that knows what went out.
+#[test]
+fn the_state_is_saved_before_its_actions() {
+    let (seller, _, _) = locked().nex_locked();
+    let (_, lock) = seller.watch().bitcoin.unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::new(directory.path(), terms().swap_id);
+    // At t1: the seller gives up and cancels.
+    let node = funded_node(lock, 120);
+    node.0.borrow_mut().store = Some(store.path().into());
+    let client = Client::new("http://127.0.0.1:9", "", Duration::from_secs(1));
+    let driver = Driver::<_, _, Offline>::start(seller, vec![], node.clone(), client, None, store);
+    let mut driver = driver.unwrap();
+    driver.poll = Duration::from_millis(1);
+    let polls = std::cell::Cell::new(0);
+    driver
+        .run_until(|_| {
+            polls.set(polls.get() + 1);
+            polls.get() > 1
+        })
+        .unwrap();
+    assert_eq!(node.0.borrow().saved, ["Cancelling"]);
+}
+
+/// The buyer signs the redeem only once the NEX lock is
+/// `nex_confirmations` deep.
+#[test]
+fn the_buyer_signs_only_on_a_deep_nex_lock() {
+    let deep = Terms {
+        nex_confirmations: 3,
+        ..terms()
+    };
+    let (_, buyer, nex_lock) = locked_with(deep).nex_locked();
+    let lock = account(500_000, 0);
+    let (buyer, actions) = buyer.step(nexus(lock, mined(nex_lock.body.clone(), 2)));
+    assert!(actions.is_empty());
+    let (_, actions) = buyer.step(nexus(lock, mined(nex_lock.body, 3)));
+    assert!(matches!(sent(&actions), Message::RedeemSignature { .. }));
+}
+
+/// The lock the buyer proposes is the funding's own lock output.
+#[test]
+fn a_lock_other_than_the_fundings_is_refused() {
+    let (seller, buyer, actions) = hellos();
+    let (_, actions) = buyer.step(Event::Funded(funding(&actions)));
+    let Message::LockProposal { funding, lock } = sent(&actions) else {
+        panic!("a proposal");
+    };
+    let elsewhere = OutPoint::new(Txid::from_byte_array([4; 32]), lock.vout);
+    for lock in [OutPoint::new(lock.txid, 0), elsewhere] {
+        let funding = funding.clone();
+        let (seller, _) = seller
+            .clone()
+            .step(message(Message::LockProposal { funding, lock }));
+        assert_eq!(seller.outcome(), Some(Outcome::Aborted(Refusal::Funding)));
+    }
+}
+
+#[test]
+fn a_wrong_buyer_cancel_signature_aborts() {
+    let (seller, buyer, actions) = hellos();
+    let (buyer, actions) = buyer.step(Event::Funded(funding(&actions)));
+    let (seller, actions) = seller.step(message(sent(&actions)));
+    let (_, actions) = buyer.step(message(sent(&actions)));
+    let Message::BuyerSignatures { mut cancel } = sent(&actions) else {
+        panic!("signatures");
+    };
+    cancel.s = schnorr_fun::fun::s!(cancel.s + 1).public();
+    let (seller, _) = seller.step(message(Message::BuyerSignatures { cancel }));
+    assert_eq!(seller.outcome(), Some(Outcome::Aborted(Refusal::Signature)));
+}
+
+/// A redeem never seen may never have gone out: it is not sent against a
+/// cancel in the mempool, then or once cancelling.
+#[test]
+fn a_redeem_never_seen_is_not_sent_against_a_pooled_cancel() {
+    let (seller, redeem, cancel) = seller_redeeming();
+    let (seller, actions) = seller.step(btc(19, Some((&cancel, 0)), None));
+    assert!(!broadcasts(&actions).contains(&redeem));
+    assert!(matches!(seller, Seller::Cancelling { .. }));
+    let (_, actions) = seller.step(btc(20, Some((&cancel, 0)), None));
+    assert!(actions.is_empty());
+}
+
+/// A funding first seen past the redeem window is cancelled: no NEX is
+/// locked for it.
+#[test]
+fn a_funding_first_seen_past_the_window_is_cancelled() {
+    let (seller, actions) = locked().seller.step(btc(18, None, None));
+    assert!(actions.is_empty());
+    assert!(matches!(seller, Seller::Cancelling { .. }));
+    let (_, actions) = seller.step(btc(20, None, None));
+    assert_eq!(broadcasts(&actions).len(), 1, "cancel at t1");
+}
+
+/// A cancelling seller ends `Swapped` only on a redeem
+/// `btc_confirmations` deep.
+#[test]
+fn a_cancelling_seller_ends_swapped_only_on_a_deep_redeem() {
+    let seller = locked_with(btc_deep()).seller;
+    let (swap, lock) = seller.watch().bitcoin.unwrap();
+    let redeem = swap.unsigned_tx(lock, Spend::Redeem);
+    let (seller, _) = seller.step(btc(18, None, None));
+    assert!(matches!(seller, Seller::Cancelling { .. }));
+    let (seller, _) = seller.step(btc(19, Some((&redeem, 2)), None));
+    assert_eq!(seller.outcome(), None);
+    let (seller, _) = seller.step(btc(20, Some((&redeem, 3)), None));
+    assert_eq!(seller.outcome(), Some(Outcome::Swapped));
+}
+
+/// The buyer ends only on a refund or a punish `btc_confirmations` deep,
+/// and waits on one in a block.
+#[test]
+fn the_buyer_ends_only_on_a_deep_refund_or_punish() {
+    let buyer = locked_with(btc_deep()).buyer;
+    let (swap, lock) = buyer.watch().bitcoin.unwrap();
+    let (buyer, actions) = buyer.step(btc(20, None, None));
+    let [cancel] = &broadcasts(&actions)[..] else {
+        panic!("cancel");
+    };
+    let refund = swap.unsigned_tx(lock, Spend::Refund);
+    let punish = swap.unsigned_tx(lock, Spend::Punish);
+    for spend in [refund, punish] {
+        let (buyer, actions) = buyer
+            .clone()
+            .step(btc(22, Some((cancel, 2)), Some((&spend, 2))));
+        assert!(actions.is_empty(), "a spend in a block is waited for");
+        assert_eq!(buyer.outcome(), None);
+        let (buyer, _) = buyer.step(btc(23, Some((cancel, 3)), Some((&spend, 3))));
+        assert!(buyer.outcome().is_some());
+    }
+}
+
+/// A claim ends the swap only `nex_confirmations` deep.
+#[test]
+fn a_claim_is_done_only_nex_confirmations_deep() {
+    let deep = Terms {
+        nex_confirmations: 3,
+        ..terms()
+    };
+    let (buyer, actions) = buyer_claiming_with(deep).step(nexus(account(500_000, 0), None));
+    let claim = submitted(&actions);
+    let (buyer, _) = buyer.step(nexus(account(0, 1), mined(claim.body.clone(), 2)));
+    assert_eq!(buyer.outcome(), None);
+    let (buyer, _) = buyer.step(nexus(account(0, 1), mined(claim.body, 3)));
+    assert_eq!(buyer.outcome(), Some(Outcome::Swapped));
+}
+
+#[test]
+fn a_claim_waits_for_a_synced_node() {
+    let lock = account(500_000, 0);
+    let unsynced = nexus_at(syncing(), account(0, 0), lock, None);
+    let (buyer, actions) = buyer_claiming().step(unsynced);
+    assert!(actions.is_empty());
+    let (_, actions) = buyer.step(nexus(lock, None));
+    submitted(&actions);
+}
+
+/// A lock that signed something other than the claim already signed is
+/// drained: the claim is not submitted again.
+#[test]
+fn a_lock_drained_after_the_claim_was_signed_is_drained() {
+    let (buyer, actions) = buyer_claiming().step(nexus(account(500_000, 0), None));
+    submitted(&actions);
+    let (buyer, actions) = buyer.step(nexus(account(0, 1), None));
+    assert!(actions.is_empty());
+    assert_eq!(buyer.outcome(), Some(Outcome::Drained));
+}
+
+/// The swap file, which holds the party's secrets, is its owner's alone,
+/// and a temporary file planted as a link is never written through.
+#[cfg(unix)]
+#[test]
+fn the_swap_file_is_its_owners_alone() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let store = || Store::new(directory.path(), terms().swap_id);
+    let target = directory.path().join("target");
+    std::fs::write(&target, "kept").unwrap();
+    std::os::unix::fs::symlink(&target, store().path().with_extension("json.tmp")).unwrap();
+    let client = Client::new("http://127.0.0.1:9", "", Duration::from_secs(1));
+    let seller = new_seller(terms());
+    Driver::<_, _, Offline>::start(seller, vec![], Offline, client, None, store()).unwrap();
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "kept");
+    let mode = std::fs::metadata(store().path())
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+    assert!(store().load::<Seller>().unwrap().is_some());
+}
+
+/// One driver at a time runs a swap: a second refuses while the first
+/// lives.
+#[test]
+fn a_swap_runs_in_one_driver_at_a_time() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = || Store::new(directory.path(), terms().swap_id);
+    let client = || Client::new("http://127.0.0.1:9", "", Duration::from_secs(1));
+    let seller = new_seller(terms());
+    let first = Driver::<_, _, Offline>::start(seller, vec![], Offline, client(), None, store());
+    let first = first.unwrap();
+    let resume = || Driver::<Seller, _, Offline>::resume(Offline, client(), None, store());
+    let refused = resume().err().expect("refused");
+    assert_eq!(refused.kind(), std::io::ErrorKind::WouldBlock);
+    assert!(refused.to_string().contains("in use"), "{refused}");
+    drop(first);
+    assert!(resume().is_ok());
+}
+
+/// The NEX lock debits `nex_amount + nex_fee`, which must fit a signed
+/// amount, or the seller could not build it once the BTC is locked.
+#[test]
+fn terms_whose_nex_debit_does_not_fit_are_refused() {
+    let most = Terms {
+        nex_amount: i64::MAX as u64 - 100,
+        ..terms()
+    };
+    assert!(most.check());
+    assert!(!Terms {
+        nex_fee: 101,
+        ..most
+    }
+    .check());
+    let past = Terms {
+        nex_amount: u64::MAX,
+        ..terms()
+    };
+    assert!(!past.check(), "no overflow");
+}
+
+/// Near its deadline a bump that keeps failing, or that is clamped to
+/// `max_fee_rate`, is logged at every block, not once.
+#[test]
+fn an_urgent_bump_in_trouble_is_logged_at_every_block() {
+    let locked = locked();
+    let logged = |heights: &[u32], failing: u32, estimate: u32, what: &str| {
+        let node = pooled(&locked, &[Spend::Redeem], estimate);
+        node.0.borrow_mut().failing = failing;
+        clear_warnings();
+        bumps(seller_watching(&locked, None), &node, heights, |_| {});
+        warnings(what)
+    };
+    // t1 = 20, margin = 3: the lock 17 deep, at 117, is near it.
+    let failing = |heights: &[u32]| logged(heights, 1_000, 50, "wallet locked");
+    assert_eq!(failing(&[105, 105, 106, 106]), 1, "far from it, once");
+    assert_eq!(failing(&[117, 117, 118, 118]), 2, "near it, every block");
+    let clamped = |heights: &[u32]| logged(heights, 0, 5_000, "clamped");
+    assert_eq!(clamped(&[105, 106, 107]), 1);
+    assert_eq!(clamped(&[117, 118, 119]), 3);
 }

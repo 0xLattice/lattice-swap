@@ -33,7 +33,8 @@ pub enum Seller {
     /// window open, until it confirms. Once a view has shown it, in the
     /// mempool or a block, `s` may be public: it is broadcast on every
     /// view it is missing from, window or not, until it is
-    /// `btc_confirmations` deep or a cancel in a block spent the lock.
+    /// `btc_confirmations` deep or a cancel in a block spent the lock, and
+    /// in `Cancelling` again whenever that cancel leaves its block.
     Redeeming {
         locked: SellerLocked,
         nex_lock: swap_nexus_tx::Transaction,
@@ -44,10 +45,16 @@ pub enum Seller {
     },
     /// No longer redeems: cancels, then claims the NEX back if the buyer
     /// refunds, or punishes if it does not. `nex_lock` is the NEX lock, if
-    /// one was signed: it may have landed.
+    /// one was signed: it may have landed. `redeem` is the redeem, if the
+    /// seller held one: once a view has shown it, `seen`, `s` may be public,
+    /// so it is broadcast instead of cancel while the lock is unspent or a
+    /// cancel spending it is only in the mempool.
     Cancelling {
         locked: SellerLocked,
         nex_lock: Option<swap_nexus_tx::Transaction>,
+        #[serde(with = "hex_tx::option")]
+        redeem: Option<Transaction>,
+        seen: bool,
     },
     ClaimingNex(Claim),
     Done(Outcome),
@@ -224,14 +231,13 @@ impl Machine for Seller {
             (AwaitFunding { locked, since }, Event::Bitcoin(view)) => {
                 let terms = &locked.setup.terms;
                 let since = since.unwrap_or(view.height);
-                if view.funding.is_none() && view.height >= since + u32::from(terms.t1) {
+                if view.funding.is_none() && view.height >= since.saturating_add(terms.t1.into()) {
                     abort(Refusal::Timeout)
                 } else if view.funding.unwrap_or(0) < terms.btc_confirmations {
                     let since = Some(since);
                     (AwaitFunding { locked, since }, vec![])
                 } else if terms.redeem_closed(&view) {
-                    let nex_lock = None;
-                    Cancelling { locked, nex_lock }.step(Event::Bitcoin(view))
+                    locked.cancelling(None, None, false, view)
                 } else {
                     let nex_lock = None;
                     (LockingNex { locked, nex_lock }, vec![])
@@ -284,15 +290,14 @@ impl Machine for Seller {
             }
             (LockingNex { locked, nex_lock }, Event::Bitcoin(view)) => {
                 if locked.gives_up(&view) {
-                    Cancelling { locked, nex_lock }.step(Event::Bitcoin(view))
+                    locked.cancelling(nex_lock, None, false, view)
                 } else {
                     (LockingNex { locked, nex_lock }, vec![])
                 }
             }
             (AwaitRedeemSignature { locked, nex_lock }, Event::Bitcoin(view)) => {
                 if locked.gives_up(&view) {
-                    let nex_lock = Some(nex_lock);
-                    Cancelling { locked, nex_lock }.step(Event::Bitcoin(view))
+                    locked.cancelling(Some(nex_lock), None, false, view)
                 } else {
                     (AwaitRedeemSignature { locked, nex_lock }, vec![])
                 }
@@ -362,15 +367,18 @@ impl Machine for Seller {
                         };
                         (state, actions)
                     }
-                    _ => {
-                        let nex_lock = Some(nex_lock);
-                        Cancelling { locked, nex_lock }.step(Event::Bitcoin(view))
-                    }
+                    _ => locked.cancelling(Some(nex_lock), Some(redeem), seen, view),
                 }
             }
-            (Cancelling { locked, nex_lock }, Event::Bitcoin(view)) => {
-                locked.cancelling(nex_lock, view)
-            }
+            (
+                Cancelling {
+                    locked,
+                    nex_lock,
+                    redeem,
+                    seen,
+                },
+                Event::Bitcoin(view),
+            ) => locked.cancelling(nex_lock, redeem, seen, view),
             (ClaimingNex(claim), event) => match claim.step(event) {
                 Claimed::Pending(claim, actions) => (ClaimingNex(claim), actions),
                 Claimed::Done | Claimed::Empty => (Done(Outcome::Refunded), vec![]),
@@ -468,12 +476,19 @@ impl SellerLocked {
     fn cancelling(
         self,
         nex_lock: Option<swap_nexus_tx::Transaction>,
+        redeem: Option<Transaction>,
+        mut seen: bool,
         view: BitcoinView,
     ) -> (Seller, Vec<Action>) {
         let setup = &self.setup;
         let terms = &setup.terms;
         let mut actions = vec![];
         match setup.spend(self.lock, &view.lock_spend) {
+            // A redeem once seen may have revealed `s`: it beats any cancel
+            // not yet in a block, which a bump of it can replace.
+            None | Some((Spend::Cancel, 0)) if seen && redeem.is_some() => {
+                actions.extend(redeem.clone().map(Action::Broadcast));
+            }
             None if terms.cancel_due(&view) => {
                 actions.push(Action::Broadcast(
                     setup.cancel(self.lock, &self.buyer_cancel),
@@ -485,6 +500,7 @@ impl SellerLocked {
                 if depth >= terms.btc_confirmations {
                     return (Seller::Done(Outcome::Swapped), vec![]);
                 }
+                seen = true;
             }
             Some((_, cancel_depth)) => match setup.spend(self.lock, &view.cancel_spend) {
                 Some((Spend::Refund, _)) => {
@@ -521,6 +537,12 @@ impl SellerLocked {
             },
         }
         let locked = self;
-        (Seller::Cancelling { locked, nex_lock }, actions)
+        let state = Seller::Cancelling {
+            locked,
+            nex_lock,
+            redeem,
+            seen,
+        };
+        (state, actions)
     }
 }

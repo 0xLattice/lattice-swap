@@ -9,6 +9,7 @@ description = "A command line tool that runs one side of a NEX<->BTC atomic swap
 swap = { path = "../swap" }
 swap-bitcoin = { path = "../swap-bitcoin" }
 swap-nexus-tx = { path = "../swap-nexus-tx" }
+base64 = "0.22"
 bitcoin = "0.32"
 clap = { version = "4", features = ["derive"] }
 data-encoding = "2"
@@ -18,9 +19,8 @@ ivy = { git = "https://github.com/0xLattice/ivy-rs", rev = "e020256" }
 rand_core = { version = "0.6", features = ["getrandom"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+ureq = { version = "2", default-features = false, features = ["json"] }
 
 [dev-dependencies]
-base64 = "0.22"
 corepc-node = { version = "0.12", features = ["30_2", "download"] }
 tempfile = "3"
-ureq = { version = "2", default-features = false, features = ["json"] }
