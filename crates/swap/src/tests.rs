@@ -258,7 +258,9 @@ impl Locked {
     }
 
     fn lock_address(&self) -> String {
-        let cid = Message::NexLocked { cid: "bafy".into() };
+        let cid = Message::NexLocked {
+            cid: swap_nexus_tx::address(&[5; 32]),
+        };
         let (buyer, _) = self.buyer.clone().step(message(cid));
         buyer.watch().nexus.unwrap().lock_address
     }
@@ -2046,6 +2048,25 @@ fn a_flood_from_one_source_evicts_only_its_own() {
 }
 
 // The mainnet audit's findings, each pinned.
+
+/// A NEX lock CID that is not one is refused on receipt: the buyer waits
+/// on, watching nothing on Nexus.
+#[test]
+fn a_nex_lock_cid_that_is_not_one_is_refused() {
+    let buyer = locked().buyer;
+    let lock = swap_nexus_tx::address(&[5; 32]);
+    for cid in [
+        "bafy".to_string(),
+        lock.to_ascii_uppercase(),
+        format!("{lock} "),
+    ] {
+        let (buyer, actions) = buyer.clone().step(message(Message::NexLocked { cid }));
+        assert!(actions.is_empty());
+        assert!(buyer.watch().nexus.is_none());
+    }
+    let (buyer, _) = buyer.step(message(Message::NexLocked { cid: lock }));
+    assert!(buyer.watch().nexus.is_some());
+}
 
 /// Bitcoin swap transactions three blocks deep: deep enough to tell a
 /// transaction in a block from one deep enough.

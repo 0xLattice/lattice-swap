@@ -181,7 +181,11 @@ impl Machine for Buyer {
                 let broadcast = Action::Broadcast(locked.funding.clone());
                 (AwaitNexLock { locked, cid: None }, vec![broadcast])
             }
-            (AwaitNexLock { locked, cid: None }, Event::Message(Message::NexLocked { cid })) => {
+            // A CID that is not one names nothing a node could show: it is
+            // refused here, once, and the buyer waits on, cancelling at t1.
+            (AwaitNexLock { locked, cid: None }, Event::Message(Message::NexLocked { cid }))
+                if swap_nexus_tx::is_cid(&cid) =>
+            {
                 let cid = Some(cid);
                 (AwaitNexLock { locked, cid }, vec![])
             }

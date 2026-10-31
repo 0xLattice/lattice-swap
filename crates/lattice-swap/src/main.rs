@@ -696,18 +696,10 @@ impl Offer {
 /// A Nexus address as Lattice prints one: a CIDv1, dag-cbor, sha2-256, in
 /// lowercase base32. NEX paid to anything else is lost.
 fn check_nex_address(text: &str) -> Result<()> {
-    let binary = text
-        .strip_prefix('b')
-        .and_then(|rest| {
-            data_encoding::BASE32_NOPAD
-                .decode(rest.to_ascii_uppercase().as_bytes())
-                .ok()
-        })
-        .filter(|binary| binary.len() == 36 && binary.starts_with(&[0x01, 0x71, 0x12, 0x20]));
-    match binary {
-        Some(_) if text == text.to_ascii_lowercase() => Ok(()),
-        _ => Err(format!("{text} is not a Nexus address").into()),
+    if !swap_nexus_tx::is_cid(text) {
+        return Err(format!("{text} is not a Nexus address").into());
     }
+    Ok(())
 }
 
 /// Refuses an address the buyer cannot dial: an unspecified `--advertise`,
