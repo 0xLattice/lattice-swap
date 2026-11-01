@@ -97,53 +97,55 @@ pub fn fee_rate(input: &str) -> Result<String> {
 
 /// Fewer blocks than this left before the seller can punish, and the
 /// refund's rate doubles at each block: an estimate aims at six blocks, as
-/// the driver asks for one, and no longer answers for the time left.
+/// the driver asks for one, and no longer answers for the time left. By
+/// `punish_at` it has doubled this many times, 64-fold.
 const URGENT: u32 = 6;
 
 /// The rate, in whole sat/vB, the child of the swap's refund pays for the
 /// two, at each bump, and the spend that sends on a refund a watchtower
-/// broadcast: the highest of the sources' `estimates`, `fallback` where
-/// none has one, never below 1 sat/vB, and bounded by nothing but what the
-/// refund holds, less dust, which [`change_child`] keeps. Once the refund
-/// waits with fewer than [`URGENT`] blocks to `punish_at`, at a `tip` above
-/// the block `last` was paid at, never less than twice `last`'s rate.
+/// broadcast.
 ///
-/// Not [`fee_rate`]'s rule: a funding that is slow only delays the swap,
-/// but a refund still unconfirmed at `punish_at` lets the seller punish and
-/// take the BTC whole. The fees are the buyer's either way, so one source
-/// that answers high costs less than one that answers low. `{"estimates",
-/// "fallback", "punish_at", "tip", "last": {"rate", "height"}}` in, all but
-/// the first two absent or null where unknown; the rate out, as a JSON
-/// number.
+/// - The base: the highest of the sources' `estimates`, `fallback` where
+///   none has one, never below 1 sat/vB; but never above [`HEADROOM`]
+///   times the higher of `quote_rate` and the lowest estimate.
+/// - With fewer than [`URGENT`] blocks left before `punish_at`, at `tip`,
+///   doubled at each block: 64-fold at `punish_at`. Past it, doubled on at
+///   each block, bounded by nothing but what the refund holds, less dust,
+///   which [`change_child`] keeps: a refund burnt to fees costs the buyer
+///   no more than a punish.
+///
+/// `punish_at` and `tip` are of the view every source showed alike, never
+/// one source's. So a source that answers high pays at most [`HEADROOM`]
+/// times what the other, or the quote, asks for; one that answers low is
+/// outbid by the escalation, block by agreed block; and no source alone
+/// can hasten it, by a tip ahead or a cancel mined early. Not
+/// [`fee_rate`]'s rule: a funding that is slow only delays the swap, but a
+/// refund still unconfirmed at `punish_at` lets the seller punish and take
+/// the BTC whole. `{"estimates", "fallback", "quote_rate", "punish_at",
+/// "tip"}` in, the last two absent or null where unknown; the rate out, as
+/// a JSON number.
 #[wasm_bindgen(js_name = refundRate)]
 pub fn refund_rate(input: &str) -> Result<String> {
-    #[derive(Deserialize)]
-    struct Last {
-        rate: u64,
-        height: u32,
-    }
     #[derive(Deserialize)]
     struct Input {
         estimates: Vec<Option<f64>>,
         fallback: u64,
+        quote_rate: u64,
         #[serde(default)]
         punish_at: Option<u32>,
         #[serde(default)]
         tip: Option<u32>,
-        #[serde(default)]
-        last: Option<Last>,
     }
     let input: Input = parse(input)?;
-    let rate = whole(known(input.estimates).reduce(f64::max), input.fallback);
-    let doubled = match (input.punish_at, input.tip, input.last) {
-        (Some(punish_at), Some(tip), Some(last))
-            if tip > last.height && punish_at.saturating_sub(tip) < URGENT =>
-        {
-            last.rate.saturating_mul(2)
-        }
+    let known: Vec<f64> = known(input.estimates).collect();
+    let highest = whole(known.iter().copied().reduce(f64::max), input.fallback);
+    let lowest = whole(known.iter().copied().reduce(f64::min), input.fallback);
+    let base = highest.min(input.quote_rate.max(lowest).saturating_mul(HEADROOM));
+    let doublings = match (input.punish_at, input.tip) {
+        (Some(punish_at), Some(tip)) => tip.saturating_add(URGENT).saturating_sub(punish_at),
         _ => 0,
     };
-    text(&rate.max(doubled))
+    text(&base.saturating_mul(1u64.checked_shl(doublings).unwrap_or(u64::MAX)))
 }
 
 /// The deposit key, and the P2WPKH output script it owns.

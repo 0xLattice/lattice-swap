@@ -891,8 +891,8 @@ fn the_refund_is_handed_over_only_once_the_redeem_is_given_up_unsigned() {
 
 /// On one source's view alone the buyer broadcasts the funding again, gives
 /// up at t1 and cancels, refunds a swap whose redeem it never signed, and
-/// claims the NEX on a redeem; it neither refunds once it has signed the
-/// redeem nor ends a swap.
+/// claims the NEX on a redeem while it awaits one; it neither refunds once
+/// it has signed the redeem, nor claims once cancelling, nor ends a swap.
 #[test]
 fn one_source_alone_does_only_what_no_lie_can_turn_against_the_buyer() {
     let one = |buyer: Buyer, event: Event| {
@@ -926,36 +926,75 @@ fn one_source_alone_does_only_what_no_lie_can_turn_against_the_buyer() {
     assert!(actions.is_empty());
 
     let (signed, sent_redeem) = buyer.step(nexus(account(500_000, 0), mined(nex_lock.body, 1)));
-    // The seller's redeem, on one source: claimed, from the redeem awaited
-    // or from cancelling. One whose signature is not the seller's is not.
+    // The seller's redeem, on one source: claimed while the redeem is
+    // awaited, but for one whose signature is not the seller's.
     let (seller, _) = seller.step(message(sent(&sent_redeem)));
     let redeem = broadcasts(&seller.step(btc(2, None, None)).1)[0].clone();
     let mut forged = redeem.clone();
     let mut witness = forged.input[0].witness.to_vec();
     witness[0][0] ^= 1;
     forged.input[0].witness = witness.into();
-    let (cancelling, _) = one(signed.clone(), btc(20, None, None));
-    for buyer in [signed.clone(), cancelling] {
-        let (claiming, actions) = one(buyer.clone(), btc(3, Some((&redeem, 0)), None));
-        assert!(matches!(claiming, Buyer::ClaimingNex(_)) && actions.is_empty());
-        let (kept, actions) = one(buyer, btc(3, Some((&forged, 0)), None));
-        assert!(matches!(kept, Buyer::Cancelling { .. }), "a forged redeem");
-        assert!(actions.is_empty());
-    }
-    assert!(one(signed.clone(), btc(19, None, None)).1.is_empty());
-    let (signed, actions) = one(signed, btc(20, None, None));
+    let (claiming, actions) = one(signed.clone(), btc(3, Some((&redeem, 0)), None));
+    assert!(matches!(claiming, Buyer::ClaimingNex(_)) && actions.is_empty());
+    let (kept, actions) = one(signed.clone(), btc(3, Some((&forged, 0)), None));
+    assert!(matches!(kept, Buyer::AwaitRedeem { .. }), "a forged redeem");
+    assert!(actions.is_empty());
+    // Cancelling, as every source showed it: no claim on one source.
+    let (cancelling, _) = signed.clone().step(btc(20, None, None));
+    let (kept, actions) = one(cancelling.clone(), btc(21, Some((&redeem, 0)), None));
     assert!(matches!(
-        signed,
+        kept,
         Buyer::Cancelling {
             redeem: Some(_),
             ..
         }
     ));
+    assert!(actions.is_empty());
+
+    // Signed, at t1: cancel, the redeem still awaited.
+    assert!(one(signed.clone(), btc(19, None, None)).1.is_empty());
+    let (signed, actions) = one(signed, btc(20, None, None));
+    assert!(matches!(signed, Buyer::AwaitRedeem { .. }));
     assert_eq!(broadcast_txids(&actions), [cancel.compute_txid()]);
-    let (signed, actions) = one(signed, btc(30, Some((&cancel, 10)), None));
-    assert!(actions.is_empty(), "no refund on one source's depth");
-    let (signed, actions) = one(signed, btc(30, Some((&cancel, 10)), Some((&refund, 9))));
-    assert!(matches!(signed, Buyer::Cancelling { .. }) && actions.is_empty());
+    for buyer in [signed, cancelling] {
+        let (buyer, actions) = one(buyer, btc(30, Some((&cancel, 10)), None));
+        assert!(actions.is_empty(), "no refund on one source's depth");
+        let (buyer, actions) = one(buyer, btc(30, Some((&cancel, 10)), Some((&refund, 9))));
+        assert!(
+            !matches!(buyer, Buyer::Done(_)) && actions.is_empty(),
+            "not ended"
+        );
+    }
+}
+
+/// Once the refund has gone out, revealing `b`, one source that shows the
+/// seller's redeem, which it can always build, does not move the buyer to
+/// claiming: it would stop the refund, the seller holding `b` would take
+/// the NEX back, and a punish the BTC.
+#[test]
+fn one_source_redeem_after_the_refund_does_not_abandon_it() {
+    let (seller, buyer, nex_lock) = locked().nex_locked();
+    let (signed, sent_redeem) = buyer.step(nexus(account(500_000, 0), mined(nex_lock.body, 1)));
+    let (seller, _) = seller.step(message(sent(&sent_redeem)));
+    let redeem = broadcasts(&seller.step(btc(2, None, None)).1)[0].clone();
+    let (cancelling, actions) = signed.step(btc(20, None, None));
+    let cancel = broadcasts(&actions)[0].clone();
+    // Every source: cancel deep, the refund out.
+    let (cancelling, actions) = cancelling.step(btc(30, Some((&cancel, 10)), None));
+    assert_eq!(broadcasts(&actions).len(), 1, "the refund out");
+    let Event::Bitcoin(lie) = btc(31, Some((&redeem, 0)), None) else {
+        unreachable!()
+    };
+    let (kept, actions) = cancelling.step_one_source(lie);
+    assert!(matches!(
+        kept,
+        Buyer::Cancelling {
+            redeem: Some(_),
+            ..
+        }
+    ));
+    assert!(actions.is_empty());
+    assert!(kept.watch().bitcoin.is_some(), "the refund still watched");
 }
 
 /// The buyer must stay open from the funding's broadcast until the swap is

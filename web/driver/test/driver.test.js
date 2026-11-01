@@ -402,8 +402,9 @@ test('a refund the watchtower broadcast is sent on from the deposit key once the
   w.chain.utxos.set(record.deposit.address, [{ txid: r.txid, vout: 0, value: r.outputs[0].value, height: w.chain.height + 1 }]);
   w.chain.mine();
 
-  // Sent on at the refund's rate: the highest estimate, uncapped.
-  [w.sources[0].fees, w.sources[1].fees] = [{ 6: 1 }, { 6: 500 }];
+  // Sent on at the refund's rate: one source's absurd estimate held to
+  // twice the quote's 10 sat/vB.
+  [w.sources[0].fees, w.sources[1].fees] = [{ 6: 2 }, { 6: 1_000_000 }];
   const back = await Buyer.resume(w.config, record.swap_id);
   const again = running(back);
   await until(async () => w.a.posted.includes((await w.store.load(record.swap_id)).deposit_refund?.tx));
@@ -411,7 +412,7 @@ test('a refund the watchtower broadcast is sent on from the deposit key once the
   assert.deepEqual(parseTx(forward.tx).inputs.map(({ txid, vout }) => `${txid}:${vout}`), [`${r.txid}:0`]);
   assert.equal(parseTx(forward.tx).outputs[0].script, record.refund_script);
   const fee = paid(forward.tx, r.outputs[0].value);
-  assert.ok(fee >= 500 * 100 && fee <= 500 * 111, `${fee} sat`);
+  assert.ok(fee >= 20 * 100 && fee <= 20 * 111, `${fee} sat`);
   w.chain.txs.set(forward.txid, { hex: forward.tx, height: w.chain.height + 1 });
   w.chain.mine();
   assert.equal(await again.done, 'refunded');
@@ -528,41 +529,133 @@ test('with the redeem signed, one source that shows cancel deep gets no refund b
   w.sources[1].txs = new Map([[lookups.lock_spends[1], { hex: cancel, height: w.chain.height - 9 }]]);
   const back = await Buyer.resume(w.config, record.swap_id);
   const again = running(back);
-  await until(async () => kind((await w.store.load(record.swap_id)).state) === 'Cancelling');
-  await pause(100);
+  await pause(300);
   await again.stop();
+  assert.equal(kind((await w.store.load(record.swap_id)).state), 'AwaitRedeem', 'the redeem still awaited');
   const refund = (tx) => parseTx(tx).txid === lookups.cancel_spends[0];
   assert.ok(![...w.a.posted, ...w.b.posted].some(refund), 'no refund broadcast');
   assert.equal((await w.store.load(record.swap_id)).refund_child, null, 'nor its child');
 });
 
-test('the refund pays the highest estimate, past the quote’s headroom, and doubles as the punish nears', async () => {
+/** A world run to the refund's broadcast, with the redeem never signed,
+ * the sources answering `fees`: `{w, run, record, child, refund}`, `child`
+ * reading the stored refund child. */
+async function refunding(fees) {
   const { w, run, record } = await funded();
-  // One source answers low; the quote's rate was 10.
-  [w.sources[0].fees, w.sources[1].fees] = [{ 6: 1 }, { 6: 500 }];
+  [w.sources[0].fees, w.sources[1].fees] = fees;
   const lookups = call('watchBuyer', record.state).bitcoin;
   const sent = (txid) => w.a.posted.find((tx) => parseTx(tx).txid === txid);
   confirmFunding(w, record, 30);
   await until(() => sent(lookups.lock_spends[1]));
   w.chain.txs.set(lookups.lock_spends[1], { hex: sent(lookups.lock_spends[1]), height: w.chain.height + 1 });
   w.chain.mine();
+  await until(() => sent(lookups.cancel_spends[0]));
   const child = async () => (await w.store.load(w.buyer.swapId)).refund_child;
-  await until(async () => (await child())?.rate === 500);
+  await until(async () => w.a.posted.includes((await child())?.tx));
+  return { w, run, record, child, refund: parseTx(sent(lookups.cancel_spends[0])) };
+}
+
+test('one source answering absurdly high pays at most twice the quote’s rate on the refund', async () => {
+  const { w, run, child, refund } = await refunding([{ 6: 2 }, { 6: 1_000_000 }]);
+  await pause(50);
+  await run.stop();
+  const { rate, tx } = await child();
+  assert.equal(rate, 20);
+  const fee = refund.outputs[0].value - parseTx(tx).outputs[0].value;
+  assert.ok(fee <= 20 * 300, `${fee} sat for the two`);
+  assert.deepEqual(w.unsaved, []);
+});
+
+test('the refund outbids one source answering low, doubling at each agreed block as the punish nears', async () => {
+  // Fees rose past the quote's 10 sat/vB; one source answers low.
+  const { w, run, child } = await refunding([{ 6: 1 }, { 6: 500 }]);
+  assert.equal((await child()).rate, 20, 'twice the quote: the higher of it and the lowest');
   const first = await child();
-  const refund = parseTx(sent(lookups.cancel_spends[0]));
-  const fee = refund.outputs[0].value - parseTx(first.tx).outputs[0].value;
-  assert.ok(fee > 500 * 100, `${fee} sat`);
   // Cancel mined at h, the punish from h + t2 - 1: with five blocks left,
   // doubled, and again at the next block.
   const punishAt = w.chain.height + 20 - 1;
   w.chain.mine(punishAt - 6 - w.chain.height);
   await pause(50);
-  assert.equal((await child()).rate, 500, 'six blocks left: the estimate');
+  assert.equal((await child()).rate, 20, 'six blocks left: the base');
   w.chain.mine();
-  await until(async () => (await child()).rate === 1000);
+  await until(async () => (await child()).rate === 40);
   w.chain.mine();
-  await until(async () => (await child()).rate === 2000);
+  await until(async () => (await child()).rate === 80);
   assert.ok((await child()).replaced.includes(first.txid), 'each replaced kept');
+  // One source alone shows the tip past the punish: no faster.
+  w.sources[1].lead = 30;
+  await pause(100);
+  assert.equal((await child()).rate, 80, 'one source’s tip does not escalate');
   await run.stop();
   assert.deepEqual(w.unsaved, []);
+});
+
+test('a tab that waited for the lock drives the swap from the store, as the first tab left it', async () => {
+  const held = new Map();
+  const locks = {
+    async request(name, options, callback) {
+      if (options.ifAvailable && held.has(name)) return callback(null);
+      while (held.has(name)) await held.get(name).released;
+      let release;
+      held.set(name, { released: new Promise((resolve) => (release = resolve)) });
+      try {
+        return await callback({ name });
+      } finally {
+        held.delete(name);
+        release();
+      }
+    },
+  };
+  const w = await world({ extra: { locks } });
+  await w.buyer.backup();
+  const first = running(w.buyer);
+  await until(() => held.has(`lattice-swap:${w.buyer.swapId}`));
+  // A second tab, opened while the swap waits for its deposit.
+  const other = await Buyer.resume(w.config, w.buyer.swapId);
+  const second = running(other);
+  await until(() => other.status().elsewhere);
+  // The first takes the offer and funds the lock, then closes.
+  w.chain.fees = { 6: 2 };
+  deposit(w, w.buyer.status().deposit.amount);
+  await until(async () => (await w.store.load(w.buyer.swapId)).child);
+  await first.stop();
+  const before = await w.store.load(w.buyer.swapId);
+  const posted = w.a.posted.length;
+  await until(() => !other.status().elsewhere);
+  // The second carries on: the funding broadcast again, nothing undone.
+  await until(() => w.a.posted.slice(posted).includes(before.funding.tx));
+  await second.stop();
+  const after = await w.store.load(w.buyer.swapId);
+  assert.equal(kind(after.state), kind(before.state));
+  assert.equal(after.taken, true);
+  assert.equal(after.funding.tx, before.funding.tx);
+  assert.equal(other.status().step, 'locking');
+  assert.equal(w.seller.log.filter((message) => message.BuyerHello).length, 1, 'never taken again');
+});
+
+test('the buyer’s signatures held past half the message timeout are never sent, though the backup comes', async () => {
+  const clock = { offset: 0 };
+  const w = await world({ clock, extra: { storage: null } });
+  await w.buyer.backup();
+  w.chain.fees = { 6: 2 };
+  deposit(w, w.buyer.status().deposit.amount);
+  const run = running(w.buyer);
+  await until(() => w.buyer.status().step === 'save-backup');
+  const { saveWithin } = w.buyer.status();
+  assert.ok(saveWithin > 25_000 && saveWithin <= 30_000, `${saveWithin} ms`);
+  // The seller, whose clock started first, may have given up.
+  clock.offset += 45_000;
+  await until(() => w.buyer.status().step !== 'save-backup');
+  await w.buyer.backup();
+  await pause(100);
+  const names = () => w.seller.log.map((message) => Object.keys(message)[0]);
+  assert.deepEqual(names(), ['BuyerHello', 'LockProposal']);
+  assert.equal(w.a.posted.length + w.b.posted.length, 0, 'nothing broadcast');
+  // The buyer's own timeout aborts it, and the deposit goes back.
+  clock.offset += 20_000;
+  await until(async () => (await w.store.load(w.buyer.swapId)).deposit_refund);
+  await run.stop();
+  const record = await w.store.load(w.buyer.swapId);
+  assert.equal(kind(record.state), 'Done');
+  assert.ok(!w.a.posted.includes(record.funding.tx), 'the funding never went out');
 });

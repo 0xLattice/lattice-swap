@@ -117,7 +117,7 @@ function unspendable(chain, posted, hex) {
  * `onPost(hex)` runs first; it refuses a transaction that spends what it
  * cannot. `source.fees`, if set, are its estimates instead of the chain's,
  * `source.txs` transactions it shows beside the chain's, as `chain.txs`,
- * and while `source.down` holds it answers nothing. */
+ * `source.lead` blocks its tip shows past the chain's, and while `source.down` holds it answers nothing. */
 export async function esplora(chain, onPost = () => {}, source = {}) {
   const posted = [];
   const server = await serve(async (method, path, body) => {
@@ -129,8 +129,11 @@ export async function esplora(chain, onPost = () => {}, source = {}) {
       posted.push(body);
       return [200, parseTx(body).txid];
     }
-    if (path === '/blocks/tip/hash') return [200, chain.hash];
-    if (path === `/block/${chain.hash}`) return [200, { height: chain.height, timestamp: chain.time }];
+    // A tip `source.lead` blocks ahead of the chain's.
+    const height = chain.height + (source.lead ?? 0);
+    const hash = height.toString(16).padStart(64, '0');
+    if (path === '/blocks/tip/hash') return [200, hash];
+    if (path === `/block/${hash}`) return [200, { height, timestamp: chain.time }];
     if (path === '/fee-estimates') return [200, source.fees ?? chain.fees];
     let m = path.match(/^\/tx\/(\w+)(\/hex)?$/);
     if (m) {

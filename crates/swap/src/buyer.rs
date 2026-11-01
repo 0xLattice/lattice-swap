@@ -387,68 +387,83 @@ impl Buyer {
 
     /// Steps on one Bitcoin source's view, for a driver that reads several
     /// and steps the machine on a view only when every source shows it
-    /// alike: what is safe on one source's word, whatever it says, so that
-    /// a source down or blocked for good does not keep the buyer from its
-    /// refund. Each of the machine's Bitcoin decisions:
+    /// alike. One source alone may do only what is safe whatever it claims,
+    /// so that a source that lies can stall a swap but never turn it
+    /// against the buyer, and one down for good still lets an unsigned swap
+    /// refund and a signed one claim on a redeem:
     ///
-    /// - The funding broadcast again while unseen: one source. It is signed,
-    ///   and the seller's signatures are made against its txid.
-    /// - Giving up, at t1 or on a spend of the lock, and broadcasting
-    ///   cancel: one source. A lie ends a swap that could have gone
-    ///   through, and nothing more: cancel before t1 is refused by
-    ///   consensus, and a buyer that gave up signs no redeem.
-    /// - The refund with the redeem unsigned, once cancel is in a block: one
-    ///   source. It reveals `b`, as the watchtower's copy does, to a seller
-    ///   that can then take nothing the buyer has not given up; early, it
-    ///   is refused.
-    /// - The refund with the redeem signed: every source. It waits for
-    ///   cancel `btc_confirmations` deep, or a seller that orphans cancel's
-    ///   block and redeems learns `b` and takes both coins: a source that
-    ///   lies about the depth hands it that.
-    /// - Claiming the NEX on a redeem seen: one source. A redeem proves
-    ///   itself: `s` is taken from it only if it matches the share the
-    ///   seller proved at the start, which no source can forge. Once the
-    ///   buyer holds `s` the NEX is its own, and it no longer refunds: the
-    ///   seller, holding the redeem signature, can have the BTC.
-    /// - The end, refunded or punished, on a spend of cancel deep enough:
-    ///   every source. Ending on a lie stops the refund going out, and a
-    ///   punish may then win.
+    /// 1. Broadcast the funding again while it is unseen. It is signed, and
+    ///    the seller's signatures are made against its txid: a lie that it
+    ///    is unseen only sends it again.
+    /// 2. Give up, at t1 or on a spend of the lock, and broadcast cancel.
+    ///    Cancel before t1 is refused by consensus (its CSV), so a lie only
+    ///    sends a transaction that cannot be mined yet. With the redeem
+    ///    unsigned the buyer moves to cancelling: it will sign no redeem,
+    ///    and a lie ends a swap that could have gone through, and nothing
+    ///    more. With the redeem signed the state is kept: cancel goes out,
+    ///    but the claim of 4 stays open until every source agrees the swap
+    ///    is cancelling.
+    /// 3. Broadcast the refund of a swap whose redeem was never signed,
+    ///    once cancel is in a block. It reveals `b`, as the watchtower's
+    ///    copy does, to a seller that cannot redeem without the buyer's
+    ///    signature, so it can take nothing the buyer has not given up;
+    ///    early, it is refused.
+    /// 4. Claim the NEX on a redeem, from the redeem awaited. A redeem
+    ///    proves itself: `s` is taken only if it matches the share the
+    ///    seller proved at the start, which no source can forge. Awaiting
+    ///    the redeem, the buyer has broadcast neither cancel nor the refund,
+    ///    so `b` is the buyer's alone and the NEX cannot have gone back.
     ///
-    /// Any other state, or event, is left as it is. So with one source down
-    /// for good, a swap whose redeem was never signed still cancels and
-    /// refunds, and one whose redeem was signed still cancels and claims
-    /// the NEX once the seller redeems; but its refund, and the end of any
-    /// swap, wait for the source to come back.
+    /// Everything else waits for every source:
+    ///
+    /// - The refund once the redeem is signed. It waits for cancel
+    ///   `btc_confirmations` deep, or a seller that orphans cancel's block
+    ///   and redeems learns `b` and takes both coins: a source that lies
+    ///   about the depth hands it that.
+    /// - The claim once cancelling with the redeem signed. The refund may
+    ///   have revealed `b`, with which the seller takes the NEX back; it can
+    ///   always build a valid redeem, so a source that shows one would stop
+    ///   the refund, and a punish takes the BTC too.
+    /// - The end, refunded or punished. Ending on a lie stops the refund
+    ///   going out, and a punish may then win.
+    /// - Any other state or event.
+    ///
+    /// These stall while a source is down or disagrees. With the redeem
+    /// signed, a refund stalled past the punish lets the seller take the
+    /// BTC: the cure is the source back, or another in its place, never a
+    /// lie believed.
     pub fn step_one_source(self, view: BitcoinView) -> (Self, Vec<Action>) {
         use Buyer::*;
-        let (locked, redeem) = match self {
-            AwaitNexLock { locked, cid } if !locked.gives_up(&view) => {
-                return AwaitNexLock { locked, cid }.step(Event::Bitcoin(view));
-            }
-            AwaitNexLock { locked, .. } => (locked, None),
-            AwaitRedeem { locked, redeem } if locked.gives_up(&view) => (locked, Some(redeem)),
-            Cancelling { locked, redeem } => (locked, redeem),
-            state => return (state, vec![]),
-        };
-        let (lock, signed) = (locked.lock, redeem.is_some());
-        let kept = Cancelling {
-            locked: locked.clone(),
-            redeem: redeem.clone(),
-        };
-        match locked.cancelling(redeem, view) {
-            (state @ Cancelling { .. }, mut actions) => {
-                // Cancel alone, of what spends the lock, once the redeem is
-                // signed.
-                if signed {
-                    actions.retain(|action| {
-                        matches!(action, Action::Broadcast(tx)
-                            if tx.input.iter().any(|input| input.previous_output == lock))
-                    });
+        match self {
+            // 1, 2 and 3: the machine's own step, but for the end.
+            AwaitNexLock { .. } | Cancelling { redeem: None, .. } => {
+                let kept = self.clone();
+                match self.step(Event::Bitcoin(view)) {
+                    (Done(_), _) => (kept, vec![]),
+                    stepped => stepped,
                 }
-                (state, actions)
             }
-            (state @ ClaimingNex(_), actions) => (state, actions),
-            _ => (kept, vec![]),
+            // 2 and 4.
+            AwaitRedeem { locked, redeem } => {
+                match locked.clone().cancelling(Some(redeem.clone()), view) {
+                    (claim @ ClaimingNex(_), actions) => (claim, actions),
+                    (_, actions) => {
+                        let actions = locked.cancel_only(actions);
+                        (AwaitRedeem { locked, redeem }, actions)
+                    }
+                }
+            }
+            // 2.
+            Cancelling {
+                locked,
+                redeem: Some(redeem),
+            } => {
+                let (_, actions) = locked.clone().cancelling(Some(redeem.clone()), view);
+                let actions = locked.cancel_only(actions);
+                let redeem = Some(redeem);
+                (Cancelling { locked, redeem }, actions)
+            }
+            state => (state, vec![]),
         }
     }
 
@@ -485,6 +500,15 @@ impl BuyerLocked {
             Some(_) => self.setup.terms.btc_confirmations,
             None => 1,
         }
+    }
+
+    /// Of `actions`, the broadcasts that spend the lock: cancel.
+    fn cancel_only(&self, mut actions: Vec<Action>) -> Vec<Action> {
+        actions.retain(|action| {
+            matches!(action, Action::Broadcast(tx)
+                if tx.input.iter().any(|input| input.previous_output == self.lock))
+        });
+        actions
     }
 
     /// The lock was spent, or cancel is due.

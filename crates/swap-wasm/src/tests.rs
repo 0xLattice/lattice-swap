@@ -857,42 +857,45 @@ fn a_spend_pays_the_lowest_estimate_within_the_quotes_headroom() {
     );
 }
 
-/// The swap's refund pays the highest source's estimate, bounded by no
-/// quote: one source that answers low cannot slow it. With fewer than six
-/// blocks to the punish, it doubles at each block.
+/// The swap's refund pays the highest source's estimate, within twice the
+/// higher of the quote's rate and the lowest estimate; with fewer than six
+/// blocks to the punish, on the agreed tip, it doubles at each block,
+/// 64-fold at the punish, and past it without bound.
 #[test]
-fn a_refund_pays_the_highest_estimate_and_doubles_as_the_punish_nears() {
+fn a_refund_pays_the_highest_estimate_within_headroom_and_doubles_as_the_punish_nears() {
     let rate = |input: Value| -> u64 { parse(&refund_rate(&input.to_string()).unwrap()).unwrap() };
-    let refund = |estimates: Value| rate(json!({"estimates": estimates, "fallback": 10}));
-    assert_eq!(refund(json!([1, 500])), 500, "one source answers low");
-    assert_eq!(refund(json!([500, 1])), 500);
+    let refund =
+        |estimates: Value| rate(json!({"estimates": estimates, "fallback": 10, "quote_rate": 10}));
+    assert_eq!(refund(json!([12, 15])), 15, "the highest");
+    assert_eq!(refund(json!([15, 12])), 15);
     assert_eq!(refund(json!([null, 2.2])), 3);
     assert_eq!(refund(json!([null, null])), 10, "the fallback");
     assert_eq!(refund(json!([0.2, null])), 1, "the relay floor");
-    // What `feeRate` caps at twice the quote's rate, it does not.
-    let quote = json!({"estimates": [1, 500], "fallback": 10, "quote_rate": 10});
-    assert_eq!(
-        parse::<u64>(&fee_rate(&quote.to_string()).unwrap()).unwrap(),
-        1
-    );
+    // One source answering absurdly high pays at most twice the quote's
+    // rate, or the other's estimate.
+    assert_eq!(refund(json!([2, 1_000_000])), 20, "twice the quote");
+    // A source alone is the lowest too: one down and one lying is two.
+    assert_eq!(refund(json!([1_000, null])), 1_000, "one source alone");
+    assert_eq!(refund(json!([400, 1_000_000])), 800, "twice the other");
+    assert_eq!(refund(json!([400, 500])), 500);
 
-    let near = |punish_at: u32, tip: u32, height: u32| {
+    let near = |estimates: Value, punish_at: u32, tip: u32| {
         rate(json!({
-            "estimates": [2, 3], "fallback": 10, "punish_at": punish_at, "tip": tip,
-            "last": {"rate": 40, "height": height},
+            "estimates": estimates, "fallback": 10, "quote_rate": 10,
+            "punish_at": punish_at, "tip": tip,
         }))
     };
-    assert_eq!(near(200, 195, 194), 80, "five blocks left: doubled");
-    assert_eq!(near(200, 194, 193), 3, "six left: the estimate");
-    assert_eq!(near(200, 195, 195), 3, "doubled once a block");
-    assert_eq!(near(200, 230, 229), 80, "past the punish too");
-    let high = json!({
-        "estimates": [2, 300], "fallback": 10, "punish_at": 200, "tip": 199,
-        "last": {"rate": 40, "height": 198},
-    });
-    assert_eq!(rate(high), 300, "never below the estimate");
-    let unknown =
-        json!({"estimates": [2, 3], "fallback": 10, "tip": 199, "last": {"rate": 40, "height": 1}});
+    // One source answering low, as fees rose past the quote: held to 20
+    // sat/vB, then outbid block by block.
+    let low = || json!([1, 500]);
+    assert_eq!(near(low(), 200, 194), 20, "six left: the base");
+    assert_eq!(near(low(), 200, 195), 40, "five left: doubled");
+    assert_eq!(near(low(), 200, 199), 640);
+    assert_eq!(near(low(), 200, 200), 1280, "64-fold at the punish");
+    assert_eq!(near(low(), 200, 201), 2560, "past it, on");
+    assert_eq!(near(low(), 200, 300), u64::MAX, "saturated");
+    assert_eq!(near(low(), 200, u32::MAX), u64::MAX);
+    let unknown = json!({"estimates": [2, 3], "fallback": 10, "quote_rate": 10, "tip": 199});
     assert_eq!(rate(unknown), 3, "no punish height yet");
 }
 
