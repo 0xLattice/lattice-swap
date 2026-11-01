@@ -3,7 +3,7 @@
 use super::*;
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, OutPoint, Txid};
-use deposit::{change_child, deposit_quote, deposit_refused, fund_lock, refund_deposit};
+use deposit::{change_child, deposit_quote, deposit_refused, fee_rate, fund_lock, refund_deposit};
 use ed25519_dalek::SigningKey;
 use session::Ivy;
 use swap::Terms;
@@ -649,17 +649,19 @@ fn a_backup_keeps_the_deposit_key() {
     let buyer = json(&start_buyer(&terms(), &payout(), "buyer-payout").unwrap());
     let state = text(&buyer["state"]).unwrap();
     let wif = json(&new_bitcoin_key("regtest").unwrap())["wif"].clone();
-    let file = json(&backup(&state, Some(wif.as_str().unwrap().into())).unwrap())["file"].clone();
+    let browser = json!({"deposit": wif, "relay": "https://relay.example", "quote_rate": 7});
+    let file = json(&backup(&state, Some(browser.to_string())).unwrap())["file"].clone();
     let restored = json(&restore(file.as_str().unwrap()).unwrap());
-    assert_eq!(restored["deposit"], wif);
+    assert_eq!(restored["browser"], browser);
     assert_eq!(restored["state"], buyer["state"]);
     let restored = json(&restore(&self::file(&state)).unwrap());
-    assert_eq!(restored["deposit"], Value::Null);
+    assert_eq!(restored["browser"], Value::Null);
+    assert!(backup(&state, Some(r#"{"deposit": 1}"#.into())).is_err());
 }
 
 #[test]
 fn a_buyer_shows_where_its_swap_is() {
-    let status = |state: Value| json(&buyer_status(&state.to_string(), None).unwrap());
+    let status = |state: Value| json(&buyer_status(&state.to_string(), None, false).unwrap());
     let (_, buyer) = hellos();
     let locking = status(buyer["state"].clone());
     assert_eq!(locking["phase"], "locking");
@@ -670,7 +672,7 @@ fn a_buyer_shows_where_its_swap_is() {
         status(json!({"Done": {"Aborted": "Timeout"}}))["phase"],
         "aborted"
     );
-    assert!(buyer_status("[]", None).is_err());
+    assert!(buyer_status("[]", None, false).is_err());
 }
 
 /// One deposit of `value` to the key `wif`.
@@ -728,7 +730,7 @@ fn a_deposit_funds_the_lock_and_returns_its_change() {
     );
     let fee = funded_["fee"].as_u64().unwrap();
     assert!(fee >= 5 * funding.vsize() as u64, "{fee}");
-    assert_eq!(funded_["change"]["value"], 100_000 - fee);
+    assert_eq!(funding.output[1].value.to_sat(), 100_000 - fee);
     let event = text(&json!({"Funded": funded_["tx"]})).unwrap();
     let state = text(&buyer["state"]).unwrap();
     let stepped = json(&step_buyer(&state, &event).unwrap());
@@ -740,10 +742,10 @@ fn a_deposit_funds_the_lock_and_returns_its_change() {
     // The child: the two together pay the rate asked.
     let child = |rate: u64| {
         let input = json!({
-            "wif": wif, "funding": funded_["tx"], "funding_fee": fee,
-            "change": funded_["change"], "refund_script": refund, "fee_rate": rate,
+            "wif": wif, "parent": funded_["tx"], "parent_fee": fee,
+            "refund_script": refund, "fee_rate": rate,
         });
-        json(&change_child(&input.to_string()).unwrap())
+        json(&change_child(&input.to_string()).unwrap().unwrap())
     };
     for rate in [5, 50] {
         let paid = child(rate);
@@ -769,8 +771,12 @@ fn a_deposit_funds_the_lock_and_returns_its_change() {
     // Change too small to pay its own child goes to the fee; a deposit
     // that cannot pay the funding is refused.
     let exact = funded(1_000_000 + 1_400, 5).unwrap();
-    assert_eq!(exact["change"], Value::Null);
     assert_eq!(hex_tx(&exact["tx"]).output.len(), 1);
+    let none = json!({
+        "wif": wif, "parent": exact["tx"], "parent_fee": 1_400,
+        "refund_script": refund, "fee_rate": 5,
+    });
+    assert_eq!(change_child(&none.to_string()).unwrap(), None, "no change");
     assert_eq!(exact["fee"], 1_400);
     assert!(funded(1_000_000 + 100, 5).is_err());
 }
@@ -825,6 +831,61 @@ fn a_deposit_that_does_not_fit_is_refunded() {
     assert_eq!(tx.output[0].script_pubkey.to_hex_string(), refund);
     assert!(tx.output[0].value.to_sat() >= 50_000 - 10 * (tx.vsize() as u64 + 1));
     assert!(back(1_000).is_err(), "it would leave dust");
+}
+
+/// A spend pays the lowest source's estimate, bounded by twice the quote's
+/// rate: one source that answers high spends nothing more.
+#[test]
+fn a_spend_pays_the_lowest_estimate_within_the_quotes_headroom() {
+    let rate = |input: Value| -> u64 { parse(&fee_rate(&input.to_string()).unwrap()).unwrap() };
+    let spend =
+        |estimates: Value| rate(json!({"estimates": estimates, "fallback": 10, "quote_rate": 10}));
+    assert_eq!(spend(json!([2, 9000])), 2);
+    assert_eq!(spend(json!([9000, 2.2])), 3);
+    assert_eq!(spend(json!([500, 9000])), 20, "the quote's headroom");
+    assert_eq!(spend(json!([null, 9000])), 20, "one source alone");
+    assert_eq!(spend(json!([null, 12])), 12);
+    assert_eq!(spend(json!([null, null])), 10, "the fallback");
+    assert_eq!(spend(json!([0.2, 5])), 1, "the relay floor");
+    // The quote's own rate is bounded by nothing but the lowest estimate.
+    assert_eq!(rate(json!({"estimates": [500, 9000], "fallback": 10})), 500);
+    assert_eq!(
+        rate(json!({"estimates": [], "fallback": 10, "quote_rate": null})),
+        10
+    );
+}
+
+/// A Nexus node is judged as the CLI judges one: its genesis, its chain,
+/// and whether it keeps the state of past blocks.
+#[test]
+fn a_nexus_node_is_checked_as_the_cli_checks_one() {
+    let health = |height: u64| json!({"phase": "active", "height": height.to_string()});
+    assert_eq!(nexus_probe_height(&health(1).to_string()).unwrap(), "null");
+    assert_eq!(nexus_probe_height(&health(9).to_string()).unwrap(), "5");
+    let check = |chain: Value, genesis: &str, height: u64, past_state: Value| {
+        let input = json!({
+            "genesis": "genesis",
+            "chain_info": {"chain": chain, "genesisHash": genesis},
+            "health": health(height),
+            "past_state": past_state,
+        });
+        check_nexus(&input.to_string()).unwrap()
+    };
+    let nexus = || json!(["Nexus"]);
+    assert_eq!(check(nexus(), "genesis", 10, json!(true)), None);
+    assert_eq!(
+        check(nexus(), "genesis", 1, Value::Null),
+        None,
+        "too short to tell"
+    );
+    let other = check(nexus(), "other", 10, json!(true)).unwrap();
+    assert!(other.contains("genesis other, not genesis"), "{other}");
+    let child = check(json!(["Nexus", "Child"]), "genesis", 10, json!(true)).unwrap();
+    assert!(child.contains("not the Nexus chain"), "{child}");
+    for past_state in [json!(false), Value::Null] {
+        let forgetful = check(nexus(), "genesis", 10, past_state).unwrap();
+        assert!(forgetful.contains("no state of past blocks"), "{forgetful}");
+    }
 }
 
 #[test]

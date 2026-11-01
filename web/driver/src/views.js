@@ -5,9 +5,15 @@
 // every Esplora source, read independently, shows exactly the same: the
 // same tip, and the same transactions at the same depths. One source that
 // lies or lags then cannot make the buyer act on a chain the other does not
-// show; a disagreement, or a source that fails, means wait and read again,
-// never act. The Nexus view comes from one node, and is one view only when
-// `nexusOneTip` holds for the health read before and after it.
+// show; a disagreement, or a source that fails, means wait and read again.
+// The exception is what is safe whatever one source says, which the machine
+// does on each source's view alone (`Buyer::step_one_source` lists each
+// case): broadcasting the funding again, giving up at t1 and cancelling,
+// and the refund of a swap whose redeem was never signed; and the bump of a
+// waiting funding. A deposit, a refund once the redeem is signed, a claim,
+// and the end of a swap wait for every source. The Nexus view comes from
+// one node, and is one view only when `nexusOneTip` holds for the health
+// read before and after it.
 
 import { call, wasm } from './wasm.js';
 
@@ -52,8 +58,12 @@ export async function bitcoinView(esplora, lookups) {
 /** What every source in `sources` shows alike, by `read(source)`, or null
  * if any fails, shows nothing, or shows otherwise. */
 export async function agreed(sources, read) {
-  const seen = await Promise.all(sources.map((source) => read(source).catch(() => null)));
-  if (seen.some((one) => one === null)) return null;
+  return alike(await Promise.all(sources.map((source) => read(source).catch(() => null))));
+}
+
+/** What every read in `seen` shows, or null if any is null or differs. */
+export function alike(seen) {
+  if (seen.length === 0 || seen.some((one) => one === null)) return null;
   const first = JSON.stringify(seen[0]);
   return seen.every((one) => JSON.stringify(one) === first) ? seen[0] : null;
 }
@@ -129,17 +139,18 @@ export async function nexusView(nexus, watch) {
 
 /** Refuses a node on another Nexus than `genesis`, where a NEX lock is
  * worthless, or one that keeps no state of past blocks and so cannot say
- * how deep a transaction is: the CLI's own checks. */
+ * how deep a transaction is: the CLI's own checks, swap-wasm's
+ * `checkNexus`, on what this reads. */
 export async function checkNexus(nexus, genesis) {
-  const info = await nexus.get('/api/chain/info');
-  if (JSON.stringify(info.chain) !== '["Nexus"]' || info.genesisHash !== genesis) {
-    throw new Error(`refused: the Nexus node follows the chain of genesis ${info.genesisHash}, not ${genesis}`);
+  const chainInfo = await nexus.get('/api/chain/info');
+  const health = await nexus.get('/health');
+  const at = call('nexusProbeHeight', health);
+  let pastState = null;
+  if (at !== null) {
+    const block = await nexus.get(`/api/block/${at}`, true);
+    const probe = block && (await nexus.get(`/accounts/${wasm.nexusProbeAddress()}?block=${block.hash}`, true));
+    pastState = Boolean(probe);
   }
-  const height = Number((await nexus.get('/health')).height);
-  if (height < 2) return;
-  const block = await nexus.get(`/api/block/${Math.ceil(height / 2)}`, true);
-  const probe = block && (await nexus.get(`/accounts/${wasm.nexusProbeAddress()}?block=${block.hash}`, true));
-  if (!probe) {
-    throw new Error('the Nexus node keeps no state of past blocks, so it cannot tell how deep a transaction is');
-  }
+  const refused = wasm.checkNexus(JSON.stringify({ genesis, chain_info: chainInfo, health, past_state: pastState }));
+  if (refused !== undefined && refused !== null) throw new Error(refused);
 }

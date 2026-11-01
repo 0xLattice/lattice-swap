@@ -213,30 +213,30 @@ impl NodeArgs {
     /// block halfway up the chain shows whether it keeps that state; a chain
     /// too short to tell passes.
     fn check_nexus(&self, client: &Client) -> Result<()> {
-        let genesis = client.genesis()?;
-        if genesis != self.nexus_genesis {
-            return Err(format!(
-                "refused: the Nexus node follows the chain of genesis {genesis}, not {}, the \
-                 one --nexus-genesis names",
-                self.nexus_genesis
-            )
-            .into());
-        }
+        use swap_nexus_tx::rpc::parse::{check_node, past_state_probe, NodeRefusal};
+        let chain_info = client.chain_info()?;
         let height = client.health()?.height;
-        if height < 2 {
-            return Ok(());
-        }
-        let block = client
-            .block_hash(height.div_ceil(2))?
-            .ok_or("the Nexus node has no block halfway up its chain")?;
-        match client.account_at(&swap_nexus_tx::address(&[0; 32]), &block)? {
-            Some(_) => Ok(()),
-            None => Err(
-                "the Nexus node keeps no state of past blocks, so it cannot tell how deep a \
-                 transaction is: run it with --state all and --block-bodies all"
-                    .into(),
-            ),
-        }
+        let past_state = match past_state_probe(height) {
+            None => None,
+            Some(at) => Some(match client.block_hash(at)? {
+                Some(block) => client
+                    .account_at(&swap_nexus_tx::address(&[0; 32]), &block)?
+                    .is_some(),
+                None => false,
+            }),
+        };
+        check_node(&self.nexus_genesis, &chain_info, height, past_state).map_err(|refusal| {
+            match refusal {
+                NodeRefusal::OtherNexus { .. } => {
+                    format!("{refusal}, the one --nexus-genesis names")
+                }
+                NodeRefusal::NoPastState => {
+                    format!("{refusal}: run it with --state all and --block-bodies all")
+                }
+                NodeRefusal::Malformed(_) => refusal.to_string(),
+            }
+            .into()
+        })
     }
 
     /// A fresh address from the wallet, as the script that pays it.
@@ -373,8 +373,11 @@ struct OfferArgs {
     /// relay's offers and take one.
     #[arg(long, conflicts_with_all = ["listen", "advertise"])]
     relay: Option<String>,
-    /// Seconds to wait for the buyer to dial.
-    #[arg(long, default_value_t = 600)]
+    /// Seconds to wait for the buyer to dial. Long enough for a browser's
+    /// buyer, which takes the offer only once its deposit confirms, at the
+    /// fee estimate for 6 blocks: a deposit slower than that goes back to
+    /// it, since the offer is gone, and nothing is lost.
+    #[arg(long, default_value_t = 7200)]
     wait: u64,
     /// The fee rate, in sat/vB, that each Bitcoin swap transaction must pay
     /// when bitcoind has no fee estimate, as on regtest. Otherwise its

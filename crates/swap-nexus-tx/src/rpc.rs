@@ -160,14 +160,14 @@ impl Client {
     /// at height 0 of its canonical root chain, which `/api/chain/info`
     /// names when asked for no other chain.
     pub fn genesis(&self) -> Result<String> {
-        let json = self.get("/api/chain/info")?;
-        if json["chain"] != serde_json::json!(["Nexus"]) {
-            return Err(Error::Malformed(format!("not the Nexus chain: {json}")));
-        }
-        let genesis = json["genesisHash"]
-            .as_str()
-            .ok_or_else(|| Error::Malformed(format!("no genesisHash in {json}")))?;
-        Ok(cid_path(genesis)?.into())
+        let genesis = parse::genesis(&self.chain_info()?).map_err(Error::Malformed)?;
+        Ok(cid_path(&genesis)?.into())
+    }
+
+    /// `GET /api/chain/info` as the node answered it, for
+    /// [`parse::check_node`].
+    pub fn chain_info(&self) -> Result<Value> {
+        self.get("/api/chain/info")
     }
 
     /// The account at the tip. The node answers balance 0, nonce 0 for an
@@ -314,6 +314,77 @@ pub mod parse {
             best_header_height,
             tip: json["tipCID"].as_str().map(String::from),
         })
+    }
+
+    /// `GET /api/chain/info`, asked for no other chain: the genesis of the
+    /// Nexus the node follows, the block at height 0 of its root chain.
+    pub fn genesis(json: &Value) -> Result<String, String> {
+        if json["chain"] != serde_json::json!(["Nexus"]) {
+            return Err(format!("not the Nexus chain: {json}"));
+        }
+        json["genesisHash"]
+            .as_str()
+            .map(String::from)
+            .ok_or_else(|| format!("no genesisHash in {json}"))
+    }
+
+    /// The height of the block after which a node is asked for an account,
+    /// to tell whether it keeps the state of past blocks: halfway up its
+    /// chain of `height`, or none for a chain too short to tell.
+    pub fn past_state_probe(height: u64) -> Option<u64> {
+        (height >= 2).then(|| height.div_ceil(2))
+    }
+
+    /// Why a node will not do for a swap on the Nexus of `expected_genesis`.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum NodeRefusal {
+        /// Its `/api/chain/info` is not a root chain's: what is wrong.
+        Malformed(String),
+        /// It follows the Nexus of `genesis`, not of `expected`, where a
+        /// NEX lock is worthless.
+        OtherNexus { genesis: String, expected: String },
+        /// It keeps no state of past blocks, so every NEX lock would look
+        /// unmined and every claim drained.
+        NoPastState,
+    }
+
+    impl std::fmt::Display for NodeRefusal {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                NodeRefusal::Malformed(e) => write!(f, "unexpected node answer: {e}"),
+                NodeRefusal::OtherNexus { genesis, expected } => write!(
+                    f,
+                    "refused: the Nexus node follows the chain of genesis {genesis}, not {expected}"
+                ),
+                NodeRefusal::NoPastState => write!(
+                    f,
+                    "the Nexus node keeps no state of past blocks, so it cannot tell how deep a \
+                     transaction is"
+                ),
+            }
+        }
+    }
+
+    /// Judges a node for a swap on the Nexus of `expected_genesis`, from
+    /// its `/api/chain/info`, its `height`, and `past_state`: whether it
+    /// showed an account after the block at [`past_state_probe`], `None`
+    /// where there is no such block to ask after. Every swap tool asks the
+    /// same of its node, whatever reads it.
+    pub fn check_node(
+        expected_genesis: &str,
+        chain_info: &Value,
+        height: u64,
+        past_state: Option<bool>,
+    ) -> Result<(), NodeRefusal> {
+        let genesis = genesis(chain_info).map_err(NodeRefusal::Malformed)?;
+        if genesis != expected_genesis {
+            let expected = expected_genesis.into();
+            return Err(NodeRefusal::OtherNexus { genesis, expected });
+        }
+        match (past_state_probe(height), past_state) {
+            (None, _) | (Some(_), Some(true)) => Ok(()),
+            (Some(_), _) => Err(NodeRefusal::NoPastState),
+        }
     }
 
     /// `GET /api/block/:height`: the block's CID.

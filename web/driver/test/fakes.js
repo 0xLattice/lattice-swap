@@ -2,6 +2,7 @@
 // node and a relay, each answering only what a test set, and a seller,
 // swap-wasm's own machine, standing in for the session.
 
+import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
 import { readFileSync } from 'node:fs';
 import { call, load } from '../src/wasm.js';
@@ -55,19 +56,81 @@ export class Chain {
   }
 }
 
-/** An Esplora over `chain`: what it posts is logged in `posted`, and
- * `onPost(hex)` runs first. */
-export async function esplora(chain, onPost = () => {}) {
+/** `hex` as a transaction: `{txid, inputs: [{txid, vout, witness}],
+ * outputs: [{value, script}]}`, scripts and witness items in hex. */
+export function parseTx(hex) {
+  const b = Buffer.from(hex, 'hex');
+  let i = 0;
+  const take = (n) => b.subarray((i += n) - n, i);
+  const varint = () => {
+    const first = b[i++];
+    if (first < 0xfd) return first;
+    return first === 0xfd ? take(2).readUInt16LE() : take(4).readUInt32LE();
+  };
+  take(4);
+  const segwit = b[i] === 0 && b[i + 1] === 1;
+  if (segwit) i += 2;
+  const body = i;
+  const inputs = Array.from({ length: varint() }, () => {
+    const txid = Buffer.from(take(32)).reverse().toString('hex');
+    const vout = take(4).readUInt32LE();
+    take(varint());
+    take(4);
+    return { txid, vout, witness: [] };
+  });
+  const outputs = Array.from({ length: varint() }, () => ({
+    value: Number(take(8).readBigUInt64LE()),
+    script: take(varint()).toString('hex'),
+  }));
+  const end = i;
+  if (segwit) for (const input of inputs) input.witness = Array.from({ length: varint() }, () => take(varint()).toString('hex'));
+  const stripped = Buffer.concat([b.subarray(0, 4), b.subarray(body, end), take(4)]);
+  const sha = (data) => createHash('sha256').update(data).digest();
+  return { txid: Buffer.from(sha(sha(stripped))).reverse().toString('hex'), inputs, outputs };
+}
+
+/** Why `hex` cannot spend what it spends, as far as an Esplora over
+ * `chain` that took `posted` can tell, or null: each input spends an
+ * output of a transaction it knows, or one paying an address, and an input
+ * signed as P2WPKH spends a P2WPKH output. */
+function unspendable(chain, posted, hex) {
+  const known = new Map(posted.map((tx) => [parseTx(tx).txid, tx]));
+  for (const [txid, { hex: tx }] of chain.txs) if (!known.has(txid)) known.set(txid, tx);
+  for (const input of parseTx(hex).inputs) {
+    const outpoint = `${input.txid}:${input.vout}`;
+    if ([...chain.utxos.values()].flat().some((utxo) => `${utxo.txid}:${utxo.vout}` === outpoint)) continue;
+    let parent;
+    try {
+      parent = parseTx(known.get(input.txid));
+    } catch {
+      return `bad-txns-inputs-missingorspent: ${outpoint}`;
+    }
+    const output = parent.outputs[input.vout];
+    if (!output) return `bad-txns-inputs-missingorspent: ${outpoint}`;
+    const p2wpkh = input.witness.length === 2 && input.witness[1].length === 66;
+    if (p2wpkh && !/^0014[0-9a-f]{40}$/.test(output.script)) return `mandatory-script-verify-flag-failed: ${outpoint}`;
+  }
+  return null;
+}
+
+/** An Esplora over `chain`: what it takes is logged in `posted`, and
+ * `onPost(hex)` runs first; it refuses a transaction that spends what it
+ * cannot. `source.fees`, if set, are its estimates instead of the chain's,
+ * and while `source.down` holds it answers nothing. */
+export async function esplora(chain, onPost = () => {}, source = {}) {
   const posted = [];
   const server = await serve(async (method, path, body) => {
+    if (source.down) return [503, 'down'];
     if (method === 'POST' && path === '/tx') {
       await onPost(body);
+      const refused = unspendable(chain, posted, body);
+      if (refused) return [400, `sendrawtransaction RPC error: ${refused}`];
       posted.push(body);
-      return [200, 'txid'];
+      return [200, parseTx(body).txid];
     }
     if (path === '/blocks/tip/hash') return [200, chain.hash];
     if (path === `/block/${chain.hash}`) return [200, { height: chain.height, timestamp: chain.time }];
-    if (path === '/fee-estimates') return [200, chain.fees];
+    if (path === '/fee-estimates') return [200, source.fees ?? chain.fees];
     let m = path.match(/^\/tx\/(\w+)(\/hex)?$/);
     if (m) {
       const tx = chain.txs.get(m[1]);
@@ -96,7 +159,7 @@ export async function esplora(chain, onPost = () => {}) {
 export function nexus() {
   return serve((method, path) => {
     if (path === '/api/chain/info') return [200, { chain: ['Nexus'], genesisHash: 'genesis', minRelayFee: '1', height: '1' }];
-    if (path === '/health') return [200, { status: 'ok', height: '1', tip: 'tip', chain: 'Nexus' }];
+    if (path === '/health') return [200, { phase: 'active', height: '1', tipCID: 'tip' }];
   });
 }
 

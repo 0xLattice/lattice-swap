@@ -5,13 +5,15 @@
 //
 // A browser has no wallet: the buyer deposits to the address of a fresh
 // key, and once the deposit confirms the driver takes the offer and funds
-// the lock from it. A deposit that does not fit, an offer gone before it
-// confirms, or a swap aborted before the lock is funded, sends the deposit
-// back to the refund address, and no swap runs.
+// the lock from it. A deposit that does not fit, an offer gone or no longer
+// acceptable before it confirms, or a swap aborted before the lock is
+// funded, sends the deposit back to the refund address, and no swap runs.
+// The swap's own refund pays the deposit key too, and is sent on from there
+// to the refund address by a child that can bump it.
 
 import { call, safe, wasm } from './wasm.js';
 import { Esplora } from './esplora.js';
-import { agreed, agreedUtxos, bitcoinView, checkNexus, Nexus, nexusView } from './views.js';
+import { agreed, agreedUtxos, alike, bitcoinView, checkNexus, Nexus, nexusView } from './views.js';
 import { offers, postWatch, Session } from './relay.js';
 
 /** The CLI's own settings, where it has one. */
@@ -42,22 +44,25 @@ export const DEFAULTS = {
   /** Opens the session to the seller, as `Session.open`; tests stand a
    * seller in. */
   openSession: undefined,
+  /** The page's `navigator.locks`, so that one tab alone drives a swap,
+   * and `navigator.storage`, asked to keep the store; the browser's own
+   * where it has them. */
+  locks: undefined,
+  storage: undefined,
   now: () => Date.now(),
 };
 
 /** The blocks a fee estimate aims to confirm in, as the CLI's. */
 const FEE_TARGET = 6;
-/** No transaction here pays below 1 sat/vB, the default relay floor. */
-const MIN_RELAY = 1;
 /** About ten minutes a Bitcoin block. */
 const BLOCK_MS = 600_000;
 
-/** The variant a state is in: what the native driver times a quiet
- * counterparty by. */
 /** `f` on `input` as JSON, for a wasm call that answers plain text or
  * none: its text, or null. */
 const text = (f, input) => f(JSON.stringify(input)) ?? null;
 
+/** The variant a state is in: what the native driver times a quiet
+ * counterparty by. */
 const kind = (state) => {
   const value = JSON.parse(state);
   return typeof value === 'string' ? value : Object.keys(value)[0];
@@ -82,12 +87,16 @@ export class Buyer extends EventTarget {
   #warning = null;
   #status = '';
   #wake = null;
+  #persisted = null;
+  #elsewhere = false;
 
   constructor(config, record) {
     super();
     this.#c = { ...DEFAULTS, ...config };
     this.#c.fetch ??= (...args) => globalThis.fetch(...args);
     this.#c.WebSocket ??= globalThis.WebSocket;
+    if (this.#c.locks === undefined) this.#c.locks = globalThis.navigator?.locks ?? null;
+    if (this.#c.storage === undefined) this.#c.storage = globalThis.navigator?.storage ?? null;
     this.#r = record;
     this.#esplora = this.#c.esplora.map((url) => new Esplora(url, this.#c.fetch));
     this.#nexus = new Nexus(this.#c.nexus, this.#c.fetch);
@@ -113,40 +122,40 @@ export class Buyer extends EventTarget {
     // Reads only, before there is a record.
     const driver = new Buyer(c, null);
     await checkNexus(driver.#nexus, c.nexusGenesis);
-    const estimate = await driver.#estimate();
-    const minRelayFee = Number((await driver.#nexus.get('/api/chain/info')).minRelayFee);
-    const refused = text(wasm.checkOffer, {
-      offer: decoded,
-      policy,
-      network: c.network,
-      nexus_genesis: c.nexusGenesis,
-      fee_estimate: estimate === null ? null : Math.ceil(estimate * 1000),
-      min_relay_fee: minRelayFee,
-    });
+    const estimates = await driver.#estimates();
+    const refused = await driver.#refusal(decoded, policy, estimates);
     if (refused !== null) throw new Error(refused);
-    const started = call('startBuyer', JSON.stringify(decoded.terms), refundScript, nexAddress);
     const deposit = call('newBitcoinKey', c.network);
+    // The machine's refund pays the deposit key, which sends it on.
+    const started = call('startBuyer', JSON.stringify(decoded.terms), deposit.script_pubkey, nexAddress);
+    const quoteRate = call('feeRate', { estimates, fallback: c.fallbackFeeRate });
     const quote = call('depositQuote', {
       btc_amount: decoded.terms.btc_amount,
-      fee_rate: driver.#rate(estimate),
+      fee_rate: quoteRate,
       deposit_wif: deposit.wif,
       refund_script: refundScript,
     });
     const record = {
       swap_id: decoded.terms.swap_id,
       offer: decoded,
+      policy,
+      relay: decoded.relay,
       state: JSON.stringify(started.state),
       // The hello, sent once the deposit confirms and the offer is taken.
       pending: started.actions,
       deposit,
       refund_script: refundScript,
       quote,
+      quote_rate: quoteRate,
+      btc_fee: decoded.terms.btc_fee,
       backed_up: false,
+      backup_stale: false,
       taken: false,
       utxos: null,
       fee_rate: null,
       funding: null,
       child: null,
+      refund_child: null,
       deposit_refund: null,
       watch_posted: false,
     };
@@ -169,27 +178,38 @@ export class Buyer extends EventTarget {
   }
 
   /** The swap in a backup `file`, from {@link Buyer#backup}, carried on
-   * from the chains alone; any BTC back to `refundAddress`. */
+   * from the chains alone; any BTC back to `refundAddress`. The funding,
+   * if the file holds one, is the state's own: its change, found by the
+   * deposit key's script, is sent on as before, its child paying as if the
+   * funding paid no fee, at most the funding's fee more. */
   static async restore(config, { file, refundAddress }) {
     const c = { ...DEFAULTS, ...config };
     const restored = call('restore', file);
     if (restored.side !== 'buyer') throw new Error('not a buyer’s swap');
     const state = JSON.stringify(restored.state);
     const swapId = call('backup', state, undefined).name.replace(/\.json$/, '');
+    const { browser } = restored;
+    const status = JSON.parse(wasm.buyerStatus(state, undefined, false));
     const record = {
       swap_id: swapId,
       offer: null,
+      policy: null,
+      relay: browser?.relay ?? null,
       state,
       pending: [],
-      deposit: restored.deposit && call('bitcoinKeyOf', restored.deposit, c.network),
+      deposit: browser && call('bitcoinKeyOf', browser.deposit, c.network),
       refund_script: wasm.scriptOf(refundAddress, c.network),
       quote: null,
+      quote_rate: browser?.quote_rate ?? null,
+      btc_fee: status.btc_fee,
       backed_up: true,
+      backup_stale: false,
       taken: true,
       utxos: null,
       fee_rate: null,
-      funding: null,
+      funding: status.funding && { tx: status.funding, fee: 0 },
       child: null,
+      refund_child: null,
       deposit_refund: null,
       watch_posted: false,
     };
@@ -200,16 +220,23 @@ export class Buyer extends EventTarget {
   }
 
   /** The swap file for the buyer to keep, `{name, file}`: the state as it
-   * stands and the deposit key, which `lattice-swap resume` and
-   * {@link Buyer.restore} read. The deposit address is shown only once
-   * this was called. A file holds the swap as it stood when taken: one
-   * taken before the lock is funded recovers the deposit, not a swap
-   * under way, whose refund needs the seller's later signatures; the
-   * store holds those. */
+   * stands, the deposit key, the relay and the quote's fee rate, which
+   * `lattice-swap resume` and {@link Buyer.restore} read. The deposit
+   * address is shown only once this was called. A file holds the swap as
+   * it stood when taken: one taken before the seller's signatures recovers
+   * the deposit, not a swap under way, whose refund needs them; the store
+   * holds those, and `status().backupStale` says to take the file again. */
   async backup() {
-    const file = call('backup', this.#r.state, this.#r.deposit?.wif);
-    if (!this.#r.backed_up) {
-      this.#r.backed_up = true;
+    const r = this.#r;
+    const browser = r.deposit && {
+      deposit: r.deposit.wif,
+      relay: r.relay,
+      quote_rate: r.quote_rate ?? this.#c.fallbackFeeRate,
+    };
+    const file = call('backup', r.state, browser && JSON.stringify(browser));
+    if (!r.backed_up || r.backup_stale) {
+      r.backed_up = true;
+      r.backup_stale = false;
       await this.#save();
     }
     return file;
@@ -226,8 +253,16 @@ export class Buyer extends EventTarget {
    *   and `refunded` when the BTC comes back; or `punished`, `drained`;
    * - `deposit`: once backed up, `{address, amount, received,
    *   confirmations}`, `amount` in sat;
-   * - `mustStayOpen`: the redeem is signed and the swap not settled:
-   *   nothing but this page refunds or claims for the buyer then;
+   * - `mustStayOpen`: from the funding's broadcast until the swap is
+   *   settled, nothing but this page acts for the buyer, and a lapse can
+   *   cost it; except once it has given up with the redeem unsigned and a
+   *   watchtower holds its refund (`Buyer::must_stay_open`);
+   * - `backupStale`: the seller's signatures are saved since the last
+   *   {@link Buyer#backup}, whose file then recovers the deposit but not a
+   *   swap under way: take it again;
+   * - `persisted`: whether the browser agreed to keep the store under
+   *   storage pressure, null if unknown: if not, a page should warn;
+   * - `elsewhere`: another tab drives this swap, and this one does not;
    * - `deadlines`: `cancel`, the height from which the lock refunds, and
    *   `punish`, the height the refund must confirm before, each with `eta`
    *   in ms since the epoch, once known;
@@ -239,6 +274,9 @@ export class Buyer extends EventTarget {
       step: null,
       deposit: null,
       mustStayOpen: false,
+      backupStale: Boolean(r.backup_stale),
+      persisted: this.#persisted,
+      elsewhere: this.#elsewhere,
       deadlines: { cancel: null, punish: null },
       tip: this.#tip,
       warning: this.#warning,
@@ -247,7 +285,7 @@ export class Buyer extends EventTarget {
     else if (r.deposit_refund) status.step = r.deposit_refund.confirmed ? 'refunded' : 'refunding';
     else if (!r.taken) status.step = 'deposit';
     else {
-      const machine = call('buyerStatus', r.state, this.#view && JSON.stringify(this.#view));
+      const machine = JSON.parse(wasm.buyerStatus(r.state, this.#view ? JSON.stringify(this.#view) : undefined, r.watch_posted));
       status.step = machine.phase === 'aborted' ? 'refunding' : machine.phase;
       status.mustStayOpen = machine.must_stay_open;
       const eta = (height) => this.#c.now() + Math.max(0, height - (this.#tip ?? height)) * BLOCK_MS;
@@ -262,8 +300,28 @@ export class Buyer extends EventTarget {
   }
 
   /** Runs the swap until it ends, or `signal` aborts: the final step. A
-   * `status` event follows every change of {@link Buyer#status}. */
+   * `status` event follows every change of {@link Buyer#status}. Only one
+   * tab drives a swap: in another, this returns null at once, with
+   * `status().elsewhere` set. */
   async run(signal) {
+    try {
+      this.#persisted = (await this.#c.storage?.persist?.()) ?? null;
+    } catch {
+      this.#persisted = false;
+    }
+    if (!this.#c.locks) return this.#loop(signal);
+    return this.#c.locks.request(`lattice-swap:${this.swapId}`, { ifAvailable: true }, (lock) => {
+      if (lock === null) {
+        this.#elsewhere = true;
+        this.#announce();
+        return null;
+      }
+      this.#elsewhere = false;
+      return this.#loop(signal);
+    });
+  }
+
+  async #loop(signal) {
     while (!signal?.aborted) {
       let done = null;
       try {
@@ -308,15 +366,25 @@ export class Buyer extends EventTarget {
       await this.#refundDeposit('the swap stopped before the lock was funded');
       return null;
     }
+    if (phase === 'refunded' && r.deposit) {
+      await this.#forward();
+      return null;
+    }
     return ['swapped', 'refunded', 'punished', 'drained'].includes(phase) ? phase : null;
   }
 
   /** Feeds `event` to the machine, saves what changed, then does what it
-   * asks: nothing is sent or broadcast that a restart would not know of. */
-  async #apply(event) {
-    const stepped = call('stepBuyer', this.#r.state, JSON.stringify(event));
+   * asks: nothing is sent or broadcast that a restart would not know of.
+   * `oneSource`: `event` is one Bitcoin source's view, which the machine
+   * takes only as far as `Buyer::step_one_source` says. */
+  async #apply(event, oneSource = false) {
+    const stepped = oneSource
+      ? call('stepBuyerOneSource', this.#r.state, JSON.stringify(event.Bitcoin))
+      : call('stepBuyer', this.#r.state, JSON.stringify(event));
     const next = JSON.stringify(stepped.state);
     if (next !== this.#r.state) {
+      // The file taken before holds none of the seller's signatures.
+      if (kind(next) === 'SendingSignatures') this.#r.backup_stale = true;
       this.#r.state = next;
       await this.#save();
     }
@@ -355,7 +423,8 @@ export class Buyer extends EventTarget {
       await this.#apply({ Funded: funded.tx });
     } else if (action.Broadcast) {
       await this.#broadcast(action.Broadcast);
-      if (r.funding && action.Broadcast === r.funding.tx) await this.#child(r.fee_rate);
+      // The funding's change, or the refund, sent on from the deposit key.
+      await this.#child(action.Broadcast);
     } else if (action.Submit) {
       try {
         await this.#nexus.submit(wasm.nexusSubmitBody(JSON.stringify(action.Submit)));
@@ -372,57 +441,77 @@ export class Buyer extends EventTarget {
     if (sent.every((one) => one.status === 'rejected')) this.#warn(`broadcast: ${sent[0].reason.message}`);
   }
 
-  /** Sends the funding's change on to the refund address, its child paying
-   * for the two together at `rate`, if not at this rate already; then
-   * broadcasts it. The way a stuck funding is bumped: by CPFP, since the
-   * seller's signatures pin the funding's txid. */
-  async #child(rate) {
+  /** Sends what `parent`, the funding or the swap's refund, pays the
+   * deposit key on to the refund address, its child paying for the two
+   * together at `rate`, the spend rate by default, if not at this rate
+   * already; then broadcasts it. The way either is bumped while it waits:
+   * by CPFP, since the seller's signatures pin both txids. A parent that
+   * pays the deposit key nothing, as cancel, has no child. */
+  async #child(parent, rate) {
     const r = this.#r;
-    if (!r.funding?.change) return;
-    if (!r.child || rate > r.child.rate) {
+    if (!r.deposit) return;
+    const funding = parent === r.funding?.tx;
+    const slot = funding ? 'child' : 'refund_child';
+    rate ??= await this.#spendRate();
+    if (!r[slot] || rate > r[slot].rate) {
       const child = call('changeChild', {
         wif: r.deposit.wif,
-        funding: r.funding.tx,
-        funding_fee: r.funding.fee,
-        change: r.funding.change,
+        parent,
+        parent_fee: funding ? r.funding.fee : (r.btc_fee ?? 0),
         refund_script: r.refund_script,
         fee_rate: rate,
       });
-      r.child = { ...child, rate };
+      if (child === null) return;
+      // Each one replaced, in case it is the one that confirms.
+      const replaced = r[slot] ? [...(r[slot].replaced ?? []), r[slot].txid] : [];
+      r[slot] = { ...child, rate, replaced };
       await this.#save();
     }
-    await this.#broadcast(r.child.tx);
+    await this.#broadcast(r[slot].tx);
   }
 
+  /** Reads every Bitcoin source. A view they all show alike goes to the
+   * machine; otherwise each one's goes to it as one source's view, which it
+   * acts on only as far as no lie can turn against the buyer: so a source
+   * down for good still lets it cancel and refund. */
   async #observeBitcoin() {
     const watch = call('watchBuyer', this.#r.state).bitcoin;
     if (!watch) return;
-    const seen = await agreed(this.#esplora, (esplora) => bitcoinView(esplora, watch));
-    if (seen === null) return;
-    const { stale, first_seen } = call('bitcoinStale', {
-      tip: seen.tip,
-      first_seen: this.#firstSeen,
-      max_tip_age: this.#c.maxTipAge,
-      now: Math.floor(this.#c.now() / 1000),
-    });
-    this.#firstSeen = first_seen;
-    this.#tip = seen.tip.height;
-    this.#view = { ...seen.view, stale };
-    await this.#apply({ Bitcoin: this.#view });
-    await this.#bump(this.#view);
+    const seen = await Promise.all(this.#esplora.map((esplora) => bitcoinView(esplora, watch).catch(() => null)));
+    const all = alike(seen);
+    if (all !== null) {
+      const { stale, first_seen } = call('bitcoinStale', {
+        tip: all.tip,
+        first_seen: this.#firstSeen,
+        max_tip_age: this.#c.maxTipAge,
+        now: Math.floor(this.#c.now() / 1000),
+      });
+      this.#firstSeen = first_seen;
+      this.#tip = all.tip.height;
+      this.#view = { ...all.view, stale };
+      await this.#apply({ Bitcoin: this.#view });
+    } else {
+      for (const one of seen.filter((one) => one !== null)) {
+        this.#tip = Math.max(this.#tip ?? 0, one.tip.height);
+        await this.#apply({ Bitcoin: { ...one.view, stale: null } }, true);
+      }
+    }
+    for (const one of seen.filter((one) => one !== null)) await this.#bump(one.view);
   }
 
-  /** At each new block while the funding waits unconfirmed, raises its
-   * child to the fee estimate, if that is a rate above the last: by at
-   * least 1 sat/vB, which a replacement must add. */
+  /** At each new block while the funding waits unconfirmed, by any
+   * source, raises its child to the spend rate, if that is a rate above
+   * the last: by at least 1 sat/vB, which a replacement must add. The
+   * refund's child is raised each time the machine broadcasts the refund
+   * again. */
   async #bump(view) {
     const r = this.#r;
-    const waiting = r.funding?.change && r.child && (view.funding === null || view.funding === 0);
+    const waiting = r.funding && r.child && (view.funding === null || view.funding === 0);
     if (!waiting || view.height === this.#bumpedAt) return;
     this.#bumpedAt = view.height;
-    const rate = this.#rate(await this.#estimate());
+    const rate = await this.#spendRate();
     await this.#broadcast(r.funding.tx);
-    await this.#child(rate);
+    await this.#child(r.funding.tx, rate);
   }
 
   async #observeNexus() {
@@ -437,7 +526,7 @@ export class Buyer extends EventTarget {
    * CLI's condition (`Buyer::watchtower`), every `watchRetry` until it
    * takes them. */
   async #watchtower() {
-    const relay = this.#c.watchtower === undefined ? this.#r.offer?.relay : this.#c.watchtower;
+    const relay = this.#c.watchtower === undefined ? this.#r.relay : this.#c.watchtower;
     if (!relay || this.#r.watch_posted) return;
     if (this.#watchTried !== null && this.#c.now() - this.#watchTried < this.#c.watchRetry) return;
     const watch = wasm.watchRequest(this.#r.state, this.#c.network);
@@ -463,7 +552,8 @@ export class Buyer extends EventTarget {
     };
     if (seen.utxos.length === 0 || this.#deposit.confirmations < 1) return;
     r.utxos = seen.utxos.map(({ txid, vout, value }) => ({ txid, vout, value }));
-    r.fee_rate = this.#rate(await this.#estimate());
+    const estimates = await this.#estimates();
+    r.fee_rate = this.#feeRate(estimates);
     const refused = text(wasm.depositRefused, {
       utxos: r.utxos,
       btc_amount: r.offer.terms.btc_amount,
@@ -473,6 +563,10 @@ export class Buyer extends EventTarget {
     if (refused !== null) return this.#refundDeposit(refused);
     const listed = (await offers(r.offer.relay, this.#c.fetch)).map((text) => JSON.parse(text).terms?.swap_id);
     if (!listed.includes(r.swap_id)) return this.#refundDeposit('the offer is no longer listed');
+    // Judged again at today's fees: the offer's own fee may have fallen
+    // below them while the deposit confirmed.
+    const stale = await this.#refusal(r.offer, r.policy, estimates);
+    if (stale !== null) return this.#refundDeposit(stale);
     const open = this.#c.openSession ?? Session.open;
     this.#session = await open(r.offer, (message) => this.#receive(message), {
       WebSocket: this.#c.WebSocket,
@@ -505,21 +599,43 @@ export class Buyer extends EventTarget {
       wif: r.deposit.wif,
       utxos: r.utxos,
       refund_script: r.refund_script,
-      fee_rate: this.#rate(await this.#estimate()),
+      fee_rate: await this.#spendRate(),
     });
     r.deposit_refund = { tx, txid, why, confirmed: false };
     await this.#save();
     await this.#broadcast(tx);
   }
 
-  /** The deposit's refund, broadcast again until both sources show it in a
-   * block. */
+  /** Once the swap refunded to the deposit key, sends it on to the
+   * refund address: by the child of the refund this driver broadcast, or,
+   * for a refund a watchtower broadcast while the buyer was away, by
+   * sending on what the deposit key holds. */
+  async #forward() {
+    const r = this.#r;
+    const child = r.refund_child;
+    if (child) {
+      const { tx, txid, replaced } = child;
+      r.deposit_refund = { tx, txid, replaced, why: 'the swap refunded', confirmed: false };
+      await this.#save();
+      await this.#broadcast(tx);
+      return;
+    }
+    // The deposit's own outputs were spent by the funding: read anew.
+    r.utxos = null;
+    await this.#refundDeposit('the swap refunded');
+  }
+
+  /** The deposit's refund, broadcast again until both sources show it, or
+   * a version it replaced, in a block. */
   async #refunding() {
     const refund = this.#r.deposit_refund;
     if (refund.confirmed) return 'refunded';
     const seen = await agreed(this.#esplora, async (esplora) => {
-      const tx = await esplora.transaction(refund.txid);
-      return { seen: tx !== null, confirmed: tx?.height != null };
+      for (const txid of [refund.txid, ...(refund.replaced ?? [])]) {
+        const tx = await esplora.transaction(txid);
+        if (tx !== null) return { seen: true, confirmed: tx.height !== null };
+      }
+      return { seen: false, confirmed: false };
     });
     if (seen?.confirmed) {
       refund.confirmed = true;
@@ -530,19 +646,40 @@ export class Buyer extends EventTarget {
     return null;
   }
 
-  /** The best estimate any source gives for the CLI's target, in sat/vB,
-   * or null: a source that answers low would only slow the funding, and
-   * one that answers high only spends the deposit's headroom. */
-  async #estimate() {
-    const rates = await Promise.all(this.#esplora.map((esplora) => esplora.feeRate(FEE_TARGET).catch(() => null)));
-    const known = rates.filter((rate) => rate !== null);
-    return known.length ? Math.max(...known) : null;
+  /** Each source's estimate for the CLI's target, in sat/vB, null where
+   * one has none. */
+  #estimates() {
+    return Promise.all(this.#esplora.map((esplora) => esplora.feeRate(FEE_TARGET).catch(() => null)));
   }
 
-  /** The rate to pay, in whole sat/vB: the estimate, else the fallback,
-   * never below the relay floor. */
-  #rate(estimate) {
-    return Math.max(MIN_RELAY, Math.ceil(estimate ?? this.#c.fallbackFeeRate));
+  /** The rate a spend from the deposit key pays, by swap-wasm's `feeRate`:
+   * the lowest estimate, bounded by the quote's headroom. */
+  #feeRate(estimates) {
+    return call('feeRate', {
+      estimates,
+      fallback: this.#c.fallbackFeeRate,
+      quote_rate: this.#r.quote_rate ?? this.#c.fallbackFeeRate,
+    });
+  }
+
+  async #spendRate() {
+    return this.#feeRate(await this.#estimates());
+  }
+
+  /** Why the buyer refuses `offer` under `policy`, as the CLI's `take`, at
+   * the highest of `estimates` for its fee floor, or null: a source that
+   * answers low must not pass an offer whose cancel would not confirm. */
+  async #refusal(offer, policy, estimates) {
+    const known = estimates.filter((rate) => rate !== null);
+    const minRelayFee = Number((await this.#nexus.get('/api/chain/info')).minRelayFee);
+    return text(wasm.checkOffer, {
+      offer,
+      policy,
+      network: this.#c.network,
+      nexus_genesis: this.#c.nexusGenesis,
+      fee_estimate: known.length ? Math.ceil(Math.max(...known) * 1000) : null,
+      min_relay_fee: minRelayFee,
+    });
   }
 
   async #save() {

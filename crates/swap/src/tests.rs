@@ -889,6 +889,99 @@ fn the_refund_is_handed_over_only_once_the_redeem_is_given_up_unsigned() {
     assert_eq!(broadcast_txids(&actions), [refund_txid]);
 }
 
+/// On one source's view alone the buyer broadcasts the funding again, gives
+/// up at t1 and cancels, and refunds a swap whose redeem it never signed;
+/// it neither refunds once it has signed the redeem nor ends a swap.
+#[test]
+fn one_source_alone_does_only_what_no_lie_can_turn_against_the_buyer() {
+    let one = |buyer: Buyer, event: Event| {
+        let Event::Bitcoin(view) = event else {
+            unreachable!()
+        };
+        buyer.step_one_source(view)
+    };
+    let locked = locked();
+    let unseen = Event::Bitcoin(BitcoinView {
+        height: 100,
+        funding: None,
+        lock_spend: None,
+        cancel_spend: None,
+        stale: None,
+    });
+    let (buyer, actions) = one(locked.buyer.clone(), unseen);
+    assert!(matches!(buyer, Buyer::AwaitNexLock { .. }));
+    assert_eq!(broadcasts(&actions), [buyer.funding().unwrap().clone()]);
+
+    let (_, buyer, nex_lock) = locked.nex_locked();
+    let (early, actions) = one(buyer.clone(), btc(19, None, None));
+    assert!(matches!(early, Buyer::AwaitNexLock { .. }) && actions.is_empty());
+    let (unsigned, actions) = one(buyer.clone(), btc(20, None, None));
+    let (cancel, refund) = unsigned.watchtower().expect("given up unsigned");
+    assert_eq!(broadcast_txids(&actions), [cancel.compute_txid()]);
+    let (unsigned, actions) = one(unsigned, btc(21, Some((&cancel, 1)), None));
+    assert_eq!(broadcast_txids(&actions), [refund.compute_txid()]);
+    let (unsigned, actions) = one(unsigned, btc(22, Some((&cancel, 2)), Some((&refund, 1))));
+    assert!(matches!(unsigned, Buyer::Cancelling { .. }), "not ended");
+    assert!(actions.is_empty());
+
+    let (signed, _) = buyer.step(nexus(account(500_000, 0), mined(nex_lock.body, 1)));
+    assert!(one(signed.clone(), btc(19, None, None)).1.is_empty());
+    let (signed, actions) = one(signed, btc(20, None, None));
+    assert!(matches!(
+        signed,
+        Buyer::Cancelling {
+            redeem: Some(_),
+            ..
+        }
+    ));
+    assert_eq!(broadcast_txids(&actions), [cancel.compute_txid()]);
+    let (signed, actions) = one(signed, btc(30, Some((&cancel, 10)), None));
+    assert!(actions.is_empty(), "no refund on one source's depth");
+    let (signed, actions) = one(signed, btc(30, Some((&cancel, 10)), Some((&refund, 9))));
+    assert!(matches!(signed, Buyer::Cancelling { .. }) && actions.is_empty());
+}
+
+/// The buyer must stay open from the funding's broadcast until the swap is
+/// settled, but for a swap given up unsigned whose refund a watchtower
+/// holds.
+#[test]
+fn the_buyer_must_stay_open_from_the_funding_to_the_end() {
+    let open = |buyer: &Buyer| [false, true].map(|watched| buyer.must_stay_open(watched));
+    let (_, start, actions) = hellos();
+    assert_eq!(open(&start), [false; 2], "awaiting the funding");
+    let (signing, _) = start.step(Event::Funded(funding(&actions)));
+    assert_eq!(open(&signing), [false; 2], "the funding held back");
+
+    let (_, buyer, nex_lock) = locked().nex_locked();
+    assert!(matches!(buyer, Buyer::AwaitNexLock { .. }));
+    assert_eq!(open(&locked().buyer), [true; 2], "the funding broadcast");
+    assert_eq!(open(&buyer), [true; 2], "the NEX lock named");
+    let (unsigned, _) = buyer.clone().step(btc(20, None, None));
+    assert!(matches!(unsigned, Buyer::Cancelling { redeem: None, .. }));
+    assert_eq!(
+        open(&unsigned),
+        [true, false],
+        "until the watchtower holds it"
+    );
+
+    let (signed, _) = buyer.step(nexus(account(500_000, 0), mined(nex_lock.body, 1)));
+    assert!(matches!(signed, Buyer::AwaitRedeem { .. }));
+    assert_eq!(open(&signed), [true; 2], "the redeem signed");
+    let (cancelling, _) = signed.step(btc(20, None, None));
+    assert!(matches!(
+        cancelling,
+        Buyer::Cancelling {
+            redeem: Some(_),
+            ..
+        }
+    ));
+    assert_eq!(open(&cancelling), [true; 2], "no watchtower once signed");
+    assert_eq!(open(&buyer_claiming()), [true; 2], "claiming");
+    for outcome in [Outcome::Swapped, Outcome::Refunded, Outcome::Punished] {
+        assert_eq!(open(&Buyer::Done(outcome)), [false; 2]);
+    }
+}
+
 #[test]
 fn the_claim_pays_at_least_the_node_relay_fee() {
     let buyer = buyer_claiming();

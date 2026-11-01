@@ -10,6 +10,12 @@
 //! replaced funding could never be refunded. The child spends only our own
 //! output, so it can itself be replaced at a higher fee.
 //!
+//! The swap's own refund pays the deposit key too, and a child of it sends
+//! it on the same way: a refund stuck in the mempool, which must confirm
+//! before the seller can punish, is bumped by CPFP like the funding. A
+//! refund a watchtower broadcast, with the buyer away, waits at the deposit
+//! key until the buyer is back to send it on.
+//!
 //! Every fee rate here is in whole sat/vB. A deposit that cannot pay for
 //! the funding at the asked rate, or holds more than twice the quote, which
 //! is a mistake and not a fee, is refunded whole, less its fee, and no swap
@@ -38,6 +44,46 @@ struct Utxo {
 /// How much headroom over its fees the quote holds, for the fee rate to
 /// rise before the deposit confirms, and for a bump: twice the fees.
 const HEADROOM: u64 = 2;
+
+/// The rate, in whole sat/vB, a spend from the deposit key pays: the
+/// lowest of the Bitcoin sources' `estimates`, in sat/vB, null where one
+/// has none; `fallback` where none has one; never below 1 sat/vB, the
+/// default relay floor. Then, unless this is the quote's own rate, never
+/// above [`HEADROOM`] times `quote_rate`, the rate the quote was made at,
+/// whose fees the deposit holds that many times over.
+///
+/// The lowest, since the rate is spent: one source that answers high would
+/// otherwise spend the deposit on fees, and one that answers low only slows
+/// the spend. The bound holds even when every source answers high, as one
+/// alone does while the other is down. A rate risen past it leaves the
+/// spend waiting rather than paying more than the deposit was asked to hold
+/// for it. `{"estimates", "fallback", "quote_rate"}` in, `quote_rate`
+/// absent or null for the quote; the rate out, as a JSON number.
+#[wasm_bindgen(js_name = feeRate)]
+pub fn fee_rate(input: &str) -> Result<String> {
+    #[derive(Deserialize)]
+    struct Input {
+        estimates: Vec<Option<f64>>,
+        fallback: u64,
+        #[serde(default)]
+        quote_rate: Option<u64>,
+    }
+    let input: Input = parse(input)?;
+    let lowest = input
+        .estimates
+        .into_iter()
+        .flatten()
+        .filter(|rate| rate.is_finite() && *rate >= 0.0)
+        .reduce(f64::min);
+    // An estimate is never near 2^64 sat/vB; `as` saturates if it were.
+    let rate = lowest
+        .map_or(input.fallback, |rate| rate.ceil() as u64)
+        .max(1);
+    let cap = input
+        .quote_rate
+        .map_or(u64::MAX, |quote| quote.saturating_mul(HEADROOM));
+    text(&rate.min(cap))
+}
 
 /// The deposit key, and the P2WPKH output script it owns.
 fn key(wif: &str) -> Result<(PrivateKey, PublicKey, ScriptBuf)> {
@@ -168,8 +214,7 @@ pub fn deposit_refused(input: &str) -> Result<Option<String>> {
 /// `amount` at the lock's `script_pubkey`, at `fee_rate`, the change, if it
 /// pays for its own way on, back to the deposit key. `{"wif", "utxos",
 /// "script_pubkey", "amount", "fee_rate", "refund_script"}` in;
-/// `{"tx", "fee", "change"}` out, `change` the change's `{"vout",
-/// "value"}` or null.
+/// `{"tx", "fee"}` out.
 #[wasm_bindgen(js_name = fundLock)]
 pub fn fund_lock(input: &str) -> Result<String> {
     #[derive(Deserialize)]
@@ -211,57 +256,53 @@ pub fn fund_lock(input: &str) -> Result<String> {
     }
     let tx = signed(&input.wif, &input.utxos, outputs)?;
     let paid = total - tx.output.iter().map(|out| out.value.to_sat()).sum::<u64>();
-    text(&json!({
-        "tx": hex(&tx),
-        "fee": paid,
-        "change": change.map(|value| json!({"vout": 1, "value": value})),
-    }))
+    text(&json!({"tx": hex(&tx), "fee": paid}))
 }
 
-/// The child that sends the funding's change to `refund_script`, paying
-/// enough that it and the funding, which paid `funding_fee`, together pay
-/// `fee_rate`: never less than its own share, and never so much that the
-/// refund address gets dust. `{"wif", "funding", "funding_fee", "change",
-/// "refund_script", "fee_rate"}` in, `change` as [`fund_lock`] gave it;
-/// `{"tx", "fee"}` out.
+/// The child that sends what `parent` pays the deposit key on to
+/// `refund_script`, paying enough that it and `parent`, which paid
+/// `parent_fee`, together pay `fee_rate`: never less than its own share, and
+/// never so much that the refund address gets dust. `parent` is the funding,
+/// whose change it returns, or the swap's refund, which pays the deposit key
+/// so that a refund stuck in the mempool can be bumped. `{"wif", "parent",
+/// "parent_fee", "refund_script", "fee_rate"}` in; `{"tx", "txid", "fee"}`
+/// out, or null if `parent` pays the deposit key nothing.
 #[wasm_bindgen(js_name = changeChild)]
-pub fn change_child(input: &str) -> Result<String> {
-    #[derive(Deserialize)]
-    struct Change {
-        vout: u32,
-        value: u64,
-    }
+pub fn change_child(input: &str) -> Result<Option<String>> {
     #[derive(Deserialize)]
     struct Input {
         wif: String,
         #[serde(deserialize_with = "tx")]
-        funding: Transaction,
-        funding_fee: u64,
-        change: Change,
+        parent: Transaction,
+        parent_fee: u64,
         refund_script: ScriptBuf,
         fee_rate: u64,
     }
     let input: Input = parse(input)?;
+    let (_, _, deposit) = key(&input.wif)?;
+    let Some((vout, change)) = (input.parent.output.iter().enumerate())
+        .find(|(_, out)| out.script_pubkey == deposit)
+        .map(|(vout, out)| (vout as u32, out.value.to_sat()))
+    else {
+        return Ok(None);
+    };
     let rate = input.fee_rate;
     let child = vsize(1, &[&input.refund_script]);
     let own = child.saturating_mul(rate);
-    let package = (input.funding.weight().to_vbytes_ceil() + child).saturating_mul(rate);
-    let most = input
-        .change
-        .value
-        .saturating_sub(input.refund_script.minimal_non_dust().to_sat());
-    let paid = package.saturating_sub(input.funding_fee).max(own).min(most);
+    let package = (input.parent.weight().to_vbytes_ceil() + child).saturating_mul(rate);
+    let most = change.saturating_sub(input.refund_script.minimal_non_dust().to_sat());
+    let paid = package.saturating_sub(input.parent_fee).max(own).min(most);
     let utxo = Utxo {
-        txid: input.funding.compute_txid(),
-        vout: input.change.vout,
-        value: input.change.value,
+        txid: input.parent.compute_txid(),
+        vout,
+        value: change,
     };
     let output = TxOut {
-        value: Amount::from_sat(input.change.value - paid),
+        value: Amount::from_sat(change - paid),
         script_pubkey: input.refund_script,
     };
     let tx = signed(&input.wif, &[utxo], vec![output])?;
-    text(&json!({"tx": hex(&tx), "fee": paid}))
+    text(&json!({"tx": hex(&tx), "txid": tx.compute_txid(), "fee": paid})).map(Some)
 }
 
 /// The deposit `utxos` back to `refund_script`, less the fee at

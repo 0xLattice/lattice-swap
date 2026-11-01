@@ -84,6 +84,15 @@ pub fn step_buyer(state: &str, event: &str) -> Result<String> {
     step::<Buyer>(state, event)
 }
 
+/// Feeds one Bitcoin source's `view` to a buyer's `state`, as
+/// [`Buyer::step_one_source`] takes it: a step. For a page that reads
+/// several sources and gives `stepBuyer` a view only when they all show it.
+#[wasm_bindgen(js_name = stepBuyerOneSource)]
+pub fn step_buyer_one_source(state: &str, view: &str) -> Result<String> {
+    let (buyer, actions) = parse::<Buyer>(state)?.step_one_source(parse(view)?);
+    stepped(&buyer, &actions)
+}
+
 fn step<M: Machine>(state: &str, event: &str) -> Result<String> {
     let machine: M = parse(state)?;
     let event: Event = parse(event)?;
@@ -104,15 +113,18 @@ fn stepped<M: Machine>(machine: &M, actions: &[swap::Action]) -> Result<String> 
 /// `name` is `<swap id>.json`, the name `lattice-swap resume` needs.
 /// Refuses anything but a seller's or buyer's state, and a finished swap,
 /// which no longer names its swap id. A buyer funding from a deposit
-/// address gives its key, as WIF, as `deposit`: the file keeps it, and
-/// `lattice-swap resume` ignores it.
+/// address gives `browser`, `{"deposit", "relay", "quote_rate"}`: the
+/// deposit key as WIF, the relay its watchtower is, if any, and the fee
+/// rate its quote was made at. The file keeps it, and `lattice-swap resume`
+/// ignores it.
 #[wasm_bindgen]
-pub fn backup(state: &str, deposit: Option<String>) -> Result<String> {
+pub fn backup(state: &str, browser: Option<String>) -> Result<String> {
     let (_, state, terms) = machine(parse(state)?)?;
     let terms = terms.ok_or("the swap is over: there is nothing to resume")?;
     let mut file = json!({"version": STATE_VERSION, "state": state});
-    if let Some(deposit) = deposit {
-        file["deposit"] = deposit.into();
+    if let Some(browser) = browser {
+        file["browser"] =
+            serde_json::to_value(parse::<Browser>(&browser)?).map_err(|e| e.to_string())?;
     }
     text(&json!({
         "name": format!("{}.json", hex::encode(terms.swap_id)),
@@ -120,9 +132,17 @@ pub fn backup(state: &str, deposit: Option<String>) -> Result<String> {
     }))
 }
 
+/// What a browser's buyer keeps in its swap file beside the state.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Browser {
+    deposit: String,
+    relay: Option<String>,
+    quote_rate: u64,
+}
+
 /// A swap file's state and its side: `{"side": "seller" | "buyer",
-/// "state", "deposit"}`, `deposit` the key [`backup`] kept, or null.
-/// Refuses a file of another state version, as the driver does.
+/// "state", "browser"}`, `browser` what [`backup`] kept, or null. Refuses a
+/// file of another state version, as the driver does.
 #[wasm_bindgen]
 pub fn restore(file: &str) -> Result<String> {
     let mut file: Value = parse(file)?;
@@ -132,8 +152,12 @@ pub fn restore(file: &str) -> Result<String> {
             "state version {version}, but this build reads only {STATE_VERSION}"
         ));
     }
+    let browser = match file["browser"].take() {
+        Value::Null => None,
+        browser => Some(serde_json::from_value::<Browser>(browser).map_err(|e| e.to_string())?),
+    };
     let (side, state, _) = machine(file["state"].take())?;
-    text(&json!({"side": side, "state": state, "deposit": file["deposit"]}))
+    text(&json!({"side": side, "state": state, "browser": browser}))
 }
 
 /// A state's side, the state, and its terms until the swap ends.
@@ -302,6 +326,33 @@ pub fn is_cid(text: &str) -> bool {
     swap_nexus_tx::is_cid(text)
 }
 
+/// The height of the block after which to read [`nexus_probe_address`]'s
+/// account, to tell whether a node keeps the state of past blocks, given
+/// its `/health`: a JSON number, or null for a chain too short to tell.
+#[wasm_bindgen(js_name = nexusProbeHeight)]
+pub fn nexus_probe_height(health: &str) -> Result<String> {
+    text(&answer::past_state_probe(
+        answer::health(&parse(health)?)?.height,
+    ))
+}
+
+/// Why a Nexus node will not do, as the CLI refuses one, or null:
+/// `{"genesis", "chain_info", "health", "past_state"}` in, `chain_info` and
+/// `health` its answers, `past_state` whether it showed the account after
+/// the block at [`nexus_probe_height`], null where there is none.
+#[wasm_bindgen(js_name = checkNexus)]
+pub fn check_nexus(input: &str) -> Result<Option<String>> {
+    let input: Value = parse(input)?;
+    let genesis = input["genesis"].as_str().ok_or("no genesis")?;
+    let height = answer::health(&input["health"])?.height;
+    let past_state = input["past_state"].as_bool();
+    Ok(
+        answer::check_node(genesis, &input["chain_info"], height, past_state)
+            .err()
+            .map(|refusal| refusal.to_string()),
+    )
+}
+
 /// An address nobody holds, whose account after a past block shows
 /// whether a Nexus node keeps the state of past blocks, as the CLI asks.
 #[wasm_bindgen(js_name = nexusProbeAddress)]
@@ -453,33 +504,30 @@ pub fn watch_request(state: &str, network: &str) -> Result<Option<String>> {
         .transpose()
 }
 
-/// Where a buyer's swap is, for a page to show: `{"phase",
-/// "awaits_message", "must_stay_open", "cancel_at", "punish_at"}`, given its `state` and the
-/// last Bitcoin view, or null. `phase` is `locking` until the NEX lock is
-/// trusted, `finishing` once the redeem is signed, `refunding` once it
-/// cancels, then the outcome: `swapped`, `refunded`, `punished`, `drained`
-/// or `aborted`. `must_stay_open` holds while the redeem is signed and the
-/// swap not settled: nothing but this page refunds or claims for it then.
-/// `cancel_at` is the Bitcoin height from which cancel can be broadcast,
-/// once the lock is in a block; `punish_at` the height from which the
-/// seller can punish, once cancel is, which the refund must beat.
+/// Where a buyer's swap is, for a page to show, given its `state`, the
+/// last Bitcoin `view` or null, and whether a watchtower holds its refund:
+/// `{"phase", "awaits_message", "must_stay_open", "cancel_at",
+/// "punish_at", "funding", "btc_fee"}`.
+///
+/// - `phase` is `locking` until the NEX lock is trusted, `finishing` once
+///   the redeem is signed, `refunding` once it cancels, then the outcome:
+///   `swapped`, `refunded`, `punished`, `drained` or `aborted`.
+/// - `must_stay_open` is [`Buyer::must_stay_open`]: nothing but this page
+///   acts for the buyer, and a lapse can cost it.
+/// - `cancel_at` is the Bitcoin height from which cancel can be broadcast,
+///   once the lock is in a block; `punish_at` the height from which the
+///   seller can punish, once cancel is, which the refund must beat.
+/// - `funding` is the signed funding transaction, once held, and
+///   `btc_fee` the fee each swap transaction pays, while the swap runs.
 #[wasm_bindgen(js_name = buyerStatus)]
-pub fn buyer_status(state: &str, view: Option<String>) -> Result<String> {
+pub fn buyer_status(state: &str, view: Option<String>, watched: bool) -> Result<String> {
     let buyer: Buyer = parse(state)?;
     let view: Option<BitcoinView> = view.as_deref().map(parse).transpose()?;
-    let value: Value = parse(state)?;
-    let redeem_signed = |field: &Value| !field["redeem"].is_null();
-    let (phase, must_stay_open) = match &value {
-        Value::Object(state) => match state.iter().next() {
-            Some((name, inner)) => match name.as_str() {
-                "AwaitRedeem" | "ClaimingNex" => ("finishing", true),
-                "Cancelling" => ("refunding", redeem_signed(inner)),
-                "Done" => (outcome(inner), false),
-                _ => ("locking", false),
-            },
-            None => return Err("not a buyer's state".into()),
-        },
-        _ => return Err("not a buyer's state".into()),
+    let phase = match &buyer {
+        Buyer::AwaitRedeem { .. } | Buyer::ClaimingNex(_) => "finishing",
+        Buyer::Cancelling { .. } => "refunding",
+        Buyer::Done(outcome) => self::outcome(outcome),
+        _ => "locking",
     };
     let (mut cancel_at, mut punish_at) = (None, None);
     if let (Some((swap, lock)), Some(view), Some(terms)) =
@@ -501,20 +549,22 @@ pub fn buyer_status(state: &str, view: Option<String>) -> Result<String> {
     text(&json!({
         "phase": phase,
         "awaits_message": buyer.awaits_message(),
-        "must_stay_open": must_stay_open,
+        "must_stay_open": buyer.must_stay_open(watched),
         "cancel_at": cancel_at,
         "punish_at": punish_at,
+        "funding": buyer.funding().map(bitcoin::consensus::encode::serialize_hex),
+        "btc_fee": buyer.terms().map(|terms| terms.btc_fee.to_sat()),
     }))
 }
 
 /// An outcome's name, as `buyer_status` gives it.
-fn outcome(outcome: &Value) -> &'static str {
-    match outcome.as_str() {
-        Some("Swapped") => "swapped",
-        Some("Refunded") => "refunded",
-        Some("Punished") => "punished",
-        Some("Drained") => "drained",
-        _ => "aborted",
+fn outcome(outcome: &swap::Outcome) -> &'static str {
+    match outcome {
+        swap::Outcome::Swapped => "swapped",
+        swap::Outcome::Refunded => "refunded",
+        swap::Outcome::Punished => "punished",
+        swap::Outcome::Drained => "drained",
+        swap::Outcome::Aborted(_) => "aborted",
     }
 }
 

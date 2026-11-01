@@ -354,6 +354,97 @@ impl Buyer {
         }))
     }
 
+    /// The signed funding transaction, once the buyer holds it and until the
+    /// swap ends.
+    pub fn funding(&self) -> Option<&Transaction> {
+        use Buyer::*;
+        match self {
+            AwaitSellerSignatures { funding, .. } => Some(funding),
+            SendingSignatures(locked)
+            | AwaitNexLock { locked, .. }
+            | AwaitRedeem { locked, .. }
+            | Cancelling { locked, .. } => Some(&locked.funding),
+            AwaitSellerHello(_) | AwaitFunded(_) | ClaimingNex(_) | Done(_) => None,
+        }
+    }
+
+    /// Whether a lapse of this buyer can cost it, nothing else acting for
+    /// it: from the funding's broadcast, as t1 nears with no one to cancel,
+    /// until the swap is settled; except once it has given up with the
+    /// redeem unsigned and a watchtower holds its refund, `watched`.
+    pub fn must_stay_open(&self, watched: bool) -> bool {
+        use Buyer::*;
+        match self {
+            AwaitNexLock { .. } | AwaitRedeem { .. } | ClaimingNex(_) => true,
+            Cancelling { .. } => !watched || self.watchtower().is_none(),
+            AwaitSellerHello(_)
+            | AwaitFunded(_)
+            | AwaitSellerSignatures { .. }
+            | SendingSignatures(_)
+            | Done(_) => false,
+        }
+    }
+
+    /// Steps on one Bitcoin source's view, for a driver that reads several
+    /// and steps the machine on a view only when every source shows it
+    /// alike: what is safe on one source's word, whatever it says, so that
+    /// a source down or blocked for good does not keep the buyer from its
+    /// refund. Each of the machine's Bitcoin decisions:
+    ///
+    /// - The funding broadcast again while unseen: one source. It is signed,
+    ///   and the seller's signatures are made against its txid.
+    /// - Giving up, at t1 or on a spend of the lock, and broadcasting
+    ///   cancel: one source. A lie ends a swap that could have gone
+    ///   through, and nothing more: cancel before t1 is refused by
+    ///   consensus, and a buyer that gave up signs no redeem.
+    /// - The refund with the redeem unsigned, once cancel is in a block: one
+    ///   source. It reveals `b`, as the watchtower's copy does, to a seller
+    ///   that can then take nothing the buyer has not given up; early, it
+    ///   is refused.
+    /// - The refund with the redeem signed: every source. It waits for
+    ///   cancel `btc_confirmations` deep, or a seller that orphans cancel's
+    ///   block and redeems learns `b` and takes both coins: a source that
+    ///   lies about the depth hands it that.
+    /// - Claiming the NEX on a redeem seen: every source. Waiting costs
+    ///   nothing: the NEX lock goes back to the seller only with `b`, which
+    ///   only the refund reveals.
+    /// - The end, refunded or punished, on a spend of cancel deep enough:
+    ///   every source. Ending on a lie stops the refund going out, and a
+    ///   punish may then win.
+    ///
+    /// Any other state, or event, is left as it is.
+    pub fn step_one_source(self, view: BitcoinView) -> (Self, Vec<Action>) {
+        use Buyer::*;
+        let (locked, redeem) = match self {
+            AwaitNexLock { locked, cid } if !locked.gives_up(&view) => {
+                return AwaitNexLock { locked, cid }.step(Event::Bitcoin(view));
+            }
+            AwaitNexLock { locked, .. } => (locked, None),
+            AwaitRedeem { locked, redeem } if locked.gives_up(&view) => (locked, Some(redeem)),
+            Cancelling { locked, redeem } => (locked, redeem),
+            state => return (state, vec![]),
+        };
+        let (lock, signed) = (locked.lock, redeem.is_some());
+        let kept = Cancelling {
+            locked: locked.clone(),
+            redeem: redeem.clone(),
+        };
+        match locked.cancelling(redeem, view) {
+            (state @ Cancelling { .. }, mut actions) => {
+                // Cancel alone, of what spends the lock, once the redeem is
+                // signed.
+                if signed {
+                    actions.retain(|action| {
+                        matches!(action, Action::Broadcast(tx)
+                            if tx.input.iter().any(|input| input.previous_output == lock))
+                    });
+                }
+                (state, actions)
+            }
+            _ => (kept, vec![]),
+        }
+    }
+
     /// The Nexus address the NEX is locked at, once the hellos are
     /// exchanged and until the swap ends.
     pub fn lock_address(&self) -> Option<String> {

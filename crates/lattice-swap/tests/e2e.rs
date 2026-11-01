@@ -933,7 +933,7 @@ fn the_browser_refunds_when_the_seller_goes() {
     let world = World::new();
     let (url, relay, _watches) = relay(&world);
     let (mut seller, offer, swap_id, seller_out) = world.offer_on(24, 2, Some(&url));
-    let (mut buyer, _, buyer_out) = world.browser_take(world.browser_config(&offer, 24));
+    let (mut buyer, config, buyer_out) = world.browser_take(world.browser_config(&offer, 24));
     world.drive(
         false,
         || true,
@@ -945,6 +945,13 @@ fn the_browser_refunds_when_the_seller_goes() {
     let status = world.finish(&mut buyer, true, false);
     assert!(status.success(), "{status}");
     assert_eq!(buyer_out.join().unwrap(), "outcome: refunded\n");
+    // The refund paid the deposit key, which sent it on.
+    let config: Value = serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+    let received = wallet_client(&world.bitcoind, "buyer")
+        .call("getreceivedbyaddress", json!([config["refund_address"], 1]))
+        .unwrap();
+    let received = Amount::from_btc(received.as_f64().unwrap()).unwrap();
+    assert!(received > BTC_AMOUNT - BTC_FEE * 10, "{received}");
     assert_eq!(relay.watchtower.len(), 1);
     assert_eq!(world.nexus.balance(&world.buyer_nex), 0);
 }
