@@ -346,14 +346,6 @@ impl BuyerLocked {
             .expect("the seller's adaptor signature was verified")
     }
 
-    /// How deep cancel must be before the refund, which reveals `b`.
-    fn refund_depth(&self, redeem: &Option<EncryptedSignature>) -> u32 {
-        match redeem {
-            Some(_) => self.setup.terms.btc_confirmations,
-            None => 1,
-        }
-    }
-
     /// The lock was spent, or cancel is due.
     fn gives_up(&self, view: &BitcoinView) -> bool {
         view.lock_spend.is_some() || self.setup.terms.cancel_due(view)
@@ -369,10 +361,16 @@ impl BuyerLocked {
         let mut actions = vec![];
         match setup.spend(self.lock, &view.lock_spend) {
             // The seller redeemed, in a block or still in the mempool: `s` is
-            // public either way.
+            // public either way. A copy that never signed the redeem derives
+            // the adaptor signature it would have sent: signing is
+            // deterministic, and `recover` takes only the proven `s`.
             Some((Spend::Redeem, _)) => {
                 let tx = &view.lock_spend.as_ref().expect("matched").tx;
-                let s = redeem
+                let adaptor = redeem.clone().or_else(|| {
+                    let key = setup.secrets.key();
+                    setup.swap().encrypted_sign(self.lock, Spend::Redeem, &key)
+                });
+                let s = adaptor
                     .as_ref()
                     .and_then(|adaptor| setup.recover(self.lock, Spend::Redeem, adaptor, tx));
                 if let Some(s) = s {
@@ -386,11 +384,11 @@ impl BuyerLocked {
                 ));
             }
             None => {}
-            // Refund only once cancel is in a block: a refund spending a
-            // cancel that a redeem then displaces would hand the seller `b`.
-            // Once the seller holds our redeem signature, a seller that
-            // orphans the block could do just that, so cancel must be
-            // `btc_confirmations` deep.
+            // Refund only once cancel is `btc_confirmations` deep: a refund
+            // spending a cancel that a redeem then displaces would hand the
+            // seller `b`. A seller holding our redeem signature that orphans
+            // the block could do just that, and no copy of this state can
+            // tell whether another copy sent it, so the depth holds always.
             Some((_, cancel_depth)) => match &view.cancel_spend {
                 Some(spent) if spent.confirmations >= terms.btc_confirmations => {
                     let outcome = match setup.spend(self.lock, &view.cancel_spend) {
@@ -405,7 +403,7 @@ impl BuyerLocked {
                 Some(spent) if spent.confirmations > 0 => {}
                 // A spend still in the mempool may yet be replaced by the
                 // refund, so the refund goes out until one is in a block.
-                _ if cancel_depth >= self.refund_depth(&redeem) => {
+                _ if cancel_depth >= terms.btc_confirmations => {
                     actions.push(Action::Broadcast(self.refund()));
                 }
                 _ => {}

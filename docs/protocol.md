@@ -167,9 +167,9 @@ only one small child, so nobody else can pin them.
 - The buyer is safe as long as its refund confirms before `t2` and stays
   confirmed: a reorg reaching below the refund's block after `t2` puts it
   back in the mempool, where the seller contests it. The buyer refunds once
-  cancel is in a block, or `btc_confirmations` deep once it has sent its
-  redeem signature, leaving at least `t2 - btc_confirmations` blocks of
-  margin. After `t2`, the punish leaf takes the seller's signature alone,
+  cancel is `btc_confirmations` deep, whether or not it sent its redeem
+  signature (a copy of its state cannot know whether another copy did),
+  leaving at least `t2 - btc_confirmations` blocks of margin. After `t2`, the punish leaf takes the seller's signature alone,
   so the seller can spend the cancel output in a shape no refund can
   replace at any fee, and contesting a punish is best effort.
 

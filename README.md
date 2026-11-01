@@ -152,9 +152,8 @@ sat, `--max-nex-fee` 1000, `--max-t1` 288, `--min-t2` 144,
 `--min-btc-confirmations` 6, `--max-btc-confirmations` 12,
 `--min-refund-window` 72, `--min-nex-confirmations` 24 and `--min-margin` 6 by
 default. Either side refuses a `--btc-amount` below two `--btc-fee`, which
-redeem pays, plus 546 sat, the highest dust limit of a wallet's payout. Once
-the buyer has signed the redeem, it refunds only when cancel is
-`btc-confirmations` deep, and the seller can punish once cancel is `t2` deep:
+redeem pays, plus 546 sat, the highest dust limit of a wallet's payout. The
+buyer refunds only when cancel is `btc-confirmations` deep, and the seller can punish once cancel is `t2` deep:
 the refund window is `t2 - btc-confirmations` blocks. The buyer also refuses a
 `--btc-fee` at which cancel or refund, the spends it relies on, pays less than
 its bitcoind's conservative fee estimate for 6 blocks, or, where bitcoind has

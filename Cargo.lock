@@ -1695,6 +1695,7 @@ dependencies = [
  "schnorr_fun",
  "serde",
  "serde_json",
+ "sha2",
  "swap-bitcoin",
  "swap-core",
  "swap-nexus",

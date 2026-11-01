@@ -818,10 +818,10 @@ fn terms_leave_room_for_a_block_and_for_the_refund() {
     assert!(deepest.check().is_err(), "no overflow");
 }
 
-/// Once the seller holds its redeem signature, the buyer refunds only on
-/// a cancel `btc_confirmations` deep.
+/// The buyer refunds only on a cancel `btc_confirmations` deep, whether or
+/// not this copy of it signed the redeem: another copy may have.
 #[test]
-fn a_buyer_that_signed_the_redeem_refunds_on_a_deep_cancel() {
+fn a_buyer_refunds_only_on_a_deep_cancel() {
     let deep = Terms {
         btc_confirmations: 2,
         ..terms()
@@ -840,9 +840,13 @@ fn a_buyer_that_signed_the_redeem_refunds_on_a_deep_cancel() {
     let (_, actions) = signed.step(btc(22, Some((cancel, 2)), None));
     assert_eq!(broadcasts(&actions).len(), 1, "the refund");
 
-    // A buyer that never signed it has nothing a reorg could take.
+    // A copy saved before it signed, whose twin may have sent the redeem
+    // signature, waits just as deep.
     let (unsigned, _) = buyer.step(btc(20, None, None));
-    let (_, actions) = unsigned.step(btc(21, Some((cancel, 1)), None));
+    assert!(matches!(unsigned, Buyer::Cancelling { redeem: None, .. }));
+    let (unsigned, actions) = unsigned.step(btc(21, Some((cancel, 1)), None));
+    assert!(actions.is_empty(), "one block of cancel is not enough");
+    let (_, actions) = unsigned.step(btc(22, Some((cancel, 2)), None));
     assert_eq!(broadcasts(&actions).len(), 1, "the refund");
 }
 
@@ -3377,4 +3381,108 @@ fn a_view_looks_up_the_swaps_own_spends() {
     );
     assert_eq!(lookups.cancel_output, OutPoint::new(txid(Spend::Cancel), 0));
     assert_eq!(lookups.t2, terms().t2);
+}
+
+/// A copy of the buyer saved before it signed the redeem (a restored backup,
+/// an old swap file) still claims the NEX once the seller redeems with the
+/// adaptor signature the live buyer sent: signing it again gives the same
+/// one, and a copy that sees the redeem first derives it.
+#[test]
+fn a_stale_buyer_copy_claims_after_the_redeem() {
+    let locked = locked();
+    let lock_address = locked.lock_address();
+    let (seller, buyer, nex_lock) = locked.nex_locked();
+    let stale = restart(&buyer);
+    let view = || nexus(account(500_000, 0), mined(nex_lock.body.clone(), 1));
+    let (buyer, actions) = buyer.step(view());
+    let Message::RedeemSignature { redeem: sent_once } = sent(&actions) else {
+        panic!("the redeem signature");
+    };
+    let (seller, _) = seller.step(btc(2, None, None));
+    let (seller, _) = seller.step(message(sent(&actions)));
+    let (_, actions) = seller.step(btc(2, None, None));
+    let [redeem] = &broadcasts(&actions)[..] else {
+        panic!("the seller redeems");
+    };
+    let (live, _) = buyer.step(btc(3, Some((redeem, 0)), None));
+    assert!(
+        matches!(live, Buyer::ClaimingNex(_)),
+        "the live buyer claims"
+    );
+
+    // Signs again from the same state, then sees the redeem.
+    let (resigned, again) = stale.clone().step(view());
+    let Message::RedeemSignature { redeem: sent_twice } = sent(&again) else {
+        panic!("the redeem signature again");
+    };
+    assert_eq!(sent_once, sent_twice, "the same adaptor signature");
+    let (resigned, _) = resigned.step(btc(3, Some((redeem, 0)), None));
+    // A redeem whose buyer signature is not the decryption of ours gives
+    // no `s`, so the derived adaptor claims nothing on a forgery.
+    let mut forged = redeem.clone();
+    let mut witness = forged.input[0].witness.to_vec();
+    witness[0][63] ^= 1;
+    forged.input[0].witness = Witness::from_slice(&witness);
+    let (unsigned, _) = stale.step(btc(3, Some((&forged, 0)), None));
+    assert!(matches!(unsigned, Buyer::Cancelling { redeem: None, .. }));
+    // Sees the redeem before it ever signs.
+    let (unsigned, _) = unsigned.step(btc(3, Some((redeem, 0)), None));
+
+    for (name, copy) in [("re-signed", resigned), ("never signed", unsigned)] {
+        assert!(matches!(copy, Buyer::ClaimingNex(_)), "{name}");
+        let (_, actions) = copy.step(nexus(account(500_000, 0), None));
+        let claim = submitted(&actions);
+        assert_eq!(
+            claim.body,
+            TransactionBody::transfer(&lock_address, BUYER_NEX, 499_900, 100, 0).unwrap(),
+            "{name}"
+        );
+        assert!(claim.verify(), "{name}: signed with the joint key");
+    }
+}
+
+/// A swap file from v0.1.0 holds the redeem adaptor it sent, signed with a
+/// random nonce. The buyer recovers `s` with that one, not with the one it
+/// would derive now.
+#[test]
+fn a_stored_random_nonce_adaptor_still_recovers() {
+    use schnorr_fun::adaptor::EncryptedSign;
+    use schnorr_fun::fun::nonce::{GlobalRng, Synthetic};
+    type Random = schnorr_fun::Schnorr<sha2::Sha256, Synthetic<sha2::Sha256, GlobalRng<OsRng>>>;
+
+    let locked = locked();
+    let (swap, lock) = locked.swap();
+    let (seller, buyer, _) = locked.nex_locked();
+    let Buyer::AwaitNexLock { .. } = &buyer else {
+        panic!("awaiting the NEX lock");
+    };
+    // Rebuild the state v0.1.0 saved after sending its redeem signature.
+    let mut state = serde_json::to_value(&buyer).unwrap();
+    let locked_json = state["AwaitNexLock"]["locked"].take();
+    let secrets: Secrets = serde_json::from_value(locked_json["setup"]["secrets"].clone()).unwrap();
+    let sighash = swap.sighash(lock, Spend::Redeem);
+    let random = Random::default().encrypted_sign(
+        &secrets.key(),
+        &swap.params().seller_share,
+        schnorr_fun::Message::raw(&sighash),
+    );
+    let derived = swap
+        .encrypted_sign(lock, Spend::Redeem, &secrets.key())
+        .unwrap();
+    assert_ne!(random, derived, "a nonce other than the derived one");
+    assert!(swap.verify_encrypted(lock, Spend::Redeem, &random));
+    let stored: Buyer = serde_json::from_value(serde_json::json!({
+        "AwaitRedeem": { "locked": locked_json, "redeem": random },
+    }))
+    .unwrap();
+
+    // The seller redeems with the adaptor that was sent.
+    let (seller, _) = seller.step(btc(2, None, None));
+    let (seller, _) = seller.step(message(Message::RedeemSignature { redeem: random }));
+    let (_, actions) = seller.step(btc(2, None, None));
+    let [redeem] = &broadcasts(&actions)[..] else {
+        panic!("the seller redeems");
+    };
+    let (stored, _) = stored.step(btc(3, Some((redeem, 0)), None));
+    assert!(matches!(stored, Buyer::ClaimingNex(_)));
 }
