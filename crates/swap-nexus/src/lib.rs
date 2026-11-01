@@ -10,6 +10,8 @@
 use curve25519_dalek::constants::ED25519_BASEPOINT_TABLE;
 use curve25519_dalek::edwards::{CompressedEdwardsY, EdwardsPoint};
 use curve25519_dalek::scalar::Scalar;
+use ed25519_dalek::hazmat::{raw_sign, ExpandedSecretKey};
+use ed25519_dalek::VerifyingKey;
 use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha512};
 use zeroize::{Zeroize, Zeroizing};
@@ -91,8 +93,10 @@ impl JointKey {
 
     /// Ed25519 signature over `message`: the exact bytes Lattice verifies
     /// (`lattice-tx-v1:` followed by the transaction's signing preimage).
+    /// Deterministic, as RFC 8032: signed again, the same message gives the
+    /// same signature, so the same transaction under the same CID.
     pub fn sign(&self, message: &[u8]) -> [u8; 64] {
-        sign_with_scalar(&self.secret, &self.public, message)
+        sign_with_scalar(&self.secret, message)
     }
 }
 
@@ -102,45 +106,28 @@ impl Drop for JointKey {
     }
 }
 
-fn sign_with_scalar(secret: &Scalar, public: &CompressedEdwardsY, message: &[u8]) -> [u8; 64] {
-    let mut entropy = Zeroizing::new([0u8; 32]);
-    OsRng.fill_bytes(entropy.as_mut_slice());
-    sign_with_entropy(secret, public, message, &entropy)
-}
-
-fn sign_with_entropy(
-    secret: &Scalar,
-    public: &CompressedEdwardsY,
-    message: &[u8],
-    entropy: &[u8; 32],
-) -> [u8; 64] {
-    // The nonce mixes fresh randomness with the key and message, so it is
-    // never reused even if the random source repeats. A reused nonce would
-    // leak the joint key.
-    let secret_bytes = Zeroizing::new(secret.to_bytes());
-    let mut nonce = Scalar::from_hash(
+/// RFC 8032 Ed25519 signing (§5.1.6) from a raw scalar. With no seed to
+/// expand, the hash prefix that RFC 8032 takes from the seed's SHA-512 is
+/// taken from the scalar's, under a domain tag: the nonce
+/// `SHA-512(prefix || message)` is then a function of the key and the
+/// message, as in RFC 8032. The same message signs to the same bytes; another
+/// message, or another key, gets another nonce. The public key is the
+/// scalar's own, never passed in: a signature under a mismatched public key
+/// would leak the key (RUSTSEC-2022-0093).
+fn sign_with_scalar(secret: &Scalar, message: &[u8]) -> [u8; 64] {
+    let digest: Zeroizing<[u8; 64]> = Zeroizing::new(
         Sha512::new()
-            .chain_update(entropy)
-            .chain_update(secret_bytes.as_slice())
-            .chain_update(message),
+            .chain_update(b"lattice-swap/joint-key/hash-prefix")
+            .chain_update(secret.as_bytes())
+            .finalize()
+            .into(),
     );
-
-    let r = (&nonce * ED25519_BASEPOINT_TABLE).compress();
-    let k = Scalar::from_hash(
-        Sha512::new()
-            .chain_update(r.as_bytes())
-            .chain_update(public.as_bytes())
-            .chain_update(message),
-    );
-    let mut k_secret = k * secret;
-    let s = nonce + k_secret;
-    nonce.zeroize();
-    k_secret.zeroize();
-
-    let mut signature = [0u8; 64];
-    signature[..32].copy_from_slice(r.as_bytes());
-    signature[32..].copy_from_slice(s.as_bytes());
-    signature
+    let key = ExpandedSecretKey {
+        scalar: *secret,
+        hash_prefix: digest[..32].try_into().expect("32 bytes"),
+    };
+    let public = VerifyingKey::from(&key);
+    raw_sign::<Sha512>(&key, message, &public).to_bytes()
 }
 
 #[cfg(test)]
@@ -185,7 +172,7 @@ mod tests {
     fn one_share_cannot_sign_for_the_lock_key() {
         let (a, b) = (KeyShare::random(), KeyShare::random());
         let lock_key = JointKey::from_shares(&a, &b).public;
-        let forged = sign_with_scalar(&a.0, &lock_key, MESSAGE);
+        let forged = sign_with_scalar(&a.0, MESSAGE);
         assert!(!verifies(lock_key.to_bytes(), MESSAGE, forged));
     }
 
@@ -201,19 +188,17 @@ mod tests {
     }
 
     #[test]
-    fn nonces_are_fresh() {
-        let joint = JointKey::from_shares(&KeyShare::random(), &KeyShare::random());
-        assert_ne!(joint.sign(MESSAGE)[..32], joint.sign(MESSAGE)[..32]);
+    fn signing_is_deterministic() {
+        let (a, b) = (KeyShare::random(), KeyShare::random());
+        let first = JointKey::from_shares(&a, &b).sign(MESSAGE);
+        let again = JointKey::from_shares(&a, &b).sign(MESSAGE);
+        assert_eq!(first, again);
     }
 
     #[test]
-    fn nonces_differ_even_if_the_entropy_repeats() {
+    fn nonces_differ_by_message_and_by_key() {
         let (a, b) = (KeyShare::random(), KeyShare::random());
-        let public = JointKey::from_shares(&a, &b).public;
-        let entropy = [7u8; 32];
-        let r = |secret: &Scalar, message: &[u8]| {
-            sign_with_entropy(secret, &public, message, &entropy)[..32].to_vec()
-        };
+        let r = |secret: &Scalar, message: &[u8]| sign_with_scalar(secret, message)[..32].to_vec();
         assert_ne!(r(&a.0, MESSAGE), r(&a.0, b"lattice-tx-v1:other"));
         assert_ne!(r(&a.0, MESSAGE), r(&b.0, MESSAGE));
     }

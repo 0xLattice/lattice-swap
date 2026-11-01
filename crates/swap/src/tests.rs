@@ -851,17 +851,22 @@ fn a_buyer_refunds_only_on_a_deep_cancel() {
 }
 
 #[test]
-fn the_claim_pays_at_least_the_node_relay_fee() {
+fn the_claim_pays_the_agreed_fee_and_waits_out_a_higher_floor() {
     let buyer = buyer_claiming();
     let lock_address = buyer.lock_address().unwrap();
-    let event = Event::Nexus(NexusView {
-        min_relay_fee: 250,
-        ..nexus_view(nexus(account(500_000, 0), None))
-    });
-    let (_, actions) = buyer.step(event);
+    let floor = |min_relay_fee| {
+        Event::Nexus(NexusView {
+            min_relay_fee,
+            ..nexus_view(nexus(account(500_000, 0), None))
+        })
+    };
+    let (buyer, actions) = buyer.step(floor(250));
+    assert!(actions.is_empty(), "the node would refuse the agreed fee");
+    assert_eq!(buyer.outcome(), None);
+    let (_, actions) = buyer.step(floor(100));
     assert_eq!(
         submitted(&actions).body,
-        TransactionBody::transfer(&lock_address, BUYER_NEX, 499_750, 250, 0).unwrap()
+        TransactionBody::transfer(&lock_address, BUYER_NEX, 499_900, 100, 0).unwrap()
     );
 }
 
@@ -890,12 +895,111 @@ fn buyer_claiming_with(terms: Terms) -> Buyer {
 }
 
 /// A lock that has signed something the claimer did not: drained, with
-/// nothing submitted.
+/// nothing submitted. The claimer first watches for the claim it would
+/// have signed, and the node does not hold it.
 #[test]
 fn a_lock_spent_by_someone_else_is_drained() {
     let (buyer, actions) = buyer_claiming().step(nexus(account(500_000, 1), None));
     assert!(actions.is_empty());
+    assert_eq!(buyer.outcome(), None, "its own claim is looked for first");
+    let (buyer, actions) = buyer.step(nexus(account(500_000, 1), None));
+    assert!(actions.is_empty());
     assert_eq!(buyer.outcome(), Some(Outcome::Drained));
+}
+
+/// A copy saved before it claimed (a restored backup, a reloaded page)
+/// finds the lock spent by the claim an earlier copy signed. The joint key
+/// signs deterministically: the copy's claim is that one, under the same
+/// CID, and the swap ends as the claim does.
+#[test]
+fn a_stale_copy_whose_claim_was_mined_ends_swapped() {
+    let stale = buyer_claiming();
+    let (_, actions) = stale.clone().step(nexus(account(500_000, 0), None));
+    let claim = submitted(&actions);
+
+    let (copy, actions) = restart(&stale).step(nexus(account(0, 1), None));
+    assert!(actions.is_empty());
+    assert_eq!(copy.outcome(), None);
+    assert_eq!(copy.watch().nexus.unwrap().cid, Some(claim.cid()));
+    let (copy, _) = copy.step(nexus(account(0, 1), mined(claim.body, 1)));
+    assert_eq!(copy.outcome(), Some(Outcome::Swapped));
+}
+
+/// The claim's fee is the terms': a copy restored onto a node with a higher
+/// relay floor than the one the earlier copy claimed on still signs the
+/// mined claim, and ends `Swapped`.
+#[test]
+fn a_stale_copy_on_a_higher_relay_floor_still_ends_swapped() {
+    let stale = buyer_claiming();
+    let (_, actions) = stale.clone().step(nexus(account(500_000, 0), None));
+    let claim = submitted(&actions);
+
+    let spent = |watched| {
+        Event::Nexus(NexusView {
+            min_relay_fee: 500,
+            ..nexus_view(nexus(account(0, 1), watched))
+        })
+    };
+    let (copy, actions) = restart(&stale).step(spent(None));
+    assert!(actions.is_empty());
+    assert_eq!(copy.watch().nexus.unwrap().cid, Some(claim.cid()));
+    let (copy, _) = copy.step(spent(mined(claim.body, 1)));
+    assert_eq!(copy.outcome(), Some(Outcome::Swapped));
+}
+
+/// A state whose terms leave nothing to claim after the fee (never one
+/// `new` builds: it checks the terms) reads a spent lock as someone else's,
+/// without signing a claim it could not have made.
+#[test]
+fn a_spent_lock_with_nothing_to_claim_is_drained() {
+    let mut state = serde_json::to_value(buyer_claiming()).unwrap();
+    fn set_fee(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(fee) = map.get_mut("nex_fee") {
+                    *fee = 500_000.into();
+                }
+                map.values_mut().for_each(set_fee);
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(set_fee),
+            _ => {}
+        }
+    }
+    set_fee(&mut state);
+    let buyer: Buyer = serde_json::from_value(state).unwrap();
+    let (buyer, actions) = buyer.step(nexus(account(0, 1), None));
+    assert!(actions.is_empty());
+    assert_eq!(buyer.outcome(), Some(Outcome::Drained));
+}
+
+/// The seller, its NEX locked and the buyer's refund seen, about to claim
+/// the NEX back.
+fn seller_claiming() -> Seller {
+    let (seller, buyer, _) = locked().nex_locked();
+    let (seller, _) = seller.step(btc(20, None, None));
+    let (cancel, refund) = cancel_and_refund(buyer);
+    let (seller, _) = seller.step(btc(21, Some((&cancel, 1)), Some((&refund, 0))));
+    assert!(matches!(seller, Seller::ClaimingNex(_)));
+    seller
+}
+
+/// The seller's claim back is the same: a stale copy finds its own mined
+/// claim and ends `Refunded`; a spend it did not sign ends `Drained`.
+#[test]
+fn a_stale_seller_copy_whose_claim_was_mined_ends_refunded() {
+    let stale = seller_claiming();
+    let (_, actions) = stale.clone().step(nexus(account(500_000, 0), None));
+    let claim = submitted(&actions);
+
+    let (copy, actions) = restart(&stale).step(nexus(account(0, 1), None));
+    assert!(actions.is_empty());
+    assert_eq!(copy.watch().nexus.unwrap().cid, Some(claim.cid()));
+    let (mined_copy, _) = copy
+        .clone()
+        .step(nexus(account(0, 1), mined(claim.body, 1)));
+    assert_eq!(mined_copy.outcome(), Some(Outcome::Refunded));
+    let (foreign, _) = copy.step(nexus(account(0, 1), None));
+    assert_eq!(foreign.outcome(), Some(Outcome::Drained));
 }
 
 #[test]
@@ -1135,9 +1239,9 @@ fn dust_does_not_keep_an_empty_lock_open() {
     assert_eq!(seller.outcome(), Some(Outcome::Refunded));
 }
 
-/// A lock holding `nex_amount`, while the node's relay fee would take all
-/// of it, is neither claimed nor empty: the seller submits nothing and keeps
-/// waiting with its shares.
+/// A lock holding `nex_amount`, on a node whose relay fee is above the
+/// agreed one, is neither claimed nor empty: the seller submits nothing and
+/// keeps waiting with its shares.
 #[test]
 fn a_lock_too_small_to_claim_is_not_empty() {
     let locked = locked();
