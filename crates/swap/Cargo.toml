@@ -63,6 +63,10 @@ required-features = ["native"]
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }
 
+[dev-dependencies]
+# Signs a random-nonce adaptor, as v0.1.0 did, in a test.
+sha2 = "0.10"
+
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 corepc-node = { version = "0.12", features = ["30_2", "download"] }
 tempfile = "3"
