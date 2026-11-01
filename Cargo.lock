@@ -1051,6 +1051,7 @@ dependencies = [
 name = "lattice-swap"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "base64 0.22.1",
  "bitcoin",
  "clap",
@@ -1787,6 +1788,7 @@ dependencies = [
  "bitcoin",
  "ed25519-dalek",
  "hex",
+ "ivy-core",
  "rand_core 0.6.4",
  "serde",
  "serde_json",

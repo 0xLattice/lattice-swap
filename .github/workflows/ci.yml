@@ -24,8 +24,9 @@ jobs:
       - run: cargo test -p swap --no-default-features
 
   # The machines without the native I/O, built for the browser, and every
-  # machine test run again in wasm under node. `secp256k1-sys` needs a clang
-  # with the WebAssembly target.
+  # machine test run again in wasm under node; then the browser's buyer,
+  # web/driver, against fake servers. `secp256k1-sys` needs a clang with the
+  # WebAssembly target.
   wasm:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -45,6 +46,12 @@ jobs:
       - run: cargo test -p swap -p swap-wasm --no-default-features --target wasm32-unknown-unknown --lib
         env:
           CARGO_PROFILE_DEV_OPT_LEVEL: 3
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - run: web/driver/build.sh
+      - run: npm ci && npm test
+        working-directory: web/driver
 
   # Rust-signed joint-key spends checked by Lattice's own consensus signature
   # rules on Linux, where swift-crypto verifies Ed25519 through BoringSSL.
@@ -64,17 +71,27 @@ jobs:
       - run: ./interop/run.sh 25
 
   # Transfers and joint-key claims built here, submitted to and mined by a real
-  # Lattice node, then whole swaps against that node and a regtest bitcoind.
+  # Lattice node, then whole swaps against that node and a regtest bitcoind,
+  # the browser's buyer among the takers, run in node from the wasm build.
   # Host networking: the node's RPC listens on loopback only.
   nexus-node:
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 50
     env:
       # lattice-node 3.2.0
       NEXUS_NODE_IMAGE: ghcr.io/0xlattice/lattice-node@sha256:b9951cdce3469add47d1c086a46185edc0f3da4d715309b94ed553e008de1d26
+      CC_wasm32_unknown_unknown: clang
+      AR_wasm32_unknown_unknown: llvm-ar
     steps:
       - uses: actions/checkout@v4
       - run: docker pull "$NEXUS_NODE_IMAGE"
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq clang llvm
+      - run: rustup target add wasm32-unknown-unknown
+      - run: cargo install wasm-bindgen-cli --version 0.2.130 --locked
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - run: web/driver/build.sh
       - run: cargo test -p swap-nexus-tx --test node -- --ignored --nocapture
       - run: cargo test -p swap --test e2e -- --ignored --nocapture --test-threads=1
       - run: cargo test -p lattice-swap --test e2e -- --ignored --nocapture --test-threads=1

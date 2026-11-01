@@ -54,6 +54,7 @@ pub mod bitcoind;
 mod buyer;
 #[cfg(feature = "native")]
 pub mod driver;
+pub mod offer;
 mod seller;
 #[cfg(feature = "native")]
 pub mod transport;

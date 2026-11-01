@@ -20,6 +20,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [dev-dependencies]
+# The Esplora shim the browser's buyer reads, over the regtest bitcoind.
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 base64 = "0.22"
 data-encoding = "2"
 corepc-node = { version = "0.12", features = ["30_2", "download"] }

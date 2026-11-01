@@ -319,6 +319,20 @@ impl Buyer {
         }
     }
 
+    /// Whether the buyer has signed the redeem and the swap is not yet
+    /// settled: from then on the seller may redeem at any moment, and the
+    /// buyer's refund, if it comes to that, must beat the punish.
+    pub fn must_stay_open(&self) -> bool {
+        matches!(
+            self,
+            Buyer::AwaitRedeem { .. }
+                | Buyer::Cancelling {
+                    redeem: Some(_),
+                    ..
+                }
+        )
+    }
+
     /// The Nexus address the NEX is locked at, once the hellos are
     /// exchanged and until the swap ends.
     pub fn lock_address(&self) -> Option<String> {

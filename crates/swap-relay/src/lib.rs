@@ -14,6 +14,9 @@
 //!   the session's bytes, as binary messages, to and from the buyer.
 //! - `GET /take/<swap id>`, a WebSocket: pairs the buyer with the seller of
 //!   that offer, which leaves the board; 404 if none is listed.
+//!
+//! Every answer lets any web page read it (`Access-Control-Allow-Origin:
+//! *`), so a buyer's page can list the offers.
 
 pub mod board;
 
@@ -61,7 +64,17 @@ pub fn router(relay: Arc<Relay>) -> Router {
         .route("/offers", get(offers))
         .route("/sell", get(sell))
         .route("/take/{id}", get(take))
+        .layer(axum::middleware::map_response(readable))
         .with_state(relay)
+}
+
+/// Lets any page read the answer: nothing here is private to a caller.
+async fn readable(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        header::HeaderValue::from_static("*"),
+    );
+    response
 }
 
 async fn offers(State(relay): State<Arc<Relay>>) -> Response {

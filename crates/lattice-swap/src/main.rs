@@ -19,14 +19,14 @@ use std::time::Duration;
 use bitcoin::address::NetworkUnchecked;
 use bitcoin::{Address, Amount, FeeRate, Network, ScriptBuf};
 use clap::{Args, Parser, Subcommand};
-use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::SigningKey;
 use rand_core::{OsRng, RngCore};
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use swap::bitcoind::{Bitcoin, Bitcoind};
 use swap::driver::{Driver, Store};
-use swap::transport::{Ivy, PeerKey, Relayed, Transport};
-use swap::{btc_fee_at, Buyer, Machine, Outcome, SecretBytes, Seller, Terms};
+use swap::offer::{self, check_offer, Bounds, Offer, Place, Policy};
+use swap::transport::{Ivy, Relayed, Transport};
+use swap::{Buyer, Machine, Outcome, SecretBytes, Seller, Terms};
 use swap_nexus_tx::rpc::Client;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -209,30 +209,30 @@ impl NodeArgs {
     /// block halfway up the chain shows whether it keeps that state; a chain
     /// too short to tell passes.
     fn check_nexus(&self, client: &Client) -> Result<()> {
-        let genesis = client.genesis()?;
-        if genesis != self.nexus_genesis {
-            return Err(format!(
-                "refused: the Nexus node follows the chain of genesis {genesis}, not {}, the \
-                 one --nexus-genesis names",
-                self.nexus_genesis
-            )
-            .into());
-        }
+        use swap_nexus_tx::rpc::parse::{check_node, past_state_probe, NodeRefusal};
+        let chain_info = client.chain_info()?;
         let height = client.health()?.height;
-        if height < 2 {
-            return Ok(());
-        }
-        let block = client
-            .block_hash(height.div_ceil(2))?
-            .ok_or("the Nexus node has no block halfway up its chain")?;
-        match client.account_at(&swap_nexus_tx::address(&[0; 32]), &block)? {
-            Some(_) => Ok(()),
-            None => Err(
-                "the Nexus node keeps no state of past blocks, so it cannot tell how deep a \
-                 transaction is: run it with --state all and --block-bodies all"
-                    .into(),
-            ),
-        }
+        let past_state = match past_state_probe(height) {
+            None => None,
+            Some(at) => Some(match client.block_hash(at)? {
+                Some(block) => client
+                    .account_at(&swap_nexus_tx::address(&[0; 32]), &block)?
+                    .is_some(),
+                None => false,
+            }),
+        };
+        check_node(&self.nexus_genesis, &chain_info, height, past_state).map_err(|refusal| {
+            match refusal {
+                NodeRefusal::OtherNexus { .. } => {
+                    format!("{refusal}, the one --nexus-genesis names")
+                }
+                NodeRefusal::NoPastState => {
+                    format!("{refusal}: run it with --state all and --block-bodies all")
+                }
+                NodeRefusal::Malformed(_) => refusal.to_string(),
+            }
+            .into()
+        })
     }
 
     /// A fresh address from the wallet, as the script that pays it.
@@ -423,34 +423,34 @@ struct PolicyArgs {
     #[arg(long)]
     nex_amount: u64,
     /// The most each Bitcoin swap transaction may pay, in satoshis.
-    #[arg(long, default_value_t = 10_000)]
+    #[arg(long, default_value_t = Bounds::DEFAULT.max_btc_fee)]
     max_btc_fee: u64,
     /// The most the NEX lock and the claim from it may pay.
-    #[arg(long, default_value_t = 1_000)]
+    #[arg(long, default_value_t = Bounds::DEFAULT.max_nex_fee)]
     max_nex_fee: u64,
     /// The least the NEX lock and the claim from it may pay, and the Nexus
     /// node's minRelayFee if higher: a fee this node pools may still be
     /// below what the network relays.
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = Bounds::DEFAULT.min_nex_fee)]
     min_nex_fee: u64,
     /// The most Bitcoin blocks the BTC stays locked before cancel.
-    #[arg(long, default_value_t = 288)]
+    #[arg(long, default_value_t = Bounds::DEFAULT.max_t1)]
     max_t1: u16,
     /// The fewest Bitcoin blocks after cancel confirms before punish is
     /// valid.
-    #[arg(long, default_value_t = 144)]
+    #[arg(long, default_value_t = Bounds::DEFAULT.min_t2)]
     min_t2: u16,
     /// The fewest Bitcoin confirmations the offer may ask.
-    #[arg(long, default_value_t = 6)]
+    #[arg(long, default_value_t = Bounds::DEFAULT.min_btc_confirmations)]
     min_btc_confirmations: u32,
     /// The most Bitcoin confirmations the offer may ask. Once it has signed
     /// the redeem, the buyer refunds only when cancel is this deep.
-    #[arg(long, default_value_t = 12)]
+    #[arg(long, default_value_t = Bounds::DEFAULT.max_btc_confirmations)]
     max_btc_confirmations: u32,
     /// The fewest Bitcoin blocks the refund has to confirm in before punish
     /// is valid, once the buyer has signed the redeem: t2 -
     /// btc-confirmations.
-    #[arg(long, default_value_t = 72)]
+    #[arg(long, default_value_t = Bounds::DEFAULT.min_refund_window)]
     min_refund_window: u16,
     /// The fee rate, in sat/vB, that each Bitcoin swap transaction must pay
     /// when bitcoind has no fee estimate, as on regtest. Otherwise its
@@ -458,11 +458,33 @@ struct PolicyArgs {
     #[arg(long)]
     min_btc_fee_rate: Option<u64>,
     /// The fewest Nexus confirmations of the NEX lock this buyer accepts.
-    #[arg(long, default_value_t = 24)]
+    #[arg(long, default_value_t = Bounds::DEFAULT.min_nex_confirmations)]
     min_nex_confirmations: u64,
     /// The fewest Bitcoin blocks of slack before a timelock.
-    #[arg(long, default_value_t = 6)]
+    #[arg(long, default_value_t = Bounds::DEFAULT.min_margin)]
     min_margin: u16,
+}
+
+impl PolicyArgs {
+    fn policy(&self) -> Policy {
+        Policy {
+            btc_amount: self.btc_amount,
+            nex_amount: self.nex_amount,
+            bounds: Bounds {
+                max_btc_fee: self.max_btc_fee,
+                max_nex_fee: self.max_nex_fee,
+                min_nex_fee: self.min_nex_fee,
+                max_t1: self.max_t1,
+                min_t2: self.min_t2,
+                min_btc_confirmations: self.min_btc_confirmations,
+                max_btc_confirmations: self.max_btc_confirmations,
+                min_refund_window: self.min_refund_window,
+                min_btc_fee_rate: self.min_btc_fee_rate,
+                min_nex_confirmations: self.min_nex_confirmations,
+                min_margin: self.min_margin,
+            },
+        }
+    }
 }
 
 #[derive(Args)]
@@ -483,255 +505,16 @@ struct SwapFileArgs {
 fn btc_fee_floor(bitcoin: &Bitcoind, fallback: Option<u64>) -> Result<u64> {
     let estimate = bitcoin.call("estimatesmartfee", json!([FEE_TARGET, "CONSERVATIVE"]))?;
     let per_kvb = match estimate["feerate"].as_f64() {
-        Some(btc) => Amount::from_btc(btc)?.to_sat(),
-        None => fallback
-            .ok_or("bitcoind has no fee estimate: give --min-btc-fee-rate")?
-            .saturating_mul(1000),
+        Some(btc) => Some(Amount::from_btc(btc)?.to_sat()),
+        None => None,
     };
-    Ok(btc_fee_at(per_kvb))
+    Ok(offer::btc_fee_floor(per_kvb, fallback)
+        .map_err(|_| "bitcoind has no fee estimate: give --min-btc-fee-rate")?)
 }
 
-/// The least `nex_fee` a party runs: `least`, or its Nexus node's relay
-/// floor if higher. A node's floor alone is not the network's: one that
-/// pools a fee its peers do not relay leaves the NEX lock, or the claim,
-/// unmined.
+/// [`offer::nex_fee_floor`] at its Nexus node's relay floor.
 fn nex_fee_floor(nexus: &Client, least: u64) -> Result<u64> {
-    Ok(least.max(nexus.min_relay_fee()?))
-}
-
-/// An offer the buyer takes: terms that work, on its Bitcoin network and
-/// its Nexus, the amounts it agreed to, a Bitcoin fee of at least
-/// `btc_fee_floor`, a Nexus fee of at least `nex_fee_floor`, and every
-/// other term within its bounds.
-fn check_offer(
-    offer: &Offer,
-    policy: &PolicyArgs,
-    network: Network,
-    nexus_genesis: &str,
-    btc_fee_floor: u64,
-    nex_fee_floor: u64,
-) -> std::result::Result<(), String> {
-    let terms = &offer.terms;
-    terms.check()?;
-    let refused = |why: String| Err(format!("refused: the offer {why}"));
-    if offer.btc_network != network {
-        return refused(format!("is on {}, not {network}", offer.btc_network));
-    }
-    if terms.nexus_genesis != nexus_genesis {
-        return refused(format!(
-            "is on the Nexus of genesis {}, not {nexus_genesis}",
-            terms.nexus_genesis
-        ));
-    }
-    if terms.btc_amount.to_sat() != policy.btc_amount {
-        return refused(format!(
-            "asks {} sat, not {}",
-            terms.btc_amount.to_sat(),
-            policy.btc_amount
-        ));
-    }
-    if terms.nex_amount != policy.nex_amount {
-        return refused(format!(
-            "sells {} NEX, not {}",
-            terms.nex_amount, policy.nex_amount
-        ));
-    }
-    if terms.btc_fee.to_sat() > policy.max_btc_fee {
-        return refused(format!(
-            "pays {} sat a Bitcoin transaction, above {}",
-            terms.btc_fee.to_sat(),
-            policy.max_btc_fee
-        ));
-    }
-    if terms.btc_fee.to_sat() < btc_fee_floor {
-        return refused(format!(
-            "pays {} sat a Bitcoin transaction, below the {btc_fee_floor} sat its node's fee \
-             rate asks",
-            terms.btc_fee.to_sat()
-        ));
-    }
-    if terms.nex_fee > policy.max_nex_fee {
-        return refused(format!(
-            "pays {} NEX a Nexus transaction, above {}",
-            terms.nex_fee, policy.max_nex_fee
-        ));
-    }
-    if terms.nex_fee < nex_fee_floor {
-        return refused(format!(
-            "pays {} NEX a Nexus transaction, below {nex_fee_floor}, --min-nex-fee or its \
-             node's minRelayFee",
-            terms.nex_fee
-        ));
-    }
-    if terms.t1 > policy.max_t1 {
-        return refused(format!("has t1 {}, above {}", terms.t1, policy.max_t1));
-    }
-    if terms.t2 < policy.min_t2 {
-        return refused(format!("has t2 {}, below {}", terms.t2, policy.min_t2));
-    }
-    if terms.btc_confirmations < policy.min_btc_confirmations {
-        return refused(format!(
-            "asks {} Bitcoin confirmations, fewer than {}",
-            terms.btc_confirmations, policy.min_btc_confirmations
-        ));
-    }
-    if terms.btc_confirmations > policy.max_btc_confirmations {
-        return refused(format!(
-            "asks {} Bitcoin confirmations, more than {}",
-            terms.btc_confirmations, policy.max_btc_confirmations
-        ));
-    }
-    let window = u64::from(terms.t2).saturating_sub(u64::from(terms.btc_confirmations));
-    if window < u64::from(policy.min_refund_window) {
-        return refused(format!(
-            "leaves {window} blocks to refund in, t2 - btc_confirmations, fewer than {}",
-            policy.min_refund_window
-        ));
-    }
-    if terms.nex_confirmations < policy.min_nex_confirmations {
-        return refused(format!(
-            "asks {} Nexus confirmations, fewer than {}",
-            terms.nex_confirmations, policy.min_nex_confirmations
-        ));
-    }
-    if terms.margin < policy.min_margin {
-        return refused(format!(
-            "has margin {}, below {}",
-            terms.margin, policy.min_margin
-        ));
-    }
-    Ok(())
-}
-
-/// What the buyer needs to take the swap: the terms, among them the Nexus
-/// the seller trades on, where the seller listens or the relay it waits on,
-/// its key, and the session key the seller made for the buyer, the only one
-/// it accepts. Whoever holds an offer can take it. The Nexus in the terms is
-/// only a courtesy: a buyer on another refuses before it locks anything, but
-/// the buyer's safety is its own node's check against its own
-/// `--nexus-genesis`.
-///
-/// The seller signs the terms and the network with its key, which the
-/// buyer's session then authenticates: a relay, or anyone the offer passes
-/// through, cannot hand the buyer other terms for the seller's key. Without
-/// it, the terms each machine checks alone, such as the confirmations and
-/// the margin, could differ between the two and neither would refuse. The
-/// rest needs no signature: another address, relay or buyer session key
-/// reaches no seller, or one that refuses the buyer.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-struct Offer {
-    terms: Terms,
-    btc_network: Network,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    address: Option<SocketAddr>,
-    /// The relay the seller waits on, by its URL, which pairs a buyer with
-    /// it by the swap id.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    relay: Option<String>,
-    seller: String,
-    #[serde(with = "hex::serde")]
-    buyer_session: [u8; 32],
-    #[serde(with = "hex::serde")]
-    signature: [u8; 64],
-}
-
-/// What the seller signs: the terms and the network, tagged.
-fn signed(terms: &Terms, network: Network) -> Vec<u8> {
-    serde_json::to_vec(&("lattice-swap offer", terms, network)).expect("terms serialize")
-}
-
-impl Offer {
-    /// The offer, signed by `seller`, whose key it names.
-    fn new(
-        terms: Terms,
-        btc_network: Network,
-        place: Place,
-        seller: &SigningKey,
-        buyer_session: [u8; 32],
-    ) -> Self {
-        let (address, relay) = match place {
-            Place::Address(address) => (Some(address), None),
-            Place::Relay(relay) => (None, Some(relay)),
-        };
-        let mut offer = Offer {
-            terms,
-            btc_network,
-            address,
-            relay,
-            seller: hex::encode(seller.verifying_key().to_bytes()),
-            buyer_session,
-            signature: [0; 64],
-        };
-        offer.sign(seller);
-        offer
-    }
-
-    fn sign(&mut self, seller: &SigningKey) {
-        self.signature = seller
-            .sign(&signed(&self.terms, self.btc_network))
-            .to_bytes();
-    }
-
-    fn encode(&self) -> String {
-        serde_json::to_string(self).expect("offers serialize")
-    }
-
-    /// The offer in `text`, if it is one, says where to find the seller,
-    /// and the seller signed its terms.
-    fn decode(text: &str) -> Result<Self> {
-        let offer: Offer =
-            serde_json::from_str(text.trim()).map_err(|e| format!("not an offer: {e}"))?;
-        let key = offer.seller_key()?;
-        offer.place()?;
-        let key = VerifyingKey::from_bytes(key.as_bytes()).expect("a peer key is a key");
-        let signature = ed25519_dalek::Signature::from_bytes(&offer.signature);
-        key.verify_strict(&signed(&offer.terms, offer.btc_network), &signature)
-            .map_err(|_| "the offer's terms are not signed by its seller")?;
-        Ok(offer)
-    }
-
-    /// Where the seller is: an address or a relay, not both.
-    fn place(&self) -> Result<Place> {
-        match (self.address, &self.relay) {
-            (Some(address), None) => Ok(Place::Address(address)),
-            (None, Some(relay)) => Ok(Place::Relay(relay.clone())),
-            _ => Err("the offer must name an address or a relay, not both".into()),
-        }
-    }
-
-    fn seller_key(&self) -> Result<PeerKey> {
-        Ok(PeerKey::from_hex(&self.seller).ok_or("the offer's seller key is not a key")?)
-    }
-
-    /// The terms, for the buyer to read before it dials.
-    fn describe(&self) -> String {
-        let t = &self.terms;
-        format!(
-            "taking {} sat for {} NEX on {}: fees {} sat and {} NEX, t1 {}, t2 {}, \
-             {} Bitcoin and {} Nexus confirmations, margin {}; {}",
-            t.btc_amount.to_sat(),
-            t.nex_amount,
-            self.btc_network,
-            t.btc_fee.to_sat(),
-            t.nex_fee,
-            t.t1,
-            t.t2,
-            t.btc_confirmations,
-            t.nex_confirmations,
-            t.margin,
-            match self.place() {
-                Ok(Place::Address(address)) => format!("dialling {address}"),
-                Ok(Place::Relay(relay)) => format!("through the relay {relay}"),
-                Err(e) => e.to_string(),
-            }
-        )
-    }
-}
-
-/// Where the buyer finds the seller.
-enum Place {
-    Address(SocketAddr),
-    Relay(String),
+    Ok(offer::nex_fee_floor(least, nexus.min_relay_fee()?))
 }
 
 /// A Nexus address as Lattice prints one: a CIDv1, dag-cbor, sha2-256, in
@@ -917,7 +700,14 @@ fn take(args: TakeArgs) -> Result<Outcome> {
     args.nodes.check_nexus(&nexus)?;
     let nex_floor = nex_fee_floor(&nexus, args.policy.min_nex_fee)?;
     let (network, genesis) = (args.nodes.btc_network, &args.nodes.nexus_genesis);
-    check_offer(&offer, &args.policy, network, genesis, floor, nex_floor)?;
+    check_offer(
+        &offer,
+        &args.policy.policy(),
+        network,
+        genesis,
+        floor,
+        nex_floor,
+    )?;
     let refund = args.nodes.payout(&bitcoin)?;
     let (buyer, actions) = Buyer::start(offer.terms.clone(), refund, args.nex_address)
         .map_err(|refusal| format!("refused: {refusal:?}"))?;
