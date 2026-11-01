@@ -18,6 +18,20 @@ const RELAY_CHUNK: usize = 64 * 1024;
 /// written, as `ivy::Connection` answers them.
 const PONG_BACKLOG: usize = 64 * 1024;
 
+/// The handshake, owning the config its initiator borrows: as
+/// fluent-bundle's `FluentResource` owns its source beside the AST that
+/// borrows it, through `self_cell`. Dropped once the session is open, the
+/// signing key with it.
+type Pending<'a> = Option<Initiator<'a>>;
+
+self_cell::self_cell!(
+    struct Handshake {
+        owner: Config,
+        #[covariant]
+        dependent: Pending,
+    }
+);
+
 /// One session to the seller an offer names. Write [`Ivy::outbound`] to
 /// the relay's socket whenever it holds bytes, and pass every binary
 /// message from the socket to [`Ivy::receive`]. Any error ends the session:
@@ -25,7 +39,7 @@ const PONG_BACKLOG: usize = 64 * 1024;
 #[wasm_bindgen]
 pub struct Ivy {
     /// `None` once open.
-    handshake: Option<Initiator<'static>>,
+    handshake: Option<Handshake>,
     session: Option<Session>,
     /// The frame limit until the session sets its own.
     max_frame_size: u32,
@@ -48,16 +62,19 @@ impl Ivy {
         hex::decode_to_slice(session_key.trim(), &mut seed)
             .map_err(|_| "the session key is not 32 bytes of hex")?;
         let peer = PeerKey::from_hex(peer).ok_or("the seller key is not a key")?;
-        // The initiator borrows its config for the handshake; the session
-        // it opens keeps its own copy. One small config per swap stays.
-        let config: &'static Config =
-            Box::leak(Box::new(Config::new(SigningKey::from_bytes(&seed))));
-        let (handshake, hello) =
-            Initiator::start(config, peer, &mut OsRng).map_err(|e| format!("ivy: {e:?}"))?;
+        let config = Config::new(SigningKey::from_bytes(&seed));
+        let max_frame_size = config.metadata.max_frame_size;
+        let mut hello = vec![];
+        let handshake = Handshake::try_new(config, |config| {
+            let (initiator, record) =
+                Initiator::start(config, peer, &mut OsRng).map_err(|e| format!("ivy: {e:?}"))?;
+            hello = record;
+            Ok::<_, String>(Some(initiator))
+        })?;
         Ok(Ivy {
             handshake: Some(handshake),
             session: None,
-            max_frame_size: config.metadata.max_frame_size,
+            max_frame_size,
             inbound: Vec::new(),
             read_from: 0,
             outbound: frame(&hello),
@@ -85,10 +102,13 @@ impl Ivy {
         let mut messages = vec![];
         while let Some(record) = self.take_frame()? {
             let Some(session) = &mut self.session else {
-                let handshake = self.handshake.take().ok_or("the session ended")?;
-                let (session, finish) = handshake
-                    .receive(&record)
-                    .map_err(|e| format!("ivy: {e:?}"))?;
+                let mut handshake = self.handshake.take().ok_or("the session ended")?;
+                let (session, finish) = handshake.with_dependent_mut(|_, initiator| {
+                    let initiator = initiator.take().ok_or("the session ended")?;
+                    initiator
+                        .receive(&record)
+                        .map_err(|e| format!("ivy: {e:?}"))
+                })?;
                 self.outbound.extend_from_slice(&frame(&finish));
                 self.max_frame_size = session.max_inbound_frame_size();
                 self.session = Some(session);
