@@ -607,6 +607,13 @@ fn a_nexus_view_is_read_as_the_driver_reads_one() {
     )
     .unwrap();
     assert_eq!(view.watched.unwrap().1, None);
+    // Mined in a block above the tip /health reports, which a public read
+    // port serves from a cache: read at two tips, no view.
+    let ahead = watched(node_transaction(Some(11)), node_transaction(Some(11)));
+    assert_eq!(
+        nexus_view(&reads(node_health(10, "tip10"), ahead)),
+        Ok(None)
+    );
     // Unknown to the node, or not watched.
     let unknown = watched(Value::Null, Value::Null);
     let view: NexusView = parse(
@@ -831,6 +838,7 @@ fn an_address_pays_its_script_on_its_network_only() {
 
 /// The offer the driver's JavaScript tests take, as its seller signed it:
 /// the relay, which the signature does not cover, they point at their own.
+#[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn the_drivers_test_offer_is_signed() {
     let path = concat!(

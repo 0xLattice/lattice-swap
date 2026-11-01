@@ -384,7 +384,7 @@ pub fn check_offer(input: &str) -> Result<Option<String>> {
 /// watched, is `{"before", "health", "after"}`: the transaction read, then
 /// `/health`, then the transaction again, each transaction null where the
 /// node holds none. The view as JSON, or null if the two healths are not
-/// at one tip.
+/// at one tip, or the transaction is in a block above it.
 #[wasm_bindgen(js_name = nexusView)]
 pub fn nexus_view(reads: &str) -> Result<Option<String>> {
     let reads: Value = parse(reads)?;
@@ -399,6 +399,18 @@ pub fn nexus_view(reads: &str) -> Result<Option<String>> {
         before => {
             let status = answer::transaction(before)?;
             let height = answer::health(&watched["health"])?.height;
+            // A public read port serves `/health` from a cache seconds old,
+            // the rest live: a transaction in a block above the tip it
+            // reports was read at a later tip. Unlike the RPC port's, such a
+            // view would show the claim mined yet at no depth, which the
+            // machine takes for someone else's: read again.
+            if status
+                .block
+                .as_ref()
+                .is_some_and(|block| block.height > height)
+            {
+                return Ok(None);
+            }
             let after = match &watched["after"] {
                 Value::Null => None,
                 after => Some(answer::transaction(after)?),
