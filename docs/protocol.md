@@ -177,12 +177,14 @@ The buyer funds the lock from its wallet at its node's estimate or else a
 fallback rate, or the mempool's minimum if higher, and not capped by the
 most a bump pays, so the lock relays when it is funded.
 
-The NEX lock and the claim from it each pay `nex_fee`, below `nex_amount`;
-the claim pays the claimant's node's relay floor if higher, out of
-`nex_amount`. A fee one node pools is no proof the network relays it: a lock
-no miner sees leaves the swap to refund at `t1`. Each side holds `nex_fee` to
-its own floor, the higher of an operator setting and its node's relay floor,
-and the seller offers, and the buyer takes, no fee below it.
+The NEX lock and the claim from it each pay `nex_fee`, below `nex_amount`,
+the claim out of `nex_amount`. The claim's fee is fixed by the terms, never a
+node's momentary relay floor, so every copy of a party signs the same claim;
+a claimant whose node's floor is above `nex_fee` waits for one that takes it.
+A fee one node pools is no proof the network relays it: a lock no miner sees
+leaves the swap to refund at `t1`. Each side holds `nex_fee` to its own
+floor, the higher of an operator setting and its node's relay floor, and the
+seller offers, and the buyer takes, no fee below it.
 
 ## State
 

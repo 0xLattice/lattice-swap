@@ -700,8 +700,9 @@ pub struct Claim {
     #[serde(default)]
     passed_at: Option<(u64, String)>,
     /// The claim, submitted again, byte for byte, until it is mined. The
-    /// joint key signs deterministically: signed again with the same fee,
-    /// it is the same transaction under the same CID.
+    /// joint key signs deterministically, and the body is the terms' and
+    /// the shares': signed again, it is the same transaction under the same
+    /// CID.
     claim: Option<swap_nexus_tx::Transaction>,
     /// The seller's punish is `btc_confirmations` deep: the BTC is its own,
     /// and however the claim ends, the swap ends `Punished`.
@@ -754,8 +755,10 @@ impl Claim {
         }
         // The claim debits exactly the `nex_amount` the lock credits: never
         // the momentary balance, whose extra dust a reorg can take back and
-        // leave the claim refused forever.
-        let fee = terms.nex_fee.max(view.min_relay_fee);
+        // leave the claim refused forever. It pays the agreed `nex_fee`,
+        // never a node's momentary floor: its body is then the terms' and
+        // the shares' alone, and every copy signs the same claim.
+        let fee = terms.nex_fee;
         if view.lock.nonce > 0 {
             // The lock signed something: perhaps this claim, signed by an
             // earlier copy of this state. The joint key signs
@@ -771,7 +774,10 @@ impl Claim {
         if !synced(&view.health) {
             return Claimed::Pending(self, vec![]);
         }
-        if view.lock.balance >= terms.nex_amount && terms.nex_amount > fee {
+        // A node whose relay floor is above the agreed fee would refuse the
+        // claim: it waits for one that takes it.
+        let relays = view.min_relay_fee <= fee;
+        if view.lock.balance >= terms.nex_amount && terms.nex_amount > fee && relays {
             let claim = self.transaction(terms.nex_amount - fee, fee);
             self.claim = Some(claim.clone());
             return Claimed::Pending(self, vec![Action::Submit(claim)]);

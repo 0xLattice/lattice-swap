@@ -307,8 +307,8 @@ impl Transaction {
     }
 
     /// The CID a node names this transaction by. It covers the signatures:
-    /// the same body signed again with fresh randomness is another
-    /// transaction.
+    /// the same body under another signature is another transaction. Both
+    /// signers here are deterministic, so signed again it is the same one.
     pub fn cid(&self) -> String {
         cid(&self.to_dag_cbor())
     }

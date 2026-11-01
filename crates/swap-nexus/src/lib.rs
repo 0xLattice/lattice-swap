@@ -96,7 +96,7 @@ impl JointKey {
     /// Deterministic, as RFC 8032: signed again, the same message gives the
     /// same signature, so the same transaction under the same CID.
     pub fn sign(&self, message: &[u8]) -> [u8; 64] {
-        sign_with_scalar(&self.secret, &self.public, message)
+        sign_with_scalar(&self.secret, message)
     }
 }
 
@@ -111,8 +111,10 @@ impl Drop for JointKey {
 /// taken from the scalar's, under a domain tag: the nonce
 /// `SHA-512(prefix || message)` is then a function of the key and the
 /// message, as in RFC 8032. The same message signs to the same bytes; another
-/// message, or another key, gets another nonce.
-fn sign_with_scalar(secret: &Scalar, public: &CompressedEdwardsY, message: &[u8]) -> [u8; 64] {
+/// message, or another key, gets another nonce. The public key is the
+/// scalar's own, never passed in: a signature under a mismatched public key
+/// would leak the key (RUSTSEC-2022-0093).
+fn sign_with_scalar(secret: &Scalar, message: &[u8]) -> [u8; 64] {
     let digest: Zeroizing<[u8; 64]> = Zeroizing::new(
         Sha512::new()
             .chain_update(b"lattice-swap/joint-key/hash-prefix")
@@ -124,7 +126,7 @@ fn sign_with_scalar(secret: &Scalar, public: &CompressedEdwardsY, message: &[u8]
         scalar: *secret,
         hash_prefix: digest[..32].try_into().expect("32 bytes"),
     };
-    let public = VerifyingKey::from_bytes(public.as_bytes()).expect("a point on the curve");
+    let public = VerifyingKey::from(&key);
     raw_sign::<Sha512>(&key, message, &public).to_bytes()
 }
 
@@ -170,7 +172,7 @@ mod tests {
     fn one_share_cannot_sign_for_the_lock_key() {
         let (a, b) = (KeyShare::random(), KeyShare::random());
         let lock_key = JointKey::from_shares(&a, &b).public;
-        let forged = sign_with_scalar(&a.0, &lock_key, MESSAGE);
+        let forged = sign_with_scalar(&a.0, MESSAGE);
         assert!(!verifies(lock_key.to_bytes(), MESSAGE, forged));
     }
 
@@ -196,10 +198,7 @@ mod tests {
     #[test]
     fn nonces_differ_by_message_and_by_key() {
         let (a, b) = (KeyShare::random(), KeyShare::random());
-        let public = JointKey::from_shares(&a, &b).public;
-        let r = |secret: &Scalar, message: &[u8]| {
-            sign_with_scalar(secret, &public, message)[..32].to_vec()
-        };
+        let r = |secret: &Scalar, message: &[u8]| sign_with_scalar(secret, message)[..32].to_vec();
         assert_ne!(r(&a.0, MESSAGE), r(&a.0, b"lattice-tx-v1:other"));
         assert_ne!(r(&a.0, MESSAGE), r(&b.0, MESSAGE));
     }
