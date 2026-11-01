@@ -699,9 +699,9 @@ pub struct Claim {
     /// shows otherwise, or that block leaves the canonical chain.
     #[serde(default)]
     passed_at: Option<(u64, String)>,
-    /// The claim, signed once and submitted again, byte for byte, until it
-    /// is mined. The joint key signs with fresh randomness: signed again,
-    /// it would be another transaction under another CID.
+    /// The claim, submitted again, byte for byte, until it is mined. The
+    /// joint key signs deterministically: signed again with the same fee,
+    /// it is the same transaction under the same CID.
     claim: Option<swap_nexus_tx::Transaction>,
     /// The seller's punish is `btc_confirmations` deep: the BTC is its own,
     /// and however the claim ends, the swap ends `Punished`.
@@ -752,17 +752,25 @@ impl Claim {
                 }
             };
         }
+        // The claim debits exactly the `nex_amount` the lock credits: never
+        // the momentary balance, whose extra dust a reorg can take back and
+        // leave the claim refused forever.
+        let fee = terms.nex_fee.max(view.min_relay_fee);
         if view.lock.nonce > 0 {
-            return Claimed::Drained;
+            // The lock signed something: perhaps this claim, signed by an
+            // earlier copy of this state. The joint key signs
+            // deterministically, so that claim has the CID this one has.
+            // Watched, the branch above tells it from someone else's spend.
+            if terms.nex_amount <= fee {
+                return Claimed::Drained;
+            }
+            self.claim = Some(self.transaction(terms.nex_amount - fee, fee));
+            return Claimed::Pending(self, vec![]);
         }
         // Only a synced node shows the lock as it is.
         if !synced(&view.health) {
             return Claimed::Pending(self, vec![]);
         }
-        // The claim is signed once, and debits exactly the `nex_amount` the
-        // lock credits: never the momentary balance, whose extra dust a
-        // reorg can take back and leave the claim refused forever.
-        let fee = terms.nex_fee.max(view.min_relay_fee);
         if view.lock.balance >= terms.nex_amount && terms.nex_amount > fee {
             let claim = self.transaction(terms.nex_amount - fee, fee);
             self.claim = Some(claim.clone());

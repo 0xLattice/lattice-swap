@@ -890,12 +890,64 @@ fn buyer_claiming_with(terms: Terms) -> Buyer {
 }
 
 /// A lock that has signed something the claimer did not: drained, with
-/// nothing submitted.
+/// nothing submitted. The claimer first watches for the claim it would
+/// have signed, and the node does not hold it.
 #[test]
 fn a_lock_spent_by_someone_else_is_drained() {
     let (buyer, actions) = buyer_claiming().step(nexus(account(500_000, 1), None));
     assert!(actions.is_empty());
+    assert_eq!(buyer.outcome(), None, "its own claim is looked for first");
+    let (buyer, actions) = buyer.step(nexus(account(500_000, 1), None));
+    assert!(actions.is_empty());
     assert_eq!(buyer.outcome(), Some(Outcome::Drained));
+}
+
+/// A copy saved before it claimed (a restored backup, a reloaded page)
+/// finds the lock spent by the claim an earlier copy signed. The joint key
+/// signs deterministically: the copy's claim is that one, under the same
+/// CID, and the swap ends as the claim does.
+#[test]
+fn a_stale_copy_whose_claim_was_mined_ends_swapped() {
+    let stale = buyer_claiming();
+    let (_, actions) = stale.clone().step(nexus(account(500_000, 0), None));
+    let claim = submitted(&actions);
+
+    let (copy, actions) = restart(&stale).step(nexus(account(0, 1), None));
+    assert!(actions.is_empty());
+    assert_eq!(copy.outcome(), None);
+    assert_eq!(copy.watch().nexus.unwrap().cid, Some(claim.cid()));
+    let (copy, _) = copy.step(nexus(account(0, 1), mined(claim.body, 1)));
+    assert_eq!(copy.outcome(), Some(Outcome::Swapped));
+}
+
+/// The seller, its NEX locked and the buyer's refund seen, about to claim
+/// the NEX back.
+fn seller_claiming() -> Seller {
+    let (seller, buyer, _) = locked().nex_locked();
+    let (seller, _) = seller.step(btc(20, None, None));
+    let (cancel, refund) = cancel_and_refund(buyer);
+    let (seller, _) = seller.step(btc(21, Some((&cancel, 1)), Some((&refund, 0))));
+    assert!(matches!(seller, Seller::ClaimingNex(_)));
+    seller
+}
+
+/// The seller's claim back is the same: a stale copy finds its own mined
+/// claim and ends `Refunded`; a spend it did not sign ends `Drained`.
+#[test]
+fn a_stale_seller_copy_whose_claim_was_mined_ends_refunded() {
+    let stale = seller_claiming();
+    let (_, actions) = stale.clone().step(nexus(account(500_000, 0), None));
+    let claim = submitted(&actions);
+
+    let (copy, actions) = restart(&stale).step(nexus(account(0, 1), None));
+    assert!(actions.is_empty());
+    assert_eq!(copy.watch().nexus.unwrap().cid, Some(claim.cid()));
+    let (mined_copy, _) = copy
+        .clone()
+        .step(nexus(account(0, 1), mined(claim.body, 1)));
+    assert_eq!(mined_copy.outcome(), Some(Outcome::Refunded));
+    let (foreign, _) = copy.step(nexus(account(0, 1), None));
+    assert_eq!(foreign.outcome(), Some(Outcome::Drained));
 }
 
 #[test]
