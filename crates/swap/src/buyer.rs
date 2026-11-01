@@ -319,27 +319,6 @@ impl Buyer {
         }
     }
 
-    /// The cancel and the fully signed refund, for a watchtower to
-    /// broadcast the refund once cancel confirms if this buyer has gone
-    /// offline; only once the buyer has given up on the swap without
-    /// signing the redeem. The refund reveals `b`, and a seller that learns
-    /// `b` while it can still redeem takes both coins: it locks the NEX,
-    /// waits for the redeem signature, sweeps the NEX lock with `s` and `b`,
-    /// then redeems. Until the buyer gives up, the seller's redeem stays
-    /// possible, or the buyer may yet sign it; so the refund goes to no one
-    /// before then.
-    pub fn watchtower(&self) -> Option<(Transaction, Transaction)> {
-        let Buyer::Cancelling {
-            locked,
-            redeem: None,
-        } = self
-        else {
-            return None;
-        };
-        let cancel = locked.setup.cancel(locked.lock, &locked.seller_cancel);
-        Some((cancel, locked.refund()))
-    }
-
     /// The Nexus address the NEX is locked at, once the hellos are
     /// exchanged and until the swap ends.
     pub fn lock_address(&self) -> Option<String> {

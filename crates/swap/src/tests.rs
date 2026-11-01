@@ -811,18 +811,6 @@ fn terms_leave_room_for_a_block_and_for_the_refund() {
     }
     .check()
     .is_ok());
-    // A relay's watchtower forgets a cancel `T2_LIMIT` deep.
-    let longest = Terms {
-        t2: T2_LIMIT - 1,
-        ..tight.clone()
-    };
-    assert!(longest.check().is_ok());
-    assert!(Terms {
-        t2: T2_LIMIT,
-        ..tight
-    }
-    .check()
-    .is_err());
     let deepest = Terms {
         btc_confirmations: u32::MAX,
         ..terms()
@@ -856,37 +844,6 @@ fn a_buyer_that_signed_the_redeem_refunds_on_a_deep_cancel() {
     let (unsigned, _) = buyer.step(btc(20, None, None));
     let (_, actions) = unsigned.step(btc(21, Some((cancel, 1)), None));
     assert_eq!(broadcasts(&actions).len(), 1, "the refund");
-}
-
-/// The buyer hands its refund to a watchtower only once it has given up
-/// without signing the redeem: the refund reveals `b`, and a seller that
-/// learns it while it can still redeem takes both coins.
-#[test]
-fn the_refund_is_handed_over_only_once_the_redeem_is_given_up_unsigned() {
-    let locked = locked();
-    let (swap, lock) = locked.swap();
-    assert!(locked.buyer.watchtower().is_none(), "locked");
-    let (_, buyer, nex_lock) = locked.nex_locked();
-    assert!(buyer.watchtower().is_none(), "the NEX lock named");
-
-    // Signed: never, not even once it gives up at t1.
-    let (signed, _) = buyer
-        .clone()
-        .step(nexus(account(500_000, 0), mined(nex_lock.body, 1)));
-    assert!(matches!(signed, Buyer::AwaitRedeem { .. }));
-    assert!(signed.watchtower().is_none(), "the redeem signed");
-    let (signed, _) = signed.step(btc(20, None, None));
-    assert!(matches!(signed, Buyer::Cancelling { .. }));
-    assert!(signed.watchtower().is_none(), "the redeem signed, at t1");
-
-    // Unsigned, at t1: cancel and the refund, which its own refund matches.
-    let (unsigned, actions) = buyer.step(btc(20, None, None));
-    let (cancel, refund) = unsigned.watchtower().expect("given up unsigned");
-    assert_eq!(broadcast_txids(&actions), [cancel.compute_txid()]);
-    let refund_txid = swap.unsigned_tx(lock, Spend::Refund).compute_txid();
-    assert_eq!(refund.compute_txid(), refund_txid);
-    let (_, actions) = unsigned.step(btc(21, Some((&cancel, 1)), None));
-    assert_eq!(broadcast_txids(&actions), [refund_txid]);
 }
 
 #[test]

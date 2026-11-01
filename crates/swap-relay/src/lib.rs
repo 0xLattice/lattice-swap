@@ -1,5 +1,5 @@
-//! A relay for lattice-swap: an offer board, a pipe between the two
-//! parties of a swap, and a watchtower for buyers' refunds.
+//! A relay for lattice-swap: an offer board and a pipe between the two
+//! parties of a swap.
 //!
 //! The relay holds no keys and no funds. The parties run their ivy session
 //! end to end through the pipe, so it sees only ciphertext, and each
@@ -14,37 +14,28 @@
 //!   the session's bytes, as binary messages, to and from the buyer.
 //! - `GET /take/<swap id>`, a WebSocket: pairs the buyer with the seller of
 //!   that offer, which leaves the board; 404 if none is listed.
-//! - `POST /watch`: a [`watch::Watch`], as JSON. Answers cancel's txid
-//!   once the watch is on disk; 503 while its cancel is not yet seen
-//!   on the network, to be asked again.
 
 pub mod board;
-pub mod watch;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::get;
 use axum::Router;
 use tokio::time::{interval, timeout, MissedTickBehavior};
 
 use board::Board;
-use watch::{Chain, Refusal, Watch, Watchtower};
 
 /// The most bytes one WebSocket message may hold: a piece of the session,
 /// which the CLI sends at most 64 KiB at a time. The relay holds a message
 /// whole while it passes it on, so this bounds what each pipe holds in each
 /// direction. An offer is held to [`board::MAX_OFFER`].
 pub const MAX_MESSAGE: usize = 64 * 1024;
-
-/// The most bytes a watch may hold: a cancel and a refund, each about 200
-/// bytes, in hex. It bounds what one request makes the relay hold.
-pub const MAX_WATCH: usize = 16 * 1024;
 
 /// How long a seller has to send its offer once connected: a connection
 /// that lists nothing holds a socket, and no slot on the board.
@@ -62,9 +53,6 @@ pub const SILENCE: Duration = PING.saturating_mul(2);
 /// The relay's state, shared by every connection.
 pub struct Relay {
     pub board: Arc<Board<WebSocket>>,
-    pub watchtower: Arc<Watchtower>,
-    /// What the watchtower reads Bitcoin through.
-    pub chain: Arc<dyn Chain>,
 }
 
 /// The relay's routes.
@@ -73,10 +61,6 @@ pub fn router(relay: Arc<Relay>) -> Router {
         .route("/offers", get(offers))
         .route("/sell", get(sell))
         .route("/take/{id}", get(take))
-        .route(
-            "/watch",
-            post(add_watch).layer(DefaultBodyLimit::max(MAX_WATCH)),
-        )
         .with_state(relay)
 }
 
@@ -204,35 +188,6 @@ fn pinger() -> tokio::time::Interval {
     // The first tick is at once.
     ping.reset();
     ping
-}
-
-async fn add_watch(State(relay): State<Arc<Relay>>, body: Bytes) -> Response {
-    let watch: Watch = match serde_json::from_slice(&body) {
-        Ok(watch) => watch,
-        Err(e) => return (StatusCode::BAD_REQUEST, format!("not a watch: {e}")).into_response(),
-    };
-    let added = tokio::task::spawn_blocking(move || relay.watchtower.add(watch, &*relay.chain));
-    match added.await.expect("adding a watch does not panic") {
-        Ok(cancel) => cancel.to_string().into_response(),
-        Err(Refusal::Invalid(why)) => (StatusCode::BAD_REQUEST, why).into_response(),
-        Err(Refusal::Unseen) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "cancel is not yet seen on the network: ask again once it is",
-        )
-            .into_response(),
-        Err(Refusal::Chain(e)) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("could not ask about cancel: {e}; ask again"),
-        )
-            .into_response(),
-        Err(Refusal::Full) => {
-            (StatusCode::SERVICE_UNAVAILABLE, "the watchtower is full").into_response()
-        }
-        Err(Refusal::Io(e)) => {
-            eprintln!("swap-relay: saving a watch: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, "the watch was not saved").into_response()
-        }
-    }
 }
 
 /// Serves `relay` on `listener` until the process ends.

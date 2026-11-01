@@ -116,11 +116,6 @@ pub struct Terms {
     pub nexus_genesis: String,
 }
 
-/// `t2` is below this many blocks, about a week: a relay's watchtower
-/// forgets a cancel this deep whose refund has not confirmed, so a longer
-/// `t2` could outlast it.
-pub const T2_LIMIT: u16 = 1008;
-
 impl Terms {
     /// Whether the terms can work, and `t1` leaves time for both locks
     /// ([`Terms::t1_floor`]) and `btc_amount` for redeem's two fees
@@ -136,7 +131,6 @@ impl Terms {
             // The buyer refunds once cancel is `btc_confirmations` deep, and
             // the refund needs time to confirm before punish is valid.
             && floor < u64::from(self.t2)
-            && self.t2 < T2_LIMIT
             && self.nex_amount > self.nex_fee
             // A Nexus amount is signed: the lock debits both.
             && self
@@ -144,11 +138,12 @@ impl Terms {
                 .checked_add(self.nex_fee)
                 .is_some_and(|debit| debit <= i64::MAX as u64);
         if !works {
-            return Err(format!(
+            return Err(
                 "the terms cannot work: confirmations must be at least 1, the margin at \
-                    least 2, t1 and t2 above btc_confirmations + margin, t2 below {T2_LIMIT}, and \
-                    nex_amount above nex_fee"
-            ));
+                least 2, t1 and t2 above btc_confirmations + margin, and nex_amount above \
+                nex_fee"
+                    .to_string(),
+            );
         }
         let floor = self.t1_floor();
         if u64::from(self.t1) < floor {

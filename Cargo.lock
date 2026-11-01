@@ -1353,7 +1353,6 @@ version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
- "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -1770,21 +1769,13 @@ name = "swap-relay"
 version = "0.1.0"
 dependencies = [
  "axum",
- "bitcoin",
  "clap",
- "corepc-node",
  "ed25519-dalek",
- "futures-util",
  "hex",
  "ivy",
- "serde",
  "serde_json",
  "swap",
- "swap-bitcoin",
- "swap-nexus-tx",
- "tempfile",
  "tokio",
- "tokio-tungstenite",
  "ureq",
 ]
 
@@ -2027,12 +2018,9 @@ dependencies = [
  "base64 0.22.1",
  "log",
  "once_cell",
- "rustls",
- "rustls-pki-types",
  "serde",
  "serde_json",
  "url",
- "webpki-roots 0.26.11",
 ]
 
 [[package]]

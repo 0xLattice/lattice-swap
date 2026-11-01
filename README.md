@@ -40,8 +40,8 @@ no Nexus consensus change is required.
   I/O, which the page does. `swap` and `swap-nexus-tx` keep their native I/O
   behind the default `native` feature, so without it they build for
   `wasm32-unknown-unknown`, with a clang that has the WebAssembly target.
-- `swap-relay`: a relay the parties can meet through: an offer board, a
-  pipe between the two, and a watchtower for buyers' refunds.
+- `swap-relay`: a relay the parties can meet through: an offer board and a
+  pipe between the two.
 - `lattice-swap`: the command line tool that runs one side of a swap.
 
 ## Install
@@ -201,22 +201,17 @@ change it.
 
 ```sh
 cargo build --release -p swap-relay
-swap-relay --listen 0.0.0.0:7500 --network bitcoin --watches /var/lib/swap-relay
+swap-relay --listen 0.0.0.0:7500
 ```
 
 It serves `GET /offers`, the offers listed; `GET /sell` and
 `GET /take/<swap id>`, the WebSockets a seller waits on and a buyer pairs
-through; and `POST /watch`, the watchtower. An offer is listed while its
-seller stays connected, until a buyer takes it. The watchtower reads Bitcoin
-through an Esplora API, `--esplora`, mempool.space's for the network by
-default (give one for regtest), every `--poll` seconds, 60 by default. Put
-TLS in front of it for `https://`. Each bound says what it protects:
-`--max-offers`, 10000 by default, the sellers held at once, listed or
-swapping, each a connection and its offer in memory; `--max-watches`, 10000,
-the watches held, each in memory and on disk, and two or three Esplora
-requests a round; an offer at most 4 KiB, the board's memory; one WebSocket
-message at most 64 KiB, which a pipe holds whole while passing it on; a
-watch at most 16 KiB. A connection silent for 60 seconds, not even
+through. An offer is listed while its seller stays connected, until a
+buyer takes it. Put TLS in front of it for `https://`. Each bound says what
+it protects: `--max-offers`, 10000 by default, the sellers held at once,
+listed or swapping, each a connection and its offer in memory; an offer at
+most 4 KiB, the board's memory; one WebSocket message at most 64 KiB, which
+a pipe holds whole while passing it on. A connection silent for 60 seconds, not even
 answering the relay's pings, is closed, and its offer withdrawn.
 
 The seller gives `--relay` instead of `--listen`; the offer it prints names
@@ -229,24 +224,8 @@ curl -s https://relay.example/offers
 ```
 
 `take` on an offer that names a relay reaches the seller through it. The
-buyer also hands the relay's watchtower its cancel and fully signed refund,
-for it to broadcast the refund as soon as cancel is in a block if the buyer
-is offline then: `--watchtower <url>` names another relay, `--no-watchtower` none, and
-`resume --watchtower <url>` hands them over from a resumed swap. The refund
-reveals the buyer's key share, with which a seller that can still redeem
-takes both coins, so the buyer hands it over only once it has given up on
-the swap at `t1` without signing the redeem, and broadcasts its cancel. The
-watchtower takes a watch only once its cancel is on the network, and only
-with a refund signed by both keys, so it holds at most one watch for each
-distinct cancel output seen on the network, each a real transaction. A
-watch is freed once that output's spend is `depth` deep, at most 144
-blocks; once cancel is 1008 blocks deep with that spend unconfirmed, which
-is why `t2` must be below 1008; or once the network has refused cancel for
-a day. A cancel that drops out of the mempool, the watchtower broadcasts
-again.
-The buyer asks again every minute until it is taken. It does not cover a
-buyer that signed the redeem: that buyer must itself be online to refund
-between cancel and `t2`.
+relay holds nothing of the swap: a buyer that gives up must itself be
+online, with `resume`, to refund between cancel and `t2`.
 
 ## License
 
