@@ -6,23 +6,17 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use bitcoin::Network;
 use ed25519_dalek::SigningKey;
 use swap::transport::{Ivy, PeerKey, Relayed, Transport};
 use swap_relay::board::Board;
-use swap_relay::watch::{Esplora, Watchtower};
 use swap_relay::Relay;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A relay on loopback, holding at most `max_offers` sellers: its URL.
-fn relay(max_offers: usize) -> (String, tempfile::TempDir) {
-    let watches = tempfile::tempdir().unwrap();
+fn relay(max_offers: usize) -> String {
     let relay = Arc::new(Relay {
         board: Board::new(max_offers),
-        watchtower: Arc::new(Watchtower::open(Network::Regtest, watches.path(), 10).unwrap()),
-        // Nothing here watches.
-        chain: Arc::new(Esplora::new("http://127.0.0.1:9", TIMEOUT)),
     });
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -34,7 +28,7 @@ fn relay(max_offers: usize) -> (String, tempfile::TempDir) {
             swap_relay::serve(listener, relay).await.unwrap();
         });
     });
-    (url, watches)
+    url
 }
 
 fn offer(id: &str) -> String {
@@ -82,7 +76,7 @@ fn wait_listed(url: &str, count: usize) {
 /// larger than one relayed piece.
 #[test]
 fn a_buyer_takes_a_listed_offer_and_the_two_talk_through_the_relay() {
-    let (url, _watches) = relay(10);
+    let url = relay(10);
     let seller = seller(&url, offer(&id(1)));
     wait_listed(&url, 1);
     assert_eq!(offers(&url)[0]["terms"]["swap_id"], id(1));
@@ -107,7 +101,7 @@ fn a_buyer_takes_a_listed_offer_and_the_two_talk_through_the_relay() {
 /// seller lists it again, and the buyer it waits for gets through.
 #[test]
 fn a_seller_lists_again_past_a_stranger() {
-    let (url, _watches) = relay(10);
+    let url = relay(10);
     let seller = seller(&url, offer(&id(2)));
     wait_listed(&url, 1);
     let stranger = Ivy::connect_relayed(&url, &id(2), &config(3), key(1), TIMEOUT);
@@ -124,7 +118,7 @@ fn a_seller_lists_again_past_a_stranger() {
 /// its offer with it.
 #[test]
 fn the_board_refuses_what_it_cannot_list() {
-    let (url, _watches) = relay(2);
+    let url = relay(2);
     let first = seller(&url, offer(&id(3)));
     wait_listed(&url, 1);
     let refused = |offer: String| {
@@ -146,7 +140,7 @@ fn the_board_refuses_what_it_cannot_list() {
 /// A seller that gives up waiting takes its offer, and its slot, with it.
 #[test]
 fn a_seller_that_goes_frees_its_slot() {
-    let (url, _watches) = relay(1);
+    let url = relay(1);
     let wait = Duration::from_millis(300);
     for n in [6, 7] {
         let waited = Ivy::accept_relayed(&url, &offer(&id(n)), &config(1), key(2), wait, TIMEOUT)

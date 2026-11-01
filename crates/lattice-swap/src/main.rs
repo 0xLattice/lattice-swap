@@ -14,7 +14,7 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bitcoin::address::NetworkUnchecked;
 use bitcoin::{Address, Amount, FeeRate, Network, ScriptBuf};
@@ -39,10 +39,6 @@ const NEX_KEY_ENV: &str = "LATTICE_SWAP_NEX_KEY";
 const BTC_PASSWORD_ENV: &str = "LATTICE_SWAP_BTC_PASSWORD";
 /// The blocks the buyer's fee estimate aims to confirm in.
 const FEE_TARGET: u16 = 6;
-/// The least time between two tries to hand a refund to a watchtower: a
-/// relay that is down, or has not yet seen cancel, is not asked again at
-/// every poll.
-const WATCH_RETRY: Duration = Duration::from_secs(60);
 /// What a seller is told without its Nexus key.
 const NO_KEY: &str = "the seller needs its Nexus key: --nex-key-file or LATTICE_SWAP_NEX_KEY";
 
@@ -410,16 +406,6 @@ struct TakeArgs {
     /// The directory the swap file goes in.
     #[arg(long, default_value = ".")]
     dir: PathBuf,
-    /// The relay, by its URL, whose watchtower gets the cancel and the
-    /// signed refund, to broadcast the refund once cancel is in a block if
-    /// this buyer is offline then; the offer's relay by default. They are handed
-    /// over only once the buyer gives up on the swap without signing the
-    /// redeem: before that, the refund would let a seller take both coins.
-    #[arg(long)]
-    watchtower: Option<String>,
-    /// Hand the refund to no watchtower.
-    #[arg(long, conflicts_with = "watchtower")]
-    no_watchtower: bool,
     #[command(flatten)]
     nodes: NodeArgs,
     #[command(flatten)]
@@ -483,11 +469,6 @@ struct PolicyArgs {
 struct SwapFileArgs {
     /// The swap file, `<swap id>.json`.
     swap_file: PathBuf,
-    /// A buyer's: the relay whose watchtower gets the cancel and the signed
-    /// refund once the buyer gives up, as `take --watchtower`. None unless
-    /// given.
-    #[arg(long)]
-    watchtower: Option<String>,
     #[command(flatten)]
     nodes: NodeArgs,
     #[command(flatten)]
@@ -866,12 +847,12 @@ fn offer(args: OfferArgs) -> Result<Outcome> {
             ));
             let transport =
                 Ivy::accept_relayed(relay, &offer.encode(), &config, buyer, wait, TIMEOUT)?;
-            start.run(seller, vec![], transport, |_| {})
+            start.run(seller, vec![], transport)
         }
         (Some(listener), None) => {
             log("waiting for the buyer");
             let transport = Ivy::accept(listener, &config, buyer, wait, TIMEOUT)?;
-            start.run(seller, vec![], transport, |_| {})
+            start.run(seller, vec![], transport)
         }
         (None, None) => unreachable!("a place was found"),
     }
@@ -888,13 +869,12 @@ struct Start<'a> {
 
 impl Start<'_> {
     /// Runs `machine`, which asks for `actions` first, over `transport` to
-    /// the swap's end, calling `see` on every state it reaches.
+    /// the swap's end.
     fn run<M: Machine, T: Transport>(
         self,
         machine: M,
         actions: Vec<swap::Action>,
         transport: T,
-        see: impl Fn(&M),
     ) -> Result<Outcome> {
         let swap_file = self.store.path().to_path_buf();
         log(&format!("swap file {}", swap_file.display()));
@@ -910,7 +890,7 @@ impl Start<'_> {
             driver.nex_key = self.nex_key;
             driver
         });
-        run(&swap_file, driver, self.bump, see)
+        run(&swap_file, driver, self.bump)
     }
 }
 
@@ -946,13 +926,6 @@ fn take(args: TakeArgs) -> Result<Outcome> {
     let config = ivy::Config::new(SigningKey::from_bytes(&offer.buyer_session));
     log(&offer.describe());
     let seller = offer.seller_key()?;
-    let watchtower = match (&args.watchtower, &offer.relay) {
-        _ if args.no_watchtower => None,
-        (Some(url), _) | (None, Some(url)) => Some(url.clone()),
-        (None, None) => None,
-    };
-    let watchtower = RefCell::new(Watchtower::new(watchtower, args.nodes.btc_network));
-    let see = |buyer: &Buyer| watchtower.borrow_mut().see(buyer);
     let start = Start {
         bitcoin,
         nexus,
@@ -963,68 +936,12 @@ fn take(args: TakeArgs) -> Result<Outcome> {
     match offer.place()? {
         Place::Address(address) => {
             let transport = Ivy::connect(address, &config, seller, TIMEOUT)?;
-            start.run(buyer, actions, transport, see)
+            start.run(buyer, actions, transport)
         }
         Place::Relay(relay) => {
             let id = hex::encode(offer.terms.swap_id);
             let transport = Ivy::<Relayed>::connect_relayed(&relay, &id, &config, seller, TIMEOUT)?;
-            start.run(buyer, actions, transport, see)
-        }
-    }
-}
-
-/// Hands the buyer's cancel and signed refund to the watchtower at `relay`
-/// once the buyer gives up without signing the redeem, the only time it is
-/// safe to: see [`Buyer::watchtower`].
-struct Watchtower {
-    relay: Option<String>,
-    network: Network,
-    posted: bool,
-    tried: Option<Instant>,
-}
-
-impl Watchtower {
-    fn new(relay: Option<String>, network: Network) -> Self {
-        Self {
-            relay,
-            network,
-            posted: false,
-            tried: None,
-        }
-    }
-
-    fn see(&mut self, buyer: &Buyer) {
-        let Some(relay) = &self.relay else { return };
-        if self.posted
-            || self
-                .tried
-                .is_some_and(|tried| tried.elapsed() < WATCH_RETRY)
-        {
-            return;
-        }
-        let (Some((cancel, refund)), Some(terms)) = (buyer.watchtower(), buyer.terms()) else {
-            return;
-        };
-        self.tried = Some(Instant::now());
-        let watch = json!({
-            "network": self.network,
-            "cancel": bitcoin::consensus::encode::serialize_hex(&cancel),
-            "refund": bitcoin::consensus::encode::serialize_hex(&refund),
-            // How deep the refund must be before the watch is done, at most
-            // the 144 a relay takes.
-            "depth": terms.btc_confirmations.min(144),
-        });
-        let url = format!("{}/watch", relay.trim_end_matches('/'));
-        match ureq::post(&url).timeout(TIMEOUT).send_json(watch) {
-            Ok(_) => {
-                self.posted = true;
-                log(&format!("handed the refund to the watchtower at {relay}"));
-            }
-            Err(ureq::Error::Status(code, response)) => log(&format!(
-                "the watchtower at {relay} refused the refund: {code} {}",
-                response.into_string().unwrap_or_default()
-            )),
-            Err(e) => log(&format!("the watchtower at {relay}: {e}")),
+            start.run(buyer, actions, transport)
         }
     }
 }
@@ -1059,7 +976,6 @@ fn resume(args: SwapFileArgs) -> Result<Outcome> {
                     driver
                 }),
                 &args.bump,
-                |_| {},
             )
         }
         Saved::Buyer(buyer) => {
@@ -1068,13 +984,10 @@ fn resume(args: SwapFileArgs) -> Result<Outcome> {
             if buyer.outcome().is_none() {
                 args.nodes.check_nexus(&nexus)?;
             }
-            let watchtower = Watchtower::new(args.watchtower, args.nodes.btc_network);
-            let watchtower = RefCell::new(watchtower);
             run(
                 &swap_file,
                 Driver::<Buyer, _, Ivy>::resume(bitcoin, nexus, None, store),
                 &args.bump,
-                |buyer| watchtower.borrow_mut().see(buyer),
             )
         }
     }
@@ -1094,20 +1007,17 @@ fn status(swap_file: &Path) -> Result<()> {
 }
 
 /// Runs the swap to its end, bumping as `bump` says, logging each state it
-/// reaches and showing it to `see`. On an error once the swap file exists,
-/// says how to carry on.
+/// reaches. On an error once the swap file exists, says how to carry on.
 fn run<M: Machine, B: Bitcoin, T: Transport>(
     swap_file: &Path,
     driver: io::Result<Driver<M, B, T>>,
     bump: &BumpArgs,
-    see: impl Fn(&M),
 ) -> Result<Outcome> {
     let last = RefCell::new(String::new());
     let outcome = driver
         .and_then(|mut driver| {
             bump.apply(&mut driver);
             driver.run_until(|state| {
-                see(state);
                 let name = state_name(state);
                 if *last.borrow() != name {
                     log(&name);
