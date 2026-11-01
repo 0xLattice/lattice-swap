@@ -4,7 +4,7 @@ import 'fake-indexeddb/auto';
 
 import { Buyer, IndexedDBStore, MemoryStore, Wallet } from '../src/index.js';
 import { call } from '../src/wasm.js';
-import { Chain, esplora, kind, loadWasm, nexus, parseTx, POLICY, seller, testOffer, until } from './fakes.js';
+import { Chain, esplora, kind, Locks, loadWasm, nexus, parseTx, POLICY, seller, testOffer, until } from './fakes.js';
 
 before(loadWasm);
 
@@ -71,6 +71,7 @@ async function world({ store = new MemoryStore(), policy = POLICY, chain = new C
     nexus: node.url,
     nexusGenesis: 'genesis',
     poll: 2,
+    locks: null,
     openSession: (...args) => w.seller.open(...args),
     ...extra,
   };
@@ -129,6 +130,7 @@ test('the wallet is made once and kept, and the swap waits for it to be funded',
   await until(() => w.buyer.status().wallet.unconfirmed === 1_100_000 && w.buyer.status().need !== null);
   const status = w.buyer.status();
   assert.equal(status.step, 'fund-wallet');
+  assert.equal(status.backupCovers, 'wallet');
   assert.equal(status.wallet.confirmed, 0);
   assert.ok(status.need > TERMS.btc_amount && status.need < TERMS.btc_amount + 1_000, `${status.need}`);
   assert.equal(w.seller.log.length, 0, 'not taken');
@@ -198,27 +200,41 @@ test('the refund lands in the wallet, and the deadlines show where it is', async
   const { deadlines } = w.buyer.status();
   assert.equal(deadlines.cancel.height, lockHeight + TERMS.t1);
   assert.equal(deadlines.punish.height, lockHeight + TERMS.t1 + TERMS.t2, 'the earliest, before cancel');
-  assert.deepEqual(deadlines.refund, { from: lockHeight + TERMS.t1, until: lockHeight + TERMS.t1 + TERMS.t2 });
+  // The refund goes out once cancel is a block deep: in the block after.
+  assert.deepEqual(deadlines.refund, { from: lockHeight + TERMS.t1 + 1, until: lockHeight + TERMS.t1 + TERMS.t2 });
   const eta = deadlines.cancel.eta - Date.now();
   assert.ok(Math.abs(eta - TERMS.t1 * 600_000) < 60_000, `${eta}`);
-  assert.equal(w.buyer.status().mustStayOpen, false, 'the redeem is unsigned');
+  assert.equal(w.buyer.status().mustStayOpen, false, 'the redeem is unsigned, and cancel not due');
+  assert.equal(w.buyer.status().backupCovers, 'lock');
 
-  // At t1 it cancels; once cancel is in a block, it refunds.
+  // At t1 it cancels; once cancel is in a block, it refunds. From cancel
+  // on, the page stays open until the refund confirms.
   w.chain.mine(TERMS.t1 - 1);
   const cancel = await broadcast(w, lookups.lock_spends[1]);
   assert.equal(w.buyer.status().step, 'refunding');
-  // A block late, so the punish moves from its earliest.
+  assert.equal(w.buyer.status().mustStayOpen, true, 'cancel is due');
+  // A block late, so the refund and the punish move from their earliest.
   w.chain.mine();
   confirm(w, cancel);
   const cancelHeight = w.chain.height;
   assert.equal(cancelHeight, lockHeight + TERMS.t1 + 1);
   await until(() => w.buyer.status().deadlines.punish?.height === cancelHeight + TERMS.t2);
+  assert.deepEqual(w.buyer.status().deadlines.refund, { from: cancelHeight + 1, until: cancelHeight + TERMS.t2 });
+  assert.equal(w.buyer.status().mustStayOpen, true);
+  // Once the redeem is signed, cancel must be `btc_confirmations` deep.
+  const state = JSON.parse((await w.store.get(`swap:${w.buyer.swapId}`)).state);
+  const locked = state.Cancelling.locked;
+  locked.setup.terms.btc_confirmations = 3;
+  const view = { height: cancelHeight, funding: TERMS.t1 + 2, lock_spend: { tx: cancel, confirmations: 1 }, cancel_spend: null, stale: null };
+  const signed = call('buyerStatus', JSON.stringify({ Cancelling: { locked, redeem: locked.refund } }), JSON.stringify(view));
+  assert.equal(signed.deadlines.refund, cancelHeight + 3);
   const refund = parseTx(await broadcast(w, lookups.cancel_spends[0]));
   assert.equal(refund.outputs[0].script, w.wallet.key.script_pubkey, 'the refund pays the wallet');
   assert.equal(refund.outputs[0].value, TERMS.btc_amount - 2 * TERMS.btc_fee, 'cancel and refund pay their fixed fees');
   confirm(w, w.a.posted.find((tx) => parseTx(tx).txid === refund.txid));
   assert.equal(await run.done, 'refunded');
   assert.equal(w.buyer.status().step, 'refunded');
+  assert.equal(w.buyer.status().mustStayOpen, false);
   assert.deepEqual(w.buyer.status().deadlines, { cancel: null, refund: null, punish: null });
   assert.deepEqual(w.unsaved, []);
 });
@@ -319,4 +335,82 @@ test('a seller that goes quiet before the lock aborts the swap, the deposit kept
   assert.equal(w.buyer.status().step, 'done');
   assert.equal(w.a.posted.length, 0, 'nothing broadcast');
   assert.equal(w.buyer.status().wallet.confirmed, 1_100_000);
+});
+
+test('two opens of a fresh store end on one wallet key', async () => {
+  const config = { network: 'regtest', esplora: 'http://esplora.invalid', locks: null };
+  const tab = () => Wallet.open({ ...config, store: new IndexedDBStore('key-race') });
+  const [a, b] = await Promise.all([tab(), tab()]);
+  assert.equal(a.address, b.address);
+  const store = new IndexedDBStore('key-race');
+  assert.equal((await store.get('wallet')).wif, a.key.wif);
+  // A key there is never written over, as `createwallet` refuses to.
+  await store.add('wallet', call('newBitcoinKey', 'regtest'));
+  assert.equal((await store.get('wallet')).wif, a.key.wif);
+  assert.equal((await Wallet.open({ ...config, store })).address, a.address);
+});
+
+test('one tab drives the wallet; another waits, then takes over from the store', async () => {
+  const locks = new Locks();
+  const first = locks.tab();
+  const w = await world({ store: new IndexedDBStore('two-tabs'), extra: { locks: first } });
+  let waiting = false;
+  const second = Wallet.open({ ...w.config, store: new IndexedDBStore('two-tabs'), locks: locks.tab(), onWaiting: () => (waiting = true) });
+  await until(() => waiting);
+  const opened = await Promise.race([second.then(() => 'opened'), pause(50).then(() => 'waiting')]);
+  assert.equal(opened, 'waiting', 'not while the first tab is open');
+  locks.close(first);
+  const wallet = await second;
+  assert.equal(wallet.address, w.wallet.address);
+  assert.deepEqual(await wallet.swaps(), [w.buyer.swapId], 'the first tab’s swap, read from the store');
+});
+
+test('a withdrawal waits for an offer being taken, then refuses', async () => {
+  const w = await world();
+  let release;
+  const gate = new Promise((resolve) => (release = resolve));
+  const open = w.seller.open;
+  let dialing = false;
+  w.seller.open = async (...args) => {
+    dialing = true;
+    await gate;
+    return open(...args);
+  };
+  deposit(w, 1_100_000);
+  const run = running(w.buyer);
+  await until(() => dialing);
+  w.withdrawing = true;
+  const withdrawal = w.wallet.withdraw(call('newBitcoinKey', 'regtest').address);
+  await pause(20);
+  release();
+  await assert.rejects(withdrawal, /is running/);
+  await run.stop();
+  assert.equal(w.a.posted.length, 0, 'no sweep');
+});
+
+test('an offer whose session will not open is given up once, nothing sent', async () => {
+  const w = await world();
+  let opens = 0;
+  w.seller.open = async () => {
+    opens += 1;
+    throw new Error('the session ended');
+  };
+  deposit(w, 1_100_000);
+  const run = running(w.buyer);
+  await until(() => w.buyer.status().step === 'offer-gone');
+  assert.equal(await run.done, null);
+  assert.equal(opens, 1);
+  assert.match(w.buyer.status().warning, /^the offer is gone: the session ended$/);
+  assert.equal(await w.store.get(`swap:${w.buyer.swapId}`), null, 'nothing kept of it');
+  assert.equal(w.a.posted.length, 0);
+});
+
+test('a failed read of the wallet’s balance skips none of the swap’s views', async () => {
+  const { w, run, funding } = await funded();
+  w.chain.utxosDown = true;
+  await until(() => /503/.test(w.buyer.status().warning ?? ''));
+  confirm(w, funding);
+  // The view still read, the balance read failing after it.
+  await until(() => w.buyer.status().confirmations.funding === 1);
+  await run.stop();
 });

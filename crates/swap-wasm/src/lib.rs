@@ -472,11 +472,16 @@ pub fn nexus_submit_body(transaction: &str) -> Result<String> {
 /// - `must_stay_open` is [`Buyer::must_stay_open`].
 /// - `confirmations`: `{"funding", "lock_spend", "cancel_spend"}` as the
 ///   view shows them, each null where it shows none.
-/// - `deadlines`: `{"cancel", "punish"}`, each the first Bitcoin block
-///   that can hold it, once the lock is in a block. Cancel is valid `t1`
-///   blocks after the lock, punish `t2` after cancel: until cancel is in a
-///   block, `punish` is the earliest it could be. The refund must be in a
-///   block before `punish`.
+/// - `deadlines`: `{"cancel", "refund", "punish"}`, each the first Bitcoin
+///   block that can hold it, once the lock is in a block. Cancel is valid
+///   `t1` blocks after the lock, punish `t2` after cancel; the refund goes
+///   out once cancel is a block deep, or `btc_confirmations` once the
+///   redeem is signed. Until cancel is in a block, `refund` and `punish` are
+///   the earliest they could be. The refund must be in a block before
+///   `punish`.
+/// - `backup_covers`: `lock` once the state is one the funding may have
+///   been broadcast from, whose backup can cancel and refund the lock; else
+///   `wallet`, a backup that holds the wallet key and no more than it.
 #[wasm_bindgen(js_name = buyerStatus)]
 pub fn buyer_status(state: &str, view: Option<String>) -> Result<String> {
     let buyer: Buyer = parse(state)?;
@@ -487,7 +492,7 @@ pub fn buyer_status(state: &str, view: Option<String>) -> Result<String> {
         Buyer::Done(outcome) => self::outcome(outcome),
         _ => "swapping",
     };
-    let (mut cancel, mut punish) = (None, None);
+    let (mut cancel, mut refund, mut punish) = (None, None, None);
     if let (Some((swap, lock)), Some(view), Some(terms)) =
         (buyer.watch().bitcoin, &view, buyer.terms())
     {
@@ -505,7 +510,23 @@ pub fn buyer_status(state: &str, view: Option<String>) -> Result<String> {
         if let Some(cancel_height) = cancelled {
             punish = Some(cancel_height + u32::from(terms.t2));
         }
+        // As `BuyerLocked::refund_depth`: cancel `btc_confirmations` deep
+        // once the redeem is signed, else a block; the refund goes out at
+        // that depth, into the next block.
+        let depth = if buyer.must_stay_open() {
+            terms.btc_confirmations
+        } else {
+            1
+        };
+        refund = cancelled.or(cancel).map(|cancel| cancel + depth);
     }
+    let backup_covers = match buyer {
+        Buyer::AwaitNexLock { .. }
+        | Buyer::AwaitRedeem { .. }
+        | Buyer::Cancelling { .. }
+        | Buyer::ClaimingNex(_) => "lock",
+        _ => "wallet",
+    };
     let depth = |spent: &Option<Spent>| spent.as_ref().map(|spent| spent.confirmations);
     text(&json!({
         "phase": phase,
@@ -516,7 +537,8 @@ pub fn buyer_status(state: &str, view: Option<String>) -> Result<String> {
             "lock_spend": view.as_ref().and_then(|view| depth(&view.lock_spend)),
             "cancel_spend": view.as_ref().and_then(|view| depth(&view.cancel_spend)),
         },
-        "deadlines": {"cancel": cancel, "punish": punish},
+        "deadlines": {"cancel": cancel, "refund": refund, "punish": punish},
+        "backup_covers": backup_covers,
     }))
 }
 

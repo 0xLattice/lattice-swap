@@ -143,6 +143,7 @@ export async function esplora(chain, onPost = () => {}) {
       return [200, txid ? { spent: true, txid } : { spent: false }];
     }
     m = path.match(/^\/address\/(\w+)\/utxo$/);
+    if (m && chain.utxosDown) return [503, 'down'];
     if (m) {
       const utxos = chain.utxos.get(m[1]) ?? [];
       return [200, utxos.map(({ txid, vout, value, height }) => ({
@@ -220,3 +221,46 @@ export const kind = (state) => {
   const value = JSON.parse(state);
   return typeof value === 'string' ? value : Object.keys(value)[0];
 };
+
+/** The Web Locks an origin's tabs share, exclusive only: `tab()` is one
+ * tab's `navigator.locks`, and `close(tab)` lets go of what it holds, as
+ * closing the tab does. */
+export class Locks {
+  constructor() {
+    this.held = new Map();
+    this.waiting = [];
+  }
+
+  tab() {
+    const tab = { closed: false, request: (name, options, callback) => this.#request(tab, name, options, callback) };
+    return tab;
+  }
+
+  close(tab) {
+    tab.closed = true;
+    this.waiting = this.waiting.filter((waiter) => waiter.tab !== tab);
+    for (const [name, holder] of this.held) if (holder === tab) this.#release(name, tab);
+  }
+
+  #request(tab, name, options, callback) {
+    if (typeof options === 'function') [options, callback] = [{}, options];
+    return new Promise((resolve, reject) => {
+      const grant = () => {
+        this.held.set(name, tab);
+        Promise.resolve(callback({ name, mode: 'exclusive' }))
+          .then(resolve, reject)
+          .finally(() => this.#release(name, tab));
+      };
+      if (!this.held.has(name)) grant();
+      else if (options.ifAvailable) Promise.resolve(callback(null)).then(resolve, reject);
+      else this.waiting.push({ name, tab, grant });
+    });
+  }
+
+  #release(name, tab) {
+    if (this.held.get(name) !== tab) return;
+    this.held.delete(name);
+    const next = this.waiting.findIndex((waiter) => waiter.name === name);
+    if (next >= 0) this.waiting.splice(next, 1)[0].grant();
+  }
+}

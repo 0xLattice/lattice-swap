@@ -33,6 +33,21 @@ export class IndexedDBStore {
     await this.#run('readwrite', (records) => records.put(structuredClone(value), key));
   }
 
+  /** Writes `value` at `key` only if nothing is there: IndexedDB's `add`,
+   * which refuses to overwrite. */
+  async add(key, value) {
+    await this.#run('readwrite', (records) => {
+      const request = records.add(structuredClone(value), key);
+      // A key already there is no failure: the transaction commits.
+      request.onerror = (event) => {
+        if (request.error.name !== 'ConstraintError') return;
+        event.preventDefault();
+        event.stopPropagation();
+      };
+      return request;
+    });
+  }
+
   async delete(key) {
     await this.#run('readwrite', (records) => records.delete(key));
   }
@@ -56,6 +71,10 @@ export class MemoryStore {
   async put(key, value) {
     this.values.set(key, structuredClone(value));
     this.puts.push([key, structuredClone(value)]);
+  }
+
+  async add(key, value) {
+    if (!this.values.has(key)) await this.put(key, value);
   }
 
   async delete(key) {

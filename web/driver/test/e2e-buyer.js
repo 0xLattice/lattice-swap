@@ -11,10 +11,12 @@
 //
 // The config: {dir, esplora, nexus, genesis, offer, policy, nex_address}.
 // What to deposit prints as one JSON line, `{"address", "need"}`; the end
-// as `outcome: <outcome>`. Each change of status writes the recovery file
-// to `<dir>/backup`, as a buyer downloads it.
+// as `outcome: <outcome>`. The recovery file is written to `<dir>/backup`
+// once, when `backupCovers` first says it covers the lock: when a page asks
+// the buyer to download it, and never again, so a restore reads it as the
+// buyer would have it, stale.
 
-import { mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Buyer, load, Wallet } from '../src/index.js';
 
@@ -39,6 +41,10 @@ class FileStore {
     renameSync(`${path}.tmp`, path);
   }
 
+  async add(key, value) {
+    if (!existsSync(join(this.dir, `${key}.json`))) await this.put(key, value);
+  }
+
   async delete() {
     throw new Error('not needed here');
   }
@@ -60,6 +66,8 @@ const config = (dir) => ({
   nexus: c.nexus,
   nexusGenesis: c.genesis,
   poll: 500,
+  // One process, the only one on its store.
+  locks: null,
 });
 
 let wallet;
@@ -74,20 +82,20 @@ if (mode === 'take') {
   buyer = await Buyer.resume(wallet, swapId);
 }
 let told = mode !== 'take';
-// One write at a time, in order: the last is the latest.
-let written = Promise.resolve();
-buyer.addEventListener('status', (event) => {
+let backedUp = mode !== 'take';
+buyer.addEventListener('status', async (event) => {
   const status = event.detail;
   console.error(JSON.stringify(status));
   if (!told && status.need !== null) {
     told = true;
     console.log(JSON.stringify({ address: status.wallet.address, need: status.need }));
   }
-  written = written.then(async () => {
+  if (!backedUp && status.backupCovers === 'lock') {
+    backedUp = true;
     const { file } = await wallet.backup();
     writeFileSync(join(c.dir, 'backup.tmp'), file);
     renameSync(join(c.dir, 'backup.tmp'), join(c.dir, 'backup'));
-  });
+  }
 });
 console.log(`outcome: ${await buyer.run()}`);
 // A session may still be open: the swap is over.

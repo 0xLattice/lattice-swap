@@ -50,6 +50,8 @@ export class Buyer extends EventTarget {
   #need = null;
   #nexusDepth = null;
   #warning = null;
+  /** Why the offer could not be taken, once it cannot. */
+  #gone = null;
   #status = '';
   #wake = null;
 
@@ -74,27 +76,29 @@ export class Buyer extends EventTarget {
     if (!safe(decoded) || !safe(policy)) throw new Error('refused: an amount JavaScript cannot hold exactly');
     if (!decoded.relay) throw new Error('refused: the offer names no relay to reach the seller through');
     if (!wasm.isCid(nexAddress)) throw new Error(`${nexAddress} is not a Nexus address`);
-    const running = await wallet.running();
-    if (running !== null) throw new Error(`refused: swap ${running} is running; one swap at a time`);
-    await checkNexus(wallet.nexus, wallet.config.nexusGenesis);
-    const refused = await refusal(wallet, decoded, policy);
-    if (refused !== null) throw new Error(refused);
-    const { store } = wallet.config;
-    for (const id of await wallet.swaps()) {
-      if (!(await store.get(swapKey(id))).taken) await store.delete(swapKey(id));
-    }
-    const started = call('startBuyer', JSON.stringify(decoded.terms), wallet.key.script_pubkey, nexAddress);
-    const record = {
-      swap_id: decoded.terms.swap_id,
-      offer: decoded,
-      policy,
-      state: JSON.stringify(started.state),
-      // The hello, sent once the offer is taken.
-      pending: started.actions,
-      taken: false,
-    };
-    await store.put(swapKey(record.swap_id), record);
-    return new Buyer(wallet, record);
+    return wallet.exclusive(async () => {
+      const running = await wallet.running();
+      if (running !== null) throw new Error(`refused: swap ${running} is running; one swap at a time`);
+      await checkNexus(wallet.nexus, wallet.config.nexusGenesis);
+      const refused = await refusal(wallet, decoded, policy);
+      if (refused !== null) throw new Error(refused);
+      const { store } = wallet.config;
+      for (const id of await wallet.swaps()) {
+        if (!(await store.get(swapKey(id))).taken) await store.delete(swapKey(id));
+      }
+      const started = call('startBuyer', JSON.stringify(decoded.terms), wallet.key.script_pubkey, nexAddress);
+      const record = {
+        swap_id: decoded.terms.swap_id,
+        offer: decoded,
+        policy,
+        state: JSON.stringify(started.state),
+        // The hello, sent once the offer is taken.
+        pending: started.actions,
+        taken: false,
+      };
+      await store.put(swapKey(record.swap_id), record);
+      return new Buyer(wallet, record);
+    });
   }
 
   /** The swap `swapId` in the wallet's store, carried on from where it
@@ -114,7 +118,9 @@ export class Buyer extends EventTarget {
   /** Where the swap is, for a page to show:
    * - `step`: `fund-wallet` until the wallet can fund the lock and the
    *   offer is taken, then `swapping`, `finishing` once the redeem is
-   *   signed, and `done`; or `refunding` and `refunded`;
+   *   signed, and `done`; or `refunding` and `refunded`; or `offer-gone`
+   *   if the session to the seller would not open, as the CLI's `take`
+   *   fails once: nothing was sent, and the buyer picks another offer;
    * - `outcome`: once ended, the machine's: `swapped`, `refunded`,
    *   `punished`, `drained` or `aborted`;
    * - `wallet`: `{address, confirmed, unconfirmed}`, in sat, and `need`,
@@ -125,18 +131,24 @@ export class Buyer extends EventTarget {
    *   cancel can be in, and `punish`, the first the seller's punish can be
    *   in (the earliest it could be, until cancel is in a block), each
    *   `{height, eta}`, `eta` in ms since the epoch; and `refund`, `{from,
-   *   until}`, the heights between which the page must be open once for
-   *   the refund to be in a block before the punish. A page shows them as
-   *   eigenwallet does: "open this page once between X and Y";
+   *   until}`: the first block the refund can be in, once cancel is deep
+   *   enough (the earliest, until cancel is in a block), and the punish's,
+   *   which it must come before. Cancel and refund run as one flow, as
+   *   eigenwallet's `cancel-and-refund`: a page shows "come back by
+   *   <cancel> and keep the page open until your refund confirms";
    * - `mustStayOpen`: the redeem is signed and the swap not yet settled
-   *   (`Buyer::must_stay_open`);
+   *   (`Buyer::must_stay_open`), or cancel is due and the refund not yet
+   *   confirmed;
+   * - `backupCovers`: what a recovery file taken now covers: `wallet`, or
+   *   `lock` once the funding may be broadcast, from when a page asks the
+   *   buyer to download it, as Boltz asks for its refund file;
    * - `tip`, and `warning`, the last failure, if any. */
   status() {
     const r = this.#r;
     const machine = call('buyerStatus', r.state, this.#view);
     const status = {
       swapId: r.swap_id,
-      step: r.taken ? STEPS[machine.phase] : 'fund-wallet',
+      step: this.#gone !== null ? 'offer-gone' : r.taken ? STEPS[machine.phase] : 'fund-wallet',
       outcome: ended(r.state) ? machine.phase : null,
       wallet: { address: this.#wallet.address, ...(this.#balance ?? { confirmed: null, unconfirmed: null }) },
       need: r.taken ? null : this.#need,
@@ -147,19 +159,21 @@ export class Buyer extends EventTarget {
         nexLock: this.#nexusDepth,
       },
       deadlines: { cancel: null, refund: null, punish: null },
-      mustStayOpen: machine.must_stay_open,
+      mustStayOpen: machine.must_stay_open || machine.phase === 'refunding',
+      backupCovers: machine.backup_covers,
       tip: this.#tip,
-      warning: this.#warning,
+      warning: this.#gone ?? this.#warning,
     };
-    const { cancel, punish } = machine.deadlines;
+    const { cancel, refund, punish } = machine.deadlines;
     const at = (height) => ({ height, eta: this.#c.now() + Math.max(0, height - (this.#tip ?? height)) * BLOCK_MS });
     if (cancel !== null && !ended(r.state)) {
-      status.deadlines = { cancel: at(cancel), refund: { from: cancel, until: punish }, punish: at(punish) };
+      status.deadlines = { cancel: at(cancel), refund: { from: refund, until: punish }, punish: at(punish) };
     }
     return status;
   }
 
-  /** Runs the swap until it ends, or `signal` aborts: the final step. A
+  /** Runs the swap until it ends, its offer is gone, or `signal` aborts:
+   * the outcome, once it ends. A
    * `status` event follows every change of {@link Buyer#status}. */
   async run(signal) {
     while (!signal?.aborted) {
@@ -186,17 +200,19 @@ export class Buyer extends EventTarget {
     return ended(this.#r.state) ? this.status().outcome : null;
   }
 
-  /** One round: whether the swap is over. */
+  /** One round: whether the swap is over, or its offer gone. */
   async #round() {
-    this.#balance = await this.#wallet.balance();
     if (!this.#r.taken) {
+      this.#balance = await this.#wallet.balance();
       await this.#take();
-      return false;
+      return this.#gone !== null;
     }
     for (const message of this.#inbox.splice(0)) await this.#apply({ Message: JSON.parse(message) });
     if (this.#awaits() && this.#c.now() - this.#since > this.#c.messageTimeout) await this.#apply('Timeout');
     await this.#observeBitcoin();
     await this.#observeNexus();
+    // Last: the balance is shown, and a failed read of it skips nothing.
+    this.#balance = await this.#wallet.balance();
     return ended(this.#r.state);
   }
 
@@ -206,20 +222,35 @@ export class Buyer extends EventTarget {
 
   /** Takes the offer once the wallet's spendable balance pays for the
    * lock: judged again first, as the CLI's `take` judges it just before it
-   * dials, at today's fees. */
+   * dials, at today's fees. Under the wallet's lock until it is saved as
+   * taken, so nothing else spends the outputs it counted. */
   async #take() {
     const r = this.#r;
-    const amount = r.offer.terms.btc_amount;
-    const fee_rate = await this.#wallet.feeRate();
-    const { enough, need } = call('walletNeed', { utxos: await this.#wallet.spendable(), amount, fee_rate });
-    this.#need = need;
-    if (!enough) return;
-    const refused = await refusal(this.#wallet, r.offer, r.policy);
-    if (refused !== null) throw new Error(refused);
-    const open = this.#c.openSession ?? Session.open;
-    this.#session = await open(r.offer, (message) => this.#receive(message), { WebSocket: this.#c.WebSocket });
-    r.taken = true;
-    await this.#save();
+    const taken = await this.#wallet.exclusive(async () => {
+      const running = await this.#wallet.running();
+      if (running !== null) throw new Error(`refused: swap ${running} is running; one swap at a time`);
+      const amount = r.offer.terms.btc_amount;
+      const fee_rate = await this.#wallet.feeRate();
+      const { enough, need } = call('walletNeed', { utxos: await this.#wallet.spendable(), amount, fee_rate });
+      this.#need = need;
+      if (!enough) return false;
+      const refused = await refusal(this.#wallet, r.offer, r.policy);
+      if (refused !== null) throw new Error(refused);
+      const open = this.#c.openSession ?? Session.open;
+      try {
+        this.#session = await open(r.offer, (message) => this.#receive(message), { WebSocket: this.#c.WebSocket });
+      } catch (e) {
+        // Once, as the CLI's `take` fails: the relay no longer pairs with
+        // the seller, whose offer is taken or withdrawn. Nothing was sent.
+        this.#gone = `the offer is gone: ${e.message}`;
+        await this.#c.store.delete(swapKey(r.swap_id));
+        return false;
+      }
+      r.taken = true;
+      await this.#save();
+      return true;
+    });
+    if (!taken) return;
     this.#since = this.#c.now();
     const pending = r.pending;
     r.pending = [];
