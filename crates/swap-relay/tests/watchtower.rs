@@ -3,7 +3,8 @@
 //! broadcasts the refund, and forgets the watch once it is deep.
 //!
 //! The relay reads the chain through a small Esplora shim over bitcoind,
-//! here in the test: the four calls the watchtower makes.
+//! here in the test: the calls the watchtower makes, answered as Esplora
+//! does, `/tx/{txid}/status` unconfirmed even for a txid never seen.
 
 use std::net::TcpListener;
 use std::sync::Arc;
@@ -127,17 +128,45 @@ fn esplora(node: Bitcoind) -> String {
             }),
         )
         .route(
-            "/tx/{txid}/status",
+            "/tx/{txid}",
             get(
                 |State(node): State<Shared>, Path(txid): Path<String>| async move {
                     let answer = ask(&node, move |n| {
                         let tx = n.call("getrawtransaction", json!([txid, true])).ok()?;
-                        Some(status(n, &tx))
+                        Some(json!({"txid": tx["txid"], "status": status(n, &tx)}))
                     });
                     match answer.await {
-                        Some(status) => Json(status).into_response(),
+                        Some(tx) => Json(tx).into_response(),
                         None => (StatusCode::NOT_FOUND, "Transaction not found").into_response(),
                     }
+                },
+            ),
+        )
+        .route(
+            "/tx/{txid}/hex",
+            get(
+                |State(node): State<Shared>, Path(txid): Path<String>| async move {
+                    let hex = ask(&node, move |n| {
+                        n.call("getrawtransaction", json!([txid, false])).ok()
+                    });
+                    match hex.await {
+                        Some(hex) => hex.as_str().unwrap().to_string().into_response(),
+                        None => (StatusCode::NOT_FOUND, "Transaction not found").into_response(),
+                    }
+                },
+            ),
+        )
+        .route(
+            "/tx/{txid}/status",
+            get(
+                |State(node): State<Shared>, Path(txid): Path<String>| async move {
+                    let status = ask(&node, move |n| {
+                        match n.call("getrawtransaction", json!([txid, true])) {
+                            Ok(tx) => status(n, &tx),
+                            Err(_) => json!({"confirmed": false}),
+                        }
+                    });
+                    Json(status.await)
                 },
             ),
         )
@@ -302,20 +331,42 @@ fn the_relay_refunds_a_buyer_that_went_offline() {
     default
         .call("sendrawtransaction", json!([serialize_hex(cancel)]))
         .unwrap();
+    // Whoever posts cancel first, stripped of its witness, takes the slot,
+    // but the relay keeps Esplora's copy, which can be broadcast again.
+    let mut stripped_cancel = cancel.clone();
+    stripped_cancel.input[0].witness = bitcoin::Witness::new();
+    let mut stripped = watch.clone();
+    stripped["cancel"] = serialize_hex(&stripped_cancel).into();
+    assert_eq!(post(&stripped), Ok(cancel.compute_txid().to_string()));
     assert_eq!(post(&watch), Ok(cancel.compute_txid().to_string()));
     drop(buyer);
 
     // The relay restarts: the watch is read back from disk, and watched.
     let tower = Arc::new(Watchtower::open(Network::Regtest, watches.path(), 10).unwrap());
     assert_eq!(tower.len(), 1);
+    // Meanwhile cancel expires from the mempool: a fortnight passes, and
+    // the next transaction in sweeps it out.
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    default
+        .call("setmocktime", json!([now + 30 * 24 * 60 * 60]))
+        .unwrap();
+    let address = default.call("getnewaddress", json!([])).unwrap();
+    default
+        .call("sendtoaddress", json!([address, 0.001]))
+        .unwrap();
+    assert!(!pooled(&default, cancel.compute_txid()));
     let watcher = tower.clone();
     thread::spawn(move || {
         let esplora = Esplora::new(&esplora_url, TIMEOUT);
         watcher.run(&esplora, Duration::from_millis(200))
     });
 
-    // No refund while cancel waits in the mempool; once it is in a block,
-    // the refund goes out.
+    // The relay broadcasts cancel again. No refund while cancel waits in
+    // the mempool; once it is in a block, the refund goes out.
+    wait_for("cancel again", || pooled(&default, cancel.compute_txid()));
     thread::sleep(Duration::from_secs(1));
     assert!(!pooled(&default, refund.compute_txid()));
     mine(1);

@@ -179,6 +179,8 @@ pub trait Chain: Send + Sync {
     /// Where `txid` is, if seen: `Some(None)` in the mempool, or the height
     /// of its block.
     fn transaction(&self, txid: Txid) -> io::Result<Option<Option<u32>>>;
+    /// The copy of `txid` in the mempool or a block, if seen.
+    fn raw(&self, txid: Txid) -> io::Result<Option<Transaction>>;
     /// What spends `outpoint`, in the mempool or a block.
     fn spender(&self, outpoint: OutPoint) -> io::Result<Option<(Txid, Option<u32>)>>;
     fn broadcast(&self, tx: &Transaction) -> io::Result<()>;
@@ -296,12 +298,24 @@ impl Watchtower {
     /// mempool or a block, which spends an output that exists, and whose
     /// one output the refund's own keys sign for. A cancel watched already
     /// is taken as it was. Returns cancel's txid.
-    pub fn add(&self, watch: Watch, chain: &dyn Chain) -> Result<Txid, Refusal> {
+    ///
+    /// The cancel kept is `chain`'s copy, not the one posted: a witness is
+    /// not in the txid, so a posted cancel stripped of its own would
+    /// otherwise hold the slot with a cancel that cannot be broadcast again.
+    pub fn add(&self, mut watch: Watch, chain: &dyn Chain) -> Result<Txid, Refusal> {
         watch.check(self.network).map_err(Refusal::Invalid)?;
         let cancel = watch.cancel.compute_txid();
-        if chain.transaction(cancel).map_err(Refusal::Chain)?.is_none() {
+        let Some(seen) = chain.raw(cancel).map_err(Refusal::Chain)? else {
             return Err(Refusal::Unseen);
+        };
+        if seen.compute_txid() != cancel {
+            let why = format!("esplora answered another transaction for {cancel}");
+            return Err(Refusal::Chain(io::Error::new(
+                io::ErrorKind::InvalidData,
+                why,
+            )));
         }
+        watch.cancel = seen;
         let mut watches = self.watches.lock().expect("the watches' lock");
         if watches.contains_key(&cancel) {
             return Ok(cancel);
@@ -428,6 +442,10 @@ impl Watchtower {
 }
 
 /// An Esplora API at `base`, such as `https://mempool.space/api`.
+///
+/// A transaction is looked up at `/tx/{txid}`, never `/tx/{txid}/status`:
+/// Esplora answers the latter `{"confirmed":false}` for a txid it has never
+/// seen, as for one in its mempool; only the former, and `/hex`, 404 it.
 pub struct Esplora {
     base: String,
     agent: ureq::Agent,
@@ -463,6 +481,12 @@ impl Status {
     }
 }
 
+/// What the watchtower reads of `/tx/{txid}`.
+#[derive(Deserialize)]
+struct Tx {
+    status: Status,
+}
+
 #[derive(Deserialize)]
 struct Outspend {
     spent: bool,
@@ -483,8 +507,17 @@ impl Chain for Esplora {
     }
 
     fn transaction(&self, txid: Txid) -> io::Result<Option<Option<u32>>> {
-        match self.get(&format!("/tx/{txid}/status"))? {
-            Some(text) => Ok(Some(json::<Status>(&text)?.height())),
+        match self.get(&format!("/tx/{txid}"))? {
+            Some(text) => Ok(Some(json::<Tx>(&text)?.status.height())),
+            None => Ok(None),
+        }
+    }
+
+    fn raw(&self, txid: Txid) -> io::Result<Option<Transaction>> {
+        match self.get(&format!("/tx/{txid}/hex"))? {
+            Some(hex) => deserialize_hex(&hex)
+                .map(Some)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
             None => Ok(None),
         }
     }

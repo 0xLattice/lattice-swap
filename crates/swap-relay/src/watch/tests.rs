@@ -72,6 +72,8 @@ const UNSEEN: u32 = 3;
 struct Fake {
     /// Where each transaction is: `None` in the mempool.
     seen: HashMap<Txid, Option<u32>>,
+    /// Each transaction seen, as the chain holds it.
+    txs: HashMap<Txid, Transaction>,
     spenders: HashMap<OutPoint, (Txid, Option<u32>)>,
     /// The broadcasts taken.
     broadcasts: Mutex<Vec<Transaction>>,
@@ -85,8 +87,13 @@ impl Fake {
     /// with `None` in the mempool.
     fn with_cancel(watch: &Watch, height: Option<u32>) -> Self {
         let mut chain = Fake::default();
-        chain.seen.insert(watch.cancel.compute_txid(), height);
+        chain.see(&watch.cancel, height);
         chain
+    }
+
+    fn see(&mut self, tx: &Transaction, height: Option<u32>) {
+        self.seen.insert(tx.compute_txid(), height);
+        self.txs.insert(tx.compute_txid(), tx.clone());
     }
 }
 
@@ -96,6 +103,10 @@ impl Chain for Fake {
     }
     fn transaction(&self, txid: Txid) -> io::Result<Option<Option<u32>>> {
         Ok(self.seen.get(&txid).copied())
+    }
+    fn raw(&self, txid: Txid) -> io::Result<Option<Transaction>> {
+        let seen = self.seen.contains_key(&txid);
+        Ok(self.txs.get(&txid).filter(|_| seen).cloned())
     }
     fn spender(&self, outpoint: OutPoint) -> io::Result<Option<(Txid, Option<u32>)>> {
         Ok(self.spenders.get(&outpoint).copied())
@@ -282,7 +293,7 @@ fn one_cancel_holds_one_watch() {
     assert_eq!(serde_json::from_str::<Watch>(&saved).unwrap(), first);
     // Another swap's buyer is taken.
     let other = watch_of(10);
-    chain.seen.insert(other.cancel.compute_txid(), None);
+    chain.see(&other.cancel, None);
     tower.add(other, &chain).unwrap();
     assert_eq!(tower.len(), 2);
 }
@@ -297,6 +308,9 @@ fn a_watch_needs_its_cancel_seen() {
             Err(io::Error::other("down"))
         }
         fn transaction(&self, _: Txid) -> io::Result<Option<Option<u32>>> {
+            Err(io::Error::other("down"))
+        }
+        fn raw(&self, _: Txid) -> io::Result<Option<Transaction>> {
             Err(io::Error::other("down"))
         }
         fn spender(&self, _: OutPoint) -> io::Result<Option<(Txid, Option<u32>)>> {
@@ -539,7 +553,7 @@ fn the_watchtower_holds_at_most_max_and_only_valid_watches() {
     let watch = watch();
     let mut chain = Fake::with_cancel(&watch, None);
     let other = watch_of(10);
-    chain.seen.insert(other.cancel.compute_txid(), None);
+    chain.see(&other.cancel, None);
     for depth in [0, MAX_DEPTH + 1, u32::MAX] {
         let mut invalid = watch.clone();
         invalid.depth = depth;
@@ -551,4 +565,38 @@ fn the_watchtower_holds_at_most_max_and_only_valid_watches() {
     tower.add(watch, &chain).unwrap();
     assert!(matches!(tower.add(other, &chain), Err(Refusal::Full)));
     assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+}
+
+/// The cancel kept is the chain's copy: whoever posts its cancel first,
+/// stripped of its witness, holds the slot with the cancel that can be
+/// broadcast again all the same.
+#[test]
+fn the_cancel_kept_is_the_chains_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let tower = Watchtower::open(Network::Regtest, dir.path(), 10).unwrap();
+    let genuine = watch();
+    let mut chain = Fake::with_cancel(&genuine, None);
+    let mut stripped = genuine.clone();
+    stripped.cancel.input[0].witness = Witness::new();
+    let cancel = tower.add(stripped, &chain).unwrap();
+    assert_eq!(tower.add(genuine.clone(), &chain).unwrap(), cancel);
+    let saved = fs::read_to_string(dir.path().join(format!("{cancel}.json"))).unwrap();
+    assert_eq!(serde_json::from_str::<Watch>(&saved).unwrap(), genuine);
+    chain.seen.remove(&cancel);
+    tower.round(&chain, UNSEEN);
+    assert_eq!(*chain.broadcasts.lock().unwrap(), vec![genuine.cancel]);
+}
+
+/// A chain that answers another transaction for the cancel's txid is not
+/// believed.
+#[test]
+fn another_transaction_for_the_cancel_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let tower = Watchtower::open(Network::Regtest, dir.path(), 10).unwrap();
+    let watch = watch();
+    let mut chain = Fake::with_cancel(&watch, None);
+    let cancel = watch.cancel.compute_txid();
+    chain.txs.insert(cancel, watch.refund.clone());
+    assert!(matches!(tower.add(watch, &chain), Err(Refusal::Chain(_))));
+    assert!(tower.is_empty());
 }

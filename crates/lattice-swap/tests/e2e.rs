@@ -67,19 +67,24 @@ fn wait_for<T>(what: &str, mut poll: impl FnMut() -> Option<T>) -> T {
     }
 }
 
-/// What the relay asks of `bitcoind` as it takes a watch: whether it has
-/// seen cancel. Its watchtower does not watch here.
+/// What the relay asks of `bitcoind` as it takes a watch: its copy of
+/// cancel, if it has seen it. Its watchtower does not watch here.
 struct Seen(Bitcoind);
 
 impl Chain for Seen {
     fn tip(&self) -> io::Result<u32> {
         Err(io::Error::other("not watching"))
     }
-    fn transaction(&self, txid: Txid) -> io::Result<Option<Option<u32>>> {
-        let tx = self
+    fn transaction(&self, _: Txid) -> io::Result<Option<Option<u32>>> {
+        Err(io::Error::other("not watching"))
+    }
+    fn raw(&self, txid: Txid) -> io::Result<Option<Transaction>> {
+        let hex = self
             .0
-            .call("getrawtransaction", json!([txid.to_string(), true]));
-        Ok(tx.ok().map(|tx| tx["blockhash"].as_str().map(|_| 0)))
+            .call("getrawtransaction", json!([txid.to_string(), false]));
+        Ok(hex
+            .ok()
+            .map(|hex| bitcoin::consensus::encode::deserialize_hex(hex.as_str().unwrap()).unwrap()))
     }
     fn spender(&self, _: OutPoint) -> io::Result<Option<(Txid, Option<u32>)>> {
         Err(io::Error::other("not watching"))
