@@ -848,6 +848,7 @@ fn resume(args: SwapFileArgs) -> Result<Outcome> {
             )
         }
         Saved::Buyer(buyer) => {
+            refuse_browser_file(&swap_file)?;
             let bitcoin = args.nodes.bitcoin()?;
             let nexus = args.nodes.nexus()?;
             if buyer.outcome().is_none() {
@@ -863,6 +864,23 @@ fn resume(args: SwapFileArgs) -> Result<Outcome> {
             )
         }
     }
+}
+
+/// Refuses a browser's swap file: its funding's change and its refund pay
+/// the deposit key the file holds, which this tool does not spend, and a
+/// save here would drop that key from the file.
+fn refuse_browser_file(swap_file: &Path) -> Result<()> {
+    let file: Value = serde_json::from_slice(&fs::read(swap_file)?)?;
+    if file["browser"].is_null() {
+        return Ok(());
+    }
+    Err(format!(
+        "refused: {} is a browser's swap file: its refund pays the deposit key the file \
+         holds, which this tool does not spend, and resuming here would drop the key from \
+         the file; restore it in the page instead",
+        swap_file.display()
+    )
+    .into())
 }
 
 fn status(swap_file: &Path) -> Result<()> {

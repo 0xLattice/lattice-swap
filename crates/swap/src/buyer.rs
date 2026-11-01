@@ -405,14 +405,20 @@ impl Buyer {
     ///   cancel `btc_confirmations` deep, or a seller that orphans cancel's
     ///   block and redeems learns `b` and takes both coins: a source that
     ///   lies about the depth hands it that.
-    /// - Claiming the NEX on a redeem seen: every source. Waiting costs
-    ///   nothing: the NEX lock goes back to the seller only with `b`, which
-    ///   only the refund reveals.
+    /// - Claiming the NEX on a redeem seen: one source. A redeem proves
+    ///   itself: `s` is taken from it only if it matches the share the
+    ///   seller proved at the start, which no source can forge. Once the
+    ///   buyer holds `s` the NEX is its own, and it no longer refunds: the
+    ///   seller, holding the redeem signature, can have the BTC.
     /// - The end, refunded or punished, on a spend of cancel deep enough:
     ///   every source. Ending on a lie stops the refund going out, and a
     ///   punish may then win.
     ///
-    /// Any other state, or event, is left as it is.
+    /// Any other state, or event, is left as it is. So with one source down
+    /// for good, a swap whose redeem was never signed still cancels and
+    /// refunds, and one whose redeem was signed still cancels and claims
+    /// the NEX once the seller redeems; but its refund, and the end of any
+    /// swap, wait for the source to come back.
     pub fn step_one_source(self, view: BitcoinView) -> (Self, Vec<Action>) {
         use Buyer::*;
         let (locked, redeem) = match self {
@@ -441,6 +447,7 @@ impl Buyer {
                 }
                 (state, actions)
             }
+            (state @ ClaimingNex(_), actions) => (state, actions),
             _ => (kept, vec![]),
         }
     }

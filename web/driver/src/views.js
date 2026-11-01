@@ -9,9 +9,10 @@
 // The exception is what is safe whatever one source says, which the machine
 // does on each source's view alone (`Buyer::step_one_source` lists each
 // case): broadcasting the funding again, giving up at t1 and cancelling,
-// and the refund of a swap whose redeem was never signed; and the bump of a
-// waiting funding. A deposit, a refund once the redeem is signed, a claim,
-// and the end of a swap wait for every source. The Nexus view comes from
+// the refund of a swap whose redeem was never signed, and the claim of the
+// NEX on a redeem, which proves itself; and the bump of a waiting funding.
+// A deposit, a refund once the redeem is signed, and the end of a swap wait
+// for every source. The Nexus view comes from
 // one node, and is one view only when `nexusOneTip` holds for the health
 // read before and after it.
 

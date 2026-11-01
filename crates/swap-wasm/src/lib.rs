@@ -116,7 +116,8 @@ fn stepped<M: Machine>(machine: &M, actions: &[swap::Action]) -> Result<String> 
 /// address gives `browser`, `{"deposit", "relay", "quote_rate"}`: the
 /// deposit key as WIF, the relay its watchtower is, if any, and the fee
 /// rate its quote was made at. The file keeps it, and `lattice-swap resume`
-/// ignores it.
+/// refuses such a file: its refund pays the deposit key, which only the
+/// page spends.
 #[wasm_bindgen]
 pub fn backup(state: &str, browser: Option<String>) -> Result<String> {
     let (_, state, terms) = machine(parse(state)?)?;

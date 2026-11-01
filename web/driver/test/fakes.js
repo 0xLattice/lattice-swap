@@ -116,6 +116,7 @@ function unspendable(chain, posted, hex) {
 /** An Esplora over `chain`: what it takes is logged in `posted`, and
  * `onPost(hex)` runs first; it refuses a transaction that spends what it
  * cannot. `source.fees`, if set, are its estimates instead of the chain's,
+ * `source.txs` transactions it shows beside the chain's, as `chain.txs`,
  * and while `source.down` holds it answers nothing. */
 export async function esplora(chain, onPost = () => {}, source = {}) {
   const posted = [];
@@ -133,7 +134,7 @@ export async function esplora(chain, onPost = () => {}, source = {}) {
     if (path === '/fee-estimates') return [200, source.fees ?? chain.fees];
     let m = path.match(/^\/tx\/(\w+)(\/hex)?$/);
     if (m) {
-      const tx = chain.txs.get(m[1]);
+      const tx = source.txs?.get(m[1]) ?? chain.txs.get(m[1]);
       if (!tx) return [404, 'Transaction not found'];
       if (m[2]) return [200, tx.hex];
       return [200, { txid: m[1], status: tx.height === null ? { confirmed: false } : { confirmed: true, block_height: tx.height } }];

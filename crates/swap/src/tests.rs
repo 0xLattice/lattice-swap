@@ -890,8 +890,9 @@ fn the_refund_is_handed_over_only_once_the_redeem_is_given_up_unsigned() {
 }
 
 /// On one source's view alone the buyer broadcasts the funding again, gives
-/// up at t1 and cancels, and refunds a swap whose redeem it never signed;
-/// it neither refunds once it has signed the redeem nor ends a swap.
+/// up at t1 and cancels, refunds a swap whose redeem it never signed, and
+/// claims the NEX on a redeem; it neither refunds once it has signed the
+/// redeem nor ends a swap.
 #[test]
 fn one_source_alone_does_only_what_no_lie_can_turn_against_the_buyer() {
     let one = |buyer: Buyer, event: Event| {
@@ -912,7 +913,7 @@ fn one_source_alone_does_only_what_no_lie_can_turn_against_the_buyer() {
     assert!(matches!(buyer, Buyer::AwaitNexLock { .. }));
     assert_eq!(broadcasts(&actions), [buyer.funding().unwrap().clone()]);
 
-    let (_, buyer, nex_lock) = locked.nex_locked();
+    let (seller, buyer, nex_lock) = locked.nex_locked();
     let (early, actions) = one(buyer.clone(), btc(19, None, None));
     assert!(matches!(early, Buyer::AwaitNexLock { .. }) && actions.is_empty());
     let (unsigned, actions) = one(buyer.clone(), btc(20, None, None));
@@ -924,7 +925,23 @@ fn one_source_alone_does_only_what_no_lie_can_turn_against_the_buyer() {
     assert!(matches!(unsigned, Buyer::Cancelling { .. }), "not ended");
     assert!(actions.is_empty());
 
-    let (signed, _) = buyer.step(nexus(account(500_000, 0), mined(nex_lock.body, 1)));
+    let (signed, sent_redeem) = buyer.step(nexus(account(500_000, 0), mined(nex_lock.body, 1)));
+    // The seller's redeem, on one source: claimed, from the redeem awaited
+    // or from cancelling. One whose signature is not the seller's is not.
+    let (seller, _) = seller.step(message(sent(&sent_redeem)));
+    let redeem = broadcasts(&seller.step(btc(2, None, None)).1)[0].clone();
+    let mut forged = redeem.clone();
+    let mut witness = forged.input[0].witness.to_vec();
+    witness[0][0] ^= 1;
+    forged.input[0].witness = witness.into();
+    let (cancelling, _) = one(signed.clone(), btc(20, None, None));
+    for buyer in [signed.clone(), cancelling] {
+        let (claiming, actions) = one(buyer.clone(), btc(3, Some((&redeem, 0)), None));
+        assert!(matches!(claiming, Buyer::ClaimingNex(_)) && actions.is_empty());
+        let (kept, actions) = one(buyer, btc(3, Some((&forged, 0)), None));
+        assert!(matches!(kept, Buyer::Cancelling { .. }), "a forged redeem");
+        assert!(actions.is_empty());
+    }
     assert!(one(signed.clone(), btc(19, None, None)).1.is_empty());
     let (signed, actions) = one(signed, btc(20, None, None));
     assert!(matches!(

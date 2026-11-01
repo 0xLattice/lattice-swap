@@ -68,7 +68,14 @@ if (mode === 'take') {
 } else {
   buyer = await Buyer.resume(config, c.swap_id);
 }
-buyer.addEventListener('status', (event) => console.error(JSON.stringify(event.detail)));
+buyer.addEventListener('status', (event) => {
+  console.error(JSON.stringify(event.detail));
+  // Node keeps no store for the browser: the backup is taken again, as a
+  // page prompts its buyer to.
+  if (event.detail.step === 'save-backup') {
+    buyer.backup().then(({ file }) => writeFileSync(join(c.dir, 'backup'), file));
+  }
+});
 console.log(`outcome: ${await buyer.run()}`);
 // A session may still be open: the swap is over.
 process.exit(0);

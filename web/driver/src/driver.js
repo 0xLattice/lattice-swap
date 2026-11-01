@@ -9,7 +9,13 @@
 // acceptable before it confirms, or a swap aborted before the lock is
 // funded, sends the deposit back to the refund address, and no swap runs.
 // The swap's own refund pays the deposit key too, and is sent on from there
-// to the refund address by a child that can bump it.
+// to the refund address by a child that can bump it, at swap-wasm's
+// `refundRate`: the highest estimate, uncapped, doubling as the punish
+// nears.
+//
+// The buyer's signatures, after which the funding goes out, are held until
+// the seller's are durable: the browser keeps the store, or the buyer took
+// the backup again since they came (`status().step` is `save-backup`).
 
 import { call, safe, wasm } from './wasm.js';
 import { Esplora } from './esplora.js';
@@ -89,6 +95,10 @@ export class Buyer extends EventTarget {
   #wake = null;
   #persisted = null;
   #elsewhere = false;
+  /** The last Bitcoin view stepped on, one source's or all of theirs. */
+  #seen = null;
+  /** The buyer's signatures, held until the seller's are durable. */
+  #held = null;
 
   constructor(config, record) {
     super();
@@ -221,11 +231,12 @@ export class Buyer extends EventTarget {
 
   /** The swap file for the buyer to keep, `{name, file}`: the state as it
    * stands, the deposit key, the relay and the quote's fee rate, which
-   * `lattice-swap resume` and {@link Buyer.restore} read. The deposit
-   * address is shown only once this was called. A file holds the swap as
-   * it stood when taken: one taken before the seller's signatures recovers
-   * the deposit, not a swap under way, whose refund needs them; the store
-   * holds those, and `status().backupStale` says to take the file again. */
+   * {@link Buyer.restore} reads; `lattice-swap resume` refuses it, since
+   * its refund pays the deposit key. The deposit address is shown only
+   * once this was called. A file holds the swap as it stood when taken:
+   * one taken before the seller's signatures recovers the deposit, not a
+   * swap under way, whose refund needs them; the store holds those, and
+   * `status().backupStale` says to take the file again. */
   async backup() {
     const r = this.#r;
     const browser = r.deposit && {
@@ -238,6 +249,8 @@ export class Buyer extends EventTarget {
       r.backed_up = true;
       r.backup_stale = false;
       await this.#save();
+      // Signatures held for this backup go out.
+      this.#wake?.();
     }
     return file;
   }
@@ -249,6 +262,12 @@ export class Buyer extends EventTarget {
   /** Where the swap is, for a page to show:
    * - `step`: `backup` until {@link Buyer#backup}, `deposit` until the
    *   deposit confirms, `locking` until the seller's NEX lock is trusted,
+   *   but `save-backup` while the seller's signatures are in, and only in,
+   *   a store the browser has not agreed to keep (`persisted`): the
+   *   buyer's signatures, and so the funding, are held until the buyer
+   *   takes {@link Buyer#backup} again, whose file can then refund it; a
+   *   buyer that does not within `messageTimeout` gets the deposit back,
+   *   the swap aborted,
    *   `finishing` once the redeem is signed, then `swapped`; `refunding`
    *   and `refunded` when the BTC comes back; or `punished`, `drained`;
    * - `deposit`: once backed up, `{address, amount, received,
@@ -282,6 +301,7 @@ export class Buyer extends EventTarget {
       warning: this.#warning,
     };
     if (!r.backed_up) status.step = 'backup';
+    else if (this.#held) status.step = 'save-backup';
     else if (r.deposit_refund) status.step = r.deposit_refund.confirmed ? 'refunded' : 'refunding';
     else if (!r.taken) status.step = 'deposit';
     else {
@@ -301,24 +321,37 @@ export class Buyer extends EventTarget {
 
   /** Runs the swap until it ends, or `signal` aborts: the final step. A
    * `status` event follows every change of {@link Buyer#status}. Only one
-   * tab drives a swap: in another, this returns null at once, with
-   * `status().elsewhere` set. */
+   * tab drives a swap: in another, this waits, with `status().elsewhere`
+   * set, until that tab closes, then drives it. */
   async run(signal) {
     try {
       this.#persisted = (await this.#c.storage?.persist?.()) ?? null;
     } catch {
       this.#persisted = false;
     }
-    if (!this.#c.locks) return this.#loop(signal);
-    return this.#c.locks.request(`lattice-swap:${this.swapId}`, { ifAvailable: true }, (lock) => {
-      if (lock === null) {
-        this.#elsewhere = true;
-        this.#announce();
-        return null;
-      }
+    const locks = this.#c.locks;
+    if (!locks) return this.#loop(signal);
+    const name = `lattice-swap:${this.swapId}`;
+    const drive = () => {
       this.#elsewhere = false;
       return this.#loop(signal);
+    };
+    // Free, it drives at once; held, it says so, then waits in line.
+    let free = false;
+    const done = await locks.request(name, { ifAvailable: true }, (lock) => {
+      if (lock === null) return null;
+      free = true;
+      return drive();
     });
+    if (free) return done;
+    this.#elsewhere = true;
+    this.#announce();
+    try {
+      return await locks.request(name, signal ? { signal } : {}, drive);
+    } catch (e) {
+      if (signal?.aborted) return null;
+      throw e;
+    }
   }
 
   async #loop(signal) {
@@ -356,6 +389,9 @@ export class Buyer extends EventTarget {
     }
     for (const message of this.#inbox.splice(0)) await this.#apply({ Message: JSON.parse(message) });
     if (this.#awaits && this.#c.now() - this.#since > this.#c.messageTimeout) await this.#apply('Timeout');
+    const held = this.#held;
+    this.#held = null;
+    if (held && kind(r.state) === 'SendingSignatures') await this.#act(held);
     await this.#observeBitcoin();
     await this.#observeNexus();
     await this.#watchtower();
@@ -399,6 +435,13 @@ export class Buyer extends EventTarget {
   async #act(action) {
     const r = this.#r;
     if (action.Send) {
+      // After these the funding goes out, and its refund needs the
+      // seller's signatures: none until they are durable. The machine
+      // waits, and the seller's silence aborts it.
+      if (kind(r.state) === 'SendingSignatures' && this.#persisted !== true && r.backup_stale) {
+        this.#held = action;
+        return;
+      }
       if (!this.#session || this.#session.closed) return;
       try {
         this.#session.send(JSON.stringify(action.Send));
@@ -443,16 +486,17 @@ export class Buyer extends EventTarget {
 
   /** Sends what `parent`, the funding or the swap's refund, pays the
    * deposit key on to the refund address, its child paying for the two
-   * together at `rate`, the spend rate by default, if not at this rate
-   * already; then broadcasts it. The way either is bumped while it waits:
-   * by CPFP, since the seller's signatures pin both txids. A parent that
-   * pays the deposit key nothing, as cancel, has no child. */
+   * together at `rate`, by default the spend rate for the funding and the
+   * refund rate for the refund, if not at this rate already; then
+   * broadcasts it. The way either is bumped while it waits: by CPFP, since
+   * the seller's signatures pin both txids. A parent that pays the deposit
+   * key nothing, as cancel, has no child. */
   async #child(parent, rate) {
     const r = this.#r;
     if (!r.deposit) return;
     const funding = parent === r.funding?.tx;
     const slot = funding ? 'child' : 'refund_child';
-    rate ??= await this.#spendRate();
+    rate ??= funding ? await this.#spendRate() : await this.#refundRate(r.refund_child);
     if (!r[slot] || rate > r[slot].rate) {
       const child = call('changeChild', {
         wif: r.deposit.wif,
@@ -463,8 +507,8 @@ export class Buyer extends EventTarget {
       });
       if (child === null) return;
       // Each one replaced, in case it is the one that confirms.
-      const replaced = r[slot] ? [...(r[slot].replaced ?? []), r[slot].txid] : [];
-      r[slot] = { ...child, rate, replaced };
+      const replaced = r[slot] ? [...(r[slot].replaced ?? []), r[slot].txid].filter((txid) => txid !== child.txid) : [];
+      r[slot] = { ...child, rate, height: this.#seen?.height ?? null, replaced };
       await this.#save();
     }
     await this.#broadcast(r[slot].tx);
@@ -473,7 +517,8 @@ export class Buyer extends EventTarget {
   /** Reads every Bitcoin source. A view they all show alike goes to the
    * machine; otherwise each one's goes to it as one source's view, which it
    * acts on only as far as no lie can turn against the buyer: so a source
-   * down for good still lets it cancel and refund. */
+   * down for good still lets it cancel, refund a redeem never signed, and
+   * claim on a redeem; a signed redeem's refund waits for both. */
   async #observeBitcoin() {
     const watch = call('watchBuyer', this.#r.state).bitcoin;
     if (!watch) return;
@@ -489,11 +534,13 @@ export class Buyer extends EventTarget {
       this.#firstSeen = first_seen;
       this.#tip = all.tip.height;
       this.#view = { ...all.view, stale };
+      this.#seen = this.#view;
       await this.#apply({ Bitcoin: this.#view });
     } else {
       for (const one of seen.filter((one) => one !== null)) {
         this.#tip = Math.max(this.#tip ?? 0, one.tip.height);
-        await this.#apply({ Bitcoin: { ...one.view, stale: null } }, true);
+        this.#seen = { ...one.view, stale: null };
+        await this.#apply({ Bitcoin: this.#seen }, true);
       }
     }
     for (const one of seen.filter((one) => one !== null)) await this.#bump(one.view);
@@ -585,8 +632,8 @@ export class Buyer extends EventTarget {
   }
 
   /** Sends the deposit back to the refund address, once it is confirmed,
-   * at the fee estimate: no swap runs. */
-  async #refundDeposit(why) {
+   * at `rate`, the spend rate by default: no swap runs. */
+  async #refundDeposit(why, rate) {
     const r = this.#r;
     if (!r.deposit) return;
     if (!r.utxos) {
@@ -599,7 +646,7 @@ export class Buyer extends EventTarget {
       wif: r.deposit.wif,
       utxos: r.utxos,
       refund_script: r.refund_script,
-      fee_rate: await this.#spendRate(),
+      fee_rate: rate ?? (await this.#spendRate()),
     });
     r.deposit_refund = { tx, txid, why, confirmed: false };
     await this.#save();
@@ -622,7 +669,7 @@ export class Buyer extends EventTarget {
     }
     // The deposit's own outputs were spent by the funding: read anew.
     r.utxos = null;
-    await this.#refundDeposit('the swap refunded');
+    await this.#refundDeposit('the swap refunded', await this.#refundRate(null));
   }
 
   /** The deposit's refund, broadcast again until both sources show it, or
@@ -664,6 +711,21 @@ export class Buyer extends EventTarget {
 
   async #spendRate() {
     return this.#feeRate(await this.#estimates());
+  }
+
+  /** The rate the swap's refund and what sends it on pay, by swap-wasm's
+   * `refundRate`, `last` its child before, if any: the highest estimate,
+   * not bounded by the quote, doubled at each block once the punish is
+   * near on the view last stepped on. */
+  async #refundRate(last) {
+    const seen = this.#seen;
+    return call('refundRate', {
+      estimates: await this.#estimates(),
+      fallback: this.#c.fallbackFeeRate,
+      punish_at: seen && call('buyerStatus', this.#r.state, seen).punish_at,
+      tip: seen?.height ?? null,
+      last: last?.height == null ? null : { rate: last.rate, height: last.height },
+    });
   }
 
   /** Why the buyer refuses `offer` under `policy`, as the CLI's `take`, at

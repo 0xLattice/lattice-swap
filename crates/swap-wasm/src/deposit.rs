@@ -12,9 +12,10 @@
 //!
 //! The swap's own refund pays the deposit key too, and a child of it sends
 //! it on the same way: a refund stuck in the mempool, which must confirm
-//! before the seller can punish, is bumped by CPFP like the funding. A
-//! refund a watchtower broadcast, with the buyer away, waits at the deposit
-//! key until the buyer is back to send it on.
+//! before the seller can punish, is bumped by CPFP like the funding, but at
+//! a rate of its own, [`refund_rate`]. A refund a watchtower broadcast,
+//! with the buyer away, waits at the deposit key until the buyer is back
+//! to send it on.
 //!
 //! Every fee rate here is in whole sat/vB. A deposit that cannot pay for
 //! the funding at the asked rate, or holds more than twice the quote, which
@@ -45,6 +46,21 @@ struct Utxo {
 /// rise before the deposit confirms, and for a bump: twice the fees.
 const HEADROOM: u64 = 2;
 
+/// The sources' `estimates`, in sat/vB, but those that are none or no rate.
+fn known(estimates: Vec<Option<f64>>) -> impl Iterator<Item = f64> {
+    estimates
+        .into_iter()
+        .flatten()
+        .filter(|rate| rate.is_finite() && *rate >= 0.0)
+}
+
+/// `rate` in whole sat/vB, `fallback` if none, never below 1 sat/vB, the
+/// default relay floor.
+fn whole(rate: Option<f64>, fallback: u64) -> u64 {
+    // An estimate is never near 2^64 sat/vB; `as` saturates if it were.
+    rate.map_or(fallback, |rate| rate.ceil() as u64).max(1)
+}
+
 /// The rate, in whole sat/vB, a spend from the deposit key pays: the
 /// lowest of the Bitcoin sources' `estimates`, in sat/vB, null where one
 /// has none; `fallback` where none has one; never below 1 sat/vB, the
@@ -57,8 +73,11 @@ const HEADROOM: u64 = 2;
 /// the spend. The bound holds even when every source answers high, as one
 /// alone does while the other is down. A rate risen past it leaves the
 /// spend waiting rather than paying more than the deposit was asked to hold
-/// for it. `{"estimates", "fallback", "quote_rate"}` in, `quote_rate`
-/// absent or null for the quote; the rate out, as a JSON number.
+/// for it. This is the rate of the funding, of its child and of a deposit
+/// sent back: a slow one only delays. The swap's refund is not one of
+/// them: see [`refund_rate`]. `{"estimates", "fallback", "quote_rate"}` in,
+/// `quote_rate` absent or null for the quote; the rate out, as a JSON
+/// number.
 #[wasm_bindgen(js_name = feeRate)]
 pub fn fee_rate(input: &str) -> Result<String> {
     #[derive(Deserialize)]
@@ -69,20 +88,62 @@ pub fn fee_rate(input: &str) -> Result<String> {
         quote_rate: Option<u64>,
     }
     let input: Input = parse(input)?;
-    let lowest = input
-        .estimates
-        .into_iter()
-        .flatten()
-        .filter(|rate| rate.is_finite() && *rate >= 0.0)
-        .reduce(f64::min);
-    // An estimate is never near 2^64 sat/vB; `as` saturates if it were.
-    let rate = lowest
-        .map_or(input.fallback, |rate| rate.ceil() as u64)
-        .max(1);
+    let rate = whole(known(input.estimates).reduce(f64::min), input.fallback);
     let cap = input
         .quote_rate
         .map_or(u64::MAX, |quote| quote.saturating_mul(HEADROOM));
     text(&rate.min(cap))
+}
+
+/// Fewer blocks than this left before the seller can punish, and the
+/// refund's rate doubles at each block: an estimate aims at six blocks, as
+/// the driver asks for one, and no longer answers for the time left.
+const URGENT: u32 = 6;
+
+/// The rate, in whole sat/vB, the child of the swap's refund pays for the
+/// two, at each bump, and the spend that sends on a refund a watchtower
+/// broadcast: the highest of the sources' `estimates`, `fallback` where
+/// none has one, never below 1 sat/vB, and bounded by nothing but what the
+/// refund holds, less dust, which [`change_child`] keeps. Once the refund
+/// waits with fewer than [`URGENT`] blocks to `punish_at`, at a `tip` above
+/// the block `last` was paid at, never less than twice `last`'s rate.
+///
+/// Not [`fee_rate`]'s rule: a funding that is slow only delays the swap,
+/// but a refund still unconfirmed at `punish_at` lets the seller punish and
+/// take the BTC whole. The fees are the buyer's either way, so one source
+/// that answers high costs less than one that answers low. `{"estimates",
+/// "fallback", "punish_at", "tip", "last": {"rate", "height"}}` in, all but
+/// the first two absent or null where unknown; the rate out, as a JSON
+/// number.
+#[wasm_bindgen(js_name = refundRate)]
+pub fn refund_rate(input: &str) -> Result<String> {
+    #[derive(Deserialize)]
+    struct Last {
+        rate: u64,
+        height: u32,
+    }
+    #[derive(Deserialize)]
+    struct Input {
+        estimates: Vec<Option<f64>>,
+        fallback: u64,
+        #[serde(default)]
+        punish_at: Option<u32>,
+        #[serde(default)]
+        tip: Option<u32>,
+        #[serde(default)]
+        last: Option<Last>,
+    }
+    let input: Input = parse(input)?;
+    let rate = whole(known(input.estimates).reduce(f64::max), input.fallback);
+    let doubled = match (input.punish_at, input.tip, input.last) {
+        (Some(punish_at), Some(tip), Some(last))
+            if tip > last.height && punish_at.saturating_sub(tip) < URGENT =>
+        {
+            last.rate.saturating_mul(2)
+        }
+        _ => 0,
+    };
+    text(&rate.max(doubled))
 }
 
 /// The deposit key, and the P2WPKH output script it owns.

@@ -1038,6 +1038,21 @@ fn status_reads_a_swap_file_the_driver_saved() {
     assert_eq!(cli(&path), Err(format!("{path}: no such swap file")));
 }
 
+/// A browser's swap file is refused by name, and left as it was: its
+/// refund pays the deposit key the file holds, which a save here drops.
+#[test]
+fn resume_refuses_a_browsers_swap_file() {
+    let (buyer, _) = Buyer::start(small(16), ScriptBuf::new(), "b".into()).unwrap();
+    let (_directory, path) = swap_file(buyer);
+    let mut file: Value = serde_json::from_str(&read(Path::new(&path)).unwrap()).unwrap();
+    file["browser"] = json!({"deposit": "wif", "relay": null, "quote_rate": 10});
+    fs::write(&path, file.to_string()).unwrap();
+    let refused = refusal(&["resume", &path], "http://127.0.0.1:1");
+    assert!(refused.starts_with("refused: "), "{refused}");
+    assert!(refused.contains("a browser's swap file"), "{refused}");
+    assert_eq!(read(Path::new(&path)).unwrap(), file.to_string());
+}
+
 #[cfg(unix)]
 fn key_file(seed: u8) -> tempfile::NamedTempFile {
     use std::os::unix::fs::PermissionsExt;

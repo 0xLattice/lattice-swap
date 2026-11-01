@@ -3,7 +3,9 @@
 use super::*;
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, OutPoint, Txid};
-use deposit::{change_child, deposit_quote, deposit_refused, fee_rate, fund_lock, refund_deposit};
+use deposit::{
+    change_child, deposit_quote, deposit_refused, fee_rate, fund_lock, refund_deposit, refund_rate,
+};
 use ed25519_dalek::SigningKey;
 use session::Ivy;
 use swap::Terms;
@@ -853,6 +855,45 @@ fn a_spend_pays_the_lowest_estimate_within_the_quotes_headroom() {
         rate(json!({"estimates": [], "fallback": 10, "quote_rate": null})),
         10
     );
+}
+
+/// The swap's refund pays the highest source's estimate, bounded by no
+/// quote: one source that answers low cannot slow it. With fewer than six
+/// blocks to the punish, it doubles at each block.
+#[test]
+fn a_refund_pays_the_highest_estimate_and_doubles_as_the_punish_nears() {
+    let rate = |input: Value| -> u64 { parse(&refund_rate(&input.to_string()).unwrap()).unwrap() };
+    let refund = |estimates: Value| rate(json!({"estimates": estimates, "fallback": 10}));
+    assert_eq!(refund(json!([1, 500])), 500, "one source answers low");
+    assert_eq!(refund(json!([500, 1])), 500);
+    assert_eq!(refund(json!([null, 2.2])), 3);
+    assert_eq!(refund(json!([null, null])), 10, "the fallback");
+    assert_eq!(refund(json!([0.2, null])), 1, "the relay floor");
+    // What `feeRate` caps at twice the quote's rate, it does not.
+    let quote = json!({"estimates": [1, 500], "fallback": 10, "quote_rate": 10});
+    assert_eq!(
+        parse::<u64>(&fee_rate(&quote.to_string()).unwrap()).unwrap(),
+        1
+    );
+
+    let near = |punish_at: u32, tip: u32, height: u32| {
+        rate(json!({
+            "estimates": [2, 3], "fallback": 10, "punish_at": punish_at, "tip": tip,
+            "last": {"rate": 40, "height": height},
+        }))
+    };
+    assert_eq!(near(200, 195, 194), 80, "five blocks left: doubled");
+    assert_eq!(near(200, 194, 193), 3, "six left: the estimate");
+    assert_eq!(near(200, 195, 195), 3, "doubled once a block");
+    assert_eq!(near(200, 230, 229), 80, "past the punish too");
+    let high = json!({
+        "estimates": [2, 300], "fallback": 10, "punish_at": 200, "tip": 199,
+        "last": {"rate": 40, "height": 198},
+    });
+    assert_eq!(rate(high), 300, "never below the estimate");
+    let unknown =
+        json!({"estimates": [2, 3], "fallback": 10, "tip": 199, "last": {"rate": 40, "height": 1}});
+    assert_eq!(rate(unknown), 3, "no punish height yet");
 }
 
 /// A Nexus node is judged as the CLI judges one: its genesis, its chain,
