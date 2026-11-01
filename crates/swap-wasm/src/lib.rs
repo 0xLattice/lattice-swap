@@ -475,8 +475,7 @@ pub fn nexus_submit_body(transaction: &str) -> Result<String> {
 /// - `deadlines`: `{"cancel", "refund", "punish"}`, each the first Bitcoin
 ///   block that can hold it, once the lock is in a block. Cancel is valid
 ///   `t1` blocks after the lock, punish `t2` after cancel; the refund goes
-///   out once cancel is a block deep, or `btc_confirmations` once the
-///   redeem is signed. Until cancel is in a block, `refund` and `punish` are
+///   out once cancel is `btc_confirmations` deep. Until cancel is in a block, `refund` and `punish` are
 ///   the earliest they could be. The refund must be in a block before
 ///   `punish`.
 /// - `backup_covers`: `lock` once the state is one the funding may have
@@ -510,15 +509,11 @@ pub fn buyer_status(state: &str, view: Option<String>) -> Result<String> {
         if let Some(cancel_height) = cancelled {
             punish = Some(cancel_height + u32::from(terms.t2));
         }
-        // As `BuyerLocked::refund_depth`: cancel `btc_confirmations` deep
-        // once the redeem is signed, else a block; the refund goes out at
-        // that depth, into the next block.
-        let depth = if buyer.must_stay_open() {
-            terms.btc_confirmations
-        } else {
-            1
-        };
-        refund = cancelled.or(cancel).map(|cancel| cancel + depth);
+        // The buyer refunds once cancel is `btc_confirmations` deep: into
+        // the next block.
+        refund = cancelled
+            .or(cancel)
+            .map(|cancel| cancel + terms.btc_confirmations);
     }
     let backup_covers = match buyer {
         Buyer::AwaitNexLock { .. }

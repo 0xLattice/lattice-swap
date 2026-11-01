@@ -200,7 +200,8 @@ test('the refund lands in the wallet, and the deadlines show where it is', async
   const { deadlines } = w.buyer.status();
   assert.equal(deadlines.cancel.height, lockHeight + TERMS.t1);
   assert.equal(deadlines.punish.height, lockHeight + TERMS.t1 + TERMS.t2, 'the earliest, before cancel');
-  // The refund goes out once cancel is a block deep: in the block after.
+  // The refund goes out once cancel is `btc_confirmations` deep (1 here):
+  // in the block after.
   assert.deepEqual(deadlines.refund, { from: lockHeight + TERMS.t1 + 1, until: lockHeight + TERMS.t1 + TERMS.t2 });
   const eta = deadlines.cancel.eta - Date.now();
   assert.ok(Math.abs(eta - TERMS.t1 * 600_000) < 60_000, `${eta}`);
@@ -221,13 +222,15 @@ test('the refund lands in the wallet, and the deadlines show where it is', async
   await until(() => w.buyer.status().deadlines.punish?.height === cancelHeight + TERMS.t2);
   assert.deepEqual(w.buyer.status().deadlines.refund, { from: cancelHeight + 1, until: cancelHeight + TERMS.t2 });
   assert.equal(w.buyer.status().mustStayOpen, true);
-  // Once the redeem is signed, cancel must be `btc_confirmations` deep.
+  // Cancel must be `btc_confirmations` deep, the redeem signed or not.
   const state = JSON.parse((await w.store.get(`swap:${w.buyer.swapId}`)).state);
   const locked = state.Cancelling.locked;
   locked.setup.terms.btc_confirmations = 3;
   const view = { height: cancelHeight, funding: TERMS.t1 + 2, lock_spend: { tx: cancel, confirmations: 1 }, cancel_spend: null, stale: null };
-  const signed = call('buyerStatus', JSON.stringify({ Cancelling: { locked, redeem: locked.refund } }), JSON.stringify(view));
-  assert.equal(signed.deadlines.refund, cancelHeight + 3);
+  for (const redeem of [null, locked.refund]) {
+    const deep = call('buyerStatus', JSON.stringify({ Cancelling: { locked, redeem } }), JSON.stringify(view));
+    assert.equal(deep.deadlines.refund, cancelHeight + 3, `redeem ${redeem === null ? 'unsigned' : 'signed'}`);
+  }
   const refund = parseTx(await broadcast(w, lookups.cancel_spends[0]));
   assert.equal(refund.outputs[0].script, w.wallet.key.script_pubkey, 'the refund pays the wallet');
   assert.equal(refund.outputs[0].value, TERMS.btc_amount - 2 * TERMS.btc_fee, 'cancel and refund pay their fixed fees');
