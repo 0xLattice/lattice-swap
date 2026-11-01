@@ -80,6 +80,9 @@ fn a_buyer_takes_a_listed_offer_and_the_two_talk_through_the_relay() {
     let seller = seller(&url, offer(&id(1)));
     wait_listed(&url, 1);
     assert_eq!(offers(&url)[0]["terms"]["swap_id"], id(1));
+    // A buyer's page, on another origin, reads the board.
+    let listed = ureq::get(&format!("{url}/offers")).call().unwrap();
+    assert_eq!(listed.header("access-control-allow-origin"), Some("*"));
 
     let mut buyer = Ivy::connect_relayed(&url, &id(1), &config(2), key(1), TIMEOUT).unwrap();
     let mut seller = seller.join().unwrap().unwrap();

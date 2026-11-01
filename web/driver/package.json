@@ -1,0 +1,19 @@
+{
+  "name": "lattice-swap-driver",
+  "version": "0.1.0",
+  "description": "The buyer's side of a NEX<->BTC swap in a browser: swap-wasm's machines and an in-browser wallet over one Esplora, one Nexus public read node and a swap relay",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.js",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "./build.sh",
+    "test": "node --test --test-force-exit --test-timeout=120000 test/*.test.js"
+  },
+  "devDependencies": {
+    "fake-indexeddb": "6.2.7"
+  }
+}

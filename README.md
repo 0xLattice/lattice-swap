@@ -44,6 +44,21 @@ no Nexus consensus change is required.
   pipe between the two.
 - `lattice-swap`: the command line tool that runs one side of a swap.
 
+`web/driver` is the buyer's side in a browser, over `swap-wasm`. It funds the
+swap from a wallet key of its own, kept in IndexedDB, that the buyer deposits
+to; the change and any refund come back to it, and a withdrawal sends it on.
+It reads Bitcoin from one Esplora (mempool.space by default) and Nexus from
+one node's public read port, and trusts each for what it shows: point both at
+your own to trust no one else. One tab drives the wallet at a time: another
+waits, holding nothing, until the first closes. Nothing watches a swap while
+the page is closed: `status()` names the cancel, refund and punish heights,
+and a buyer whose swap stalls must come back by the cancel height and keep
+the page open until the refund confirms, which must come before the punish.
+`backup()` gives a recovery file with the wallet key and every running swap;
+`status().backupCovers` says when a file taken now covers the lock. Build it
+with `web/driver/build.sh` (wasm-bindgen-cli 0.2.130) and test it with
+`npm test` there.
+
 ## Install
 
 Download the archive for your platform from

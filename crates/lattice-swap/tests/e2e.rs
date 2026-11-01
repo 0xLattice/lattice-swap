@@ -4,6 +4,10 @@
 //! in Docker, each test its own. The test, not the parties, mines blocks on
 //! both chains.
 //!
+//! The browser's buyer, web/driver run in Node, takes offers here too,
+//! through an Esplora shim over the regtest bitcoind and the node's public
+//! read port; web/driver/build.sh builds what it loads first.
+//!
 //! Ignored by a plain `cargo test`; run with `NEXUS_NODE_IMAGE` naming the
 //! node image and `-- --ignored`. The node's RPC listens on loopback only,
 //! so its container shares the host's network.
@@ -27,6 +31,8 @@ use swap_nexus_tx::address;
 use swap_nexus_tx::rpc::Client;
 use swap_relay::board::Board;
 use swap_relay::Relay;
+
+mod esplora;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 /// Nexus's block reward over its first halving interval.
@@ -89,6 +95,8 @@ fn relay() -> (String, Arc<Relay>) {
 struct Nexus {
     container: String,
     url: String,
+    /// The public read port, which also takes submits, unthrottled.
+    public: String,
     cookie: String,
 }
 
@@ -96,10 +104,12 @@ impl Nexus {
     fn start() -> Self {
         let image =
             std::env::var("NEXUS_NODE_IMAGE").expect("NEXUS_NODE_IMAGE names the node image");
-        let (rpc, p2p) = (free_port(), free_port());
+        let (rpc, p2p, public) = (free_port(), free_port(), free_port());
         let script = format!(
             "lattice-node --data-directory /tmp/d --identity-key /tmp/p.key \
-             --listen-port {p2p} --rpc-port {rpc} --websocket-port 0 --no-default-peers"
+             --listen-port {p2p} --rpc-port {rpc} --websocket-port 0 --no-default-peers \
+             --public-read-port {public} --public-submit --public-read-rate 0 \
+             --public-read-expensive-rate 0 --public-read-max-rate 0 --public-submit-rate 0"
         );
         let out = Command::new("docker")
             .args([
@@ -122,6 +132,7 @@ impl Nexus {
         let mut nexus = Nexus {
             container: String::from_utf8(out.stdout).unwrap().trim().to_string(),
             url: format!("http://127.0.0.1:{rpc}"),
+            public: format!("http://127.0.0.1:{public}"),
             cookie: String::new(),
         };
         nexus.cookie = wait_for("node cookie", || {
@@ -399,6 +410,51 @@ impl World {
         nex_confirmations: u64,
         relay: Option<&str>,
     ) -> (Party, Party, String, JoinHandle<String>) {
+        let (seller, offer, swap_id, seller_out) = self.offer_on(t1, nex_confirmations, relay);
+        let offer_file = self.directory.path().join("offer");
+        std::fs::write(&offer_file, &offer).unwrap();
+        let (t1, nex_fee) = (t1.to_string(), self.nex_fee.to_string());
+        let buyer = Party(
+            lattice_swap()
+                .arg("take")
+                .arg(&offer_file)
+                .args(["--nex-address", &self.buyer_nex])
+                .args(["--btc-amount", &BTC_AMOUNT.to_sat().to_string()])
+                .args(["--nex-amount", &NEX_AMOUNT.to_string()])
+                .args(["--max-btc-fee", &BTC_FEE.to_sat().to_string()])
+                .args(["--max-nex-fee", &nex_fee])
+                .args([
+                    "--max-t1",
+                    &t1,
+                    "--min-t2",
+                    "10",
+                    "--min-refund-window",
+                    "9",
+                ])
+                .args(["--min-margin", "3"])
+                // Regtest has no fee estimate.
+                .args(["--min-btc-fee-rate", "1"])
+                .args(NO_BUMP)
+                .args(["--min-btc-confirmations", "1"])
+                .args(["--min-nex-confirmations", "1"])
+                .arg("--dir")
+                .arg(self.dir("buyer"))
+                .args(self.node_args("buyer"))
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        (seller, buyer, swap_id, seller_out)
+    }
+
+    /// The seller's side of [`World::start_on`]: the seller, its offer as
+    /// the buyer reads it, the swap id, and the rest of its output.
+    fn offer_on(
+        &self,
+        t1: u16,
+        nex_confirmations: u64,
+        relay: Option<&str>,
+    ) -> (Party, String, String, JoinHandle<String>) {
         let (t1, nex_confirmations) = (t1.to_string(), nex_confirmations.to_string());
         let nex_fee = self.nex_fee.to_string();
         let place = match relay {
@@ -448,8 +504,6 @@ impl World {
             assert_eq!(listed["terms"]["swap_id"], swap_id.as_str());
             offer = listed.to_string();
         }
-        let offer_file = self.directory.path().join("offer");
-        std::fs::write(&offer_file, &offer).unwrap();
         // The rest of the seller's output, read as it comes so it never
         // blocks.
         let seller_out = thread::spawn(move || {
@@ -457,38 +511,7 @@ impl World {
             reader.read_to_string(&mut rest).unwrap();
             rest
         });
-
-        let buyer = Party(
-            lattice_swap()
-                .arg("take")
-                .arg(&offer_file)
-                .args(["--nex-address", &self.buyer_nex])
-                .args(["--btc-amount", &BTC_AMOUNT.to_sat().to_string()])
-                .args(["--nex-amount", &NEX_AMOUNT.to_string()])
-                .args(["--max-btc-fee", &BTC_FEE.to_sat().to_string()])
-                .args(["--max-nex-fee", &nex_fee])
-                .args([
-                    "--max-t1",
-                    &t1,
-                    "--min-t2",
-                    "10",
-                    "--min-refund-window",
-                    "9",
-                ])
-                .args(["--min-margin", "3"])
-                // Regtest has no fee estimate.
-                .args(["--min-btc-fee-rate", "1"])
-                .args(NO_BUMP)
-                .args(["--min-btc-confirmations", "1"])
-                .args(["--min-nex-confirmations", "1"])
-                .arg("--dir")
-                .arg(self.dir("buyer"))
-                .args(self.node_args("buyer"))
-                .stdout(Stdio::piped())
-                .spawn()
-                .unwrap(),
-        );
-        (seller, buyer, swap_id, seller_out)
+        (seller, offer, swap_id, seller_out)
     }
 
     /// `resume` on `side`'s swap file, the seller with its key file.
@@ -714,4 +737,193 @@ fn happy_path_through_a_relay() {
     );
     // Taken, the offer left the board.
     assert!(relay.board.offers().is_empty());
+}
+
+/// The browser's buyer: web/driver in Node, its wallet and swap kept in
+/// files.
+fn browser(mode: &str, config: &std::path::Path) -> Party {
+    let script = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../web/driver/test/e2e-buyer.js"
+    );
+    Party(
+        Command::new("node")
+            .arg(script)
+            .arg(mode)
+            .arg(config)
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("node, with web/driver built"),
+    )
+}
+
+impl World {
+    /// The browser's config for taking `offer`, as listed: its Esplora
+    /// shim, the node's public read port, and the CLI buyer's bounds.
+    fn browser_config(&self, offer: &str, t1: u16) -> PathBuf {
+        let config = json!({
+            "dir": self.dir("browser"),
+            "esplora": esplora::esplora(wallet_client(&self.bitcoind, "")),
+            "nexus": self.nexus.public,
+            "genesis": self.nexus_genesis,
+            "offer": offer,
+            "policy": {
+                "btc_amount": BTC_AMOUNT.to_sat(), "nex_amount": NEX_AMOUNT,
+                "max_btc_fee": BTC_FEE.to_sat(), "max_nex_fee": self.nex_fee,
+                "max_t1": t1, "min_t2": 10, "min_refund_window": 9, "min_margin": 3,
+                "min_btc_fee_rate": 1, "min_btc_confirmations": 1, "min_nex_confirmations": 1,
+            },
+            "nex_address": self.buyer_nex,
+        });
+        let path = self.directory.path().join("browser.json");
+        std::fs::write(&path, config.to_string()).unwrap();
+        path
+    }
+
+    /// The browser prepares the offer in `config`, and the buyer's bitcoind
+    /// wallet funds the browser's wallet with what it asks: the buyer, its
+    /// wallet's address, and the rest of its output.
+    fn browser_take(&self, config: &std::path::Path) -> (Party, String, JoinHandle<String>) {
+        let mut buyer = browser("take", config);
+        let mut reader = BufReader::new(buyer.0.stdout.take().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let wallet: Value = serde_json::from_str(&line).expect("the wallet");
+        let amount = Amount::from_sat(wallet["need"].as_u64().unwrap());
+        wallet_client(&self.bitcoind, "buyer")
+            .call("sendtoaddress", json!([wallet["address"], amount.to_btc()]))
+            .unwrap();
+        let rest = thread::spawn(move || {
+            let mut rest = String::new();
+            reader.read_to_string(&mut rest).unwrap();
+            rest
+        });
+        (buyer, wallet["address"].as_str().unwrap().into(), rest)
+    }
+
+    /// The state the browser's store holds for `swap_id`; empty before it
+    /// holds one.
+    fn browser_state(&self, swap_id: &str) -> String {
+        let path = self.dir("browser").join(format!("swap:{swap_id}.json"));
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return String::new();
+        };
+        let record: Value = serde_json::from_str(&text).unwrap();
+        match serde_json::from_str::<Value>(record["state"].as_str().unwrap()).unwrap() {
+            Value::Object(state) => state.keys().next().unwrap().clone(),
+            state => panic!("a state: {state}"),
+        }
+    }
+
+    /// What the buyer's bitcoind holds at `address` in blocks.
+    fn received(&self, address: &str) -> Amount {
+        let received = wallet_client(&self.bitcoind, "")
+            .call(
+                "scantxoutset",
+                json!(["start", [format!("addr({address})")]]),
+            )
+            .unwrap();
+        Amount::from_btc(received["total_amount"].as_f64().unwrap()).unwrap()
+    }
+}
+
+/// The browser's buyer takes a CLI seller's offer from a relay, funded
+/// from its wallet, and swaps; the change stays in its wallet.
+#[test]
+#[ignore = "needs Docker, NEXUS_NODE_IMAGE and web/driver built"]
+fn the_browser_swaps_through_a_relay() {
+    let world = World::new();
+    let (url, relay) = relay();
+    let (mut seller, offer, _, seller_out) = world.offer_on(20, 1, Some(&url));
+    let config = world.browser_config(&offer, 20);
+    let (mut buyer, wallet, buyer_out) = world.browser_take(&config);
+    let (mut seller_done, mut buyer_done) = (None, None);
+    world.drive(
+        false,
+        || true,
+        || {
+            seller_done = seller_done.or(seller.0.try_wait().unwrap());
+            buyer_done = buyer_done.or(buyer.0.try_wait().unwrap());
+            seller_done.is_some() && buyer_done.is_some()
+        },
+    );
+    assert!(seller_done.unwrap().success());
+    assert!(buyer_done.unwrap().success());
+    assert_eq!(seller_out.join().unwrap(), "outcome: Swapped\n");
+    assert_eq!(buyer_out.join().unwrap(), "outcome: swapped\n");
+    assert_eq!(
+        world.nexus.balance(&world.buyer_nex),
+        NEX_AMOUNT - world.nex_fee
+    );
+    let seller_wallet = wallet_client(&world.bitcoind, "seller");
+    assert_eq!(btc_balance(&seller_wallet), BTC_AMOUNT - BTC_FEE * 2);
+    // The deposit less the lock and the funding's fee: under 1000 sat.
+    let change = world.received(&wallet);
+    assert!(change < Amount::from_sat(1_000), "{change}");
+    assert!(relay.board.offers().is_empty());
+}
+
+/// The seller goes once the NEX is locked: the browser cancels at t1 and
+/// refunds to its wallet.
+#[test]
+#[ignore = "needs Docker, NEXUS_NODE_IMAGE and web/driver built"]
+fn the_browser_refunds_to_its_wallet_when_the_seller_goes() {
+    let world = World::new();
+    let (url, _relay) = relay();
+    let (mut seller, offer, swap_id, seller_out) = world.offer_on(24, 2, Some(&url));
+    let config = world.browser_config(&offer, 24);
+    let (mut buyer, wallet, buyer_out) = world.browser_take(&config);
+    world.drive(
+        false,
+        || true,
+        || world.state("seller", &swap_id) == "AwaitRedeemSignature",
+    );
+    kill(&mut seller);
+    seller_out.join().unwrap();
+    let status = world.finish(&mut buyer, true, false);
+    assert!(status.success(), "{status}");
+    assert_eq!(buyer_out.join().unwrap(), "outcome: refunded\n");
+    // The lock less cancel's and refund's fees, back in the wallet.
+    let held = world.received(&wallet);
+    assert!(held >= BTC_AMOUNT - BTC_FEE * 2, "{held}");
+    assert!(held < BTC_AMOUNT, "{held}");
+    assert_eq!(world.nexus.balance(&world.buyer_nex), 0);
+}
+
+/// The browser killed once it has seen the redeem and is claiming the NEX:
+/// a fresh store restored from its recovery file carries on to the swap.
+#[test]
+#[ignore = "needs Docker, NEXUS_NODE_IMAGE and web/driver built"]
+fn the_browser_killed_restores_from_its_recovery_file() {
+    let world = World::new();
+    let (url, _relay) = relay();
+    let (mut seller, offer, swap_id, seller_out) = world.offer_on(20, 1, Some(&url));
+    let config = world.browser_config(&offer, 20);
+    let (mut buyer, _, _) = world.browser_take(&config);
+    // Nexus stops once the seller holds the redeem signature: the claim
+    // waits in the pool.
+    let redeeming = || {
+        matches!(
+            world.state("seller", &swap_id).as_str(),
+            "Redeeming" | "Done"
+        )
+    };
+    world.drive(
+        false,
+        || !redeeming(),
+        || world.browser_state(&swap_id) == "ClaimingNex",
+    );
+    kill(&mut buyer);
+    let status = world.finish(&mut seller, false, false);
+    assert!(status.success(), "{status}");
+    assert_eq!(seller_out.join().unwrap(), "outcome: Swapped\n");
+
+    let mut buyer = browser("restore", &config);
+    let status = world.finish(&mut buyer, false, true);
+    assert!(status.success(), "{status}");
+    assert_eq!(stdout(&mut buyer.0), "outcome: swapped\n");
+    assert_eq!(
+        world.nexus.balance(&world.buyer_nex),
+        NEX_AMOUNT - world.nex_fee
+    );
 }
