@@ -378,9 +378,9 @@ test('with one source down for good, the buyer still cancels, refunds and sends 
   await until(() => sent(lookups.cancel_spends[0]));
   const refund = parseTx(sent(lookups.cancel_spends[0]));
   assert.equal(refund.outputs[0].script, record.deposit.script_pubkey, 'the refund pays the deposit key');
-  await until(async () => (await w.store.load(w.buyer.swapId)).refund_child);
+  // Saved, then broadcast.
+  await until(async () => w.a.posted.includes((await w.store.load(w.buyer.swapId)).refund_child?.tx));
   const { refund_child: child } = await w.store.load(w.buyer.swapId);
-  assert.ok(w.a.posted.includes(child.tx));
   assert.equal(parseTx(child.tx).inputs[0].txid, refund.txid);
   assert.equal(parseTx(child.tx).outputs[0].script, record.refund_script, 'sent on to the refund address');
   assert.equal(w.buyer.status().step, 'refunding');
@@ -403,9 +403,8 @@ test('a refund the watchtower broadcast is sent on from the deposit key once the
 
   const back = await Buyer.resume(w.config, record.swap_id);
   const again = running(back);
-  await until(async () => (await w.store.load(record.swap_id)).deposit_refund);
+  await until(async () => w.a.posted.includes((await w.store.load(record.swap_id)).deposit_refund?.tx));
   const forward = (await w.store.load(record.swap_id)).deposit_refund;
-  assert.ok(w.a.posted.includes(forward.tx));
   assert.deepEqual(parseTx(forward.tx).inputs.map(({ txid, vout }) => `${txid}:${vout}`), [`${r.txid}:0`]);
   assert.equal(parseTx(forward.tx).outputs[0].script, record.refund_script);
   w.chain.txs.set(forward.txid, { hex: forward.tx, height: w.chain.height + 1 });
