@@ -1748,6 +1748,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "swap-nexus-light"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "data-encoding",
+ "sha2",
+]
+
+[[package]]
 name = "swap-nexus-tx"
 version = "0.1.0"
 dependencies = [

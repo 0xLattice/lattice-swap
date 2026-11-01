@@ -39,8 +39,8 @@ jobs:
       - run: rustup target add wasm32-unknown-unknown && rustup component add clippy
       # The version Cargo.lock pins for `wasm-bindgen`.
       - run: cargo install wasm-bindgen-cli --version 0.2.130 --locked
-      - run: cargo clippy -p swap -p swap-nexus-tx -p swap-wasm --no-default-features --target wasm32-unknown-unknown --all-targets -- -D warnings
-      - run: cargo build --release -p swap-wasm --target wasm32-unknown-unknown
+      - run: cargo clippy -p swap -p swap-nexus-tx -p swap-nexus-light -p swap-wasm --no-default-features --target wasm32-unknown-unknown --all-targets -- -D warnings
+      - run: cargo build --release -p swap-wasm -p swap-nexus-light --target wasm32-unknown-unknown
       # Unoptimized, the proofs take minutes in wasm.
       - run: cargo test -p swap -p swap-wasm --no-default-features --target wasm32-unknown-unknown --lib
         env:
