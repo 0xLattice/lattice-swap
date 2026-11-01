@@ -1,12 +1,13 @@
 //! Header checks: CID binding, proof of work (Lattice's
-//! `makeProofOfWorkPreimage` and `validateProofOfWork`), the work floor, and
-//! the parent link rules of `headerAdmission` that a header and its parent
-//! decide alone.
+//! `makeProofOfWorkPreimage` and `validateProofOfWork`), the work floor, the
+//! pinned spec, the parent link rules of `headerAdmission` that a header and
+//! its parent decide alone, the difficulty schedule (`validateNextTarget`),
+//! and the caller's clock.
 
 use sha2::{Digest, Sha256};
 
 use crate::cbor::{self, Value};
-use crate::{cid_of, is_standard_cid, link, Error, U256};
+use crate::{cid_of, is_standard_cid, link, ChainParams, Error, U256};
 
 /// The only header version Lattice admits (`Block.currentVersion`).
 const BLOCK_VERSION: u64 = 1;
@@ -46,7 +47,6 @@ struct Header {
     parent: Option<String>,
     target: U256,
     next_target: U256,
-    spec: String,
     prev_state: String,
     post_state: String,
     height: u64,
@@ -54,19 +54,30 @@ struct Header {
 }
 
 /// Verifies `headers` (CID and raw header bytes), tip first, back through
-/// parent links. Each header must hash to its CID, carry its proof of work,
-/// meet `floor` (`target <= floor`), and follow the next header as its
-/// parent: the parent's CID, height + 1, a later timestamp, the parent's
-/// `postState` as its `prevState`, the same spec, and a target no easier
-/// than the parent's `nextTarget`. The last header's own parent is not
-/// checked.
-pub fn verify_chain(headers: &[(String, Vec<u8>)], floor: &U256) -> Result<VerifiedChain, Error> {
+/// parent links, against the chain `params` and the caller's clock `now_ms`
+/// (Unix milliseconds).
+///
+/// Each header must hash to its CID, carry its proof of work, meet `floor`
+/// (`target <= floor`), carry `params.spec`, and follow the next header as
+/// its parent: the parent's CID, height + 1, a later timestamp, the
+/// parent's `postState` as its `prevState`, and a target no easier than the
+/// parent's `nextTarget`. Its `nextTarget` must be the schedule's at its
+/// own height and timestamp ([`ChainParams::next_target`]), and its
+/// timestamp at most [`crate::MAX_FUTURE_MS`] past `now_ms`. The tip must be
+/// stamped at least `now_ms -` [`crate::MAX_TIP_AGE_MS`]. The last header's
+/// own parent is not checked.
+pub fn verify_chain(
+    headers: &[(String, Vec<u8>)],
+    floor: &U256,
+    params: &ChainParams,
+    now_ms: i64,
+) -> Result<VerifiedChain, Error> {
     if headers.is_empty() {
         return Err(Error::Malformed("no headers"));
     }
     let decoded = headers
         .iter()
-        .map(|(cid, bytes)| check_header(cid, bytes, floor))
+        .map(|(cid, bytes)| check_header(cid, bytes, floor, &params.spec))
         .collect::<Result<Vec<_>, _>>()?;
     for (i, pair) in decoded.windows(2).enumerate() {
         let (child, parent) = (&pair[0], &pair[1]);
@@ -86,12 +97,26 @@ pub fn verify_chain(headers: &[(String, Vec<u8>)], floor: &U256) -> Result<Verif
         if child.prev_state != parent.post_state {
             return Err(broken("prevState is not the parent's postState"));
         }
-        if child.spec != parent.spec {
-            return Err(broken("spec differs from the parent's"));
-        }
         if child.target > parent.next_target {
             return Err(broken("target easier than the parent's nextTarget"));
         }
+    }
+    let latest = now_ms.saturating_add(crate::MAX_FUTURE_MS);
+    for ((cid, _), h) in headers.iter().zip(&decoded) {
+        // `validateNextTarget`, with the anchor pinned instead of walked to.
+        if h.height < params.anchor_height
+            || h.next_target != params.next_target(h.height, h.timestamp)
+        {
+            return Err(Error::OffSchedule { cid: cid.clone() });
+        }
+        if h.timestamp > latest {
+            return Err(Error::FutureTimestamp { cid: cid.clone() });
+        }
+    }
+    if decoded[0].timestamp < now_ms.saturating_sub(crate::MAX_TIP_AGE_MS) {
+        return Err(Error::StaleTip {
+            cid: headers[0].0.clone(),
+        });
     }
     let blocks = headers
         .iter()
@@ -107,7 +132,7 @@ pub fn verify_chain(headers: &[(String, Vec<u8>)], floor: &U256) -> Result<Verif
     Ok(VerifiedChain { blocks })
 }
 
-fn check_header(cid: &str, bytes: &[u8], floor: &U256) -> Result<Header, Error> {
+fn check_header(cid: &str, bytes: &[u8], floor: &U256, spec_pin: &str) -> Result<Header, Error> {
     if cid_of(bytes) != cid {
         return Err(Error::CidMismatch {
             cid: cid.to_owned(),
@@ -193,11 +218,15 @@ fn check_header(cid: &str, bytes: &[u8], floor: &U256) -> Result<Header, Error> 
             cid: cid.to_owned(),
         });
     }
+    if spec != spec_pin {
+        return Err(Error::WrongSpec {
+            cid: cid.to_owned(),
+        });
+    }
     Ok(Header {
         parent,
         target,
         next_target,
-        spec,
         prev_state,
         post_state,
         height,

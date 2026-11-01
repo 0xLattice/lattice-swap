@@ -1754,6 +1754,7 @@ dependencies = [
  "ciborium",
  "data-encoding",
  "sha2",
+ "wasm-bindgen-test",
 ]
 
 [[package]]

@@ -1,9 +1,21 @@
 //! The subset of DAG-CBOR that Lattice headers and state nodes use:
 //! integers, text, arrays, maps with text keys, and null. Anything else
 //! (bytes, tags, floats, indefinite lengths, trailing bytes, a repeated map
-//! key) is refused; the bytes are CID-bound, so a refusal only stalls.
+//! key, more than [`MAX_NODE_BYTES`]) is refused; the bytes are CID-bound,
+//! so a refusal only stalls.
+
+use std::collections::HashSet;
 
 use crate::Error;
+
+/// The most bytes a header or state node may have. A header is about 1 KB:
+/// fixed fields and links, its transactions in other entries of the block
+/// volume behind the `transactions` link, so the spec's `maxBlockSize`
+/// bounds those and not the header. The largest state node is a trie
+/// branch with all 94 visible-ASCII children at 82 bytes each, about 8 KB.
+/// 64 KiB leaves eightfold headroom over that and bounds what hostile bytes
+/// cost to decode.
+pub const MAX_NODE_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, PartialEq)]
 pub enum Value {
@@ -17,6 +29,9 @@ pub enum Value {
 }
 
 pub fn decode(bytes: &[u8]) -> Result<Value, Error> {
+    if bytes.len() > MAX_NODE_BYTES {
+        return Err(Error::Malformed("node too large"));
+    }
     let mut at = 0;
     let value = item(bytes, &mut at, 0)?;
     if at != bytes.len() {
@@ -66,11 +81,12 @@ fn item(bytes: &[u8], at: &mut usize, depth: usize) -> Result<Value, Error> {
         }
         5 => {
             let mut entries: Vec<(String, Value)> = Vec::new();
+            let mut keys = HashSet::new();
             for _ in 0..n {
                 let Value::Text(key) = item(bytes, at, depth + 1)? else {
                     return Err(Error::Malformed("map key not text"));
                 };
-                if entries.iter().any(|(k, _)| *k == key) {
+                if !keys.insert(key.clone()) {
                     return Err(Error::Malformed("repeated map key"));
                 }
                 let value = item(bytes, at, depth + 1)?;
@@ -99,6 +115,49 @@ impl Value {
         match self {
             Value::Map(entries) => entries.iter().find(|(k, _)| k == key).map(|(_, v)| v),
             _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A map of `keys`, each to null.
+    fn map_of(keys: &[String]) -> Vec<u8> {
+        let mut out = vec![0xb9];
+        out.extend((keys.len() as u16).to_be_bytes());
+        for key in keys {
+            out.push(0x78);
+            out.push(key.len() as u8);
+            out.extend(key.as_bytes());
+            out.push(0xf6);
+        }
+        out
+    }
+
+    #[test]
+    fn repeated_map_key_is_refused() {
+        let mut keys: Vec<String> = (0..3000).map(|i| format!("k{i}")).collect();
+        let Ok(Value::Map(entries)) = decode(&map_of(&keys)) else {
+            panic!()
+        };
+        assert_eq!(entries.len(), 3000);
+        keys.push("k1234".into());
+        assert_eq!(
+            decode(&map_of(&keys)),
+            Err(Error::Malformed("repeated map key"))
+        );
+    }
+
+    #[test]
+    fn oversized_node_is_refused() {
+        // A text of exactly the cap's bytes, header included, and one more.
+        for (len, ok) in [(MAX_NODE_BYTES, true), (MAX_NODE_BYTES + 1, false)] {
+            let mut bytes = vec![0x7a];
+            bytes.extend(((len - 5) as u32).to_be_bytes());
+            bytes.resize(len, b'x');
+            assert_eq!(decode(&bytes).is_ok(), ok, "{len}");
         }
     }
 }

@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 
 use crate::cbor::{self, Value};
-use crate::{cid_of, link, Error};
+use crate::{cid_of, is_standard_cid, link, Error};
 
 /// What a state commits to for one account. `nonce` is the stored nonce,
 /// `None` when the account has never sent a transaction; its next
@@ -49,9 +49,11 @@ pub fn prove_account(
     nodes: &[(String, Vec<u8>)],
     address: &str,
 ) -> Result<Account, Error> {
-    // `isValidAccountAtom`: visible ASCII, no '/'.
-    if address.is_empty() || !address.bytes().all(is_key_byte) || address.contains('/') {
-        return Err(Error::Malformed("address not an account atom"));
+    // `CryptoUtils.isValidAddress`: a standard CID, spelled canonically.
+    // That also rules out every reserved key (`isReservedAccountKey`: the
+    // `_nonce_` prefix), so a nonce entry is never read as a balance.
+    if !is_standard_cid(address) {
+        return Err(Error::Malformed("address not a standard CID"));
     }
     let mut by_cid = HashMap::new();
     for (cid, bytes) in nodes {

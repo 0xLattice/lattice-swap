@@ -42,7 +42,7 @@ jobs:
       - run: cargo clippy -p swap -p swap-nexus-tx -p swap-nexus-light -p swap-wasm --no-default-features --target wasm32-unknown-unknown --all-targets -- -D warnings
       - run: cargo build --release -p swap-wasm -p swap-nexus-light --target wasm32-unknown-unknown
       # Unoptimized, the proofs take minutes in wasm.
-      - run: cargo test -p swap -p swap-wasm --no-default-features --target wasm32-unknown-unknown --lib
+      - run: cargo test -p swap -p swap-wasm -p swap-nexus-light --no-default-features --target wasm32-unknown-unknown --lib
         env:
           CARGO_PROFILE_DEV_OPT_LEVEL: 3
 

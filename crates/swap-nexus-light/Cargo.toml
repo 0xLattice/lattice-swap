@@ -12,3 +12,8 @@ sha2 = "0.10"
 
 [dev-dependencies]
 ciborium = "0.2"
+
+# The 32-bit unit tests (archive lengths, the schedule's arithmetic) run in
+# wasm too.
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
