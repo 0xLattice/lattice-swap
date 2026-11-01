@@ -3,6 +3,9 @@
 use super::*;
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, OutPoint, Txid};
+use deposit::{change_child, deposit_quote, deposit_refused, fund_lock, refund_deposit};
+use ed25519_dalek::SigningKey;
+use session::Ivy;
 use swap::Terms;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen_test::wasm_bindgen_test as test;
@@ -69,7 +72,7 @@ fn the_hellos_cross_as_json() {
 #[test]
 fn a_backup_restores_its_side_and_state() {
     let seller = new_seller(&terms(), "seller", &payout(), &payout()).unwrap();
-    let backed_up = json(&backup(&seller).unwrap());
+    let backed_up = json(&backup(&seller, None).unwrap());
     assert_eq!(backed_up["name"], format!("{}.json", hex::encode([1; 32])));
     let restored = json(&restore(backed_up["file"].as_str().unwrap()).unwrap());
     assert_eq!(restored["side"], "seller");
@@ -87,7 +90,7 @@ fn a_backup_restores_its_side_and_state() {
 
 /// A backup's file.
 fn file(state: &str) -> String {
-    json(&backup(state).unwrap())["file"]
+    json(&backup(state, None).unwrap())["file"]
         .as_str()
         .unwrap()
         .into()
@@ -95,10 +98,10 @@ fn file(state: &str) -> String {
 
 #[test]
 fn only_a_running_swap_is_backed_up() {
-    assert!(backup("{}").is_err());
-    assert!(backup(r#"{"AwaitBuyerHello": {}}"#).is_err());
+    assert!(backup("{}", None).is_err());
+    assert!(backup(r#"{"AwaitBuyerHello": {}}"#, None).is_err());
     let done = text(&json!({"Done": "Swapped"})).unwrap();
-    assert!(backup(&done).unwrap_err().contains("over"));
+    assert!(backup(&done, None).unwrap_err().contains("over"));
 }
 
 /// Both machines claim in `ClaimingNex`, with the same claim: its setup
@@ -400,4 +403,443 @@ fn a_nexus_view_is_one_tips() {
     assert_eq!(nexus_one_tip(&health(5, "a"), &health(5, "a")), Ok(true));
     assert_eq!(nexus_one_tip(&health(5, "a"), &health(6, "a")), Ok(false));
     assert_eq!(nexus_one_tip(&health(5, "a"), &health(5, "b")), Ok(false));
+}
+
+/// An offer signed as the CLI's `offer` signs it.
+fn signed_offer(relay: &str) -> Offer {
+    let key = SigningKey::from_bytes(&[4; 32]);
+    let terms = parse(&terms()).unwrap();
+    let place = swap::offer::Place::Relay(relay.into());
+    Offer::new(terms, Network::Regtest, place, &key, [7; 32])
+}
+
+#[test]
+fn an_offer_is_read_only_as_its_seller_signed_it() {
+    let offer = signed_offer("http://relay.example");
+    let decoded = json(&decode_offer(&offer.encode()).unwrap());
+    assert_eq!(decoded, json(&text(&offer).unwrap()));
+    let mut changed = offer.clone();
+    changed.terms.margin += 1;
+    let refused = decode_offer(&changed.encode()).unwrap_err();
+    assert!(refused.contains("not signed by its seller"), "{refused}");
+    assert!(decode_offer("{}").is_err());
+}
+
+#[test]
+fn an_offer_is_judged_by_the_clis_policy() {
+    let offer = signed_offer("http://relay.example");
+    let check = |policy: Value, fee_estimate: Value| {
+        let input = json!({
+            "offer": offer,
+            "policy": policy,
+            "network": "regtest",
+            "nexus_genesis": "genesis",
+            "fee_estimate": fee_estimate,
+            "min_relay_fee": 1,
+        });
+        check_offer(&input.to_string()).unwrap()
+    };
+    // The bounds the regtest terms need, the rest the CLI's defaults.
+    let policy = json!({
+        "btc_amount": 1_000_000, "nex_amount": 500_000, "max_t1": 20, "min_t2": 20,
+        "min_btc_confirmations": 1, "min_nex_confirmations": 1, "min_margin": 3,
+        "min_refund_window": 19,
+    });
+    assert_eq!(check(policy.clone(), json!(1_000)), None);
+    let mut other = policy.clone();
+    other["nex_amount"] = json!(1);
+    assert!(check(other, json!(1_000))
+        .unwrap()
+        .contains("sells 500000 NEX"));
+    // A fee rate at which cancel and refund pay more than the offer's fee.
+    let refused = check(policy.clone(), json!(100_000)).unwrap();
+    assert!(refused.contains("below the"), "{refused}");
+    // No estimate, and no floor given: refused, as `take` refuses.
+    assert!(check(policy.clone(), Value::Null)
+        .unwrap()
+        .contains("no fee estimate"));
+    let mut floored = policy;
+    floored["min_btc_fee_rate"] = json!(1);
+    assert_eq!(check(floored, Value::Null), None);
+}
+
+/// The browser's session against the seller's side of ivy-core, the bytes
+/// cut anywhere as a relay may cut them.
+#[test]
+fn the_session_carries_swap_messages_both_ways() {
+    use ivy_core::{frame, Config, Message as Record, Responder};
+    let seller = Config::new(SigningKey::from_bytes(&[4; 32]));
+    let id = hex::encode([1; 32]);
+    let mut ivy = Ivy::new(&hex::encode([7; 32]), &seller.peer_key().hex(), &id).unwrap();
+    assert!(!ivy.is_open());
+    let hello = ivy.outbound();
+    let buyer = Config::new(SigningKey::from_bytes(&[7; 32])).peer_key();
+    let (waiting, reply) = Responder::new(&seller)
+        .receive(&hello[4..], |key| *key == buyer, &mut OsRng)
+        .unwrap();
+    let reply = frame(&reply);
+    assert!(ivy.receive(&reply[..3]).unwrap().is_empty());
+    assert!(ivy.receive(&reply[3..]).unwrap().is_empty());
+    assert!(ivy.is_open());
+    let finish = ivy.outbound();
+    let mut session = waiting.receive(&finish[4..]).unwrap();
+
+    let message = Message::NexLocked {
+        cid: swap_nexus_tx::address(&[5; 32]),
+    };
+    let sealed = |session: &mut ivy_core::Session, topic: &str, payload: Vec<u8>| {
+        frame(
+            &session
+                .seal(&Record::PeerMessage {
+                    topic: topic.into(),
+                    payload,
+                })
+                .unwrap(),
+        )
+    };
+    let mut bytes = sealed(&mut session, swap::TOPIC, message.encode([1; 32]));
+    // Another topic, and another swap's, are dropped.
+    bytes.extend(sealed(&mut session, "other", message.encode([1; 32])));
+    bytes.extend(sealed(&mut session, swap::TOPIC, message.encode([2; 32])));
+    bytes.extend(frame(&session.seal(&Record::Ping(9)).unwrap()));
+    let (a, b) = bytes.split_at(10);
+    assert!(ivy.receive(a).unwrap().is_empty());
+    let received = ivy.receive(b).unwrap();
+    assert_eq!(received.len(), 1);
+    assert_eq!(json(&received[0]), json(&text(&message).unwrap()));
+    // The ping is answered.
+    let pong = ivy.outbound();
+    assert_eq!(session.open(&pong[4..]).unwrap(), Some(Record::Pong(9)));
+
+    ivy.send(&text(&message).unwrap()).unwrap();
+    let out = ivy.outbound();
+    let Some(Record::PeerMessage { topic, payload }) = session.open(&out[4..]).unwrap() else {
+        panic!("a message");
+    };
+    assert_eq!(topic, swap::TOPIC);
+    assert_eq!(payload, message.encode([1; 32]));
+    // A record the seller did not sign ends the session.
+    let mut forged = sealed(&mut session, swap::TOPIC, message.encode([1; 32]));
+    let last = forged.len() - 1;
+    forged[last] ^= 1;
+    assert!(ivy.receive(&forged).is_err());
+}
+
+#[test]
+fn a_session_to_another_key_never_opens() {
+    use ivy_core::{frame, Config, Responder};
+    let impostor = Config::new(SigningKey::from_bytes(&[5; 32]));
+    let seller = Config::new(SigningKey::from_bytes(&[4; 32])).peer_key();
+    let mut ivy = Ivy::new(&hex::encode([7; 32]), &seller.hex(), &hex::encode([1; 32])).unwrap();
+    let hello = ivy.outbound();
+    // It cannot even answer a hello addressed to another key.
+    assert!(Responder::new(&impostor)
+        .receive(&hello[4..], |_| true, &mut OsRng)
+        .is_err());
+    let (_, reply) = Responder::new(&Config::new(SigningKey::from_bytes(&[4; 32])))
+        .receive(&hello[4..], |_| true, &mut OsRng)
+        .unwrap();
+    let mut reply = frame(&reply);
+    let last = reply.len() - 1;
+    reply[last] ^= 1;
+    assert!(ivy.receive(&reply).is_err());
+    assert!(!ivy.is_open());
+}
+
+/// The node's answers as its routes give them.
+fn node_health(height: u64, tip: &str) -> Value {
+    json!({"phase": "active", "height": height.to_string(),
+           "bestHeaderHeight": height.to_string(), "tipCID": tip})
+}
+
+fn node_transaction(height: Option<u64>) -> Value {
+    let mut tx = json!({
+        "accountActions": [{"owner": "lock", "delta": "500000"}],
+        "depositActions": [], "receiptActions": [], "withdrawalActions": [],
+        "signers": ["seller"], "nonce": "0", "chainPath": ["Nexus"],
+    });
+    if let Some(height) = height {
+        tx["blockHeight"] = json!(height.to_string());
+        tx["blockHash"] = json!(format!("block{height}"));
+    }
+    tx
+}
+
+#[test]
+fn a_nexus_view_is_read_as_the_driver_reads_one() {
+    let account = json!({"balance": "500000", "nonce": "0"});
+    let reads = |after: Value, watched: Value| {
+        json!({
+            "health": node_health(10, "tip10"),
+            "own": {"balance": "0", "nonce": "0"},
+            "lock": account,
+            "chain_info": {"minRelayFee": "3"},
+            "watched": watched,
+            "block_at": null,
+            "health_after": after,
+        })
+        .to_string()
+    };
+    let watched = |before: Value, after: Value| json!({"before": before, "health": node_health(10, "tip10"), "after": after});
+    let mined = watched(node_transaction(Some(8)), node_transaction(Some(8)));
+    let view: NexusView = parse(
+        &nexus_view(&reads(node_health(10, "tip10"), mined.clone()))
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(view.lock.balance, 500_000);
+    assert_eq!(view.min_relay_fee, 3);
+    let (status, depth) = view.watched.unwrap();
+    assert_eq!(status.body.account_actions[0].delta, 500_000);
+    assert_eq!(depth, Some(3));
+    // The tip moved under the reads: no view.
+    assert_eq!(
+        nexus_view(&reads(node_health(11, "tip11"), mined)),
+        Ok(None)
+    );
+    // Its block changed between the two reads of it: not deep at all.
+    let moved = watched(node_transaction(Some(8)), node_transaction(Some(9)));
+    let view: NexusView = parse(
+        &nexus_view(&reads(node_health(10, "tip10"), moved))
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(view.watched.unwrap().1, None);
+    // Unknown to the node, or not watched.
+    let unknown = watched(Value::Null, Value::Null);
+    let view: NexusView = parse(
+        &nexus_view(&reads(node_health(10, "tip10"), unknown))
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(view.watched.is_none());
+    // A transaction the node lists with other actions is refused, as the
+    // native client refuses it.
+    let mut other = node_transaction(Some(8));
+    other["depositActions"] = json!([{}]);
+    let other = watched(other.clone(), other);
+    assert!(nexus_view(&reads(node_health(10, "tip10"), other)).is_err());
+}
+
+#[test]
+fn a_submit_body_is_the_native_clients() {
+    let key = json(&new_nex_key().unwrap());
+    let body =
+        TransactionBody::transfer(key["address"].as_str().unwrap(), "lock", 10, 1, 0).unwrap();
+    let signed = sign_nex(key["seed"].as_str().unwrap(), &text(&body).unwrap()).unwrap();
+    let transaction: Transaction = parse(&signed).unwrap();
+    assert_eq!(
+        json(&nexus_submit_body(&signed).unwrap()),
+        transaction.to_submit_json()
+    );
+}
+
+#[test]
+fn a_backup_keeps_the_deposit_key() {
+    let buyer = json(&start_buyer(&terms(), &payout(), "buyer-payout").unwrap());
+    let state = text(&buyer["state"]).unwrap();
+    let wif = json(&new_bitcoin_key("regtest").unwrap())["wif"].clone();
+    let file = json(&backup(&state, Some(wif.as_str().unwrap().into())).unwrap())["file"].clone();
+    let restored = json(&restore(file.as_str().unwrap()).unwrap());
+    assert_eq!(restored["deposit"], wif);
+    assert_eq!(restored["state"], buyer["state"]);
+    let restored = json(&restore(&self::file(&state)).unwrap());
+    assert_eq!(restored["deposit"], Value::Null);
+}
+
+#[test]
+fn a_buyer_shows_where_its_swap_is() {
+    let status = |state: Value| json(&buyer_status(&state.to_string(), None).unwrap());
+    let (_, buyer) = hellos();
+    let locking = status(buyer["state"].clone());
+    assert_eq!(locking["phase"], "locking");
+    assert_eq!(locking["must_stay_open"], false);
+    assert_eq!(locking["cancel_at"], Value::Null);
+    assert_eq!(status(json!({"Done": "Swapped"}))["phase"], "swapped");
+    assert_eq!(
+        status(json!({"Done": {"Aborted": "Timeout"}}))["phase"],
+        "aborted"
+    );
+    assert!(buyer_status("[]", None).is_err());
+}
+
+/// One deposit of `value` to the key `wif`.
+fn utxos(value: u64) -> Value {
+    json!([{"txid": Txid::from_byte_array([9; 32]), "vout": 1, "value": value}])
+}
+
+/// Whether input 0 of `tx` is signed by `wif`, spending `value`.
+fn signed_by(tx: &bitcoin::Transaction, wif: &str, value: u64) -> bool {
+    use bitcoin::sighash::{EcdsaSighashType, SighashCache};
+    let key = PrivateKey::from_wif(wif).unwrap();
+    let secp = Secp256k1::new();
+    let public = CompressedPublicKey::from_private_key(&secp, &key).unwrap();
+    let script = ScriptBuf::new_p2wpkh(&public.wpubkey_hash());
+    let sighash = SighashCache::new(tx)
+        .p2wpkh_signature_hash(0, &script, Amount::from_sat(value), EcdsaSighashType::All)
+        .unwrap();
+    let witness = &tx.input[0].witness;
+    let signature = bitcoin::ecdsa::Signature::from_slice(witness.nth(0).unwrap()).unwrap();
+    let message = bitcoin::secp256k1::Message::from_digest(sighash.to_byte_array());
+    witness.nth(1) == Some(&public.to_bytes()[..])
+        && secp
+            .verify_ecdsa(&message, &signature.signature, &public.0)
+            .is_ok()
+}
+
+fn hex_tx(hex: &Value) -> bitcoin::Transaction {
+    bitcoin::consensus::encode::deserialize_hex(hex.as_str().unwrap()).unwrap()
+}
+
+/// A deposit funds the lock as the buyer's machine takes it: the agreed
+/// amount at the lock, every input segwit, the change back to the
+/// deposit key, which a child sends on to the refund address.
+#[test]
+fn a_deposit_funds_the_lock_and_returns_its_change() {
+    let (_, buyer) = hellos();
+    let fund = &buyer["actions"][0]["FundLock"];
+    let key = json(&new_bitcoin_key("regtest").unwrap());
+    let wif = key["wif"].as_str().unwrap();
+    let refund = payout();
+    let funded = |value: u64, rate: u64| {
+        let input = json!({
+            "wif": wif, "utxos": utxos(value), "script_pubkey": fund["script_pubkey"],
+            "amount": fund["amount"], "fee_rate": rate, "refund_script": refund,
+        });
+        fund_lock(&input.to_string()).map(|funded| json(&funded))
+    };
+    let funded_ = funded(1_100_000, 5).unwrap();
+    let funding = hex_tx(&funded_["tx"]);
+    assert!(signed_by(&funding, wif, 1_100_000));
+    assert_eq!(funding.output[0].value.to_sat(), 1_000_000);
+    assert_eq!(
+        funding.output[1].script_pubkey.to_hex_string(),
+        key["script_pubkey"]
+    );
+    let fee = funded_["fee"].as_u64().unwrap();
+    assert!(fee >= 5 * funding.vsize() as u64, "{fee}");
+    assert_eq!(funded_["change"]["value"], 100_000 - fee);
+    let event = text(&json!({"Funded": funded_["tx"]})).unwrap();
+    let state = text(&buyer["state"]).unwrap();
+    let stepped = json(&step_buyer(&state, &event).unwrap());
+    assert!(
+        stepped["state"]["AwaitSellerSignatures"].is_object(),
+        "{stepped}"
+    );
+
+    // The child: the two together pay the rate asked.
+    let child = |rate: u64| {
+        let input = json!({
+            "wif": wif, "funding": funded_["tx"], "funding_fee": fee,
+            "change": funded_["change"], "refund_script": refund, "fee_rate": rate,
+        });
+        json(&change_child(&input.to_string()).unwrap())
+    };
+    for rate in [5, 50] {
+        let paid = child(rate);
+        let tx = hex_tx(&paid["tx"]);
+        assert!(signed_by(&tx, wif, 100_000 - fee));
+        assert_eq!(
+            tx.input[0].previous_output,
+            OutPoint::new(funding.compute_txid(), 1)
+        );
+        assert_eq!(tx.output[0].script_pubkey.to_hex_string(), refund);
+        let package = (funding.vsize() + tx.vsize()) as u64;
+        let total = fee + paid["fee"].as_u64().unwrap();
+        assert!(total >= rate * package, "{rate}: {total} for {package} vB");
+        assert!(
+            total < (rate + 1) * package + 10,
+            "{rate}: {total} for {package} vB"
+        );
+    }
+    // Never more than the change but dust.
+    let all = child(1_000_000);
+    assert_eq!(hex_tx(&all["tx"]).output[0].value.to_sat(), 294);
+
+    // Change too small to pay its own child goes to the fee; a deposit
+    // that cannot pay the funding is refused.
+    let exact = funded(1_000_000 + 1_400, 5).unwrap();
+    assert_eq!(exact["change"], Value::Null);
+    assert_eq!(hex_tx(&exact["tx"]).output.len(), 1);
+    assert_eq!(exact["fee"], 1_400);
+    assert!(funded(1_000_000 + 100, 5).is_err());
+}
+
+#[test]
+fn a_deposit_that_does_not_fit_is_refunded() {
+    let key = json(&new_bitcoin_key("regtest").unwrap());
+    let wif = key["wif"].as_str().unwrap();
+    let refund = payout();
+    let quote = deposit_quote(
+        &json!({"btc_amount": 1_000_000, "fee_rate": 10, "deposit_wif": wif, "refund_script": refund})
+            .to_string(),
+    )
+    .unwrap();
+    let quote: u64 = parse(&quote).unwrap();
+    assert!(
+        quote > 1_000_000 + 2 * 10 * 150 && quote < 1_000_000 + 2 * 10 * 400,
+        "{quote}"
+    );
+    let refused = |utxos: Value, rate: u64| {
+        let input =
+            json!({"utxos": utxos, "btc_amount": 1_000_000, "quote": quote, "fee_rate": rate});
+        deposit_refused(&input.to_string()).unwrap()
+    };
+    assert_eq!(refused(utxos(quote), 10), None);
+    assert_eq!(refused(utxos(2 * quote), 10), None);
+    assert!(refused(utxos(2 * quote + 1), 10).unwrap().contains("twice"));
+    assert!(refused(utxos(1_000_000 + 100), 10)
+        .unwrap()
+        .contains("below"));
+    // At a rate risen past the quote's headroom.
+    assert!(refused(utxos(quote), 100).unwrap().contains("below"));
+    assert!(refused(json!([]), 10).unwrap().contains("nothing"));
+    // Two deposits count together.
+    let two = json!([
+        {"txid": Txid::from_byte_array([9; 32]), "vout": 0, "value": 600_000},
+        {"txid": Txid::from_byte_array([8; 32]), "vout": 1, "value": quote - 600_000},
+    ]);
+    assert_eq!(refused(two, 10), None);
+
+    let back = |value: u64| {
+        let input =
+            json!({"wif": wif, "utxos": utxos(value), "refund_script": refund, "fee_rate": 10});
+        refund_deposit(&input.to_string())
+    };
+    let back50 = json(&back(50_000).unwrap());
+    let tx: bitcoin::Transaction =
+        bitcoin::consensus::encode::deserialize_hex(back50["tx"].as_str().unwrap()).unwrap();
+    assert_eq!(back50["txid"], tx.compute_txid().to_string());
+    assert!(signed_by(&tx, wif, 50_000));
+    assert_eq!(tx.output.len(), 1);
+    assert_eq!(tx.output[0].script_pubkey.to_hex_string(), refund);
+    assert!(tx.output[0].value.to_sat() >= 50_000 - 10 * (tx.vsize() as u64 + 1));
+    assert!(back(1_000).is_err(), "it would leave dust");
+}
+
+#[test]
+fn an_address_pays_its_script_on_its_network_only() {
+    let key = json(&new_bitcoin_key("regtest").unwrap());
+    let address = key["address"].as_str().unwrap();
+    assert_eq!(script_of(address, "regtest").unwrap(), key["script_pubkey"]);
+    assert!(script_of(address, "bitcoin").is_err());
+    assert!(script_of("nonsense", "regtest").is_err());
+}
+
+/// The offer the driver's JavaScript tests take, as its seller signed it:
+/// the relay, which the signature does not cover, they point at their own.
+#[test]
+fn the_drivers_test_offer_is_signed() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../web/driver/test/offer.json"
+    );
+    let offer = signed_offer("http://relay.invalid").encode();
+    if std::env::var_os("WRITE_FIXTURES").is_some() {
+        std::fs::write(path, &offer).unwrap();
+    }
+    assert_eq!(std::fs::read_to_string(path).unwrap(), offer);
 }

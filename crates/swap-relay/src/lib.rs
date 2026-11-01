@@ -17,6 +17,11 @@
 //! - `POST /watch`: a [`watch::Watch`], as JSON. Answers cancel's txid
 //!   once the watch is on disk; 503 while its cancel is not yet seen
 //!   on the network, to be asked again.
+//!
+//! Every answer lets any web page read it (`Access-Control-Allow-Origin:
+//! *`), so a buyer's page can list the offers and hand over its refund: a
+//! page posts a watch as `text/plain`, which needs no preflight, and the
+//! body is read as JSON whatever its type.
 
 pub mod board;
 pub mod watch;
@@ -77,7 +82,17 @@ pub fn router(relay: Arc<Relay>) -> Router {
             "/watch",
             post(add_watch).layer(DefaultBodyLimit::max(MAX_WATCH)),
         )
+        .layer(axum::middleware::map_response(readable))
         .with_state(relay)
+}
+
+/// Lets any page read the answer: nothing here is private to a caller.
+async fn readable(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        header::HeaderValue::from_static("*"),
+    );
+    response
 }
 
 async fn offers(State(relay): State<Arc<Relay>>) -> Response {

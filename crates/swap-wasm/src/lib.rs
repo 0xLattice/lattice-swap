@@ -9,6 +9,15 @@
 //! [`cancel_search_from`] and [`nexus_one_tip`]. [`backup`] wraps a state
 //! as a swap file `lattice-swap resume` reads, and [`restore`] reads one
 //! back.
+//!
+//! For a buyer in a browser, without a wallet or nodes of its own: it reads
+//! an offer by [`decode_offer`] and judges it by [`check_offer`], talks to
+//! the seller over [`session::Ivy`], funds the lock from a deposit address
+//! ([`deposit`]), builds its Nexus view by [`nexus_view`], hands a relay its
+//! refund by [`watch_request`], and shows where it is by [`buyer_status`].
+
+mod deposit;
+mod session;
 
 use std::str::FromStr;
 
@@ -17,9 +26,11 @@ use bitcoin::{Address, CompressedPublicKey, Network, PrivateKey, ScriptBuf};
 use ed25519_dalek::SigningKey;
 use rand_core::{OsRng, RngCore};
 use serde_json::{json, Value};
+use swap::offer::{self, Offer, Policy};
 use swap::view::{self, Lookups, Tip};
-use swap::{Buyer, Event, Machine, Message, SecretBytes, Seller, Spent, STATE_VERSION};
-use swap_nexus_tx::rpc::Health;
+use swap::STATE_VERSION;
+use swap::{BitcoinView, Buyer, Event, Machine, Message, NexusView, SecretBytes, Seller, Spent};
+use swap_nexus_tx::rpc::{parse as answer, Health};
 use swap_nexus_tx::{Transaction, TransactionBody};
 use wasm_bindgen::prelude::*;
 
@@ -92,19 +103,26 @@ fn stepped<M: Machine>(machine: &M, actions: &[swap::Action]) -> Result<String> 
 /// A state as the swap file the driver writes: `{"name", "file"}`, where
 /// `name` is `<swap id>.json`, the name `lattice-swap resume` needs.
 /// Refuses anything but a seller's or buyer's state, and a finished swap,
-/// which no longer names its swap id.
+/// which no longer names its swap id. A buyer funding from a deposit
+/// address gives its key, as WIF, as `deposit`: the file keeps it, and
+/// `lattice-swap resume` ignores it.
 #[wasm_bindgen]
-pub fn backup(state: &str) -> Result<String> {
+pub fn backup(state: &str, deposit: Option<String>) -> Result<String> {
     let (_, state, terms) = machine(parse(state)?)?;
     let terms = terms.ok_or("the swap is over: there is nothing to resume")?;
+    let mut file = json!({"version": STATE_VERSION, "state": state});
+    if let Some(deposit) = deposit {
+        file["deposit"] = deposit.into();
+    }
     text(&json!({
         "name": format!("{}.json", hex::encode(terms.swap_id)),
-        "file": text(&json!({"version": STATE_VERSION, "state": state}))?,
+        "file": text(&file)?,
     }))
 }
 
 /// A swap file's state and its side: `{"side": "seller" | "buyer",
-/// "state"}`. Refuses a file of another state version, as the driver does.
+/// "state", "deposit"}`, `deposit` the key [`backup`] kept, or null.
+/// Refuses a file of another state version, as the driver does.
 #[wasm_bindgen]
 pub fn restore(file: &str) -> Result<String> {
     let mut file: Value = parse(file)?;
@@ -115,7 +133,7 @@ pub fn restore(file: &str) -> Result<String> {
         ));
     }
     let (side, state, _) = machine(file["state"].take())?;
-    text(&json!({"side": side, "state": state}))
+    text(&json!({"side": side, "state": state, "deposit": file["deposit"]}))
 }
 
 /// A state's side, the state, and its terms until the swap ends.
@@ -232,7 +250,7 @@ pub fn decode_message(bytes: &[u8], swap_id: &str) -> Result<Option<String>> {
         .transpose()
 }
 
-fn swap_id_bytes(swap_id: &str) -> Result<[u8; 32]> {
+pub(crate) fn swap_id_bytes(swap_id: &str) -> Result<[u8; 32]> {
     let mut bytes = [0u8; 32];
     hex::decode_to_slice(swap_id.trim(), &mut bytes)
         .map_err(|_| "the swap id is not 32 bytes of hex")?;
@@ -253,14 +271,54 @@ pub fn new_nex_key() -> Result<String> {
 pub fn new_bitcoin_key(network: &str) -> Result<String> {
     let network = Network::from_str(network).map_err(|e| e.to_string())?;
     let secret = SecretKey::from_slice(&random32()).map_err(|e| e.to_string())?;
-    let key = PrivateKey::new(secret, network);
-    let public = CompressedPublicKey(secret.public_key(&Secp256k1::signing_only()));
+    bitcoin_key(PrivateKey::new(secret, network), network)
+}
+
+/// The key `wif`, on `network`, as [`new_bitcoin_key`] gives one.
+#[wasm_bindgen(js_name = bitcoinKeyOf)]
+pub fn bitcoin_key_of(wif: &str, network: &str) -> Result<String> {
+    let network = Network::from_str(network).map_err(|e| e.to_string())?;
+    let key = PrivateKey::from_wif(wif.trim()).map_err(|e| e.to_string())?;
+    if key.network != network.into() {
+        return Err(format!("the key is not for {network}"));
+    }
+    bitcoin_key(key, network)
+}
+
+fn bitcoin_key(key: PrivateKey, network: Network) -> Result<String> {
+    let public = CompressedPublicKey(key.inner.public_key(&Secp256k1::signing_only()));
     let address = Address::p2wpkh(&public, network);
     text(&json!({
         "wif": key.to_wif(),
         "script_pubkey": address.script_pubkey(),
         "address": address.to_string(),
     }))
+}
+
+/// Whether `text` is spelled as Lattice spells a CID, as a Nexus address
+/// is: NEX paid to anything else is lost.
+#[wasm_bindgen(js_name = isCid)]
+pub fn is_cid(text: &str) -> bool {
+    swap_nexus_tx::is_cid(text)
+}
+
+/// An address nobody holds, whose account after a past block shows
+/// whether a Nexus node keeps the state of past blocks, as the CLI asks.
+#[wasm_bindgen(js_name = nexusProbeAddress)]
+pub fn nexus_probe_address() -> String {
+    swap_nexus_tx::address(&[0; 32])
+}
+
+/// The output script, in hex, that pays `address` on `network`; refuses
+/// an address of another network.
+#[wasm_bindgen(js_name = scriptOf)]
+pub fn script_of(address: &str, network: &str) -> Result<String> {
+    let network = Network::from_str(network).map_err(|e| e.to_string())?;
+    let address = Address::from_str(address.trim()).map_err(|e| e.to_string())?;
+    let address = address
+        .require_network(network)
+        .map_err(|e| e.to_string())?;
+    Ok(address.script_pubkey().to_hex_string())
 }
 
 /// Answers a seller's `SignNex`: the body signed with the Nexus key whose
@@ -275,11 +333,184 @@ pub fn sign_nex(seed: &str, body: &str) -> Result<String> {
     text(&transaction)
 }
 
-fn parse<T: serde::de::DeserializeOwned>(json: &str) -> Result<T> {
+/// The offer in `text`, as the CLI's `take` reads one: it names where to
+/// find the seller, and the seller signed its terms (strictly). The offer
+/// as JSON.
+#[wasm_bindgen(js_name = decodeOffer)]
+pub fn decode_offer(text: &str) -> Result<String> {
+    self::text(&Offer::decode(text)?)
+}
+
+/// Why a buyer refuses an offer, as the CLI's `take` refuses it, or null.
+/// `{"offer", "policy", "network", "nexus_genesis", "fee_estimate",
+/// "min_relay_fee"}` in: the policy as [`Policy`], its bounds defaulting to
+/// the CLI's; `fee_estimate` the estimate for 6 blocks in sat/kvB, or null
+/// where there is none; `min_relay_fee` the Nexus node's.
+#[wasm_bindgen(js_name = checkOffer)]
+pub fn check_offer(input: &str) -> Result<Option<String>> {
+    #[derive(serde::Deserialize)]
+    struct Input {
+        offer: Offer,
+        policy: Policy,
+        network: Network,
+        nexus_genesis: String,
+        fee_estimate: Option<u64>,
+        min_relay_fee: u64,
+    }
+    let input: Input = parse(input)?;
+    let bounds = &input.policy.bounds;
+    let floor = match offer::btc_fee_floor(input.fee_estimate, bounds.min_btc_fee_rate) {
+        Ok(floor) => floor,
+        Err(why) => return Ok(Some(why)),
+    };
+    let nex_floor = offer::nex_fee_floor(bounds.min_nex_fee, input.min_relay_fee);
+    Ok(offer::check_offer(
+        &input.offer,
+        &input.policy,
+        input.network,
+        &input.nexus_genesis,
+        floor,
+        nex_floor,
+    )
+    .err())
+}
+
+/// A Nexus view from the node's answers, read in the order
+/// [`swap::view`] gives: `{"health", "own", "lock", "chain_info",
+/// "watched", "block_at", "health_after"}`, each a route's JSON as the
+/// node answered it. `own` and `lock` are `/api/state/account/:address`,
+/// `chain_info` is `/api/chain/info`, and `block_at` is
+/// `/api/block/:height`, null if not asked or unknown. `watched`, if
+/// watched, is `{"before", "health", "after"}`: the transaction read, then
+/// `/health`, then the transaction again, each transaction null where the
+/// node holds none. The view as JSON, or null if the two healths are not
+/// at one tip.
+#[wasm_bindgen(js_name = nexusView)]
+pub fn nexus_view(reads: &str) -> Result<Option<String>> {
+    let reads: Value = parse(reads)?;
+    let health = answer::health(&reads["health"])?;
+    let after = answer::health(&reads["health_after"])?;
+    if !view::one_tip(&health, &after) {
+        return Ok(None);
+    }
+    let watched = &reads["watched"];
+    let watched = match &watched["before"] {
+        Value::Null => None,
+        before => {
+            let status = answer::transaction(before)?;
+            let height = answer::health(&watched["health"])?.height;
+            let after = match &watched["after"] {
+                Value::Null => None,
+                after => Some(answer::transaction(after)?),
+            };
+            let after = after.and_then(|after| after.block);
+            let depth = answer::confirmations(status.block.as_ref(), height, after.as_ref());
+            Some((status, depth))
+        }
+    };
+    let block_at = match &reads["block_at"] {
+        Value::Null => None,
+        block => Some(answer::block_hash(block)?),
+    };
+    text(&NexusView {
+        health,
+        own: answer::account(&reads["own"])?,
+        lock: answer::account(&reads["lock"])?,
+        min_relay_fee: answer::min_relay_fee(&reads["chain_info"])?,
+        watched,
+        block_at,
+    })
+    .map(Some)
+}
+
+/// The body to `POST /transactions` a Nexus node for `transaction`, from a
+/// `Submit` action.
+#[wasm_bindgen(js_name = nexusSubmitBody)]
+pub fn nexus_submit_body(transaction: &str) -> Result<String> {
+    text(&parse::<swap_nexus_tx::Transaction>(transaction)?.to_submit_json())
+}
+
+/// What to `POST /watch` a relay for a buyer's `state` on the Bitcoin
+/// `network`, or null: the CLI's condition, [`Buyer::watchtower`].
+#[wasm_bindgen(js_name = watchRequest)]
+pub fn watch_request(state: &str, network: &str) -> Result<Option<String>> {
+    let network = Network::from_str(network).map_err(|e| e.to_string())?;
+    parse::<Buyer>(state)?
+        .watch_request(network)
+        .map(|watch| text(&watch))
+        .transpose()
+}
+
+/// Where a buyer's swap is, for a page to show: `{"phase",
+/// "awaits_message", "must_stay_open", "cancel_at", "punish_at"}`, given its `state` and the
+/// last Bitcoin view, or null. `phase` is `locking` until the NEX lock is
+/// trusted, `finishing` once the redeem is signed, `refunding` once it
+/// cancels, then the outcome: `swapped`, `refunded`, `punished`, `drained`
+/// or `aborted`. `must_stay_open` holds while the redeem is signed and the
+/// swap not settled: nothing but this page refunds or claims for it then.
+/// `cancel_at` is the Bitcoin height from which cancel can be broadcast,
+/// once the lock is in a block; `punish_at` the height from which the
+/// seller can punish, once cancel is, which the refund must beat.
+#[wasm_bindgen(js_name = buyerStatus)]
+pub fn buyer_status(state: &str, view: Option<String>) -> Result<String> {
+    let buyer: Buyer = parse(state)?;
+    let view: Option<BitcoinView> = view.as_deref().map(parse).transpose()?;
+    let value: Value = parse(state)?;
+    let redeem_signed = |field: &Value| !field["redeem"].is_null();
+    let (phase, must_stay_open) = match &value {
+        Value::Object(state) => match state.iter().next() {
+            Some((name, inner)) => match name.as_str() {
+                "AwaitRedeem" | "ClaimingNex" => ("finishing", true),
+                "Cancelling" => ("refunding", redeem_signed(inner)),
+                "Done" => (outcome(inner), false),
+                _ => ("locking", false),
+            },
+            None => return Err("not a buyer's state".into()),
+        },
+        _ => return Err("not a buyer's state".into()),
+    };
+    let (mut cancel_at, mut punish_at) = (None, None);
+    if let (Some((swap, lock)), Some(view), Some(terms)) =
+        (buyer.watch().bitcoin, view, buyer.terms())
+    {
+        // Mined `depth` deep at `view.height`: in block `height + 1 - depth`.
+        let mined = |depth: u32| (depth > 0).then(|| view.height + 1 - depth);
+        if let Some(lock_height) = view.funding.and_then(mined) {
+            cancel_at = Some(lock_height + u32::from(terms.t1) - 1);
+        }
+        let cancel = Lookups::new(&swap, lock).lock_spends[1];
+        let cancelled = view
+            .lock_spend
+            .filter(|spent| spent.tx.compute_txid() == cancel);
+        if let Some(cancel_height) = cancelled.and_then(|spent| mined(spent.confirmations)) {
+            punish_at = Some(cancel_height + u32::from(terms.t2) - 1);
+        }
+    }
+    text(&json!({
+        "phase": phase,
+        "awaits_message": buyer.awaits_message(),
+        "must_stay_open": must_stay_open,
+        "cancel_at": cancel_at,
+        "punish_at": punish_at,
+    }))
+}
+
+/// An outcome's name, as `buyer_status` gives it.
+fn outcome(outcome: &Value) -> &'static str {
+    match outcome.as_str() {
+        Some("Swapped") => "swapped",
+        Some("Refunded") => "refunded",
+        Some("Punished") => "punished",
+        Some("Drained") => "drained",
+        _ => "aborted",
+    }
+}
+
+pub(crate) fn parse<T: serde::de::DeserializeOwned>(json: &str) -> Result<T> {
     serde_json::from_str(json).map_err(|e| e.to_string())
 }
 
-fn text<T: serde::Serialize>(value: &T) -> Result<String> {
+pub(crate) fn text<T: serde::Serialize>(value: &T) -> Result<String> {
     serde_json::to_string(value).map_err(|e| e.to_string())
 }
 

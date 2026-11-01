@@ -3,19 +3,12 @@
 //! broadcasts the refund, and forgets the watch once it is deep.
 //!
 //! The relay reads the chain through a small Esplora shim over bitcoind,
-//! here in the test: the calls the watchtower makes, answered as Esplora
-//! does, `/tx/{txid}/status` unconfirmed even for a txid never seen.
+//! [`support::esplora`].
 
-use std::net::TcpListener;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
-use axum::routing::{get, post};
-use axum::{Json, Router};
 use bitcoin::consensus::encode::serialize_hex;
 use bitcoin::{Amount, FeeRate, Network, Txid};
 use corepc_node::{Conf, Node};
@@ -28,6 +21,9 @@ use swap_relay::board::Board;
 use swap_relay::watch::{Esplora, Watchtower};
 use swap_relay::Relay;
 
+mod support;
+use support::esplora::{esplora, serve};
+
 const TIMEOUT: Duration = Duration::from_secs(10);
 /// The driver's default `max_tip_age`.
 const AGE: Duration = Duration::from_secs(90 * 60);
@@ -39,157 +35,6 @@ fn rpc(node: &Node, wallet: &str) -> Bitcoind {
         wallet => node.rpc_url_with_wallet(wallet),
     };
     Bitcoind::new(&url, &cookie, Network::Regtest, TIMEOUT)
-}
-
-/// Serves `router` on loopback, on its own runtime: its URL.
-fn serve(router: Router) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
-    listener.set_nonblocking(true).unwrap();
-    thread::spawn(move || {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        runtime.block_on(async {
-            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-            axum::serve(listener, router).await.unwrap();
-        });
-    });
-    url
-}
-
-type Shared = Arc<Bitcoind>;
-
-/// Runs `call` on bitcoind off the runtime.
-async fn ask<T: Send + 'static>(
-    node: &Shared,
-    call: impl FnOnce(&Bitcoind) -> T + Send + 'static,
-) -> T {
-    let node = node.clone();
-    tokio::task::spawn_blocking(move || call(&node))
-        .await
-        .unwrap()
-}
-
-fn height_of(node: &Bitcoind, tx: &Value) -> Option<u64> {
-    let hash = tx["blockhash"].as_str()?;
-    let header = node.call("getblockheader", json!([hash])).unwrap();
-    header["height"].as_u64()
-}
-
-fn status(node: &Bitcoind, tx: &Value) -> Value {
-    match height_of(node, tx) {
-        Some(height) => json!({"confirmed": true, "block_height": height}),
-        None => json!({"confirmed": false}),
-    }
-}
-
-/// What spends `txid:vout`: the mempool first, then every block from the
-/// tip down.
-fn outspend(node: &Bitcoind, txid: &str, vout: u64) -> Value {
-    let unspent = node.call("gettxout", json!([txid, vout, true])).unwrap();
-    if !unspent.is_null() {
-        return json!({"spent": false});
-    }
-    let spends = |tx: &Value| {
-        tx["vin"].as_array().unwrap().iter().any(|input| {
-            input["txid"].as_str() == Some(txid) && input["vout"].as_u64() == Some(vout)
-        })
-    };
-    let pool = node.call("getrawmempool", json!([])).unwrap();
-    for spender in pool.as_array().unwrap() {
-        let tx = node
-            .call("getrawtransaction", json!([spender, true]))
-            .unwrap();
-        if spends(&tx) {
-            return json!({"spent": true, "txid": tx["txid"], "status": {"confirmed": false}});
-        }
-    }
-    let mut hash = node.call("getbestblockhash", json!([])).unwrap();
-    while !hash.is_null() {
-        let block = node.call("getblock", json!([hash, 2])).unwrap();
-        for tx in block["tx"].as_array().unwrap() {
-            if spends(tx) {
-                let status = json!({"confirmed": true, "block_height": block["height"]});
-                return json!({"spent": true, "txid": tx["txid"], "status": status});
-            }
-        }
-        hash = block["previousblockhash"].clone();
-    }
-    json!({"spent": false})
-}
-
-/// The Esplora calls the watchtower makes, answered from `node`.
-fn esplora(node: Bitcoind) -> String {
-    let router = Router::new()
-        .route(
-            "/blocks/tip/height",
-            get(|State(node): State<Shared>| async move {
-                let count = ask(&node, |n| n.call("getblockcount", json!([])).unwrap()).await;
-                count.to_string()
-            }),
-        )
-        .route(
-            "/tx/{txid}",
-            get(
-                |State(node): State<Shared>, Path(txid): Path<String>| async move {
-                    let answer = ask(&node, move |n| {
-                        let tx = n.call("getrawtransaction", json!([txid, true])).ok()?;
-                        Some(json!({"txid": tx["txid"], "status": status(n, &tx)}))
-                    });
-                    match answer.await {
-                        Some(tx) => Json(tx).into_response(),
-                        None => (StatusCode::NOT_FOUND, "Transaction not found").into_response(),
-                    }
-                },
-            ),
-        )
-        .route(
-            "/tx/{txid}/hex",
-            get(
-                |State(node): State<Shared>, Path(txid): Path<String>| async move {
-                    let hex = ask(&node, move |n| {
-                        n.call("getrawtransaction", json!([txid, false])).ok()
-                    });
-                    match hex.await {
-                        Some(hex) => hex.as_str().unwrap().to_string().into_response(),
-                        None => (StatusCode::NOT_FOUND, "Transaction not found").into_response(),
-                    }
-                },
-            ),
-        )
-        .route(
-            "/tx/{txid}/status",
-            get(
-                |State(node): State<Shared>, Path(txid): Path<String>| async move {
-                    let status = ask(&node, move |n| {
-                        match n.call("getrawtransaction", json!([txid, true])) {
-                            Ok(tx) => status(n, &tx),
-                            Err(_) => json!({"confirmed": false}),
-                        }
-                    });
-                    Json(status.await)
-                },
-            ),
-        )
-        .route(
-            "/tx/{txid}/outspend/{vout}",
-            get(
-                |State(node): State<Shared>, Path((txid, vout)): Path<(String, u64)>| async move {
-                    Json(ask(&node, move |n| outspend(n, &txid, vout)).await)
-                },
-            ),
-        )
-        .route(
-            "/tx",
-            post(|State(node): State<Shared>, hex: String| async move {
-                let sent = ask(&node, move |n| n.call("sendrawtransaction", json!([hex])));
-                match sent.await {
-                    Ok(txid) => txid.as_str().unwrap().to_string().into_response(),
-                    Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
-                }
-            }),
-        )
-        .with_state(Arc::new(node));
-    serve(router)
 }
 
 fn sent(actions: &[Action]) -> Message {
@@ -317,7 +162,11 @@ fn the_relay_refunds_a_buyer_that_went_offline() {
         "depth": 1,
     });
     // The answer, or the status refusing the watch.
-    let post = |watch: &Value| match ureq::post(&format!("{url}/watch")).send_json(watch) {
+    // As a buyer's page posts it: plain text, which needs no preflight.
+    let post = |watch: &Value| match ureq::post(&format!("{url}/watch"))
+        .set("Content-Type", "text/plain")
+        .send_string(&watch.to_string())
+    {
         Ok(answer) => Ok(answer.into_string().unwrap()),
         Err(ureq::Error::Status(status, _)) => Err(status),
         Err(e) => panic!("{e}"),

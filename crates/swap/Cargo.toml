@@ -14,7 +14,6 @@ native = [
     "dep:base64",
     "dep:futures-util",
     "dep:ivy",
-    "dep:ivy-core",
     "dep:rustls",
     "dep:tokio",
     "dep:tokio-tungstenite",
@@ -35,8 +34,8 @@ futures-util = { version = "0.3", default-features = false, features = ["sink"],
 ed25519-dalek = "2"
 hex = { version = "0.4", features = ["serde"] }
 ivy = { git = "https://github.com/0xLattice/ivy-rs", rev = "e020256", optional = true }
-# `ivy` does not re-export the peer key type.
-ivy-core = { git = "https://github.com/0xLattice/ivy-rs", rev = "e020256", optional = true }
+# `ivy` does not re-export the peer key type, which an offer names.
+ivy-core = { git = "https://github.com/0xLattice/ivy-rs", rev = "e020256" }
 rand_core = { version = "0.6", features = ["getrandom"] }
 schnorr_fun = { version = "0.13", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }

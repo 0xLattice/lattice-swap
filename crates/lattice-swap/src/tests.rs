@@ -2,7 +2,8 @@ use super::*;
 use bitcoin::hashes::Hash;
 use bitcoin::{OutPoint, WScriptHash};
 use clap::CommandFactory;
-use swap::btc_amount_floor;
+use swap::transport::PeerKey;
+use swap::{btc_amount_floor, btc_fee_at};
 use swap_bitcoin::{KeyPair, Params, Scalar, Spend, Swap};
 use swap_nexus_tx::MAINNET_GENESIS as MAINNET;
 
@@ -311,7 +312,14 @@ const NEX_FLOOR: u64 = 1_000;
 fn take_refuses_any_term_outside_its_policy() {
     let (policy, network) = policy(&[]);
     assert_eq!(
-        check_offer(&agreed(), &policy, network, MAINNET, FLOOR, NEX_FLOOR),
+        check_offer(
+            &agreed(),
+            &policy.policy(),
+            network,
+            MAINNET,
+            FLOOR,
+            NEX_FLOOR
+        ),
         Ok(())
     );
     type Change = (&'static str, fn(&mut Offer));
@@ -339,7 +347,8 @@ fn take_refuses_any_term_outside_its_policy() {
         let mut offer = agreed();
         change(&mut offer);
         assert_eq!(Terms::check(&offer.terms), Ok(()), "{what}");
-        let refused = check_offer(&offer, &policy, network, MAINNET, FLOOR, NEX_FLOOR).unwrap_err();
+        let refused =
+            check_offer(&offer, &policy.policy(), network, MAINNET, FLOOR, NEX_FLOOR).unwrap_err();
         assert!(
             refused.starts_with("refused: the offer"),
             "{what}: {refused}"
@@ -348,12 +357,20 @@ fn take_refuses_any_term_outside_its_policy() {
     // The defaults leave t2 - btc_confirmations = 144 - 6.
     let (policy, network) = self::policy(&["--min-refund-window", "138"]);
     assert_eq!(
-        check_offer(&agreed(), &policy, network, MAINNET, FLOOR, NEX_FLOOR),
+        check_offer(
+            &agreed(),
+            &policy.policy(),
+            network,
+            MAINNET,
+            FLOOR,
+            NEX_FLOOR
+        ),
         Ok(())
     );
     let mut offer = agreed();
     offer.terms.btc_confirmations += 1;
-    let refused = check_offer(&offer, &policy, network, MAINNET, FLOOR, NEX_FLOOR).unwrap_err();
+    let refused =
+        check_offer(&offer, &policy.policy(), network, MAINNET, FLOOR, NEX_FLOOR).unwrap_err();
     assert!(refused.contains("blocks to refund in"), "{refused}");
 }
 
@@ -372,7 +389,7 @@ fn take_refuses_terms_that_cannot_work() {
     let mut offer = agreed();
     offer.terms.t1 = 100;
     assert!(
-        check_offer(&offer, &policy, network, MAINNET, 0, 0).is_err(),
+        check_offer(&offer, &policy.policy(), network, MAINNET, 0, 0).is_err(),
         "below the floor"
     );
 }
@@ -884,7 +901,8 @@ fn an_amount_that_cannot_pay_redeem_is_refused() {
     let (policy, network) = policy(&[]);
     let mut offer = agreed();
     offer.terms.btc_amount = Amount::from_sat(2 * 10_000 + 545);
-    let refused = check_offer(&offer, &policy, network, MAINNET, FLOOR, NEX_FLOOR).unwrap_err();
+    let refused =
+        check_offer(&offer, &policy.policy(), network, MAINNET, FLOOR, NEX_FLOOR).unwrap_err();
     assert!(refused.contains("redeem pays two btc_fee"), "{refused}");
 }
 

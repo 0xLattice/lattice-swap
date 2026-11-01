@@ -340,6 +340,20 @@ impl Buyer {
         Some((cancel, locked.refund()))
     }
 
+    /// What a relay's `POST /watch` takes for [`Buyer::watchtower`], on
+    /// the Bitcoin `network`: the cancel, the refund, and how deep the
+    /// refund must be before the watch is done, at most the 144 a relay
+    /// takes.
+    pub fn watch_request(&self, network: bitcoin::Network) -> Option<serde_json::Value> {
+        let ((cancel, refund), terms) = (self.watchtower()?, self.terms()?);
+        Some(serde_json::json!({
+            "network": network,
+            "cancel": serialize_hex(&cancel),
+            "refund": serialize_hex(&refund),
+            "depth": terms.btc_confirmations.min(144),
+        }))
+    }
+
     /// The Nexus address the NEX is locked at, once the hellos are
     /// exchanged and until the swap ends.
     pub fn lock_address(&self) -> Option<String> {

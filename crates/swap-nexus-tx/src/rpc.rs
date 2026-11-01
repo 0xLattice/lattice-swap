@@ -21,9 +21,9 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "native")]
 use serde_json::Value;
 
-use crate::TransactionBody;
 #[cfg(feature = "native")]
-use crate::{AccountAction, Transaction};
+use crate::Transaction;
+use crate::{AccountAction, TransactionBody};
 
 #[cfg(feature = "native")]
 #[derive(Debug)]
@@ -136,20 +136,7 @@ impl Client {
     }
 
     pub fn health(&self) -> Result<Health> {
-        let json = self.get("/health")?;
-        let best_header_height = match json.get("bestHeaderHeight") {
-            Some(_) => Some(decimal(&json, "bestHeaderHeight")?),
-            None => None,
-        };
-        Ok(Health {
-            phase: json["phase"]
-                .as_str()
-                .ok_or_else(|| Error::Malformed(format!("no phase in {json}")))?
-                .into(),
-            height: decimal(&json, "height")?,
-            best_header_height,
-            tip: json["tipCID"].as_str().map(String::from),
-        })
+        parse::health(&self.get("/health")?).map_err(Error::Malformed)
     }
 
     /// The CID of the canonical block at `height`, or `None` if the node has
@@ -160,16 +147,13 @@ impl Client {
             Err(Error::Status { status: 404, .. }) => return Ok(None),
             Err(e) => return Err(e),
         };
-        json["hash"]
-            .as_str()
-            .map(|hash| Some(hash.into()))
-            .ok_or_else(|| Error::Malformed(format!("no hash in {json}")))
+        parse::block_hash(&json).map(Some).map_err(Error::Malformed)
     }
 
     /// The smallest fee this node pools: a whole-transaction amount (debits
     /// less credits), not a rate. Node policy, not consensus.
     pub fn min_relay_fee(&self) -> Result<u64> {
-        decimal(&self.get("/api/chain/info")?, "minRelayFee")
+        parse::min_relay_fee(&self.get("/api/chain/info")?).map_err(Error::Malformed)
     }
 
     /// The CID of the genesis block of the Nexus the node follows: the block
@@ -191,10 +175,7 @@ impl Client {
     /// not a node of this version), so it stays an error.
     pub fn account(&self, address: &str) -> Result<Account> {
         let json = self.get(&format!("/api/state/account/{}", cid_path(address)?))?;
-        Ok(Account {
-            balance: decimal(&json, "balance")?,
-            nonce: decimal(&json, "nonce")?,
-        })
+        parse::account(&json).map_err(Error::Malformed)
     }
 
     /// The account after the block `block_cid`, or `None` if the node has
@@ -211,10 +192,7 @@ impl Client {
             Err(Error::Status { status: 404, .. }) => return Ok(None),
             Err(e) => return Err(e),
         };
-        Ok(Some(Account {
-            balance: decimal(&json, "balance")?,
-            nonce: decimal(&json, "nonce")?,
-        }))
+        parse::account(&json).map(Some).map_err(Error::Malformed)
     }
 
     /// Submits to the node's pool and returns the transaction CID (of the
@@ -241,50 +219,9 @@ impl Client {
             Err(Error::Status { status: 404, .. }) => return Ok(None),
             Err(e) => return Err(e),
         };
-        for kind in ["depositActions", "receiptActions", "withdrawalActions"] {
-            if json[kind].as_array().is_none_or(|list| !list.is_empty()) {
-                return Err(Error::Malformed(format!("{kind} not empty in {json}")));
-            }
-        }
-        let strings = |field: &str| -> Result<Vec<String>> {
-            json[field]
-                .as_array()
-                .and_then(|list| list.iter().map(|s| s.as_str().map(String::from)).collect())
-                .ok_or_else(|| Error::Malformed(format!("{field} is not a string list in {json}")))
-        };
-        let account_actions = json["accountActions"]
-            .as_array()
-            .ok_or_else(|| Error::Malformed(format!("no accountActions in {json}")))?
-            .iter()
-            .map(|action| {
-                Ok(AccountAction {
-                    owner: action["owner"]
-                        .as_str()
-                        .ok_or_else(|| Error::Malformed(format!("no owner in {action}")))?
-                        .into(),
-                    delta: decimal(action, "delta")?,
-                })
-            })
-            .collect::<Result<_>>()?;
-        let block = match json.get("blockHeight") {
-            Some(_) => Some(Inclusion {
-                height: decimal(&json, "blockHeight")?,
-                hash: json["blockHash"]
-                    .as_str()
-                    .ok_or_else(|| Error::Malformed(format!("no blockHash in {json}")))?
-                    .into(),
-            }),
-            None => None,
-        };
-        Ok(Some(TransactionStatus {
-            body: TransactionBody {
-                account_actions,
-                signers: strings("signers")?,
-                nonce: decimal(&json, "nonce")?,
-                chain_path: strings("chainPath")?,
-            },
-            block,
-        }))
+        parse::transaction(&json)
+            .map(Some)
+            .map_err(Error::Malformed)
     }
 
     /// Blocks on top of and including the canonical block that executed
@@ -303,10 +240,11 @@ impl Client {
             return Ok(None);
         };
         let height = self.health()?.height;
-        if block(self)?.as_ref() != Some(&before) {
-            return Ok(None);
-        }
-        Ok(height.checked_sub(before.height).map(|depth| depth + 1))
+        Ok(parse::confirmations(
+            Some(&before),
+            height,
+            block(self)?.as_ref(),
+        ))
     }
 
     fn get(&self, path: &str) -> Result<Value> {
@@ -353,12 +291,122 @@ fn read(response: std::result::Result<ureq::Response, ureq::Error>) -> Result<Va
     }
 }
 
-#[cfg(feature = "native")]
-fn decimal<T: std::str::FromStr>(json: &Value, field: &str) -> Result<T> {
-    json[field]
-        .as_str()
-        .and_then(|text| text.parse().ok())
-        .ok_or_else(|| Error::Malformed(format!("{field} is not a decimal string in {json}")))
+/// Reading the node's answers apart from fetching them: [`Client`] reads
+/// them so, and so does a browser that fetched the same routes itself.
+/// Each takes a route's JSON and fails, naming what is wrong, on one that
+/// is not as the node writes it.
+pub mod parse {
+    use super::{Account, AccountAction, Health, Inclusion, TransactionBody, TransactionStatus};
+    use serde_json::Value;
+
+    /// `GET /health`.
+    pub fn health(json: &Value) -> Result<Health, String> {
+        let best_header_height = match json.get("bestHeaderHeight") {
+            Some(_) => Some(decimal(json, "bestHeaderHeight")?),
+            None => None,
+        };
+        Ok(Health {
+            phase: json["phase"]
+                .as_str()
+                .ok_or_else(|| format!("no phase in {json}"))?
+                .into(),
+            height: decimal(json, "height")?,
+            best_header_height,
+            tip: json["tipCID"].as_str().map(String::from),
+        })
+    }
+
+    /// `GET /api/block/:height`: the block's CID.
+    pub fn block_hash(json: &Value) -> Result<String, String> {
+        json["hash"]
+            .as_str()
+            .map(String::from)
+            .ok_or_else(|| format!("no hash in {json}"))
+    }
+
+    /// `GET /api/chain/info`: the smallest fee the node pools.
+    pub fn min_relay_fee(json: &Value) -> Result<u64, String> {
+        decimal(json, "minRelayFee")
+    }
+
+    /// `GET /api/state/account/:address`, or `/accounts/:address?block=`.
+    pub fn account(json: &Value) -> Result<Account, String> {
+        Ok(Account {
+            balance: decimal(json, "balance")?,
+            nonce: decimal(json, "nonce")?,
+        })
+    }
+
+    /// `GET /api/transaction/:cid`.
+    pub fn transaction(json: &Value) -> Result<TransactionStatus, String> {
+        for kind in ["depositActions", "receiptActions", "withdrawalActions"] {
+            if json[kind].as_array().is_none_or(|list| !list.is_empty()) {
+                return Err(format!("{kind} not empty in {json}"));
+            }
+        }
+        let strings = |field: &str| -> Result<Vec<String>, String> {
+            json[field]
+                .as_array()
+                .and_then(|list| list.iter().map(|s| s.as_str().map(String::from)).collect())
+                .ok_or_else(|| format!("{field} is not a string list in {json}"))
+        };
+        let account_actions = json["accountActions"]
+            .as_array()
+            .ok_or_else(|| format!("no accountActions in {json}"))?
+            .iter()
+            .map(|action| {
+                Ok(AccountAction {
+                    owner: action["owner"]
+                        .as_str()
+                        .ok_or_else(|| format!("no owner in {action}"))?
+                        .into(),
+                    delta: decimal(action, "delta")?,
+                })
+            })
+            .collect::<Result<_, String>>()?;
+        let block = match json.get("blockHeight") {
+            Some(_) => Some(Inclusion {
+                height: decimal(json, "blockHeight")?,
+                hash: json["blockHash"]
+                    .as_str()
+                    .ok_or_else(|| format!("no blockHash in {json}"))?
+                    .into(),
+            }),
+            None => None,
+        };
+        Ok(TransactionStatus {
+            body: TransactionBody {
+                account_actions,
+                signers: strings("signers")?,
+                nonce: decimal(json, "nonce")?,
+                chain_path: strings("chainPath")?,
+            },
+            block,
+        })
+    }
+
+    /// Blocks on top of and including the canonical block that executed a
+    /// transaction, from its block read `before` and `after` the tip
+    /// `height`: `None` while it is in no canonical block, or if its block
+    /// changed in between, as the chain moved under the reads.
+    pub fn confirmations(
+        before: Option<&Inclusion>,
+        height: u64,
+        after: Option<&Inclusion>,
+    ) -> Option<u64> {
+        let before = before?;
+        if after != Some(before) {
+            return None;
+        }
+        height.checked_sub(before.height).map(|depth| depth + 1)
+    }
+
+    fn decimal<T: std::str::FromStr>(json: &Value, field: &str) -> Result<T, String> {
+        json[field]
+            .as_str()
+            .and_then(|text| text.parse().ok())
+            .ok_or_else(|| format!("{field} is not a decimal string in {json}"))
+    }
 }
 
 #[cfg(feature = "native")]
