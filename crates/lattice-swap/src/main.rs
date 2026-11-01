@@ -1,9 +1,10 @@
 //! `lattice-swap`: one side of a NEX<->BTC swap, run against the operator's
 //! own bitcoind and lattice-node.
 //!
-//! The seller runs `offer`: it listens, and prints an offer for the buyer.
-//! The two agree off-tool, and the buyer runs `take` on that offer, which
-//! dials the seller. Each side then runs its [`Driver`] until the swap ends,
+//! The seller runs `offer`: it listens, or lists the offer on a relay, and
+//! prints an offer for the buyer. The buyer runs `take` on that offer, which
+//! dials the seller, or reaches it through the relay. Each side then runs
+//! its [`Driver`] until the swap ends,
 //! saving its state to a swap file that `resume` carries on from after a
 //! restart and `status` reads.
 
@@ -13,18 +14,18 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bitcoin::address::NetworkUnchecked;
 use bitcoin::{Address, Amount, FeeRate, Network, ScriptBuf};
 use clap::{Args, Parser, Subcommand};
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use swap::bitcoind::{Bitcoin, Bitcoind};
 use swap::driver::{Driver, Store};
-use swap::transport::{Ivy, PeerKey, Transport};
+use swap::transport::{Ivy, PeerKey, Relayed, Transport};
 use swap::{btc_fee_at, Buyer, Machine, Outcome, SecretBytes, Seller, Terms};
 use swap_nexus_tx::rpc::Client;
 
@@ -38,6 +39,10 @@ const NEX_KEY_ENV: &str = "LATTICE_SWAP_NEX_KEY";
 const BTC_PASSWORD_ENV: &str = "LATTICE_SWAP_BTC_PASSWORD";
 /// The blocks the buyer's fee estimate aims to confirm in.
 const FEE_TARGET: u16 = 6;
+/// The least time between two tries to hand a refund to a watchtower: a
+/// relay that is down, or has not yet seen cancel, is not asked again at
+/// every poll.
+const WATCH_RETRY: Duration = Duration::from_secs(60);
 /// What a seller is told without its Nexus key.
 const NO_KEY: &str = "the seller needs its Nexus key: --nex-key-file or LATTICE_SWAP_NEX_KEY";
 
@@ -59,10 +64,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Sell NEX for BTC. Prints an offer, one line, to hand to the buyer
-    /// privately, waits for the buyer to dial, then runs the swap to its end.
+    /// privately or lists it on a relay, waits for the buyer, then runs the
+    /// swap to its end.
     Offer(OfferArgs),
-    /// Buy NEX with BTC: dials the seller an offer names and runs the swap
-    /// to its end.
+    /// Buy NEX with BTC: dials the seller an offer names, or reaches it
+    /// through the offer's relay, and runs the swap to its end.
     Take(TakeArgs),
     /// Carries on a swap from its swap file until it ends. There is no
     /// session: the rest runs from the chains alone, and a swap still
@@ -356,12 +362,17 @@ struct OfferArgs {
     #[command(flatten)]
     terms: TermsArgs,
     /// Where to listen for the buyer.
-    #[arg(long)]
-    listen: SocketAddr,
+    #[arg(long, required_unless_present = "relay")]
+    listen: Option<SocketAddr>,
     /// The address the buyer dials, if not the one listened on. Required
     /// when listening on an unspecified address, such as 0.0.0.0.
     #[arg(long)]
     advertise: Option<SocketAddr>,
+    /// A relay, by its http:// or https:// URL, to list the offer on and
+    /// meet the buyer through, instead of listening. Anyone can list the
+    /// relay's offers and take one.
+    #[arg(long, conflicts_with_all = ["listen", "advertise"])]
+    relay: Option<String>,
     /// Seconds to wait for the buyer to dial.
     #[arg(long, default_value_t = 600)]
     wait: u64,
@@ -399,6 +410,16 @@ struct TakeArgs {
     /// The directory the swap file goes in.
     #[arg(long, default_value = ".")]
     dir: PathBuf,
+    /// The relay, by its URL, whose watchtower gets the cancel and the
+    /// signed refund, to broadcast the refund once cancel is in a block if
+    /// this buyer is offline then; the offer's relay by default. They are handed
+    /// over only once the buyer gives up on the swap without signing the
+    /// redeem: before that, the refund would let a seller take both coins.
+    #[arg(long)]
+    watchtower: Option<String>,
+    /// Hand the refund to no watchtower.
+    #[arg(long, conflicts_with = "watchtower")]
+    no_watchtower: bool,
     #[command(flatten)]
     nodes: NodeArgs,
     #[command(flatten)]
@@ -462,6 +483,11 @@ struct PolicyArgs {
 struct SwapFileArgs {
     /// The swap file, `<swap id>.json`.
     swap_file: PathBuf,
+    /// A buyer's: the relay whose watchtower gets the cancel and the signed
+    /// refund once the buyer gives up, as `take --watchtower`. None unless
+    /// given.
+    #[arg(long)]
+    watchtower: Option<String>,
     #[command(flatten)]
     nodes: NodeArgs,
     #[command(flatten)]
@@ -597,31 +623,99 @@ fn check_offer(
 }
 
 /// What the buyer needs to take the swap: the terms, among them the Nexus
-/// the seller trades on, where the seller listens and its key, and the
-/// session key the seller made for the buyer, the only one it accepts.
-/// Whoever holds an offer can take it. The Nexus in the terms is only a
-/// courtesy: a buyer on another refuses before it locks anything, but the
-/// buyer's safety is its own node's check against its own `--nexus-genesis`.
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+/// the seller trades on, where the seller listens or the relay it waits on,
+/// its key, and the session key the seller made for the buyer, the only one
+/// it accepts. Whoever holds an offer can take it. The Nexus in the terms is
+/// only a courtesy: a buyer on another refuses before it locks anything, but
+/// the buyer's safety is its own node's check against its own
+/// `--nexus-genesis`.
+///
+/// The seller signs the terms and the network with its key, which the
+/// buyer's session then authenticates: a relay, or anyone the offer passes
+/// through, cannot hand the buyer other terms for the seller's key. Without
+/// it, the terms each machine checks alone, such as the confirmations and
+/// the margin, could differ between the two and neither would refuse. The
+/// rest needs no signature: another address, relay or buyer session key
+/// reaches no seller, or one that refuses the buyer.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct Offer {
     terms: Terms,
     btc_network: Network,
-    address: SocketAddr,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    address: Option<SocketAddr>,
+    /// The relay the seller waits on, by its URL, which pairs a buyer with
+    /// it by the swap id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    relay: Option<String>,
     seller: String,
     #[serde(with = "hex::serde")]
     buyer_session: [u8; 32],
+    #[serde(with = "hex::serde")]
+    signature: [u8; 64],
+}
+
+/// What the seller signs: the terms and the network, tagged.
+fn signed(terms: &Terms, network: Network) -> Vec<u8> {
+    serde_json::to_vec(&("lattice-swap offer", terms, network)).expect("terms serialize")
 }
 
 impl Offer {
+    /// The offer, signed by `seller`, whose key it names.
+    fn new(
+        terms: Terms,
+        btc_network: Network,
+        place: Place,
+        seller: &SigningKey,
+        buyer_session: [u8; 32],
+    ) -> Self {
+        let (address, relay) = match place {
+            Place::Address(address) => (Some(address), None),
+            Place::Relay(relay) => (None, Some(relay)),
+        };
+        let mut offer = Offer {
+            terms,
+            btc_network,
+            address,
+            relay,
+            seller: hex::encode(seller.verifying_key().to_bytes()),
+            buyer_session,
+            signature: [0; 64],
+        };
+        offer.sign(seller);
+        offer
+    }
+
+    fn sign(&mut self, seller: &SigningKey) {
+        self.signature = seller
+            .sign(&signed(&self.terms, self.btc_network))
+            .to_bytes();
+    }
+
     fn encode(&self) -> String {
         serde_json::to_string(self).expect("offers serialize")
     }
 
+    /// The offer in `text`, if it is one, says where to find the seller,
+    /// and the seller signed its terms.
     fn decode(text: &str) -> Result<Self> {
         let offer: Offer =
             serde_json::from_str(text.trim()).map_err(|e| format!("not an offer: {e}"))?;
-        offer.seller_key()?;
+        let key = offer.seller_key()?;
+        offer.place()?;
+        let key = VerifyingKey::from_bytes(key.as_bytes()).expect("a peer key is a key");
+        let signature = ed25519_dalek::Signature::from_bytes(&offer.signature);
+        key.verify_strict(&signed(&offer.terms, offer.btc_network), &signature)
+            .map_err(|_| "the offer's terms are not signed by its seller")?;
         Ok(offer)
+    }
+
+    /// Where the seller is: an address or a relay, not both.
+    fn place(&self) -> Result<Place> {
+        match (self.address, &self.relay) {
+            (Some(address), None) => Ok(Place::Address(address)),
+            (None, Some(relay)) => Ok(Place::Relay(relay.clone())),
+            _ => Err("the offer must name an address or a relay, not both".into()),
+        }
     }
 
     fn seller_key(&self) -> Result<PeerKey> {
@@ -633,7 +727,7 @@ impl Offer {
         let t = &self.terms;
         format!(
             "taking {} sat for {} NEX on {}: fees {} sat and {} NEX, t1 {}, t2 {}, \
-             {} Bitcoin and {} Nexus confirmations, margin {}; dialling {}",
+             {} Bitcoin and {} Nexus confirmations, margin {}; {}",
             t.btc_amount.to_sat(),
             t.nex_amount,
             self.btc_network,
@@ -644,9 +738,19 @@ impl Offer {
             t.btc_confirmations,
             t.nex_confirmations,
             t.margin,
-            self.address
+            match self.place() {
+                Ok(Place::Address(address)) => format!("dialling {address}"),
+                Ok(Place::Relay(relay)) => format!("through the relay {relay}"),
+                Err(e) => e.to_string(),
+            }
         )
     }
+}
+
+/// Where the buyer finds the seller.
+enum Place {
+    Address(SocketAddr),
+    Relay(String),
 }
 
 /// A Nexus address as Lattice prints one: a CIDv1, dag-cbor, sha2-256, in
@@ -692,7 +796,9 @@ fn seller_key(
 }
 
 fn offer(args: OfferArgs) -> Result<Outcome> {
-    check_listen(args.listen, args.advertise)?;
+    if let Some(listen) = args.listen {
+        check_listen(listen, args.advertise)?;
+    }
     let terms = args
         .terms
         .terms(random32(), args.nodes.nexus_genesis.clone());
@@ -726,38 +832,86 @@ fn offer(args: OfferArgs) -> Result<Outcome> {
     fs::create_dir_all(&args.dir)?;
     let store = Store::new(&args.dir, terms.swap_id);
 
-    let listener = TcpListener::bind(args.listen)?;
-    let config = ivy::Config::new(SigningKey::from_bytes(&random32()));
+    let listener = args.listen.map(TcpListener::bind).transpose()?;
+    let place = match (&listener, &args.relay) {
+        (_, Some(relay)) => Place::Relay(relay.clone()),
+        (Some(listener), None) => Place::Address(args.advertise.unwrap_or(listener.local_addr()?)),
+        (None, None) => return Err("give --listen or --relay".into()),
+    };
+    let session = SigningKey::from_bytes(&random32());
+    let config = ivy::Config::new(session.clone());
     let buyer_session = random32();
     let buyer = ivy::Config::new(SigningKey::from_bytes(&buyer_session)).peer_key();
-    let offer = Offer {
+    let offer = Offer::new(
         terms,
-        btc_network: args.nodes.btc_network,
-        address: args.advertise.unwrap_or(listener.local_addr()?),
-        seller: config.peer_key().hex(),
+        args.nodes.btc_network,
+        place,
+        &session,
         buyer_session,
-    };
+    );
     println!("{}", offer.encode());
     io::stdout().flush()?;
-    log("waiting for the buyer");
-    let transport = Ivy::accept(
-        listener,
-        &config,
-        buyer,
-        Duration::from_secs(args.wait),
-        TIMEOUT,
-    )?;
-    let swap_file = store.path().to_path_buf();
-    log(&format!("swap file {}", swap_file.display()));
-    let driver = Driver::start(seller, vec![], bitcoin, nexus, Some(transport), store);
-    run(
-        &swap_file,
-        driver.map(|mut driver| {
-            driver.nex_key = Some(key);
+    let wait = Duration::from_secs(args.wait);
+    let start = Start {
+        bitcoin,
+        nexus,
+        store,
+        nex_key: Some(key),
+        bump: &args.bump,
+    };
+    match (listener, &args.relay) {
+        (_, Some(relay)) => {
+            log(&format!(
+                "listing the offer on {relay}, waiting for the buyer"
+            ));
+            let transport =
+                Ivy::accept_relayed(relay, &offer.encode(), &config, buyer, wait, TIMEOUT)?;
+            start.run(seller, vec![], transport, |_| {})
+        }
+        (Some(listener), None) => {
+            log("waiting for the buyer");
+            let transport = Ivy::accept(listener, &config, buyer, wait, TIMEOUT)?;
+            start.run(seller, vec![], transport, |_| {})
+        }
+        (None, None) => unreachable!("a place was found"),
+    }
+}
+
+/// What a swap starts on, once the session is up.
+struct Start<'a> {
+    bitcoin: Bitcoind,
+    nexus: Client,
+    store: Store,
+    nex_key: Option<SecretBytes>,
+    bump: &'a BumpArgs,
+}
+
+impl Start<'_> {
+    /// Runs `machine`, which asks for `actions` first, over `transport` to
+    /// the swap's end, calling `see` on every state it reaches.
+    fn run<M: Machine, T: Transport>(
+        self,
+        machine: M,
+        actions: Vec<swap::Action>,
+        transport: T,
+        see: impl Fn(&M),
+    ) -> Result<Outcome> {
+        let swap_file = self.store.path().to_path_buf();
+        log(&format!("swap file {}", swap_file.display()));
+        let driver = Driver::start(
+            machine,
+            actions,
+            self.bitcoin,
+            self.nexus,
+            Some(transport),
+            self.store,
+        );
+        let driver = driver.map(|mut driver| {
+            driver.nex_key = self.nex_key;
             driver
-        }),
-        &args.bump,
-    )
+        });
+        run(&swap_file, driver, self.bump, see)
+    }
 }
 
 fn take(args: TakeArgs) -> Result<Outcome> {
@@ -791,11 +945,88 @@ fn take(args: TakeArgs) -> Result<Outcome> {
 
     let config = ivy::Config::new(SigningKey::from_bytes(&offer.buyer_session));
     log(&offer.describe());
-    let transport = Ivy::connect(offer.address, &config, offer.seller_key()?, TIMEOUT)?;
-    let swap_file = store.path().to_path_buf();
-    log(&format!("swap file {}", swap_file.display()));
-    let driver = Driver::start(buyer, actions, bitcoin, nexus, Some(transport), store);
-    run(&swap_file, driver, &args.bump)
+    let seller = offer.seller_key()?;
+    let watchtower = match (&args.watchtower, &offer.relay) {
+        _ if args.no_watchtower => None,
+        (Some(url), _) | (None, Some(url)) => Some(url.clone()),
+        (None, None) => None,
+    };
+    let watchtower = RefCell::new(Watchtower::new(watchtower, args.nodes.btc_network));
+    let see = |buyer: &Buyer| watchtower.borrow_mut().see(buyer);
+    let start = Start {
+        bitcoin,
+        nexus,
+        store,
+        nex_key: None,
+        bump: &args.bump,
+    };
+    match offer.place()? {
+        Place::Address(address) => {
+            let transport = Ivy::connect(address, &config, seller, TIMEOUT)?;
+            start.run(buyer, actions, transport, see)
+        }
+        Place::Relay(relay) => {
+            let id = hex::encode(offer.terms.swap_id);
+            let transport = Ivy::<Relayed>::connect_relayed(&relay, &id, &config, seller, TIMEOUT)?;
+            start.run(buyer, actions, transport, see)
+        }
+    }
+}
+
+/// Hands the buyer's cancel and signed refund to the watchtower at `relay`
+/// once the buyer gives up without signing the redeem, the only time it is
+/// safe to: see [`Buyer::watchtower`].
+struct Watchtower {
+    relay: Option<String>,
+    network: Network,
+    posted: bool,
+    tried: Option<Instant>,
+}
+
+impl Watchtower {
+    fn new(relay: Option<String>, network: Network) -> Self {
+        Self {
+            relay,
+            network,
+            posted: false,
+            tried: None,
+        }
+    }
+
+    fn see(&mut self, buyer: &Buyer) {
+        let Some(relay) = &self.relay else { return };
+        if self.posted
+            || self
+                .tried
+                .is_some_and(|tried| tried.elapsed() < WATCH_RETRY)
+        {
+            return;
+        }
+        let (Some((cancel, refund)), Some(terms)) = (buyer.watchtower(), buyer.terms()) else {
+            return;
+        };
+        self.tried = Some(Instant::now());
+        let watch = json!({
+            "network": self.network,
+            "cancel": bitcoin::consensus::encode::serialize_hex(&cancel),
+            "refund": bitcoin::consensus::encode::serialize_hex(&refund),
+            // How deep the refund must be before the watch is done, at most
+            // the 144 a relay takes.
+            "depth": terms.btc_confirmations.min(144),
+        });
+        let url = format!("{}/watch", relay.trim_end_matches('/'));
+        match ureq::post(&url).timeout(TIMEOUT).send_json(watch) {
+            Ok(_) => {
+                self.posted = true;
+                log(&format!("handed the refund to the watchtower at {relay}"));
+            }
+            Err(ureq::Error::Status(code, response)) => log(&format!(
+                "the watchtower at {relay} refused the refund: {code} {}",
+                response.into_string().unwrap_or_default()
+            )),
+            Err(e) => log(&format!("the watchtower at {relay}: {e}")),
+        }
+    }
 }
 
 fn resume(args: SwapFileArgs) -> Result<Outcome> {
@@ -828,6 +1059,7 @@ fn resume(args: SwapFileArgs) -> Result<Outcome> {
                     driver
                 }),
                 &args.bump,
+                |_| {},
             )
         }
         Saved::Buyer(buyer) => {
@@ -836,10 +1068,13 @@ fn resume(args: SwapFileArgs) -> Result<Outcome> {
             if buyer.outcome().is_none() {
                 args.nodes.check_nexus(&nexus)?;
             }
+            let watchtower = Watchtower::new(args.watchtower, args.nodes.btc_network);
+            let watchtower = RefCell::new(watchtower);
             run(
                 &swap_file,
                 Driver::<Buyer, _, Ivy>::resume(bitcoin, nexus, None, store),
                 &args.bump,
+                |buyer| watchtower.borrow_mut().see(buyer),
             )
         }
     }
@@ -859,17 +1094,20 @@ fn status(swap_file: &Path) -> Result<()> {
 }
 
 /// Runs the swap to its end, bumping as `bump` says, logging each state it
-/// reaches. On an error once the swap file exists, says how to carry on.
+/// reaches and showing it to `see`. On an error once the swap file exists,
+/// says how to carry on.
 fn run<M: Machine, B: Bitcoin, T: Transport>(
     swap_file: &Path,
     driver: io::Result<Driver<M, B, T>>,
     bump: &BumpArgs,
+    see: impl Fn(&M),
 ) -> Result<Outcome> {
     let last = RefCell::new(String::new());
     let outcome = driver
         .and_then(|mut driver| {
             bump.apply(&mut driver);
             driver.run_until(|state| {
+                see(state);
                 let name = state_name(state);
                 if *last.borrow() != name {
                     log(&name);

@@ -319,6 +319,27 @@ impl Buyer {
         }
     }
 
+    /// The cancel and the fully signed refund, for a watchtower to
+    /// broadcast the refund once cancel confirms if this buyer has gone
+    /// offline; only once the buyer has given up on the swap without
+    /// signing the redeem. The refund reveals `b`, and a seller that learns
+    /// `b` while it can still redeem takes both coins: it locks the NEX,
+    /// waits for the redeem signature, sweeps the NEX lock with `s` and `b`,
+    /// then redeems. Until the buyer gives up, the seller's redeem stays
+    /// possible, or the buyer may yet sign it; so the refund goes to no one
+    /// before then.
+    pub fn watchtower(&self) -> Option<(Transaction, Transaction)> {
+        let Buyer::Cancelling {
+            locked,
+            redeem: None,
+        } = self
+        else {
+            return None;
+        };
+        let cancel = locked.setup.cancel(locked.lock, &locked.seller_cancel);
+        Some((cancel, locked.refund()))
+    }
+
     /// The Nexus address the NEX is locked at, once the hellos are
     /// exchanged and until the swap ends.
     pub fn lock_address(&self) -> Option<String> {
@@ -336,6 +357,16 @@ impl Buyer {
 }
 
 impl BuyerLocked {
+    /// The refund, fully signed. It reveals `b`.
+    fn refund(&self) -> Transaction {
+        let setup = &self.setup;
+        let swap = setup.swap();
+        let seller = setup.decrypt(&self.refund);
+        let own = swap.sign(self.lock, Spend::Refund, &setup.secrets.key());
+        swap.finalize(self.lock, Spend::Refund, &seller, Some(&own))
+            .expect("the seller's adaptor signature was verified")
+    }
+
     /// How deep cancel must be before the refund, which reveals `b`.
     fn refund_depth(&self, redeem: &Option<EncryptedSignature>) -> u32 {
         match redeem {
@@ -396,13 +427,7 @@ impl BuyerLocked {
                 // A spend still in the mempool may yet be replaced by the
                 // refund, so the refund goes out until one is in a block.
                 _ if cancel_depth >= self.refund_depth(&redeem) => {
-                    let swap = setup.swap();
-                    let seller = setup.decrypt(&self.refund);
-                    let own = swap.sign(self.lock, Spend::Refund, &setup.secrets.key());
-                    let refund = swap
-                        .finalize(self.lock, Spend::Refund, &seller, Some(&own))
-                        .expect("the seller's adaptor signature was verified");
-                    actions.push(Action::Broadcast(refund));
+                    actions.push(Action::Broadcast(self.refund()));
                 }
                 _ => {}
             },
