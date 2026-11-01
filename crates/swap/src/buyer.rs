@@ -369,10 +369,16 @@ impl BuyerLocked {
         let mut actions = vec![];
         match setup.spend(self.lock, &view.lock_spend) {
             // The seller redeemed, in a block or still in the mempool: `s` is
-            // public either way.
+            // public either way. A copy that never signed the redeem derives
+            // the adaptor signature it would have sent: signing is
+            // deterministic, and `recover` takes only the proven `s`.
             Some((Spend::Redeem, _)) => {
                 let tx = &view.lock_spend.as_ref().expect("matched").tx;
-                let s = redeem
+                let adaptor = redeem.clone().or_else(|| {
+                    let key = setup.secrets.key();
+                    setup.swap().encrypted_sign(self.lock, Spend::Redeem, &key)
+                });
+                let s = adaptor
                     .as_ref()
                     .and_then(|adaptor| setup.recover(self.lock, Spend::Redeem, adaptor, tx));
                 if let Some(s) = s {

@@ -3378,3 +3378,61 @@ fn a_view_looks_up_the_swaps_own_spends() {
     assert_eq!(lookups.cancel_output, OutPoint::new(txid(Spend::Cancel), 0));
     assert_eq!(lookups.t2, terms().t2);
 }
+
+/// A copy of the buyer saved before it signed the redeem (a restored backup,
+/// an old swap file) still claims the NEX once the seller redeems with the
+/// adaptor signature the live buyer sent: signing it again gives the same
+/// one, and a copy that sees the redeem first derives it.
+#[test]
+fn a_stale_buyer_copy_claims_after_the_redeem() {
+    let locked = locked();
+    let lock_address = locked.lock_address();
+    let (seller, buyer, nex_lock) = locked.nex_locked();
+    let stale = restart(&buyer);
+    let view = || nexus(account(500_000, 0), mined(nex_lock.body.clone(), 1));
+    let (buyer, actions) = buyer.step(view());
+    let Message::RedeemSignature { redeem: sent_once } = sent(&actions) else {
+        panic!("the redeem signature");
+    };
+    let (seller, _) = seller.step(btc(2, None, None));
+    let (seller, _) = seller.step(message(sent(&actions)));
+    let (_, actions) = seller.step(btc(2, None, None));
+    let [redeem] = &broadcasts(&actions)[..] else {
+        panic!("the seller redeems");
+    };
+    let (live, _) = buyer.step(btc(3, Some((redeem, 0)), None));
+    assert!(
+        matches!(live, Buyer::ClaimingNex(_)),
+        "the live buyer claims"
+    );
+
+    // Signs again from the same state, then sees the redeem.
+    let (resigned, again) = stale.clone().step(view());
+    let Message::RedeemSignature { redeem: sent_twice } = sent(&again) else {
+        panic!("the redeem signature again");
+    };
+    assert_eq!(sent_once, sent_twice, "the same adaptor signature");
+    let (resigned, _) = resigned.step(btc(3, Some((redeem, 0)), None));
+    // A redeem whose buyer signature is not the decryption of ours gives
+    // no `s`, so the derived adaptor claims nothing on a forgery.
+    let mut forged = redeem.clone();
+    let mut witness = forged.input[0].witness.to_vec();
+    witness[0][63] ^= 1;
+    forged.input[0].witness = Witness::from_slice(&witness);
+    let (unsigned, _) = stale.step(btc(3, Some((&forged, 0)), None));
+    assert!(matches!(unsigned, Buyer::Cancelling { redeem: None, .. }));
+    // Sees the redeem before it ever signs.
+    let (unsigned, _) = unsigned.step(btc(3, Some((redeem, 0)), None));
+
+    for (name, copy) in [("re-signed", resigned), ("never signed", unsigned)] {
+        assert!(matches!(copy, Buyer::ClaimingNex(_)), "{name}");
+        let (_, actions) = copy.step(nexus(account(500_000, 0), None));
+        let claim = submitted(&actions);
+        assert_eq!(
+            claim.body,
+            TransactionBody::transfer(&lock_address, BUYER_NEX, 499_900, 100, 0).unwrap(),
+            "{name}"
+        );
+        assert!(claim.verify(), "{name}: signed with the joint key");
+    }
+}

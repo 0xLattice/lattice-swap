@@ -84,7 +84,7 @@ use bitcoin::{
 };
 use rand_core::OsRng;
 use schnorr_fun::adaptor::{Adaptor, EncryptedSign};
-use schnorr_fun::fun::nonce::{GlobalRng, Synthetic};
+use schnorr_fun::fun::nonce::{Deterministic, GlobalRng, Synthetic};
 use schnorr_fun::{Message, Schnorr};
 use sha2::Sha256;
 
@@ -180,6 +180,14 @@ impl std::error::Error for Error {}
 
 type Bip340 = Schnorr<Sha256, Synthetic<Sha256, GlobalRng<OsRng>>>;
 
+/// Adaptor signatures take deterministic nonces, as in eigenwallet's
+/// `encsign`: the nonce hashes the secret key, the public key, the
+/// encryption key and the message, so signing a spend again, from any copy
+/// of the state, gives the same adaptor signature, and different spends or
+/// encryption keys never share a nonce. A copy saved before it signed the
+/// redeem then holds, or can derive, the one the seller decrypts.
+type Bip340Adaptor = Schnorr<Sha256, Deterministic<Sha256>>;
+
 /// The swap's scripts and transactions, derived from [`Params`].
 pub struct Swap {
     params: Params,
@@ -189,6 +197,7 @@ pub struct Swap {
     lock: TaprootSpendInfo,
     cancel: TaprootSpendInfo,
     schnorr: Bip340,
+    adaptor: Bip340Adaptor,
 }
 
 impl Swap {
@@ -251,6 +260,7 @@ impl Swap {
             lock,
             cancel,
             schnorr: Bip340::default(),
+            adaptor: Bip340Adaptor::default(),
         };
 
         // Size each spend with placeholder signatures: the witness has the
@@ -379,6 +389,7 @@ impl Swap {
 
     /// The adaptor signature for `Redeem` (by the buyer, encrypted to `S`) or
     /// `Refund` (by the seller, encrypted to `T_b`). `None` for other spends.
+    /// Deterministic: the same key and spend give the same signature.
     pub fn encrypted_sign(
         &self,
         lock: OutPoint,
@@ -388,7 +399,7 @@ impl Swap {
         let (_, encryption_key) = self.adaptor(spend)?;
         let sighash = self.sighash(lock, spend);
         Some(
-            self.schnorr
+            self.adaptor
                 .encrypted_sign(key, &encryption_key, Message::raw(&sighash)),
         )
     }
@@ -830,6 +841,33 @@ mod tests {
             Err(Error::Signature(Party::Seller))
         );
         assert!(swap.finalize(lock(), Spend::Redeem, &a, Some(&b)).is_ok());
+    }
+
+    /// A copy of a party's state that signs a spend again must make the
+    /// adaptor signature it already sent, or it could not recover the secret
+    /// from the spend the other party publishes with the first one.
+    #[test]
+    fn adaptor_signatures_are_deterministic() {
+        let swap = Swap::new(params()).unwrap();
+        let bytes = |encrypted: EncryptedSignature| {
+            let mut bytes = encrypted.R.to_bytes().to_vec();
+            bytes.extend(encrypted.s_hat.to_bytes());
+            bytes.push(encrypted.needs_negation as u8);
+            bytes
+        };
+        for (spend, key) in [(Spend::Redeem, key(2)), (Spend::Refund, key(1))] {
+            let sign = || swap.encrypted_sign(lock(), spend, &key).unwrap();
+            let first = sign();
+            assert!(swap.verify_encrypted(lock(), spend, &first));
+            assert_eq!(bytes(first), bytes(sign()), "{spend:?}");
+        }
+        // Another spend, or another lock, takes another nonce.
+        let redeem = swap.encrypted_sign(lock(), Spend::Redeem, &key(2)).unwrap();
+        let refund = swap.encrypted_sign(lock(), Spend::Refund, &key(2)).unwrap();
+        assert_ne!(redeem.R, refund.R);
+        let other = OutPoint::new(lock().txid, 1);
+        let elsewhere = swap.encrypted_sign(other, Spend::Redeem, &key(2)).unwrap();
+        assert_ne!(redeem.R, elsewhere.R);
     }
 
     #[test]
