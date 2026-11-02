@@ -95,14 +95,11 @@ function running(buyer) {
 
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-/** A swap run until its funding is broadcast, the recovery file saved
- * when it asks. */
+/** A swap run until its funding is broadcast. */
 async function funded(options) {
   const w = await world(options);
   deposit(w, 1_100_000);
   const run = running(w.buyer);
-  await until(() => w.buyer.status().step === 'save-backup');
-  w.buyer.backupSaved();
   await until(() => w.a.posted.length > 0).catch((e) => assert.fail(`${e.message}: ${JSON.stringify(w.buyer.status())}`));
   const record = await w.store.get(`swap:${w.buyer.swapId}`);
   return { w, run, record, funding: known(record.state).funding };
@@ -445,37 +442,6 @@ test('two Wallets of one store in a tab share the swap lock', async () => {
     await run.stop();
     assert.equal(w.a.posted.length, 0, 'no sweep');
   }
-});
-
-test('the funding waits for the recovery file, which covers the lock', async () => {
-  const w = await world();
-  deposit(w, 1_100_000);
-  const run = running(w.buyer);
-  await until(() => w.buyer.status().step === 'save-backup');
-  assert.equal(w.buyer.status().backupCovers, 'lock');
-  await pause(50);
-  assert.equal(w.a.posted.length, 0, 'nothing broadcast before the file is saved');
-  const { file } = await w.buyer.backup();
-  const [swap] = JSON.parse(file).swaps;
-  assert.equal(Object.keys(swap.state)[0], 'AwaitNexLock', 'the file restores to the state the funding goes out from');
-  w.buyer.backupSaved();
-  await until(() => w.a.posted.length > 0);
-  assert.equal(w.a.posted[0], JSON.parse(file).swaps[0].state.AwaitNexLock.locked.funding);
-  assert.equal(w.buyer.status().step, 'swapping');
-  await run.stop();
-  assert.deepEqual(w.unsaved, []);
-});
-
-test('a recovery file never saved lets the swap abort before funding, at the message timeout', async () => {
-  let now = Date.now();
-  const w = await world({ extra: { now: () => now } });
-  deposit(w, 1_100_000);
-  const run = running(w.buyer);
-  await until(() => w.buyer.status().step === 'save-backup');
-  now += 60_001;
-  assert.equal(await run.done, 'aborted');
-  assert.equal(w.a.posted.length, 0, 'never funded');
-  assert.equal(await w.wallet.running(), null, 'the wallet is free again');
 });
 
 test('a refused Web Lock request is asked again', async () => {

@@ -210,14 +210,11 @@ export class Wallet {
 
   /** The recovery file, `{name, file}`, as Boltz has its buyer download
    * one: the wallet key and every swap not yet ended, as each stands now.
-   * {@link Wallet.restore} reads it. `states` stands a swap's state, by
-   * id, in for the one the store holds: a buyer's, whose funding waits for
-   * the file. */
-  async backup(states = {}) {
+   * {@link Wallet.restore} reads it. */
+  async backup() {
     const swaps = [];
     for (const id of await this.swaps()) {
-      const stored = await this.config.store.get(swapKey(id));
-      const record = { ...stored, state: states[id] ?? stored.state };
+      const record = await this.config.store.get(swapKey(id));
       if (ended(record.state)) continue;
       const { version } = JSON.parse(call('backup', record.state).file);
       swaps.push({ ...record, version, state: JSON.parse(record.state) });
