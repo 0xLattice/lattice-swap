@@ -60,6 +60,8 @@ export class Buyer extends EventTarget {
   #nexusChecked;
   /** A swap that ended: its terms, which its state no longer holds. */
   #doneTerms = null;
+  /** Whether {@link Buyer#cancel} dropped the swap before it was taken. */
+  #cancelled = false;
 
   constructor(wallet, record, nexusChecked) {
     super();
@@ -140,7 +142,8 @@ export class Buyer extends EventTarget {
    *   signed, and `done`; or `refunding` and `refunded`; or `offer-gone`
    *   if the session to the seller would not open, or the seller refused
    *   the amount or answered other terms, as the CLI's `take` fails once:
-   *   nothing of the swap was sent, and the buyer picks another offer;
+   *   nothing of the swap was sent, and the buyer picks another offer; or
+   *   `cancelled`, once {@link Buyer#cancel} dropped it untaken;
    * - `outcome`: once ended, the machine's: `swapped`, `refunded`,
    *   `punished`, `drained` or `aborted`;
    * - `wallet`: `{address, confirmed, unconfirmed}`, in sat, and `need`,
@@ -182,7 +185,7 @@ export class Buyer extends EventTarget {
     const terms = machine.terms ?? this.#doneTerms;
     const status = {
       swapId: r.swap_id,
-      step: this.#gone !== null ? 'offer-gone' : r.taken ? STEPS[machine.phase] : 'fund-wallet',
+      step: this.#cancelled ? 'cancelled' : this.#gone !== null ? 'offer-gone' : r.taken ? STEPS[machine.phase] : 'fund-wallet',
       outcome: ended(r.state) ? machine.phase : null,
       wallet: { address: this.#wallet.address, ...(this.#balance ?? { confirmed: null, unconfirmed: null }) },
       need: r.taken ? null : this.#need,
@@ -213,11 +216,39 @@ export class Buyer extends EventTarget {
     return status;
   }
 
-  /** Runs the swap until it ends, its offer is gone, or `signal` aborts:
-   * the outcome, once it ends. A
-   * `status` event follows every change of {@link Buyer#status}. A failed
-   * round, a backend's or the Nexus check's, is the status's `warning`,
-   * and the next round tries again.
+  /** Cancels the swap while it has not taken its offer, as eigenwallet's
+   * GUI lets its user cancel while it waits for the Bitcoin deposit, before
+   * the swap is set up: its record dropped, as `prepare` drops an untaken
+   * one, and {@link Buyer#run} returns null, `status().step` `cancelled`.
+   * Under the swap lock, which `#take` holds from before it dials until
+   * the swap is saved as taken, so it comes either before the take, which
+   * then never dials, or after it, and refuses. Nothing is at stake while
+   * untaken: the only message sent before then is the request, under that
+   * lock, and a declined one drops the record itself; the hello, the lock's
+   * funding and every broadcast and Nexus submit are the machine's actions,
+   * carried out only once taken. Refuses a swap that has taken its offer,
+   * which runs on to its end or its refund.
+   * @returns {Promise<void>} */
+  async cancel() {
+    const r = this.#r;
+    const key = swapKey(r.swap_id);
+    await this.#wallet.exclusive(async () => {
+      const held = await this.#c.store.get(key);
+      if (r.taken || held?.taken) throw new Error(`refused: swap ${r.swap_id} has taken its offer; it runs on to its end or its refund`);
+      // Only this swap's record: a later `prepare` of the same offer may
+      // hold the id, and it is that swap's to cancel.
+      if (held?.state === r.state) await this.#c.store.delete(key);
+      this.#cancelled = true;
+    });
+    this.#wake?.();
+    this.#announce();
+  }
+
+  /** Runs the swap until it ends, its offer is gone, it is cancelled, or
+   * `signal` aborts: the outcome, once it ends. A `status` event follows
+   * every change of {@link Buyer#status}. A failed round, a backend's or
+   * the Nexus check's, is the status's `warning`, and the next round tries
+   * again.
    * @returns {Promise<string | null>} */
   async run(signal) {
     while (!signal?.aborted) {
@@ -244,12 +275,14 @@ export class Buyer extends EventTarget {
     return ended(this.#r.state) ? this.status().outcome : null;
   }
 
-  /** One round: whether the swap is over, or its offer gone. */
+  /** One round: whether the swap is over, its offer gone, or it is
+   * cancelled. */
   async #round() {
+    if (this.#cancelled) return true;
     if (!this.#r.taken) {
       this.#balance = await this.#wallet.balance();
       await this.#take();
-      return this.#gone !== null;
+      return this.#gone !== null || this.#cancelled;
     }
     for (const message of this.#inbox.splice(0)) await this.#apply({ Message: JSON.parse(message) });
     if (this.#awaits() && this.#c.now() - this.#since > this.#c.messageTimeout) await this.#apply('Timeout');
@@ -271,6 +304,8 @@ export class Buyer extends EventTarget {
   async #take() {
     const r = this.#r;
     const taken = await this.#wallet.exclusive(async () => {
+      // Cancelled while this waited for the lock: never dialed.
+      if (this.#cancelled) return false;
       const running = await this.#wallet.running();
       if (running !== null) throw new Error(`refused: swap ${running} is running; one swap at a time`);
       // Only while the store still holds this record, which a later

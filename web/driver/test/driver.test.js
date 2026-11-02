@@ -683,6 +683,72 @@ test('a restore refuses a second unfinished swap beside one the store runs', asy
   }
 });
 
+test('a swap not yet taken is cancelled: its record dropped, its run ended, nothing sent', async () => {
+  const w = await world();
+  const run = running(w.buyer);
+  await until(() => w.buyer.status().need !== null);
+  await w.buyer.cancel();
+  assert.equal(await run.done, null);
+  assert.equal(w.buyer.status().step, 'cancelled');
+  assert.deepEqual(await w.wallet.swaps(), []);
+  // A deposit after it takes nothing.
+  deposit(w, 1_100_000);
+  assert.equal(await w.buyer.run(), null);
+  assert.equal(w.seller.log.length, 0, 'nothing sent');
+  assert.equal(w.a.posted.length, 0, 'nothing broadcast');
+});
+
+test('a cancel waits for an offer being taken, then refuses', async () => {
+  const w = await world();
+  let release;
+  const gate = new Promise((resolve) => (release = resolve));
+  const open = w.seller.open;
+  let dialing = false;
+  w.seller.open = async (...args) => {
+    dialing = true;
+    await gate;
+    return open(...args);
+  };
+  deposit(w, 1_100_000);
+  const run = running(w.buyer);
+  await until(() => dialing);
+  let settled = false;
+  const cancel = w.buyer.cancel().finally(() => (settled = true));
+  await pause(20);
+  assert.equal(settled, false, 'not while the offer is being taken');
+  release();
+  await assert.rejects(cancel, /has taken its offer/);
+  assert.equal((await w.store.get(`swap:${w.buyer.swapId}`)).taken, true);
+  assert.notEqual(w.buyer.status().step, 'cancelled');
+  await run.stop();
+});
+
+test('a cancel before the take is waited on, and the take never dials', async () => {
+  const w = await world();
+  let dials = 0;
+  const open = w.seller.open;
+  w.seller.open = (...args) => ((dials += 1), open(...args));
+  deposit(w, 1_100_000);
+  // The cancel holds the lock first; the round's take waits behind it.
+  const cancel = w.buyer.cancel();
+  const run = running(w.buyer);
+  await cancel;
+  assert.equal(await Promise.race([run.done, pause(2000).then(() => 'still running')]), null);
+  await run.stop();
+  assert.equal(dials, 0);
+  assert.equal(w.buyer.status().step, 'cancelled');
+  assert.equal(w.buyer.status().warning, null, 'cancelled, not dropped by another prepare');
+  assert.deepEqual(await w.wallet.swaps(), []);
+});
+
+test('a taken swap is not cancelled', async () => {
+  const { w, run } = await funded();
+  await assert.rejects(w.buyer.cancel(), /has taken its offer/);
+  assert.equal((await w.store.get(`swap:${w.buyer.swapId}`)).taken, true);
+  assert.notEqual(w.buyer.status().step, 'cancelled');
+  await run.stop();
+});
+
 test('the wasm builds from the pinned dependencies and toolchain', async () => {
   const { readFileSync } = await import('node:fs');
   const build = readFileSync(new URL('../build.sh', import.meta.url), 'utf8');
