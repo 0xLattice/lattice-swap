@@ -417,3 +417,52 @@ test('a failed read of the wallet’s balance skips none of the swap’s views',
   await until(() => w.buyer.status().confirmations.funding === 1);
   await run.stop();
 });
+
+test('two Wallets of one store in a tab share the swap lock', async () => {
+  for (const second of [(w) => Wallet.open(w.config), async (w) => Wallet.restore(w.config, (await w.wallet.backup()).file)]) {
+    const w = await world();
+    const other = await second(w);
+    let release;
+    const gate = new Promise((resolve) => (release = resolve));
+    const open = w.seller.open;
+    let dialing = false;
+    w.seller.open = async (...args) => {
+      dialing = true;
+      await gate;
+      return open(...args);
+    };
+    deposit(w, 1_100_000);
+    const run = running(w.buyer);
+    await until(() => dialing);
+    w.withdrawing = true;
+    const withdrawal = other.withdraw(call('newBitcoinKey', 'regtest').address);
+    await pause(20);
+    release();
+    await assert.rejects(withdrawal, /is running/);
+    await run.stop();
+    assert.equal(w.a.posted.length, 0, 'no sweep');
+  }
+});
+
+test('a refused Web Lock request is asked again', async () => {
+  const locks = new Locks().tab();
+  const request = locks.request;
+  let refusals = 1;
+  locks.request = (...args) => (refusals-- > 0 ? Promise.reject(new Error('SecurityError')) : request(...args));
+  const config = { network: 'regtest', esplora: 'http://esplora.invalid', store: new MemoryStore(), locks };
+  await assert.rejects(Wallet.open(config), /SecurityError/);
+  assert.match((await Wallet.open(config)).address, /^bcrt1q/);
+});
+
+test('a swap dropped by a later prepare never takes its offer', async () => {
+  const w = await world();
+  const first = w.buyer;
+  const second = await Buyer.prepare(w.wallet, { offer: w.offer, policy: POLICY, nexAddress: w.nexAddress });
+  deposit(w, 1_100_000);
+  const run = running(first);
+  await until(() => first.status().step === 'offer-gone');
+  assert.equal(await run.done, null);
+  assert.match(first.status().warning, /dropped when another was prepared/);
+  assert.equal(w.seller.log.length, 0, 'nothing sent');
+  assert.equal((await w.store.get(`swap:${second.swapId}`)).taken, false, 'the second’s record kept');
+});

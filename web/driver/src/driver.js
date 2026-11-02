@@ -229,6 +229,13 @@ export class Buyer extends EventTarget {
     const taken = await this.#wallet.exclusive(async () => {
       const running = await this.#wallet.running();
       if (running !== null) throw new Error(`refused: swap ${running} is running; one swap at a time`);
+      // Only while the store still holds this record, which a later
+      // `prepare` drops: checked before acting, as an HTTP `If-Match`
+      // refuses a write to what changed since it was read.
+      if ((await this.#c.store.get(swapKey(r.swap_id)))?.state !== r.state) {
+        this.#gone = 'refused: this swap was dropped when another was prepared';
+        return false;
+      }
       const amount = r.offer.terms.btc_amount;
       const fee_rate = await this.#wallet.feeRate();
       const { enough, need } = call('walletNeed', { utxos: await this.#wallet.spendable(), amount, fee_rate });

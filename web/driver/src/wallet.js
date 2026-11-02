@@ -93,9 +93,19 @@ function single(locks = globalThis.navigator?.locks, onWaiting = undefined) {
         .catch(reject);
     });
     instances.set(locks, instance);
+    // A refusal is not kept, so the page can ask again, as Node's
+    // `require` drops a module from its cache when loading it throws.
+    instance.catch(() => instances.delete(locks));
   }
   return instances.get(locks);
 }
+
+/** The swap lock: one for the page, not one per `Wallet`, as eigenwallet
+ * keeps one `SwapLock` per `Context` and Bitcoin Core's `loadwallet` refuses
+ * a wallet already loaded. Two `Wallet`s of one store in a tab, from two
+ * `open`s or an `open` and a `restore`, wait on the same lock; the page is
+ * the one instance driving the store, so one lock for it is one per store. */
+let swapLock = Promise.resolve();
 
 export class Wallet {
   /** The wallet in `config.store`, made and saved first if there is none. */
@@ -116,8 +126,6 @@ export class Wallet {
     }
     return new Wallet(c, call('bitcoinKeyOf', key.wif, c.network));
   }
-
-  #swapLock = Promise.resolve();
 
   constructor(config, key) {
     this.config = config;
@@ -175,8 +183,8 @@ export class Wallet {
    * or one taking its offer, until it is saved as taken, each waits for
    * the one before. */
   exclusive(act) {
-    const run = this.#swapLock.then(act);
-    this.#swapLock = run.catch(() => {});
+    const run = swapLock.then(act);
+    swapLock = run.catch(() => {});
     return run;
   }
 
