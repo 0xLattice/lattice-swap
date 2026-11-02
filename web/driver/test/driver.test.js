@@ -95,11 +95,14 @@ function running(buyer) {
 
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-/** A swap run until its funding is broadcast. */
+/** A swap run until its funding is broadcast, the recovery file saved
+ * when it asks. */
 async function funded(options) {
   const w = await world(options);
   deposit(w, 1_100_000);
   const run = running(w.buyer);
+  await until(() => w.buyer.status().step === 'save-backup');
+  w.buyer.backupSaved();
   await until(() => w.a.posted.length > 0).catch((e) => assert.fail(`${e.message}: ${JSON.stringify(w.buyer.status())}`));
   const record = await w.store.get(`swap:${w.buyer.swapId}`);
   return { w, run, record, funding: known(record.state).funding };
@@ -416,4 +419,84 @@ test('a failed read of the wallet’s balance skips none of the swap’s views',
   // The view still read, the balance read failing after it.
   await until(() => w.buyer.status().confirmations.funding === 1);
   await run.stop();
+});
+
+test('two Wallets of one store in a tab share the swap lock', async () => {
+  for (const second of [(w) => Wallet.open(w.config), async (w) => Wallet.restore(w.config, (await w.wallet.backup()).file)]) {
+    const w = await world();
+    const other = await second(w);
+    let release;
+    const gate = new Promise((resolve) => (release = resolve));
+    const open = w.seller.open;
+    let dialing = false;
+    w.seller.open = async (...args) => {
+      dialing = true;
+      await gate;
+      return open(...args);
+    };
+    deposit(w, 1_100_000);
+    const run = running(w.buyer);
+    await until(() => dialing);
+    w.withdrawing = true;
+    const withdrawal = other.withdraw(call('newBitcoinKey', 'regtest').address);
+    await pause(20);
+    release();
+    await assert.rejects(withdrawal, /is running/);
+    await run.stop();
+    assert.equal(w.a.posted.length, 0, 'no sweep');
+  }
+});
+
+test('the funding waits for the recovery file, which covers the lock', async () => {
+  const w = await world();
+  deposit(w, 1_100_000);
+  const run = running(w.buyer);
+  await until(() => w.buyer.status().step === 'save-backup');
+  assert.equal(w.buyer.status().backupCovers, 'lock');
+  await pause(50);
+  assert.equal(w.a.posted.length, 0, 'nothing broadcast before the file is saved');
+  const { file } = await w.buyer.backup();
+  const [swap] = JSON.parse(file).swaps;
+  assert.equal(Object.keys(swap.state)[0], 'AwaitNexLock', 'the file restores to the state the funding goes out from');
+  w.buyer.backupSaved();
+  await until(() => w.a.posted.length > 0);
+  assert.equal(w.a.posted[0], JSON.parse(file).swaps[0].state.AwaitNexLock.locked.funding);
+  assert.equal(w.buyer.status().step, 'swapping');
+  await run.stop();
+  assert.deepEqual(w.unsaved, []);
+});
+
+test('a recovery file never saved lets the swap abort before funding, at the message timeout', async () => {
+  let now = Date.now();
+  const w = await world({ extra: { now: () => now } });
+  deposit(w, 1_100_000);
+  const run = running(w.buyer);
+  await until(() => w.buyer.status().step === 'save-backup');
+  now += 60_001;
+  assert.equal(await run.done, 'aborted');
+  assert.equal(w.a.posted.length, 0, 'never funded');
+  assert.equal(await w.wallet.running(), null, 'the wallet is free again');
+});
+
+test('a refused Web Lock request is asked again', async () => {
+  const locks = new Locks().tab();
+  const request = locks.request;
+  let refusals = 1;
+  locks.request = (...args) => (refusals-- > 0 ? Promise.reject(new Error('SecurityError')) : request(...args));
+  const config = { network: 'regtest', esplora: 'http://esplora.invalid', store: new MemoryStore(), locks };
+  await assert.rejects(Wallet.open(config), /SecurityError/);
+  assert.match((await Wallet.open(config)).address, /^bcrt1q/);
+});
+
+test('a swap dropped by a later prepare never takes its offer', async () => {
+  const w = await world();
+  const first = w.buyer;
+  const second = await Buyer.prepare(w.wallet, { offer: w.offer, policy: POLICY, nexAddress: w.nexAddress });
+  deposit(w, 1_100_000);
+  const run = running(first);
+  await until(() => first.status().step === 'offer-gone');
+  assert.equal(await run.done, null);
+  assert.match(first.status().warning, /dropped when another was prepared/);
+  assert.equal(w.seller.log.length, 0, 'nothing sent');
+  assert.equal((await w.store.get(`swap:${second.swapId}`)).taken, false, 'the second’s record kept');
 });

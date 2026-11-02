@@ -54,6 +54,10 @@ export class Buyer extends EventTarget {
   #gone = null;
   #status = '';
   #wake = null;
+  /** The state after `Sent`, once the signatures are sent, while its
+   * funding waits for the page to save the recovery file. */
+  #held = null;
+  #backupSaved = false;
 
   constructor(wallet, record) {
     super();
@@ -117,8 +121,9 @@ export class Buyer extends EventTarget {
 
   /** Where the swap is, for a page to show:
    * - `step`: `fund-wallet` until the wallet can fund the lock and the
-   *   offer is taken, then `swapping`, `finishing` once the redeem is
-   *   signed, and `done`; or `refunding` and `refunded`; or `offer-gone`
+   *   offer is taken, then `swapping`, `save-backup` while the funding
+   *   waits for {@link Buyer#backupSaved}, `swapping` again, `finishing`
+   *   once the redeem is signed, and `done`; or `refunding` and `refunded`; or `offer-gone`
    *   if the session to the seller would not open, as the CLI's `take`
    *   fails once: nothing was sent, and the buyer picks another offer;
    * - `outcome`: once ended, the machine's: `swapped`, `refunded`,
@@ -140,15 +145,16 @@ export class Buyer extends EventTarget {
    *   (`Buyer::must_stay_open`), or cancel is due and the refund not yet
    *   confirmed;
    * - `backupCovers`: what a recovery file taken now covers: `wallet`, or
-   *   `lock` once the funding may be broadcast, from when a page asks the
-   *   buyer to download it, as Boltz asks for its refund file;
+   *   `lock` from `save-backup` on, when a page has the buyer download
+   *   {@link Buyer#backup} before the funding goes out, as Boltz has its
+   *   user download the rescue file before it shows the lockup;
    * - `tip`, and `warning`, the last failure, if any. */
   status() {
     const r = this.#r;
     const machine = call('buyerStatus', r.state, this.#view);
     const status = {
       swapId: r.swap_id,
-      step: this.#gone !== null ? 'offer-gone' : r.taken ? STEPS[machine.phase] : 'fund-wallet',
+      step: this.#gone !== null ? 'offer-gone' : this.#held !== null ? 'save-backup' : r.taken ? STEPS[machine.phase] : 'fund-wallet',
       outcome: ended(r.state) ? machine.phase : null,
       wallet: { address: this.#wallet.address, ...(this.#balance ?? { confirmed: null, unconfirmed: null }) },
       need: r.taken ? null : this.#need,
@@ -160,7 +166,7 @@ export class Buyer extends EventTarget {
       },
       deadlines: { cancel: null, refund: null, punish: null },
       mustStayOpen: machine.must_stay_open || machine.phase === 'refunding',
-      backupCovers: machine.backup_covers,
+      backupCovers: this.#held !== null ? 'lock' : machine.backup_covers,
       tip: this.#tip,
       warning: this.#gone ?? this.#warning,
     };
@@ -170,6 +176,19 @@ export class Buyer extends EventTarget {
       status.deadlines = { cancel: at(cancel), refund: { from: refund, until: punish }, punish: at(punish) };
     }
     return status;
+  }
+
+  /** The recovery file, as {@link Wallet#backup}, with this swap as it
+   * stands once its funding goes out while it waits in `save-backup`. */
+  backup() {
+    return this.#wallet.backup(this.#held !== null ? { [this.swapId]: this.#held } : {});
+  }
+
+  /** Lets the funding go out, once the page has saved {@link Buyer#backup}
+   * in `save-backup`. */
+  backupSaved() {
+    this.#backupSaved = true;
+    this.#wake?.();
   }
 
   /** Runs the swap until it ends, its offer is gone, or `signal` aborts:
@@ -207,8 +226,18 @@ export class Buyer extends EventTarget {
       await this.#take();
       return this.#gone !== null;
     }
+    if (this.#held !== null && this.#backupSaved) {
+      this.#held = null;
+      await this.#apply('Sent');
+    }
     for (const message of this.#inbox.splice(0)) await this.#apply({ Message: JSON.parse(message) });
-    if (this.#awaits() && this.#c.now() - this.#since > this.#c.messageTimeout) await this.#apply('Timeout');
+    // A hold lasts no longer than the seller's own wait for a message: the
+    // state is still the one before `Sent`, so the machine aborts before
+    // anything is funded.
+    if (this.#awaits() && this.#c.now() - this.#since > this.#c.messageTimeout) {
+      this.#held = null;
+      await this.#apply('Timeout');
+    }
     await this.#observeBitcoin();
     await this.#observeNexus();
     // Last: the balance is shown, and a failed read of it skips nothing.
@@ -229,6 +258,13 @@ export class Buyer extends EventTarget {
     const taken = await this.#wallet.exclusive(async () => {
       const running = await this.#wallet.running();
       if (running !== null) throw new Error(`refused: swap ${running} is running; one swap at a time`);
+      // Only while the store still holds this record, which a later
+      // `prepare` drops: checked before acting, as an HTTP `If-Match`
+      // refuses a write to what changed since it was read.
+      if ((await this.#c.store.get(swapKey(r.swap_id)))?.state !== r.state) {
+        this.#gone = 'refused: this swap was dropped when another was prepared';
+        return false;
+      }
       const amount = r.offer.terms.btc_amount;
       const fee_rate = await this.#wallet.feeRate();
       const { enough, need } = call('walletNeed', { utxos: await this.#wallet.spendable(), amount, fee_rate });
@@ -286,6 +322,14 @@ export class Buyer extends EventTarget {
       } catch (e) {
         this.#warning = `session ended: ${e.message}`;
         this.#session = null;
+        return;
+      }
+      // The state `Sent` steps to is one the funding may go out from: it
+      // waits, unsaved, for the page to save its recovery file first.
+      const next = JSON.stringify(call('stepBuyer', this.#r.state, '"Sent"').state);
+      const covers = (state) => call('buyerStatus', state, null).backup_covers;
+      if (covers(this.#r.state) === 'wallet' && covers(next) === 'lock') {
+        this.#held = next;
         return;
       }
       await this.#apply('Sent');

@@ -93,9 +93,19 @@ function single(locks = globalThis.navigator?.locks, onWaiting = undefined) {
         .catch(reject);
     });
     instances.set(locks, instance);
+    // A refusal is not kept, so the page can ask again, as Node's
+    // `require` drops a module from its cache when loading it throws.
+    instance.catch(() => instances.delete(locks));
   }
   return instances.get(locks);
 }
+
+/** The swap lock: one for the page, not one per `Wallet`, as eigenwallet
+ * keeps one `SwapLock` per `Context` and Bitcoin Core's `loadwallet` refuses
+ * a wallet already loaded. Two `Wallet`s of one store in a tab, from two
+ * `open`s or an `open` and a `restore`, wait on the same lock; the page is
+ * the one instance driving the store, so one lock for it is one per store. */
+let swapLock = Promise.resolve();
 
 export class Wallet {
   /** The wallet in `config.store`, made and saved first if there is none. */
@@ -116,8 +126,6 @@ export class Wallet {
     }
     return new Wallet(c, call('bitcoinKeyOf', key.wif, c.network));
   }
-
-  #swapLock = Promise.resolve();
 
   constructor(config, key) {
     this.config = config;
@@ -175,8 +183,8 @@ export class Wallet {
    * or one taking its offer, until it is saved as taken, each waits for
    * the one before. */
   exclusive(act) {
-    const run = this.#swapLock.then(act);
-    this.#swapLock = run.catch(() => {});
+    const run = swapLock.then(act);
+    swapLock = run.catch(() => {});
     return run;
   }
 
@@ -202,11 +210,14 @@ export class Wallet {
 
   /** The recovery file, `{name, file}`, as Boltz has its buyer download
    * one: the wallet key and every swap not yet ended, as each stands now.
-   * {@link Wallet.restore} reads it. */
-  async backup() {
+   * {@link Wallet.restore} reads it. `states` stands a swap's state, by
+   * id, in for the one the store holds: a buyer's, whose funding waits for
+   * the file. */
+  async backup(states = {}) {
     const swaps = [];
     for (const id of await this.swaps()) {
-      const record = await this.config.store.get(swapKey(id));
+      const stored = await this.config.store.get(swapKey(id));
+      const record = { ...stored, state: states[id] ?? stored.state };
       if (ended(record.state)) continue;
       const { version } = JSON.parse(call('backup', record.state).file);
       swaps.push({ ...record, version, state: JSON.parse(record.state) });

@@ -12,9 +12,9 @@
 // The config: {dir, esplora, nexus, genesis, offer, policy, nex_address}.
 // What to deposit prints as one JSON line, `{"address", "need"}`; the end
 // as `outcome: <outcome>`. The recovery file is written to `<dir>/backup`
-// once, when `backupCovers` first says it covers the lock: when a page asks
-// the buyer to download it, and never again, so a restore reads it as the
-// buyer would have it, stale.
+// once, at `save-backup`, before the funding goes out: when a page has the
+// buyer download it, and never again, so a restore reads it as the buyer
+// would have it, stale.
 
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -90,11 +90,12 @@ buyer.addEventListener('status', async (event) => {
     told = true;
     console.log(JSON.stringify({ address: status.wallet.address, need: status.need }));
   }
-  if (!backedUp && status.backupCovers === 'lock') {
+  if (!backedUp && status.step === 'save-backup') {
     backedUp = true;
-    const { file } = await wallet.backup();
+    const { file } = await buyer.backup();
     writeFileSync(join(c.dir, 'backup.tmp'), file);
     renameSync(join(c.dir, 'backup.tmp'), join(c.dir, 'backup'));
+    buyer.backupSaved();
   }
 });
 console.log(`outcome: ${await buyer.run()}`);
