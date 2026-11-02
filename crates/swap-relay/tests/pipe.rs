@@ -32,7 +32,7 @@ fn relay(max_offers: usize) -> String {
 }
 
 fn offer(id: &str) -> String {
-    format!(r#"{{"terms":{{"swap_id":"{id}"}},"relay":"here"}}"#)
+    format!(r#"{{"template":{{"swap_id":"{id}"}},"relay":"here"}}"#)
 }
 
 fn id(n: u8) -> String {
@@ -79,7 +79,7 @@ fn a_buyer_takes_a_listed_offer_and_the_two_talk_through_the_relay() {
     let url = relay(10);
     let seller = seller(&url, offer(&id(1)));
     wait_listed(&url, 1);
-    assert_eq!(offers(&url)[0]["terms"]["swap_id"], id(1));
+    assert_eq!(offers(&url)[0]["template"]["swap_id"], id(1));
     // A buyer's page, on another origin, reads the board.
     let listed = ureq::get(&format!("{url}/offers")).call().unwrap();
     assert_eq!(listed.header("access-control-allow-origin"), Some("*"));

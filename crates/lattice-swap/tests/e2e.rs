@@ -43,6 +43,14 @@ const BTC_FEE: Amount = Amount::from_sat(1_000);
 /// regtest's missing estimate and as the cap: nothing is bumped, and each
 /// costs exactly `BTC_FEE`, but redeem, which pays two.
 const NO_BUMP: [&str; 4] = ["--fallback-fee-rate", "1", "--max-fee-rate", "1"];
+/// The seller's quote: satoshis a NEX of 10^6 base units, and the range it
+/// takes, which `BTC_AMOUNT` is inside of and below the top of. A sat
+/// below 50 a base unit: `BTC_AMOUNT` buys 1000000.02 base units, so 1 sat
+/// of it buys nothing.
+const PRICE: u64 = 49_999_999;
+const MIN_BTC_AMOUNT: Amount = Amount::from_sat(10_000_000);
+const MAX_BTC_AMOUNT: Amount = Amount::from_sat(60_000_000);
+/// What `BTC_AMOUNT` buys at `PRICE`, rounded down.
 const NEX_AMOUNT: u64 = 1_000_000;
 /// What the buyer's wallet holds before a swap.
 const BUYER_BTC: Amount = Amount::from_sat(100_000_000);
@@ -420,7 +428,7 @@ impl World {
                 .arg(&offer_file)
                 .args(["--nex-address", &self.buyer_nex])
                 .args(["--btc-amount", &BTC_AMOUNT.to_sat().to_string()])
-                .args(["--nex-amount", &NEX_AMOUNT.to_string()])
+                .args(["--price", &PRICE.to_string()])
                 .args(["--max-btc-fee", &BTC_FEE.to_sat().to_string()])
                 .args(["--max-nex-fee", &nex_fee])
                 .args([
@@ -465,11 +473,12 @@ impl World {
             lattice_swap()
                 .arg("offer")
                 .args(place)
-                .args(["--btc-amount", &BTC_AMOUNT.to_sat().to_string()])
+                .args(["--price", &PRICE.to_string()])
+                .args(["--min-btc-amount", &MIN_BTC_AMOUNT.to_sat().to_string()])
+                .args(["--max-btc-amount", &MAX_BTC_AMOUNT.to_sat().to_string()])
                 .args(["--btc-fee", &BTC_FEE.to_sat().to_string()])
                 // Regtest has no fee estimate.
                 .args(["--min-btc-fee-rate", "1"])
-                .args(["--nex-amount", &NEX_AMOUNT.to_string()])
                 .args(["--nex-fee", &nex_fee])
                 .args(["--t1", &t1, "--t2", "10", "--margin", "3"])
                 .args(["--btc-confirmations", "1"])
@@ -487,7 +496,7 @@ impl World {
         let mut offer = String::new();
         let mut reader = BufReader::new(seller.0.stdout.take().unwrap());
         reader.read_line(&mut offer).unwrap();
-        let swap_id = serde_json::from_str::<Value>(&offer).unwrap()["terms"]["swap_id"]
+        let swap_id = serde_json::from_str::<Value>(&offer).unwrap()["template"]["swap_id"]
             .as_str()
             .unwrap()
             .to_string();
@@ -501,7 +510,7 @@ impl World {
                     .unwrap();
                 offers.as_array().unwrap().first().cloned()
             });
-            assert_eq!(listed["terms"]["swap_id"], swap_id.as_str());
+            assert_eq!(listed["template"]["swap_id"], swap_id.as_str());
             offer = listed.to_string();
         }
         // The rest of the seller's output, read as it comes so it never
@@ -768,7 +777,7 @@ impl World {
             "genesis": self.nexus_genesis,
             "offer": offer,
             "policy": {
-                "btc_amount": BTC_AMOUNT.to_sat(), "nex_amount": NEX_AMOUNT,
+                "btc_amount": BTC_AMOUNT.to_sat(), "price": PRICE,
                 "max_btc_fee": BTC_FEE.to_sat(), "max_nex_fee": self.nex_fee,
                 "max_t1": t1, "min_t2": 10, "min_refund_window": 9, "min_margin": 3,
                 "min_btc_fee_rate": 1, "min_btc_confirmations": 1, "min_nex_confirmations": 1,
