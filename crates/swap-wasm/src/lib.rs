@@ -514,6 +514,8 @@ pub fn nexus_submit_body(transaction: &str) -> Result<String> {
 /// - `backup_covers`: `lock` once the state is one the funding may have
 ///   been broadcast from, whose backup can cancel and refund the lock; else
 ///   `wallet`, a backup that holds the wallet key and no more than it.
+/// - `terms`: the swap's [`swap::Terms`] as the state holds them, until it
+///   ends; null once it has.
 #[wasm_bindgen(js_name = buyerStatus)]
 pub fn buyer_status(state: &str, view: Option<String>) -> Result<String> {
     let buyer: Buyer = parse(state)?;
@@ -567,6 +569,7 @@ pub fn buyer_status(state: &str, view: Option<String>) -> Result<String> {
         },
         "deadlines": {"cancel": cancel, "refund": refund, "punish": punish},
         "backup_covers": backup_covers,
+        "terms": buyer.terms(),
     }))
 }
 

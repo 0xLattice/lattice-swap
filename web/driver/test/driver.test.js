@@ -707,3 +707,93 @@ test('every public method of Wallet and Buyer documents what it returns', async 
     }
   }
 });
+
+/** The funded swap's record, its state moved on to one that watches
+ * Nexus: the NEX lock seen at a CID, or the claim. */
+function watchingNexus(record) {
+  const { locked } = JSON.parse(record.state).AwaitNexLock;
+  return [
+    { AwaitNexLock: { locked, cid: call('newNexKey').address } },
+    { ClaimingNex: { setup: locked.setup, other: '02'.repeat(32), lock: 'Seen', passed_at: null, claim: null, punished: false } },
+  ].map((state) => ({ ...record, state: JSON.stringify(state) }));
+}
+
+test('a resumed swap that watches Nexus reads nothing of a node on another Nexus', async () => {
+  const { w, run, record } = await funded();
+  await run.stop();
+  for (const watching of watchingNexus(record)) {
+    assert.notEqual(call('watchBuyer', watching.state).nexus, null, 'it watches Nexus');
+    await w.store.put(`swap:${record.swap_id}`, watching);
+    w.node.genesis = 'another';
+    w.node.paths = [];
+    const buyer = await Buyer.resume(w.wallet, record.swap_id);
+    const again = running(buyer);
+    await until(() => /another/.test(buyer.status().warning ?? ''));
+    await pause(20);
+    await again.stop();
+    assert.deepEqual(w.node.paths.filter((path) => !['/api/chain/info', '/health'].includes(path)), [], 'only the check’s reads');
+  }
+});
+
+test('a resumed swap whose terms name another Nexus than the page’s is refused', async () => {
+  const { w, run, record } = await funded();
+  await run.stop();
+  // The page now on another Nexus, its node on it too.
+  const wallet = await Wallet.open({ ...w.config, nexusGenesis: 'another' });
+  w.node.genesis = 'another';
+  for (const watching of watchingNexus(record)) {
+    await w.store.put(`swap:${record.swap_id}`, watching);
+    w.node.paths = [];
+    const buyer = await Buyer.resume(wallet, record.swap_id);
+    const again = running(buyer);
+    await until(() => (buyer.status().warning ?? '').includes('trades on the Nexus of genesis genesis, not another'));
+    await pause(20);
+    await again.stop();
+    assert.deepEqual(w.node.paths, [], 'nothing read from it');
+  }
+});
+
+test('a taken swap’s terms come from its state, its offer not read', async () => {
+  const { w, run, record } = await funded();
+  await run.stop();
+  await w.store.put(`swap:${record.swap_id}`, { ...record, offer: 'gone' });
+  const buyer = await Buyer.resume(w.wallet, record.swap_id);
+  const status = buyer.status();
+  assert.equal(status.btc_amount, TERMS.btc_amount);
+  assert.equal(status.nex_amount, TERMS.nex_amount);
+  assert.equal(status.btc_confirmations, OFFER.template.btc_confirmations);
+  // Ended, from the offer: the state holds none.
+  await w.store.put(`swap:${record.swap_id}`, { ...record, state: JSON.stringify({ Done: 'Swapped' }) });
+  const ended = await Buyer.resume(w.wallet, record.swap_id);
+  assert.equal(ended.status().nex_amount, TERMS.nex_amount);
+});
+
+test('a restore refuses a file that holds taken a swap the store holds untaken', async () => {
+  const { w, run, record } = await funded();
+  await run.stop();
+  const { file } = await w.wallet.backup();
+  const store = new MemoryStore();
+  const untaken = { ...record, taken: false };
+  await store.put(`swap:${record.swap_id}`, untaken);
+  await assert.rejects(Wallet.restore({ ...w.config, store }, file), /holds swap .* untaken, and the file holds it taken/);
+  assert.deepEqual(await store.get(`swap:${record.swap_id}`), untaken);
+});
+
+test('Wallet.exists with no store given closes the one it opens', async () => {
+  const { IDBFactory } = await import('fake-indexeddb');
+  const factory = new IDBFactory();
+  const indexedDB = globalThis.indexedDB;
+  globalThis.indexedDB = factory;
+  try {
+    assert.equal(await Wallet.exists({}), false);
+    // A connection left open would block the delete.
+    await new Promise((resolve, reject) => {
+      const request = factory.deleteDatabase('lattice-swap');
+      request.onsuccess = resolve;
+      request.onerror = reject;
+      request.onblocked = () => reject(new Error('blocked: a connection is still open'));
+    });
+  } finally {
+    globalThis.indexedDB = indexedDB;
+  }
+});

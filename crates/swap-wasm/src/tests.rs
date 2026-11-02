@@ -716,7 +716,9 @@ fn a_buyer_shows_where_its_swap_is() {
         json!({"cancel": null, "refund": null, "punish": null})
     );
     assert_eq!(swapping["backup_covers"], "wallet");
+    assert_eq!(swapping["terms"], json(&terms()));
     assert_eq!(status(json!({"Done": "Swapped"}))["phase"], "swapped");
+    assert_eq!(status(json!({"Done": "Swapped"}))["terms"], Value::Null);
     assert_eq!(
         status(json!({"Done": {"Aborted": "Timeout"}}))["phase"],
         "aborted"

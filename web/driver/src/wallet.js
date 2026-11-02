@@ -134,11 +134,16 @@ export class Wallet {
    * Bitcoin Core's `listwallets` names wallets without `createwallet`.
    * Read without the Web Lock, and safe so: the key is only ever added
    * where none is (`add`) and never written over or deleted, so another
-   * tab can only have made it since, and `open` then reads that one.
+   * tab can only have made it since, and `open` then reads that one. A
+   * store made here, with none given, is closed once read.
    * @returns {Promise<boolean>} */
   static async exists(config) {
     const store = config.store ?? new IndexedDBStore();
-    return (await store.get(WALLET)) !== null;
+    try {
+      return (await store.get(WALLET)) !== null;
+    } finally {
+      if (!config.store) (await store.database).close();
+    }
   }
 
   /** The wallet in `config.store`, made and saved first if there is none.
@@ -303,10 +308,16 @@ export class Wallet {
     // Under the swap lock, as a swap taking its offer is: what runs is
     // read and added to at once.
     await exclusively(async () => {
-      // A swap the store holds is as far on as the file's, or further.
+      // A swap the store holds is as far on as the file's, or further;
+      // one it holds untaken that the file holds taken is not, and is
+      // refused, as another wallet's key is.
       const added = [];
       for (const record of records) {
-        if ((await c.store.get(swapKey(record.swap_id))) === null) added.push(record);
+        const held = await c.store.get(swapKey(record.swap_id));
+        if (held === null) added.push(record);
+        else if (!held.taken && record.taken) {
+          throw new Error(`refused: the store holds swap ${record.swap_id} untaken, and the file holds it taken`);
+        }
       }
       const ids = (await c.store.keys()).filter((id) => id.startsWith('swap:'));
       const runs = [];

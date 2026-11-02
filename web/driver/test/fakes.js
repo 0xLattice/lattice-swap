@@ -156,9 +156,11 @@ export async function esplora(chain, onPost = () => {}) {
 }
 
 /** A Nexus node at height 1 on the test offer's genesis, or on `genesis`;
- * it answers 503 to everything while `down` holds. */
+ * it answers 503 to everything while `down` holds, and logs each path
+ * asked in `paths`, if given. */
 export function nexus(node = {}) {
   return serve((method, path) => {
+    node.paths?.push(path);
     if (node.down) return [503, 'down'];
     if (path === '/api/chain/info' && node.genesis) return [200, { chain: ['Nexus'], genesisHash: node.genesis, minRelayFee: '1', height: '1' }];
     if (path === '/api/chain/info') return [200, { chain: ['Nexus'], genesisHash: 'genesis', minRelayFee: '1', height: '1' }];

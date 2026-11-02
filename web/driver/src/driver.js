@@ -58,9 +58,8 @@ export class Buyer extends EventTarget {
    * `prepare` checks it first; a resumed swap checks it the first round
    * it reads Nexus. */
   #nexusChecked;
-  /** The terms the swap was taken on: the offer's at the policy's amount,
-   * the only ones `#request` accepts. */
-  #terms;
+  /** A swap that ended: its terms, which its state no longer holds. */
+  #doneTerms = null;
 
   constructor(wallet, record, nexusChecked) {
     super();
@@ -70,7 +69,6 @@ export class Buyer extends EventTarget {
     this.#kind = kind(record.state);
     this.#since = this.#c.now();
     this.#nexusChecked = nexusChecked;
-    this.#terms = call('offerTerms', { offer: record.offer, btc_amount: record.policy.btc_amount });
   }
 
   /** A swap of `offer`, an offer's text from a relay's board, that the
@@ -168,9 +166,11 @@ export class Buyer extends EventTarget {
    *   {@link Wallet#running} judges it: while it does, no other swap is
    *   prepared and the wallet withdraws nothing;
    * - `btc_amount`, in sat, `price`, in sat a NEX of 1,000,000 base units,
-   *   and `nex_amount`, in base units: the terms asked for at take, the
-   *   only ones the swap goes on with; `btc_confirmations` and
-   *   `nex_confirmations`, how deep each lock must be, for "1 of N";
+   *   and `nex_amount`, in base units: the swap's terms, read from its
+   *   state as the CLI reads them, and once it ends, from the offer at the
+   *   policy's amount, the only terms `#request` accepts;
+   *   `btc_confirmations` and `nex_confirmations`, how deep each lock must
+   *   be, for "1 of N";
    * - `nexAddress`, where the NEX goes (null for a swap prepared before
    *   it was recorded);
    * - `tip`, and `warning`, the last failure, if any.
@@ -178,6 +178,8 @@ export class Buyer extends EventTarget {
   status() {
     const r = this.#r;
     const machine = call('buyerStatus', r.state, this.#view);
+    if (machine.terms === null) this.#doneTerms ??= call('offerTerms', { offer: r.offer, btc_amount: r.policy.btc_amount });
+    const terms = machine.terms ?? this.#doneTerms;
     const status = {
       swapId: r.swap_id,
       step: this.#gone !== null ? 'offer-gone' : r.taken ? STEPS[machine.phase] : 'fund-wallet',
@@ -194,11 +196,11 @@ export class Buyer extends EventTarget {
       mustStayOpen: machine.must_stay_open || machine.phase === 'refunding',
       backupCovers: machine.backup_covers,
       running: isRunning(r),
-      btc_amount: this.#terms.btc_amount,
+      btc_amount: terms.btc_amount,
       price: r.policy.price,
-      nex_amount: this.#terms.nex_amount,
-      btc_confirmations: this.#terms.btc_confirmations,
-      nex_confirmations: this.#terms.nex_confirmations,
+      nex_amount: terms.nex_amount,
+      btc_confirmations: terms.btc_confirmations,
+      nex_confirmations: terms.nex_confirmations,
       nexAddress: r.nex_address ?? null,
       tip: this.#tip,
       warning: this.#gone ?? this.#warning,
@@ -432,11 +434,18 @@ export class Buyer extends EventTarget {
   }
 
   /** Refuses a node on another Nexus, once per Buyer: a resumed swap's
-   * first use of it, as `prepare` checks it before anything else. Throws
-   * into the round, as any failed read does. */
+   * first use of it, as `prepare` checks it before anything else. A swap
+   * whose terms name another Nexus than the page's is refused first, as
+   * the CLI's `resume` refuses one: the node is checked against the
+   * page's. Throws into the round, as any failed read does. */
   async #checkNexus() {
     if (this.#nexusChecked) return;
-    await checkNexus(this.#wallet.nexus, this.#c.nexusGenesis);
+    const genesis = call('buyerStatus', this.#r.state, null).terms?.nexus_genesis;
+    const page = this.#c.nexusGenesis;
+    if (genesis !== undefined && genesis !== page) {
+      throw new Error(`refused: swap ${this.#r.swap_id} trades on the Nexus of genesis ${genesis}, not ${page}, the one nexusGenesis names`);
+    }
+    await checkNexus(this.#wallet.nexus, page);
     this.#nexusChecked = true;
   }
 
