@@ -114,30 +114,39 @@ block time or since the tool first saw it, may hide that
 the redeem window closed: the seller starts no redeem and locks no NEX on it,
 and the tool warns until it catches up. Every other spend and bump goes on.
 The seller's protection against a node someone cut off is that node's own
-connectivity: for a large swap, run a well-connected one. The two agree on the terms off-tool. The
-seller, who has NEX, makes an offer and waits for the buyer to dial:
+connectivity: for a large swap, run a well-connected one. The seller, who
+has NEX, makes an offer, a price and the range of BTC it takes, as
+eigenwallet's sellers quote one, and waits for the buyer to dial:
 
 ```sh
 lattice-swap offer --nex-key-file ~/.lattice-swap/nex.key \
-  --btc-amount 50000000 --btc-fee 2000 --nex-amount 1000000 --nex-fee 10 \
+  --price 50 --min-btc-amount 10000000 --max-btc-amount 50000000 \
+  --btc-fee 2000 --nex-fee 10 \
   --listen 0.0.0.0:7400 --advertise 203.0.113.5:7400 \
   --btc-wallet sell --btc-cookie ~/.bitcoin/.cookie \
   --nexus-url http://127.0.0.1:8080 --nexus-cookie ~/lattice/.cookie > offer
 ```
 
-The first line it prints is the offer: the terms, where the seller listens and
-its key, and a session key for the buyer. The offer is a secret: whoever holds
+The first line it prints is the offer: the quote, `--price` satoshis a NEX
+for `--min-btc-amount` to `--max-btc-amount` satoshis, the other terms,
+where the seller listens and its key, and a session key for the buyer. The offer is a secret: whoever holds
 it can take it, so write it where only you can read it (run `umask 077` first)
 and hand it over on a private channel. The buyer, who has BTC, takes it:
 
 ```sh
 lattice-swap take offer --nex-address <your Nexus address> \
-  --btc-amount 50000000 --nex-amount 1000000 \
+  --price 50 --btc-amount 20000000 \
   --btc-wallet buy --btc-cookie ~/.bitcoin/.cookie \
   --nexus-url http://127.0.0.1:8080 --nexus-cookie ~/lattice/.cookie
 ```
 
-Both then run until the swap ends and print its outcome. Each keeps its
+`take` asks the seller for `--btc-amount` satoshis, or the most the offer
+takes if it is left out, as eigenwallet's CLI swaps up to its seller's
+maximum, and buys `floor(btc-amount / price)` NEX, rounded down as
+eigenwallet rounds: here 400000. The seller checks the amount against its
+quote and answers with the terms at it, which the buyer takes only if they
+are the ones it asked for. Both then run until the swap ends and print its
+outcome. Each keeps its
 state in `<swap id>.json` in `--dir`, which holds its secrets for the swap
 but never the seller's Nexus wallet key: that comes from `--nex-key-file`,
 which only its owner may read, or `LATTICE_SWAP_NEX_KEY`, never from an
@@ -160,14 +169,16 @@ a swap with the build that started it.
 The defaults are `t1` 288 and `t2` 144 Bitcoin blocks, 6 Bitcoin and 24 Nexus
 confirmations, and a margin of 12. A Nexus block is about 6 Bitcoin blocks, so
 the tool refuses any `t1` below `btc-confirmations + 6 × (nex-confirmations +
-1) + margin`. A buyer refuses an offer on another `--btc-network`, or for
-other amounts than its `--btc-amount` and `--nex-amount`, and prints the terms
-before it dials. It also refuses one outside its bounds: `--max-btc-fee` 10000
+1) + margin`. A buyer refuses an offer on another `--btc-network`, at another
+price than its `--price`, or whose range does not hold its `--btc-amount`,
+and prints the offer before it dials. It also refuses one outside its bounds: `--max-btc-fee` 10000
 sat, `--max-nex-fee` 1000, `--max-t1` 288, `--min-t2` 144,
 `--min-btc-confirmations` 6, `--max-btc-confirmations` 12,
 `--min-refund-window` 72, `--min-nex-confirmations` 24 and `--min-margin` 6 by
-default. Either side refuses a `--btc-amount` below two `--btc-fee`, which
-redeem pays, plus 546 sat, the highest dust limit of a wallet's payout. The
+default. The seller refuses to offer a range that is empty or whose terms do
+not work at either end: a `--min-btc-amount` below two `--btc-fee`, which
+redeem pays, plus 546 sat, the highest dust limit of a wallet's payout, or
+one that buys no more NEX than `--nex-fee`. The
 buyer refunds only when cancel is `btc-confirmations` deep, and the seller can punish once cancel is `t2` deep:
 the refund window is `t2 - btc-confirmations` blocks. The buyer also refuses a
 `--btc-fee` at which cancel or refund, the spends it relies on, pays less than
@@ -177,7 +188,7 @@ to offer such a `--btc-fee` too: cancel, which it needs to reclaim its NEX,
 pays it as signed and is never bumped, so leave headroom.
 
 The NEX lock and the buyer's claim from it each pay `--nex-fee`, and
-`--nex-amount` must exceed it. A fee one node pools may still be below what
+the NEX bought must exceed it. A fee one node pools may still be below what
 the rest of the network relays: then no miner sees the lock, and the swap
 waits until `t1` and refunds. So the seller refuses to offer, and the buyer
 to take, a `--nex-fee` below `--min-nex-fee`, 1 by default, the default
@@ -209,7 +220,7 @@ by one process at a time: a second `resume` while one runs refuses.
 A relay lets the seller post an offer without a reachable address, and
 anyone find it. It holds no keys and no funds: the parties' session runs end
 to end through it, encrypted, each side authenticating the other's key, and
-the buyer checks the seller's signature over the offer's terms. A relay can
+the buyer checks the seller's signature over the offer's quote and terms. A relay can
 drop or delay what it carries, which ends a swap in a refund, but cannot
 change it.
 

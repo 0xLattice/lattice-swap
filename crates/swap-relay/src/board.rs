@@ -45,7 +45,7 @@ struct Listing<T> {
 /// Why the board refuses an offer.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Refusal {
-    /// Not an offer: no swap id in its terms.
+    /// Not an offer: no swap id in its template.
     NotAnOffer(String),
     /// An offer of that swap id is listed already.
     Listed,
@@ -94,12 +94,12 @@ impl<T> Drop for Ticket<T> {
     }
 }
 
-/// The swap id `offer` names: `terms.swap_id`, 32 bytes in lowercase hex.
+/// The swap id `offer` names: `template.swap_id`, 32 bytes in lowercase hex.
 pub fn offer_id(offer: &str) -> Result<String, String> {
     let offer: serde_json::Value = serde_json::from_str(offer).map_err(|e| e.to_string())?;
-    let id = offer["terms"]["swap_id"]
+    let id = offer["template"]["swap_id"]
         .as_str()
-        .ok_or("its terms name no swap id")?;
+        .ok_or("its template names no swap id")?;
     let hex = id.len() == 64
         && id
             .bytes()
@@ -185,7 +185,7 @@ mod tests {
 
     fn offer(n: u8) -> String {
         format!(
-            r#"{{"terms":{{"swap_id":"{}"}},"relay":"x"}}"#,
+            r#"{{"template":{{"swap_id":"{}"}},"relay":"x"}}"#,
             hex::encode([n; 32])
         )
     }
@@ -250,7 +250,7 @@ mod tests {
         let board = Board::<u32>::new(2);
         let id = hex::encode([1; 32]);
         let sized = |n: usize| {
-            let offer = format!(r#"{{"terms":{{"swap_id":"{id}"}},"pad":""}}"#);
+            let offer = format!(r#"{{"template":{{"swap_id":"{id}"}},"pad":""}}"#);
             offer.replace(
                 r#""pad":"""#,
                 &format!(r#""pad":"{}""#, "x".repeat(n - offer.len())),
@@ -270,10 +270,10 @@ mod tests {
         for bad in [
             "not json",
             "{}",
-            r#"{"terms":{"swap_id":7}}"#,
-            r#"{"terms":{"swap_id":"ab"}}"#,
-            &format!(r#"{{"terms":{{"swap_id":"{}"}}}}"#, "AB".repeat(32)),
-            &format!(r#"{{"terms":{{"swap_id":"{}"}}}}"#, "gg".repeat(32)),
+            r#"{"template":{"swap_id":7}}"#,
+            r#"{"template":{"swap_id":"ab"}}"#,
+            &format!(r#"{{"template":{{"swap_id":"{}"}}}}"#, "AB".repeat(32)),
+            &format!(r#"{{"template":{{"swap_id":"{}"}}}}"#, "gg".repeat(32)),
         ] {
             assert!(
                 matches!(board.list(bad.into()), Err(Refusal::NotAnOffer(_))),

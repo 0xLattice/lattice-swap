@@ -3,7 +3,9 @@
 
 import { wasm } from './wasm.js';
 
-/** The offers `relay` lists, each as its text, which `decodeOffer` reads. */
+/** The offers `relay` lists, each as its text, which `decodeOffer` reads:
+ * its `quote` holds the `price`, in sat a NEX, and the `min_btc_amount`
+ * and `max_btc_amount` a buyer picks between. */
 export async function offers(relay, fetchImpl = globalThis.fetch) {
   const response = await fetchImpl(`${relay.replace(/\/+$/, '')}/offers`, { cache: 'no-store' });
   if (!response.ok) throw new Error(`${relay}/offers: ${response.status}`);
@@ -25,7 +27,7 @@ export function socketUrl(relay, path) {
 export class Session {
   /** Opens it, and waits up to `timeout` ms for the handshake. */
   static async open(offer, onMessage, { WebSocket = globalThis.WebSocket, timeout = 30_000 } = {}) {
-    const swapId = offer.terms.swap_id;
+    const swapId = offer.template.swap_id;
     const socket = new WebSocket(socketUrl(offer.relay, `take/${swapId}`));
     socket.binaryType = 'arraybuffer';
     const session = new Session(socket, new wasm.Ivy(offer.buyer_session, offer.seller, swapId), onMessage);

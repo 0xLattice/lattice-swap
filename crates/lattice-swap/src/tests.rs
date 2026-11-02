@@ -30,12 +30,14 @@ fn parse(args: &[&str]) -> std::result::Result<Cli, clap::Error> {
 fn offer_args(extra: &[&str]) -> OfferArgs {
     let mut args = vec![
         "offer",
-        "--btc-amount",
+        "--price",
+        "50",
+        "--min-btc-amount",
+        "10000000",
+        "--max-btc-amount",
         "50000000",
         "--btc-fee",
         "1000",
-        "--nex-amount",
-        "1000000",
         "--nex-fee",
         "10",
         "--listen",
@@ -50,7 +52,12 @@ fn offer_args(extra: &[&str]) -> OfferArgs {
 
 /// Terms whose floor is 1 + 6 x (1 + 1) + 3 = 16.
 fn small(t1: u16) -> Terms {
-    let args = offer_args(&[
+    terms_of(&small_args(t1))
+}
+
+/// The offer of [`small`].
+fn small_args(t1: u16) -> OfferArgs {
+    offer_args(&[
         "--btc-confirmations",
         "1",
         "--nex-confirmations",
@@ -61,19 +68,33 @@ fn small(t1: u16) -> Terms {
         "10",
         "--t1",
         &t1.to_string(),
-    ]);
-    args.terms.terms([7; 32], MAINNET.into())
+    ])
+}
+
+/// The terms `args` offer at the most they take.
+fn terms_of(args: &OfferArgs) -> Terms {
+    let quote = args.terms.quote();
+    let template = args.terms.template([7; 32], MAINNET.into());
+    template.terms(&quote, quote.max_btc_amount)
+}
+
+/// The offer `args` make, signed by `key`.
+fn offer_of(args: &OfferArgs, network: Network, place: Place, key: &SigningKey) -> Offer {
+    let template = args.terms.template([7; 32], MAINNET.into());
+    Offer::new(args.terms.quote(), template, network, place, key, [7; 32])
 }
 
 #[test]
 fn the_defaults_are_the_agreed_settings_and_pass() {
     let args = offer_args(&[]);
-    let terms = args.terms.terms([7; 32], MAINNET.into());
+    let terms = terms_of(&args);
     assert_eq!((terms.t1, terms.t2), (288, 144));
     assert_eq!((terms.btc_confirmations, terms.nex_confirmations), (6, 24));
     assert_eq!(terms.btc_amount, Amount::from_sat(50_000_000));
+    assert_eq!(terms.nex_amount, 1_000_000);
     assert_eq!(args.nodes.btc_network, Network::Bitcoin);
-    assert_eq!(Terms::check(&terms), Ok(()));
+    let template = args.terms.template([7; 32], MAINNET.into());
+    assert_eq!(template.check(&args.terms.quote()), Ok(()));
 }
 
 #[test]
@@ -147,14 +168,16 @@ fn address() -> Place {
 fn an_offer_parses_back_into_the_same_terms() {
     let key = SigningKey::from_bytes(&random32());
     for place in [address(), Place::Relay("https://relay.example".into())] {
-        let terms = offer_args(&[]).terms.terms(random32(), MAINNET.into());
-        let offer = Offer::new(terms, Network::Signet, place, &key, random32());
+        let args = offer_args(&[]);
+        let template = args.terms.template(random32(), MAINNET.into());
+        let quote = args.terms.quote();
+        let offer = Offer::new(quote, template, Network::Signet, place, &key, random32());
         let text = offer.encode();
         assert!(!text.contains('\n'), "one line");
         assert_eq!(Offer::decode(&format!("{text}\n")).unwrap(), offer);
     }
     // The session authenticates the key the offer names, which signs it.
-    let offer = Offer::new(small(16), Network::Signet, address(), &key, [7; 32]);
+    let offer = offer_of(&small_args(16), Network::Signet, address(), &key);
     let peer = ivy::Config::new(key).peer_key();
     assert_eq!(offer.seller_key().unwrap(), peer);
 }
@@ -162,7 +185,7 @@ fn an_offer_parses_back_into_the_same_terms() {
 #[test]
 fn an_offer_with_a_bad_seller_key_is_refused() {
     let key = SigningKey::from_bytes(&[1; 32]);
-    let mut offer = Offer::new(small(16), Network::Bitcoin, address(), &key, [7; 32]);
+    let mut offer = offer_of(&small_args(16), Network::Bitcoin, address(), &key);
     offer.seller = "00".repeat(31);
     assert!(Offer::decode(&offer.encode()).is_err());
 }
@@ -174,12 +197,12 @@ fn an_offer_with_a_bad_seller_key_is_refused() {
 #[test]
 fn an_offer_whose_terms_are_changed_is_refused() {
     let key = SigningKey::from_bytes(&[1; 32]);
-    let signed = Offer::new(small(16), Network::Bitcoin, address(), &key, [7; 32]);
+    let signed = offer_of(&small_args(16), Network::Bitcoin, address(), &key);
     Offer::decode(&signed.encode()).unwrap();
     type Change = (&'static str, fn(&mut Offer));
     let changes: [Change; 4] = [
-        ("confirmations", |o| o.terms.nex_confirmations -= 1),
-        ("margin", |o| o.terms.margin += 1),
+        ("confirmations", |o| o.template.nex_confirmations -= 1),
+        ("margin", |o| o.template.margin += 1),
         ("network", |o| o.btc_network = Network::Testnet),
         ("signature", |o| o.signature[0] ^= 1),
     ];
@@ -208,7 +231,7 @@ fn an_offer_whose_terms_are_changed_is_refused() {
 #[test]
 fn an_offer_names_an_address_or_a_relay() {
     let key = SigningKey::from_bytes(&[1; 32]);
-    let mut offer = Offer::new(small(16), Network::Bitcoin, address(), &key, [7; 32]);
+    let mut offer = offer_of(&small_args(16), Network::Bitcoin, address(), &key);
     offer.relay = Some("http://relay.example".into());
     assert!(Offer::decode(&offer.encode()).is_err());
     offer.relay = None;
@@ -223,12 +246,14 @@ fn offer_listens_or_uses_a_relay() {
     assert!(args.listen.is_some() && args.relay.is_none());
     let base: Vec<&str> = [
         "offer",
-        "--btc-amount",
+        "--price",
+        "50",
+        "--min-btc-amount",
+        "10000000",
+        "--max-btc-amount",
         "50000000",
         "--btc-fee",
         "2000",
-        "--nex-amount",
-        "1000000",
         "--nex-fee",
         "1",
     ]
@@ -278,16 +303,7 @@ fn an_alias_of_a_nexus_address_is_refused() {
 }
 
 fn policy(extra: &[&str]) -> (PolicyArgs, Network) {
-    let mut args = vec![
-        "take",
-        "offer",
-        "--nex-address",
-        "b",
-        "--btc-amount",
-        "50000000",
-        "--nex-amount",
-        "1000000",
-    ];
+    let mut args = vec!["take", "offer", "--nex-address", "b", "--price", "50"];
     args.extend(extra);
     match parse(&args).unwrap().command {
         Command::Take(args) => (args.policy, args.nodes.btc_network),
@@ -297,11 +313,11 @@ fn policy(extra: &[&str]) -> (PolicyArgs, Network) {
 
 /// The default terms, at the default bounds.
 fn agreed() -> Offer {
-    let mut terms = offer_args(&[]).terms.terms([7; 32], MAINNET.into());
-    terms.btc_fee = Amount::from_sat(10_000);
-    terms.nex_fee = 1_000;
+    let mut args = offer_args(&[]);
+    args.terms.btc_fee = 10_000;
+    args.terms.nex_fee = 1_000;
     let key = SigningKey::from_bytes(&[1; 32]);
-    Offer::new(terms, Network::Bitcoin, address(), &key, [7; 32])
+    offer_of(&args, Network::Bitcoin, address(), &key)
 }
 
 /// The fee floors the policy tests pass: the agreed fees.
@@ -314,7 +330,7 @@ fn take_refuses_any_term_outside_its_policy() {
     assert_eq!(
         check_offer(
             &agreed(),
-            &policy.policy(),
+            &policy.policy(&agreed()),
             network,
             MAINNET,
             FLOOR,
@@ -326,29 +342,43 @@ fn take_refuses_any_term_outside_its_policy() {
     let changes: [Change; 16] = [
         ("network", |o| o.btc_network = Network::Testnet),
         ("nexus", |o| {
-            o.terms.nexus_genesis = swap_nexus_tx::cid(b"dev")
+            o.template.nexus_genesis = swap_nexus_tx::cid(b"dev")
         }),
-        ("more btc", |o| o.terms.btc_amount += Amount::from_sat(1)),
-        ("less btc", |o| o.terms.btc_amount -= Amount::from_sat(1)),
-        ("more nex", |o| o.terms.nex_amount += 1),
-        ("less nex", |o| o.terms.nex_amount -= 1),
-        ("btc fee", |o| o.terms.btc_fee += Amount::from_sat(1)),
-        ("btc fee floor", |o| o.terms.btc_fee -= Amount::from_sat(1)),
-        ("nex fee", |o| o.terms.nex_fee += 1),
-        ("nex fee floor", |o| o.terms.nex_fee -= 1),
-        ("t1", |o| o.terms.t1 += 1),
-        ("t2", |o| o.terms.t2 -= 1),
-        ("btc confirmations", |o| o.terms.btc_confirmations -= 1),
-        ("max btc confirmations", |o| o.terms.btc_confirmations = 13),
-        ("nex confirmations", |o| o.terms.nex_confirmations -= 1),
-        ("margin", |o| o.terms.margin = 5),
+        ("higher price", |o| o.quote.price += 1),
+        ("lower price", |o| o.quote.price -= 1),
+        ("below the range", |o| o.quote.max_btc_amount -= 1),
+        ("above the range", |o| {
+            o.quote.min_btc_amount = 50_000_001;
+            o.quote.max_btc_amount = 60_000_000;
+        }),
+        ("btc fee", |o| o.template.btc_fee += Amount::from_sat(1)),
+        ("btc fee floor", |o| {
+            o.template.btc_fee -= Amount::from_sat(1)
+        }),
+        ("nex fee", |o| o.template.nex_fee += 1),
+        ("nex fee floor", |o| o.template.nex_fee -= 1),
+        ("t1", |o| o.template.t1 += 1),
+        ("t2", |o| o.template.t2 -= 1),
+        ("btc confirmations", |o| o.template.btc_confirmations -= 1),
+        ("max btc confirmations", |o| {
+            o.template.btc_confirmations = 13
+        }),
+        ("nex confirmations", |o| o.template.nex_confirmations -= 1),
+        ("margin", |o| o.template.margin = 5),
     ];
     for (what, change) in changes {
         let mut offer = agreed();
         change(&mut offer);
-        assert_eq!(Terms::check(&offer.terms), Ok(()), "{what}");
-        let refused =
-            check_offer(&offer, &policy.policy(), network, MAINNET, FLOOR, NEX_FLOOR).unwrap_err();
+        assert_eq!(offer.check(), Ok(()), "{what}");
+        let refused = check_offer(
+            &offer,
+            &policy.policy(&agreed()),
+            network,
+            MAINNET,
+            FLOOR,
+            NEX_FLOOR,
+        )
+        .unwrap_err();
         assert!(
             refused.starts_with("refused: the offer"),
             "{what}: {refused}"
@@ -359,7 +389,7 @@ fn take_refuses_any_term_outside_its_policy() {
     assert_eq!(
         check_offer(
             &agreed(),
-            &policy.policy(),
+            &policy.policy(&agreed()),
             network,
             MAINNET,
             FLOOR,
@@ -368,9 +398,16 @@ fn take_refuses_any_term_outside_its_policy() {
         Ok(())
     );
     let mut offer = agreed();
-    offer.terms.btc_confirmations += 1;
-    let refused =
-        check_offer(&offer, &policy.policy(), network, MAINNET, FLOOR, NEX_FLOOR).unwrap_err();
+    offer.template.btc_confirmations += 1;
+    let refused = check_offer(
+        &offer,
+        &policy.policy(&agreed()),
+        network,
+        MAINNET,
+        FLOOR,
+        NEX_FLOOR,
+    )
+    .unwrap_err();
     assert!(refused.contains("blocks to refund in"), "{refused}");
 }
 
@@ -383,23 +420,275 @@ fn the_refund_window_defaults_to_half_a_day() {
     assert_eq!(policy.min_margin, 6);
 }
 
+/// A quote is offered only if every amount in its range can be swapped:
+/// the range is not empty and the terms work at both its ends.
+#[test]
+fn a_quote_works_across_its_whole_range() {
+    let offer = agreed();
+    assert_eq!(offer.check(), Ok(()));
+    let mut empty = agreed();
+    empty.quote.min_btc_amount = empty.quote.max_btc_amount + 1;
+    let refused = empty.check().unwrap_err();
+    assert!(refused.contains("range is empty"), "{refused}");
+    // One amount is a range.
+    let mut one = agreed();
+    one.quote.min_btc_amount = one.quote.max_btc_amount;
+    assert_eq!(one.check(), Ok(()));
+    // At the least it takes, the NEX must exceed its fee: 1000 NEX at 50
+    // sat a NEX is 50000 sat.
+    let mut low = agreed();
+    low.quote.min_btc_amount = 50_049;
+    let refused = low.check().unwrap_err();
+    assert!(refused.contains("at 50049 sat"), "{refused}");
+    low.quote.min_btc_amount = 50_050;
+    assert_eq!(low.check(), Ok(()));
+    // At the most, the debit must fit a signed amount.
+    let mut high = agreed();
+    high.quote.price = 1;
+    high.quote.max_btc_amount = i64::MAX as u64 - 1_000;
+    assert_eq!(high.check(), Ok(()));
+    high.quote.max_btc_amount += 1;
+    let refused = high.check().unwrap_err();
+    assert!(
+        refused.contains(&format!("at {} sat", high.quote.max_btc_amount)),
+        "{refused}"
+    );
+    // No NEX at a price of 0.
+    let mut free = agreed();
+    free.quote.price = 0;
+    assert!(free.check().is_err());
+}
+
+/// The NEX an amount buys is rounded down, as eigenwallet's `Rate::quote`
+/// truncates: what is left buys nothing.
+#[test]
+fn the_nex_is_rounded_down() {
+    let quote = Quote {
+        price: 50,
+        min_btc_amount: 0,
+        max_btc_amount: u64::MAX,
+    };
+    assert_eq!(quote.nex_amount(49), 0);
+    assert_eq!(quote.nex_amount(50), 1);
+    assert_eq!(quote.nex_amount(99), 1);
+    assert_eq!(quote.nex_amount(100), 2);
+    assert_eq!(quote.nex_amount(u64::MAX), u64::MAX / 50);
+    assert_eq!(Quote { price: 0, ..quote }.nex_amount(100), 0);
+    let terms = agreed().terms(10_000_049);
+    assert_eq!(
+        (terms.btc_amount.to_sat(), terms.nex_amount),
+        (10_000_049, 200_000)
+    );
+}
+
+/// `take` asks only for an amount in the offer's range, at its price.
+#[test]
+fn take_asks_only_for_an_amount_in_the_range() {
+    let offer = agreed();
+    let (policy, network) = policy(&[]);
+    for (amount, taken) in [
+        (10_000_000, true),
+        (50_000_000, true),
+        (9_999_999, false),
+        (50_000_001, false),
+    ] {
+        let policy = Policy {
+            btc_amount: amount,
+            ..policy.policy(&offer)
+        };
+        let checked = check_offer(&offer, &policy, network, MAINNET, FLOOR, NEX_FLOOR);
+        assert_eq!(checked.is_ok(), taken, "{amount}: {checked:?}");
+        if !taken {
+            let refused = checked.unwrap_err();
+            assert!(
+                refused.contains("takes 10000000 to 50000000 sat"),
+                "{refused}"
+            );
+        }
+    }
+}
+
+/// The seller fixes the terms at the amount asked for only while it is in
+/// its quote's range and asked at its price.
+#[test]
+fn the_seller_answers_only_a_request_its_quote_holds() {
+    use swap::offer::Declined;
+    let offer = agreed();
+    assert_eq!(
+        offer.answer(10_000_000, 50),
+        Answer::Terms(offer.terms(10_000_000))
+    );
+    assert_eq!(
+        offer.answer(50_000_000, 50),
+        Answer::Terms(offer.terms(50_000_000))
+    );
+    let refused = |btc, price| match offer.answer(btc, price) {
+        Answer::Refused(why) => why,
+        Answer::Terms(terms) => panic!("{btc} at {price}: {terms:?}"),
+    };
+    assert_eq!(
+        refused(9_999_999, 50),
+        Declined::AmountBelowMinimum { min: 10_000_000 }
+    );
+    assert_eq!(
+        refused(50_000_001, 50),
+        Declined::AmountAboveMaximum { max: 50_000_000 }
+    );
+    assert_eq!(
+        refused(10_000_000, 49),
+        Declined::PriceChanged { price: 50 }
+    );
+    assert_eq!(
+        refused(10_000_000, 51),
+        Declined::PriceChanged { price: 50 }
+    );
+}
+
+/// The buyer starts only on terms exactly the ones it asked for: its
+/// amount, and the NEX the signed price gives for it.
+#[test]
+fn the_buyer_takes_only_the_terms_it_asked_for() {
+    let offer = agreed();
+    let (policy, _) = policy(&["--btc-amount", "20000000"]);
+    let policy = policy.policy(&offer);
+    let asked = offer.terms(20_000_000);
+    assert_eq!(asked.nex_amount, 400_000);
+    assert_eq!(
+        offer.check_answer(&policy, &Answer::Terms(asked.clone())),
+        Ok(asked.clone())
+    );
+    type Change = (&'static str, fn(&mut Terms));
+    let changes: [Change; 5] = [
+        ("more btc", |t| t.btc_amount += Amount::from_sat(1)),
+        ("less nex", |t| t.nex_amount -= 1),
+        ("more nex", |t| t.nex_amount += 1),
+        ("margin", |t| t.margin += 1),
+        ("swap id", |t| t.swap_id[0] ^= 1),
+    ];
+    for (what, change) in changes {
+        let mut terms = asked.clone();
+        change(&mut terms);
+        let refused = offer
+            .check_answer(&policy, &Answer::Terms(terms))
+            .unwrap_err();
+        assert!(
+            refused.contains("not the ones asked for"),
+            "{what}: {refused}"
+        );
+    }
+    // Terms at another price than the one signed, though the seller's own.
+    let mut repriced = offer.clone();
+    repriced.quote.price = 40;
+    let terms = repriced.terms(20_000_000);
+    assert!(offer.check_answer(&policy, &Answer::Terms(terms)).is_err());
+    let other = Policy {
+        price: 40,
+        ..policy.clone()
+    };
+    assert!(offer.check_answer(&other, &Answer::Terms(asked)).is_err());
+    let declined = Answer::Refused(swap::offer::Declined::PriceChanged { price: 60 });
+    let refused = offer.check_answer(&policy, &declined).unwrap_err();
+    assert_eq!(refused, "refused by the seller: the price is 60 sat a NEX");
+}
+
+/// A session that hands out `inbox` and keeps what is sent.
+#[derive(Default)]
+struct Scripted {
+    inbox: std::collections::VecDeque<Vec<u8>>,
+    sent: Vec<Message>,
+    swap_id: [u8; 32],
+}
+
+impl Transport for Scripted {
+    fn send(&mut self, payload: &[u8]) -> io::Result<()> {
+        self.sent
+            .push(Message::decode(payload, self.swap_id).unwrap());
+        Ok(())
+    }
+
+    fn recv(&mut self, _: Duration) -> io::Result<Option<Vec<u8>>> {
+        Ok(self.inbox.pop_front())
+    }
+}
+
+/// The request and the answer before either machine starts, as `offer`
+/// and `take` exchange them.
+#[test]
+fn the_terms_are_fixed_before_the_machines_start() {
+    let offer = agreed();
+    let swap_id = offer.template.swap_id;
+    let (policy, _) = policy(&["--btc-amount", "20000000"]);
+    let policy = policy.policy(&offer);
+    let session = |inbox: Vec<Message>| Scripted {
+        inbox: inbox.iter().map(|m| m.encode(swap_id)).collect(),
+        sent: vec![],
+        swap_id,
+    };
+    let request = |btc_amount, price| Message::Request { btc_amount, price };
+
+    // The seller answers a request in its quote with the terms at it.
+    let mut seller = session(vec![request(20_000_000, 50)]);
+    let terms = answer_request(&mut seller, &offer).unwrap();
+    assert_eq!(terms, offer.terms(20_000_000));
+    let answered = Message::Answer(Answer::Terms(terms.clone()));
+    assert_eq!(seller.sent.len(), 1);
+    assert_eq!(seller.sent[0].encode(swap_id), answered.encode(swap_id));
+    // And refuses, saying why, one outside it.
+    let mut seller = session(vec![request(50_000_001, 50)]);
+    let refused = answer_request(&mut seller, &offer).unwrap_err().to_string();
+    assert!(
+        refused.contains("the most it takes is 50000000 sat"),
+        "{refused}"
+    );
+    assert!(matches!(
+        seller.sent[..],
+        [Message::Answer(Answer::Refused(_))]
+    ));
+    let mut seller = session(vec![request(20_000_000, 49)]);
+    assert!(answer_request(&mut seller, &offer).is_err());
+    // A buyer that opens with anything else is refused.
+    let mut seller = session(vec![]);
+    assert!(answer_request(&mut seller, &offer).is_err());
+
+    // The buyer asks for its amount at the signed price, and takes the
+    // terms only if they are the ones it asked for.
+    let mut buyer = session(vec![answered]);
+    assert_eq!(request_terms(&mut buyer, &offer, &policy).unwrap(), terms);
+    assert_eq!(
+        buyer.sent[0].encode(swap_id),
+        request(20_000_000, 50).encode(swap_id)
+    );
+    let mut other = terms.clone();
+    other.nex_amount += 1;
+    let mut buyer = session(vec![Message::Answer(Answer::Terms(other))]);
+    assert!(request_terms(&mut buyer, &offer, &policy).is_err());
+    let mut buyer = session(vec![]);
+    let refused = request_terms(&mut buyer, &offer, &policy).unwrap_err();
+    assert_eq!(refused.to_string(), "the seller sent no answer");
+}
+
 #[test]
 fn take_refuses_terms_that_cannot_work() {
     let (policy, network) = policy(&["--max-t1", "1000"]);
     let mut offer = agreed();
-    offer.terms.t1 = 100;
+    offer.template.t1 = 100;
     assert!(
-        check_offer(&offer, &policy.policy(), network, MAINNET, 0, 0).is_err(),
+        check_offer(&offer, &policy.policy(&agreed()), network, MAINNET, 0, 0).is_err(),
         "below the floor"
     );
 }
 
+/// `take` needs the price agreed to; the amount defaults to the most the
+/// offer takes, as eigenwallet's CLI swaps up to its seller's maximum.
 #[test]
-fn take_requires_the_agreed_amounts() {
-    for amount in ["--btc-amount", "--nex-amount"] {
-        let args = ["take", "offer", "--nex-address", "b", amount, "1"];
-        assert!(parse(&args).is_err(), "{amount}");
-    }
+fn take_requires_the_agreed_price() {
+    let args = ["take", "offer", "--nex-address", "b", "--btc-amount", "1"];
+    assert!(parse(&args).is_err());
+    let (policy, _) = policy(&[]);
+    assert_eq!(policy.btc_amount, None);
+    assert_eq!(policy.policy(&agreed()).btc_amount, 50_000_000);
+    let (policy, _) = self::policy(&["--btc-amount", "10000000"]);
+    assert_eq!(policy.policy(&agreed()).btc_amount, 10_000_000);
 }
 
 #[test]
@@ -769,7 +1058,7 @@ fn take_refusal_on(
     fs::write(file.path(), offer.encode()).unwrap();
     let path = file.path().to_str().unwrap();
     let mut args = vec!["take", path, "--nex-address", address];
-    args.extend(["--btc-amount", "50000000", "--nex-amount", "1000000"]);
+    args.extend(["--price", "50"]);
     args.extend(extra);
     refusal_on(&args, btc_url, nexus_url)
 }
@@ -809,10 +1098,10 @@ fn take_refuses_a_fee_below_its_nodes_estimate() {
     let address = swap_nexus_tx::address(&[9; 32]);
     let floor = btc_fee_at(10_000);
     let mut offer = takeable();
-    offer.terms.btc_fee = Amount::from_sat(floor - 1);
+    offer.template.btc_fee = Amount::from_sat(floor - 1);
     let refused = take_refusal(&offer, &address, &[], &bitcoind(estimate()));
     assert!(refused.contains("below the"), "{refused}");
-    offer.terms.btc_fee = Amount::from_sat(floor);
+    offer.template.btc_fee = Amount::from_sat(floor);
     let taken = take_refusal(&offer, &address, &[], &bitcoind(estimate()));
     assert_eq!(taken, PAST_THE_CHECKS);
 
@@ -894,15 +1183,21 @@ fn an_amount_that_cannot_pay_redeem_is_refused() {
     assert!(Terms::check(&terms).is_err(), "no overflow");
 
     // `offer` refuses before it asks any node; `take` before it dials.
+    // Either end of the range.
     let mut args = offer_args(&[]);
-    args.terms.btc_amount = 2_545;
+    args.terms.min_btc_amount = 2_545;
     let refused = offer(args).unwrap_err().to_string();
-    assert!(refused.contains("redeem pays two btc_fee"), "{refused}");
-    let (policy, network) = policy(&[]);
+    assert!(refused.contains("at 2545 sat, btc_amount"), "{refused}");
+    let (policy, network) = policy(&["--btc-amount", "20545"]);
     let mut offer = agreed();
-    offer.terms.btc_amount = Amount::from_sat(2 * 10_000 + 545);
-    let refused =
-        check_offer(&offer, &policy.policy(), network, MAINNET, FLOOR, NEX_FLOOR).unwrap_err();
+    offer.quote.price = 1;
+    offer.quote.min_btc_amount = 2 * 10_000 + 545;
+    offer.quote.max_btc_amount = 2 * 10_000 + 545;
+    let policy = Policy {
+        price: 1,
+        ..policy.policy(&offer)
+    };
+    let refused = check_offer(&offer, &policy, network, MAINNET, FLOOR, NEX_FLOOR).unwrap_err();
     assert!(refused.contains("redeem pays two btc_fee"), "{refused}");
 }
 
@@ -1203,7 +1498,7 @@ fn every_run_checks_its_node() {
 fn take_again_points_at_resume() {
     let offer = takeable();
     let directory = tempfile::tempdir().unwrap();
-    let store = Store::new(directory.path(), offer.terms.swap_id);
+    let store = Store::new(directory.path(), offer.template.swap_id);
     fs::write(store.path(), "{}").unwrap();
     let address = swap_nexus_tx::address(&[9; 32]);
     let dir = ["--dir", directory.path().to_str().unwrap()];
@@ -1396,12 +1691,14 @@ fn offer_take_and_resume_check_the_nexus_node() {
     refused(refusal_on(
         &[
             "offer",
-            "--btc-amount",
+            "--price",
+            "50",
+            "--min-btc-amount",
+            "10000000",
+            "--max-btc-amount",
             "50000000",
             "--btc-fee",
             &fee,
-            "--nex-amount",
-            "1000000",
             "--nex-fee",
             "10",
             "--listen",
@@ -1441,24 +1738,17 @@ fn the_nexus_genesis_defaults_to_mainnets() {
         MAINNET,
         "bafyreiggtg4ezifboyekbf4gxst2jr3mpjqcxsbmopy7w6fp46g4ngpgxa"
     );
-    let take = [
-        "take",
-        "o",
-        "--nex-address",
-        "b",
-        "--btc-amount",
-        "1",
-        "--nex-amount",
-        "1",
-    ];
+    let take = ["take", "o", "--nex-address", "b", "--price", "1"];
     for args in [
         &[
             "offer",
-            "--btc-amount",
+            "--price",
+            "1",
+            "--min-btc-amount",
+            "1",
+            "--max-btc-amount",
             "1",
             "--btc-fee",
-            "1",
-            "--nex-amount",
             "1",
             "--nex-fee",
             "1",
@@ -1500,12 +1790,14 @@ fn offer_take_and_resume_refuse_another_nexus() {
     let offer = |extra: &[&str], nexus_url: &str| {
         let mut args = vec![
             "offer",
-            "--btc-amount",
+            "--price",
+            "50",
+            "--min-btc-amount",
+            "10000000",
+            "--max-btc-amount",
             "50000000",
             "--btc-fee",
             &fee,
-            "--nex-amount",
-            "1000000",
             "--nex-fee",
             "10",
             "--listen",
@@ -1538,7 +1830,7 @@ fn offer_take_and_resume_refuse_another_nexus() {
     };
     refused(take(&takeable(), &[], &elsewhere()), &dev, MAINNET);
     let mut dev_offer = takeable();
-    dev_offer.terms.nexus_genesis = dev.clone();
+    dev_offer.template.nexus_genesis = dev.clone();
     refused(
         take(&dev_offer, &on_dev, &nexus_node(10, true)),
         MAINNET,
@@ -1632,7 +1924,7 @@ fn offer_and_take_refuse_a_nex_fee_below_the_floor() {
     let url = bitcoind(estimate());
     let taken_with = |nex_fee: u64, extra: &[&str], node: &str| {
         let mut offer = takeable();
-        offer.terms.nex_fee = nex_fee;
+        offer.template.nex_fee = nex_fee;
         take_refusal_on(&offer, &address, extra, &url, node)
     };
     let taken = |nex_fee: u64, extra: &[&str], relay: u64| {
