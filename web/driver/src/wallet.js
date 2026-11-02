@@ -33,6 +33,12 @@ export const DEFAULTS = {
   /** Called once if another tab holds the store: the page shows "open in
    * another tab", and goes on once that tab closes. */
   onWaiting: undefined,
+  /** Called once this page holds the store's Web Lock, whether or not it
+   * waited: `onWaiting`'s counterpart, when the page stops showing "open
+   * in another tab". The Web Locks API marks the same moment by calling a
+   * request's callback with the lock granted. Not called where `locks` is
+   * null, with no lock to hold. */
+  onAcquired: undefined,
   network: 'bitcoin',
   /** The Esplora API; by default `ESPLORA[network]`. */
   esplora: undefined,
@@ -75,12 +81,13 @@ const instances = new WeakMap();
  * exclusive Web Lock `lattice-swap` from then until it closes. If another
  * tab holds it, `onWaiting` is called and this page waits for that tab to
  * close; it reads the store only once it holds the lock. */
-function single(locks = globalThis.navigator?.locks, onWaiting = undefined) {
+function single(locks = globalThis.navigator?.locks, onWaiting = undefined, onAcquired = undefined) {
   if (locks === null) return Promise.resolve();
   if (locks === undefined) throw new Error('refused: this browser has no Web Locks, to keep one tab on the swap');
   if (!instances.has(locks)) {
     const instance = new Promise((resolve, reject) => {
       const hold = () => {
+        onAcquired?.();
         resolve();
         return new Promise(() => {});
       };
@@ -107,8 +114,41 @@ function single(locks = globalThis.navigator?.locks, onWaiting = undefined) {
  * the one instance driving the store, so one lock for it is one per store. */
 let swapLock = Promise.resolve();
 
+/** Runs `act` once the swap lock is free, holding it until `act` settles:
+ * {@link Wallet#exclusive}, which `restore` takes too. */
+function exclusively(act) {
+  const run = swapLock.then(act);
+  swapLock = run.catch(() => {});
+  return run;
+}
+
+/** Whether a swap's record has taken its offer and not ended: what
+ * {@link Wallet#running} looks for, one swap at a time. */
+export function isRunning(record) {
+  return record.taken && !ended(record.state);
+}
+
 export class Wallet {
-  /** The wallet in `config.store`, made and saved first if there is none. */
+  /** Whether `config.store` holds a wallet, no key made: a page opens
+   * one only when it does, or when the buyer starts, as
+   * Bitcoin Core's `listwallets` names wallets without `createwallet`.
+   * Read without the Web Lock, and safe so: the key is only ever added
+   * where none is (`add`) and never written over or deleted, so another
+   * tab can only have made it since, and `open` then reads that one. A
+   * store made here, with none given, is closed once read.
+   * @returns {Promise<boolean>} */
+  static async exists(config) {
+    const store = config.store ?? new IndexedDBStore();
+    try {
+      return (await store.get(WALLET)) !== null;
+    } finally {
+      if (!config.store) (await store.database).close();
+    }
+  }
+
+  /** The wallet in `config.store`, made and saved first if there is none.
+   * Resolves once this page holds the store (see `onAcquired`).
+   * @returns {Promise<Wallet>} */
   static async open(config) {
     const c = { ...DEFAULTS, ...config };
     c.store ??= new IndexedDBStore();
@@ -116,7 +156,7 @@ export class Wallet {
     c.WebSocket ??= globalThis.WebSocket;
     c.esplora ??= ESPLORA[c.network];
     if (!c.esplora) throw new Error(`no default Esplora for ${c.network}: give one`);
-    await single(c.locks, c.onWaiting);
+    await single(c.locks, c.onWaiting, c.onAcquired);
     let key = await c.store.get(WALLET);
     if (key === null) {
       // Written only where none is, and read back, as Bitcoin Core's
@@ -134,20 +174,23 @@ export class Wallet {
     this.nexus = new Nexus(config.nexus, config.fetch);
   }
 
-  /** Where the buyer deposits. */
+  /** Where the buyer deposits.
+   * @returns {string} */
   get address() {
     return this.key.address;
   }
 
   /** The outputs the wallet holds: those in a block are spendable, as
-   * Bitcoin Core spends none it received still unconfirmed. */
+   * Bitcoin Core spends none it received still unconfirmed.
+   * @returns {Promise<{txid: string, vout: number, value: number}[]>} */
   async spendable() {
     const utxos = await this.esplora.utxos(this.address);
     return utxos.filter((utxo) => utxo.height !== null).map(({ txid, vout, value }) => ({ txid, vout, value }));
   }
 
   /** `{confirmed, unconfirmed}`, in sat: what the wallet can spend, and
-   * what is on its way to it. */
+   * what is on its way to it.
+   * @returns {Promise<{confirmed: number, unconfirmed: number}>} */
   async balance() {
     const utxos = await this.esplora.utxos(this.address);
     const sum = (confirmed) =>
@@ -157,23 +200,37 @@ export class Wallet {
 
   /** The Esplora's estimate for the CLI's target, in whole sat/vB, never
    * below the relay floor, which is also the rate where it has none, as on
-   * regtest: how Electrum and eigenwallet price their own spends. */
+   * regtest: how Electrum and eigenwallet price their own spends.
+   * @returns {Promise<number>} */
   async feeRate() {
     const estimate = await this.esplora.feeRate(FEE_TARGET);
     return Math.max(MIN_RELAY, Math.ceil(estimate ?? MIN_RELAY));
   }
 
-  /** The swap ids in the store. */
+  /** `{enough, need}`: whether the spendable balance funds a swap of
+   * `btcAmount` sat at today's fee rate, and the balance a funding with
+   * change needs, in sat: what a swap's `status().need` shows before it
+   * takes its offer, and what a page shows for an amount before preparing
+   * one. Only the amount counts: the lock is that output, and the offer's
+   * swap fees are paid out of it.
+   * @returns {Promise<{enough: boolean, need: number}>} */
+  async need(btcAmount) {
+    const utxos = await this.spendable();
+    return call('walletNeed', { utxos, amount: btcAmount, fee_rate: await this.feeRate() });
+  }
+
+  /** The swap ids in the store.
+   * @returns {Promise<string[]>} */
   async swaps() {
     return (await this.config.store.keys()).filter((key) => key.startsWith('swap:')).map((key) => key.slice(5));
   }
 
   /** The swap that has taken its offer and not ended, if any: eigenwallet
-   * runs one swap at a time. */
+   * runs one swap at a time.
+   * @returns {Promise<string | null>} */
   async running() {
     for (const id of await this.swaps()) {
-      const record = await this.config.store.get(swapKey(id));
-      if (record.taken && !ended(record.state)) return id;
+      if (isRunning(await this.config.store.get(swapKey(id)))) return id;
     }
     return null;
   }
@@ -181,15 +238,17 @@ export class Wallet {
   /** Runs `act` with the wallet's outputs to itself, as eigenwallet's
    * `SwapLock` is held from a swap's start: a withdrawal, a swap prepared,
    * or one taking its offer, until it is saved as taken, each waits for
-   * the one before. */
+   * the one before. `act`'s answer, or its failure.
+   * @template T
+   * @param {() => T | Promise<T>} act
+   * @returns {Promise<T>} */
   exclusive(act) {
-    const run = swapLock.then(act);
-    swapLock = run.catch(() => {});
-    return run;
+    return exclusively(act);
   }
 
   /** Sends the whole spendable balance to `address`, less its fee: the
-   * txid. Not while a swap runs, whose funding spends the same outputs. */
+   * txid. Not while a swap runs, whose funding spends the same outputs.
+   * @returns {Promise<string>} */
   withdraw(address) {
     return this.exclusive(async () => {
       const running = await this.running();
@@ -210,7 +269,8 @@ export class Wallet {
 
   /** The recovery file, `{name, file}`, as Boltz has its buyer download
    * one: the wallet key and every swap not yet ended, as each stands now.
-   * {@link Wallet.restore} reads it. */
+   * {@link Wallet.restore} reads it.
+   * @returns {Promise<{name: string, file: string}>} */
   async backup() {
     const swaps = [];
     for (const id of await this.swaps()) {
@@ -225,7 +285,10 @@ export class Wallet {
 
   /** The wallet in a recovery `file` from {@link Wallet#backup}, put in
    * `config.store` with its swaps, but those the store holds already.
-   * Refuses a store that holds another wallet, whose key it would lose. */
+   * Refuses a store that holds another wallet, whose key it would lose,
+   * and a file whose unfinished swap would run beside another the store
+   * runs: one swap at a time, as eigenwallet's `SwapLock` refuses a second.
+   * @returns {Promise<Wallet>} */
   static async restore(config, file) {
     const c = { ...DEFAULTS, ...config };
     c.store ??= new IndexedDBStore();
@@ -233,7 +296,7 @@ export class Wallet {
     if (backup.format !== FORMAT) throw new Error('not a recovery file');
     if (backup.network !== c.network) throw new Error(`the file is for ${backup.network}, not ${c.network}`);
     const key = call('bitcoinKeyOf', backup.wallet, c.network);
-    await single(c.locks, c.onWaiting);
+    await single(c.locks, c.onWaiting, c.onAcquired);
     const held = await c.store.get(WALLET);
     if (held !== null && held.wif !== key.wif) throw new Error('refused: the store holds another wallet');
     const records = backup.swaps.map(({ version, state, ...record }) => {
@@ -242,13 +305,30 @@ export class Wallet {
       if (restored.side !== 'buyer') throw new Error('not a buyer’s swap');
       return { ...record, state: JSON.stringify(restored.state) };
     });
-    // Never over another wallet, as `open` makes one.
-    await c.store.add(WALLET, key);
-    if ((await c.store.get(WALLET)).wif !== key.wif) throw new Error('refused: the store holds another wallet');
-    // A swap the store holds is as far on as the file's, or further.
-    for (const record of records) {
-      if ((await c.store.get(swapKey(record.swap_id))) === null) await c.store.put(swapKey(record.swap_id), record);
-    }
+    // Under the swap lock, as a swap taking its offer is: what runs is
+    // read and added to at once.
+    await exclusively(async () => {
+      // A swap the store holds is as far on as the file's, or further;
+      // one it holds untaken that the file holds taken is not, and is
+      // refused, as another wallet's key is.
+      const added = [];
+      for (const record of records) {
+        const held = await c.store.get(swapKey(record.swap_id));
+        if (held === null) added.push(record);
+        else if (!held.taken && record.taken) {
+          throw new Error(`refused: the store holds swap ${record.swap_id} untaken, and the file holds it taken`);
+        }
+      }
+      const ids = (await c.store.keys()).filter((id) => id.startsWith('swap:'));
+      const runs = [];
+      for (const id of ids) if (isRunning(await c.store.get(id))) runs.push(id.slice(5));
+      for (const record of added) if (isRunning(record)) runs.push(record.swap_id);
+      if (runs.length > 1) throw new Error(`refused: swaps ${runs.join(' and ')} would both run; one swap at a time`);
+      // Never over another wallet, as `open` makes one.
+      await c.store.add(WALLET, key);
+      if ((await c.store.get(WALLET)).wif !== key.wif) throw new Error('refused: the store holds another wallet');
+      for (const record of added) await c.store.put(swapKey(record.swap_id), record);
+    });
     return Wallet.open(c);
   }
 }
