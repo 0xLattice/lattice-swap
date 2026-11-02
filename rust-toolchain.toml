@@ -1,0 +1,8 @@
+# The toolchain CI builds, lints and tests with, and build.sh builds the
+# browser's wasm with: one compiler for every build, as Cargo.lock pins one
+# set of dependencies (`--locked`). The stable release CI ran on when this
+# was pinned; rustup installs it where it is missing.
+[toolchain]
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]

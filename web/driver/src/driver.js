@@ -14,7 +14,7 @@
 import { call, safe, wasm } from './wasm.js';
 import { bitcoinView, checkNexus, nexusView } from './views.js';
 import { Session } from './relay.js';
-import { ended, swapKey } from './wallet.js';
+import { ended, isRunning, swapKey } from './wallet.js';
 
 /** About ten minutes a Bitcoin block. */
 const BLOCK_MS = 600_000;
@@ -54,14 +54,23 @@ export class Buyer extends EventTarget {
   #gone = null;
   #status = '';
   #wake = null;
+  /** Whether the Nexus node is known to follow the swap's Nexus:
+   * `prepare` checks it first; a resumed swap checks it the first round
+   * it reads Nexus. */
+  #nexusChecked;
+  /** The terms the swap was taken on: the offer's at the policy's amount,
+   * the only ones `#request` accepts. */
+  #terms;
 
-  constructor(wallet, record) {
+  constructor(wallet, record, nexusChecked) {
     super();
     this.#wallet = wallet;
     this.#c = wallet.config;
     this.#r = record;
     this.#kind = kind(record.state);
     this.#since = this.#c.now();
+    this.#nexusChecked = nexusChecked;
+    this.#terms = call('offerTerms', { offer: record.offer, btc_amount: record.policy.btc_amount });
   }
 
   /** A swap of `offer`, an offer's text from a relay's board, that the
@@ -73,7 +82,8 @@ export class Buyer extends EventTarget {
    * The NEX goes to `nexAddress`, and a refund to the wallet. Refuses the
    * offer as the CLI's `take` would, and while another swap runs. A swap
    * prepared before that never took its offer is dropped: nothing was sent
-   * for it. */
+   * for it.
+   * @returns {Promise<Buyer>} */
   static async prepare(wallet, { offer, policy, nexAddress }) {
     const decoded = call('decodeOffer', offer);
     if (!safe(decoded) || !safe(policy)) throw new Error('refused: an amount JavaScript cannot hold exactly');
@@ -99,22 +109,29 @@ export class Buyer extends EventTarget {
         // The hello, sent once the seller has answered with these terms.
         pending: started.actions,
         taken: false,
+        // Where the NEX goes, for `status()`.
+        nex_address: nexAddress,
       };
       await store.put(swapKey(record.swap_id), record);
-      return new Buyer(wallet, record);
+      return new Buyer(wallet, record, true);
     });
   }
 
   /** The swap `swapId` in the wallet's store, carried on from where it
    * stopped. Its session, if it had one, is gone: the swap goes on from
-   * the chains, as after `lattice-swap resume`. */
+   * the chains, as after `lattice-swap resume`. Reads no backend: the
+   * Nexus node is checked by `run`, the first round it is needed, and a
+   * failed check is a round's warning, retried the next, as eigenwallet
+   * resumes a swap and retries its backends. A refunding swap watches no
+   * Nexus, and never waits on one.
+   * @returns {Promise<Buyer>} */
   static async resume(wallet, swapId) {
     const record = await wallet.config.store.get(swapKey(swapId));
     if (!record) throw new Error(`no swap ${swapId} in the store`);
-    await checkNexus(wallet.nexus, wallet.config.nexusGenesis);
-    return new Buyer(wallet, record);
+    return new Buyer(wallet, record, false);
   }
 
+  /** @returns {string} */
   get swapId() {
     return this.#r.swap_id;
   }
@@ -147,7 +164,17 @@ export class Buyer extends EventTarget {
    * - `backupCovers`: what a recovery file taken now covers: `wallet`, or
    *   `lock` once the funding may be broadcast, from when a page asks the
    *   buyer to download it, as Boltz asks for its refund file;
-   * - `tip`, and `warning`, the last failure, if any. */
+   * - `running`: the swap has taken its offer and not ended, as
+   *   {@link Wallet#running} judges it: while it does, no other swap is
+   *   prepared and the wallet withdraws nothing;
+   * - `btc_amount`, in sat, `price`, in sat a NEX of 1,000,000 base units,
+   *   and `nex_amount`, in base units: the terms asked for at take, the
+   *   only ones the swap goes on with; `btc_confirmations` and
+   *   `nex_confirmations`, how deep each lock must be, for "1 of N";
+   * - `nexAddress`, where the NEX goes (null for a swap prepared before
+   *   it was recorded);
+   * - `tip`, and `warning`, the last failure, if any.
+   * @returns {object} */
   status() {
     const r = this.#r;
     const machine = call('buyerStatus', r.state, this.#view);
@@ -166,6 +193,13 @@ export class Buyer extends EventTarget {
       deadlines: { cancel: null, refund: null, punish: null },
       mustStayOpen: machine.must_stay_open || machine.phase === 'refunding',
       backupCovers: machine.backup_covers,
+      running: isRunning(r),
+      btc_amount: this.#terms.btc_amount,
+      price: r.policy.price,
+      nex_amount: this.#terms.nex_amount,
+      btc_confirmations: this.#terms.btc_confirmations,
+      nex_confirmations: this.#terms.nex_confirmations,
+      nexAddress: r.nex_address ?? null,
       tip: this.#tip,
       warning: this.#gone ?? this.#warning,
     };
@@ -179,7 +213,10 @@ export class Buyer extends EventTarget {
 
   /** Runs the swap until it ends, its offer is gone, or `signal` aborts:
    * the outcome, once it ends. A
-   * `status` event follows every change of {@link Buyer#status}. */
+   * `status` event follows every change of {@link Buyer#status}. A failed
+   * round, a backend's or the Nexus check's, is the status's `warning`,
+   * and the next round tries again.
+   * @returns {Promise<string | null>} */
   async run(signal) {
     while (!signal?.aborted) {
       let done = null;
@@ -241,11 +278,10 @@ export class Buyer extends EventTarget {
         this.#gone = 'refused: this swap was dropped when another was prepared';
         return false;
       }
-      const amount = r.policy.btc_amount;
-      const fee_rate = await this.#wallet.feeRate();
-      const { enough, need } = call('walletNeed', { utxos: await this.#wallet.spendable(), amount, fee_rate });
+      const { enough, need } = await this.#wallet.need(r.policy.btc_amount);
       this.#need = need;
       if (!enough) return false;
+      await this.#checkNexus();
       const refused = await refusal(this.#wallet, r.offer, r.policy);
       if (refused !== null) throw new Error(refused);
       const open = this.#c.openSession ?? Session.open;
@@ -358,6 +394,7 @@ export class Buyer extends EventTarget {
       }
     } else if (action.Submit) {
       try {
+        await this.#checkNexus();
         await this.#wallet.nexus.submit(wasm.nexusSubmitBody(JSON.stringify(action.Submit)));
       } catch (e) {
         this.#warning = `nexus submit: ${e.message}`;
@@ -386,11 +423,21 @@ export class Buyer extends EventTarget {
   async #observeNexus() {
     const watch = call('watchBuyer', this.#r.state).nexus;
     if (!watch) return;
+    await this.#checkNexus();
     const view = await nexusView(this.#wallet.nexus, watch);
     // The tip moved while the view was read: read again next round.
     if (view === null) return;
     this.#nexusDepth = view.watched?.[1] ?? null;
     await this.#apply({ Nexus: view });
+  }
+
+  /** Refuses a node on another Nexus, once per Buyer: a resumed swap's
+   * first use of it, as `prepare` checks it before anything else. Throws
+   * into the round, as any failed read does. */
+  async #checkNexus() {
+    if (this.#nexusChecked) return;
+    await checkNexus(this.#wallet.nexus, this.#c.nexusGenesis);
+    this.#nexusChecked = true;
   }
 
   async #save() {

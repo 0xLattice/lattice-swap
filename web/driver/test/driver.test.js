@@ -45,7 +45,8 @@ async function world({ store = new MemoryStore(), policy = POLICY, chain = new C
     if (funding !== hex && !txids.includes(parseTx(hex).txid)) unsaved.push({ broadcast: hex.slice(0, 16), state: kind(record.state) });
   };
   const a = await esplora(chain, onPost);
-  const node = await nexus();
+  w.node = {};
+  const node = await nexus(w.node);
   servers.push(a, node);
   w.a = a;
   w.offer = testOffer('http://relay.invalid');
@@ -535,4 +536,174 @@ test('a swap dropped by a later prepare never takes its offer', async () => {
   assert.match(first.status().warning, /dropped when another was prepared/);
   assert.equal(w.seller.log.length, 0, 'nothing sent');
   assert.equal((await w.store.get(`swap:${second.swapId}`)).taken, false, 'the second’s record kept');
+});
+
+test('a swap resumes with its Nexus node down, and drives on from Bitcoin', async () => {
+  const { w, run, funding } = await funded();
+  await run.stop();
+  w.node.down = true;
+  // Resumed from the store, as a page reopened resumes it: no backend read.
+  const buyer = await Buyer.resume(w.wallet, w.buyer.swapId);
+  const again = running(buyer);
+  confirm(w, funding);
+  await until(() => buyer.status().confirmations.funding === 1);
+  await again.stop();
+  assert.equal(buyer.status().warning, null, 'a state that watches no Nexus never reads it');
+});
+
+test('a resumed swap whose Nexus node is down warns, and takes its offer once it is back', async () => {
+  const w = await world();
+  w.node.down = true;
+  const buyer = await Buyer.resume(w.wallet, w.buyer.swapId);
+  deposit(w, 1_100_000);
+  const run = running(buyer);
+  await until(() => /503 down/.test(buyer.status().warning ?? ''));
+  assert.equal(w.seller.log.length, 0);
+  w.node.down = false;
+  await until(() => w.seller.log.length > 0);
+  await run.stop();
+});
+
+test('a resumed swap still refuses a node on another Nexus before taking its offer', async () => {
+  const w = await world();
+  w.node.genesis = 'another';
+  const buyer = await Buyer.resume(w.wallet, w.buyer.swapId);
+  deposit(w, 1_100_000);
+  const run = running(buyer);
+  await until(() => /another/.test(buyer.status().warning ?? ''));
+  await pause(20);
+  await run.stop();
+  assert.equal(w.seller.log.length, 0, 'not taken');
+  assert.equal(buyer.status().step, 'fund-wallet');
+});
+
+test('onAcquired says when the tab holds the store, after onWaiting if it waited', async () => {
+  const locks = new Locks();
+  const first = locks.tab();
+  const events = [];
+  const store = new MemoryStore();
+  const config = { network: 'regtest', esplora: 'http://esplora.invalid', store };
+  await Wallet.open({ ...config, locks: first, onWaiting: () => events.push('first waits'), onAcquired: () => events.push('first holds') });
+  assert.deepEqual(events, ['first holds']);
+  const second = Wallet.open({ ...config, locks: locks.tab(), onWaiting: () => events.push('second waits'), onAcquired: () => events.push('second holds') });
+  await until(() => events.length === 2);
+  await pause(20);
+  assert.deepEqual(events, ['first holds', 'second waits']);
+  locks.close(first);
+  await second;
+  assert.deepEqual(events, ['first holds', 'second waits', 'second holds']);
+});
+
+test('status() carries the amounts, the confirmations asked for, the NEX address and whether it runs', async () => {
+  const w = await world();
+  const terms = {
+    btc_amount: TERMS.btc_amount,
+    price: POLICY.price,
+    nex_amount: TERMS.nex_amount,
+    btc_confirmations: OFFER.template.btc_confirmations,
+    nex_confirmations: OFFER.template.nex_confirmations,
+    nexAddress: w.nexAddress,
+  };
+  const pick = (status) => Object.fromEntries(Object.keys(terms).map((key) => [key, status[key]]));
+  assert.deepEqual(pick(w.buyer.status()), terms);
+  assert.equal(TERMS.nex_amount, 500_000);
+  assert.equal(w.buyer.status().running, false, 'not taken');
+  deposit(w, 1_100_000);
+  const run = running(w.buyer);
+  await until(() => w.buyer.status().running);
+  assert.equal(await w.wallet.running(), w.buyer.swapId, 'as the wallet judges it');
+  await run.stop();
+  // A restored swap shows the same.
+  const wallet = await Wallet.restore({ ...w.config, store: new MemoryStore() }, (await w.wallet.backup()).file);
+  const resumed = await Buyer.resume(wallet, w.buyer.swapId);
+  assert.deepEqual(pick(resumed.status()), terms);
+  assert.equal(resumed.status().running, true);
+});
+
+test('a swap that ends is no longer running', async () => {
+  const clock = { offset: 0 };
+  const w = await world({ extra: { now: () => Date.now() + clock.offset } });
+  w.seller.open = async (_offer, onMessage) => ({
+    closed: false,
+    send(message) {
+      if (JSON.parse(message).Request) setTimeout(() => onMessage(JSON.stringify({ Answer: { Terms: TERMS } })), 1);
+    },
+    close() {},
+  });
+  deposit(w, 1_100_000);
+  const run = running(w.buyer);
+  await until(() => w.buyer.status().running);
+  clock.offset += 61_000;
+  assert.equal(await run.done, 'aborted');
+  assert.equal(w.buyer.status().running, false);
+});
+
+test('a wallet is found, and a swap’s need computed, without making a key', async () => {
+  const store = new MemoryStore();
+  const locks = new Locks();
+  const other = locks.tab();
+  const config = { network: 'regtest', esplora: 'http://esplora.invalid', store, locks: other };
+  assert.equal(await Wallet.exists(config), false);
+  assert.deepEqual(store.puts, [], 'nothing written');
+  await Wallet.open(config);
+  // Answered while another tab holds the store: a plain read.
+  assert.equal(await Wallet.exists({ ...config, locks: locks.tab() }), true);
+
+  const w = await world({ policy: { ...POLICY, btc_amount: 500_000 } });
+  deposit(w, 100_000);
+  const short = await w.wallet.need(500_000);
+  assert.equal(short.enough, false);
+  assert.ok(short.need > 500_000 && short.need < 501_000, `${short.need}`);
+  assert.equal((await w.wallet.need(50_000)).enough, true);
+  assert.ok((await w.wallet.need(50_000)).need < 51_000);
+  // What the swap asks for, before it takes its offer.
+  const run = running(w.buyer);
+  await until(() => w.buyer.status().need !== null);
+  await run.stop();
+  assert.equal(w.buyer.status().need, short.need);
+});
+
+test('a restore refuses a second unfinished swap beside one the store runs', async () => {
+  const { w, run, record } = await funded();
+  await run.stop();
+  const { file } = await w.wallet.backup();
+  // A store with the same wallet, running another swap.
+  const store = new MemoryStore();
+  await store.put('wallet', { wif: w.wallet.key.wif });
+  const other = { ...record, swap_id: 'ff'.repeat(32) };
+  await store.put(`swap:${other.swap_id}`, other);
+  await assert.rejects(Wallet.restore({ ...w.config, store }, file), /would both run; one swap at a time/);
+  assert.deepEqual((await store.keys()).sort(), [`swap:${other.swap_id}`, 'wallet'], 'nothing added');
+  // Beside a swap that ended, or never took its offer, it restores.
+  for (const beside of [{ ...other, state: JSON.stringify({ Done: 'Swapped' }) }, { ...other, taken: false }]) {
+    const fine = new MemoryStore();
+    await fine.put(`swap:${other.swap_id}`, beside);
+    const wallet = await Wallet.restore({ ...w.config, store: fine }, file);
+    assert.equal(await wallet.running(), record.swap_id);
+  }
+});
+
+test('the wasm builds from the pinned dependencies and toolchain', async () => {
+  const { readFileSync } = await import('node:fs');
+  const build = readFileSync(new URL('../build.sh', import.meta.url), 'utf8');
+  assert.match(build, /^cargo build --release --locked -p swap-wasm /m);
+  const toolchain = readFileSync(new URL('../../../rust-toolchain.toml', import.meta.url), 'utf8');
+  assert.match(toolchain, /^channel = "\d+\.\d+\.\d+"$/m, 'an exact release, not a channel that moves');
+});
+
+test('every public method of Wallet and Buyer documents what it returns', async () => {
+  const { readFileSync } = await import('node:fs');
+  for (const [file, cls] of [['wallet.js', Wallet], ['driver.js', Buyer]]) {
+    const source = readFileSync(new URL(`../src/${file}`, import.meta.url), 'utf8');
+    const names = [
+      ...Object.getOwnPropertyNames(cls).filter((name) => typeof cls[name] === 'function'),
+      ...Object.getOwnPropertyNames(cls.prototype).filter((name) => name !== 'constructor'),
+    ];
+    for (const name of names) {
+      const at = source.search(new RegExp(`^  (static )?(async )?(get )?${name}\\(`, 'm'));
+      assert.ok(at > 0, `${cls.name}.${name} found`);
+      const doc = source.slice(source.lastIndexOf('/**', at), at);
+      assert.match(doc, /@returns \{.+\}\s*\*\/\s*$/, `${cls.name}.${name}`);
+    }
+  }
 });
