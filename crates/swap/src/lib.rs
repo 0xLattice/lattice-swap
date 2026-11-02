@@ -10,6 +10,8 @@
 //!
 //! The order of a swap:
 //!
+//! 0. B -> S `Request`, S -> B `Answer`: the amount the buyer picks from
+//!    the offer's quote, and the terms the seller fixes at it.
 //! 1. B -> S `BuyerHello`, S -> B `SellerHello`: Bitcoin keys, key shares
 //!    with their cross-curve proofs, payout scripts.
 //! 2. B -> S `LockProposal`: the funding transaction, unsigned. B has
@@ -240,9 +242,20 @@ pub fn btc_fee_at(per_kvb: u64) -> u64 {
         .expect("two spends")
 }
 
-/// The messages, in the order they are sent.
+/// The messages, in the order they are sent. `Request` and `Answer` fix
+/// the terms before either machine starts, as eigenwallet's swap setup
+/// opens with `SpotPriceRequest` and `SpotPriceResponse`
+/// (swap-p2p/src/protocols/swap_setup.rs); the machines never see them.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Message {
+    /// B -> S: the satoshis the buyer takes from the offer's quote, at the
+    /// price it read there.
+    Request {
+        btc_amount: u64,
+        price: u64,
+    },
+    /// S -> B: the terms at that amount, or why not.
+    Answer(offer::Answer),
     BuyerHello {
         key: Point<EvenY>,
         share: Box<ShareProof>,

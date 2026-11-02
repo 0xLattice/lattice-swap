@@ -24,9 +24,9 @@ use rand_core::{OsRng, RngCore};
 use serde_json::{json, Value};
 use swap::bitcoind::{Bitcoin, Bitcoind};
 use swap::driver::{Driver, Store};
-use swap::offer::{self, check_offer, Bounds, Offer, Place, Policy};
+use swap::offer::{self, check_offer, Answer, Bounds, Offer, Place, Policy, Quote, Template};
 use swap::transport::{Ivy, Relayed, Transport};
-use swap::{Buyer, Machine, Outcome, SecretBytes, Seller, Terms};
+use swap::{Buyer, Machine, Message, Outcome, SecretBytes, Seller, Terms};
 use swap_nexus_tx::rpc::Client;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -82,15 +82,18 @@ enum Command {
 /// Defaults are this tool's settings, not protocol rules.
 #[derive(Args)]
 struct TermsArgs {
-    /// BTC to receive, in satoshis.
+    /// The price, in satoshis a NEX.
     #[arg(long)]
-    btc_amount: u64,
+    price: u64,
+    /// The least BTC to receive, in satoshis.
+    #[arg(long)]
+    min_btc_amount: u64,
+    /// The most BTC to receive, in satoshis.
+    #[arg(long)]
+    max_btc_amount: u64,
     /// Paid by each Bitcoin swap transaction, in satoshis.
     #[arg(long)]
     btc_fee: u64,
-    /// NEX to sell.
-    #[arg(long)]
-    nex_amount: u64,
     /// Paid by the NEX lock and by the claim from it.
     #[arg(long)]
     nex_fee: u64,
@@ -113,12 +116,18 @@ struct TermsArgs {
 }
 
 impl TermsArgs {
-    fn terms(&self, swap_id: [u8; 32], nexus_genesis: String) -> Terms {
-        Terms {
+    fn quote(&self) -> Quote {
+        Quote {
+            price: self.price,
+            min_btc_amount: self.min_btc_amount,
+            max_btc_amount: self.max_btc_amount,
+        }
+    }
+
+    fn template(&self, swap_id: [u8; 32], nexus_genesis: String) -> Template {
+        Template {
             swap_id,
-            btc_amount: Amount::from_sat(self.btc_amount),
             btc_fee: Amount::from_sat(self.btc_fee),
-            nex_amount: self.nex_amount,
             nex_fee: self.nex_fee,
             t1: self.t1,
             t2: self.t2,
@@ -416,12 +425,13 @@ struct TakeArgs {
 /// refuses an offer outside them. Defaults are this tool's settings.
 #[derive(Args)]
 struct PolicyArgs {
-    /// The BTC agreed to pay, in satoshis.
+    /// The BTC to pay, in satoshis, in the offer's range; the most it
+    /// takes if left out, as eigenwallet swaps up to its seller's maximum.
     #[arg(long)]
-    btc_amount: u64,
-    /// The NEX agreed to buy.
+    btc_amount: Option<u64>,
+    /// The price agreed to, in satoshis a NEX.
     #[arg(long)]
-    nex_amount: u64,
+    price: u64,
     /// The most each Bitcoin swap transaction may pay, in satoshis.
     #[arg(long, default_value_t = Bounds::DEFAULT.max_btc_fee)]
     max_btc_fee: u64,
@@ -466,10 +476,11 @@ struct PolicyArgs {
 }
 
 impl PolicyArgs {
-    fn policy(&self) -> Policy {
+    /// The policy for taking `offer`.
+    fn policy(&self, offer: &Offer) -> Policy {
         Policy {
-            btc_amount: self.btc_amount,
-            nex_amount: self.nex_amount,
+            btc_amount: self.btc_amount.unwrap_or(offer.quote.max_btc_amount),
+            price: self.price,
             bounds: Bounds {
                 max_btc_fee: self.max_btc_fee,
                 max_nex_fee: self.max_nex_fee,
@@ -563,38 +574,38 @@ fn offer(args: OfferArgs) -> Result<Outcome> {
     if let Some(listen) = args.listen {
         check_listen(listen, args.advertise)?;
     }
-    let terms = args
+    let template = args
         .terms
-        .terms(random32(), args.nodes.nexus_genesis.clone());
-    terms.check()?;
+        .template(random32(), args.nodes.nexus_genesis.clone());
+    let swap_id = template.swap_id;
+    let quote = args.terms.quote();
+    template.check(&quote)?;
     let key = args.key.load()?;
     let bitcoin = args.nodes.bitcoin()?;
     let floor = btc_fee_floor(&bitcoin, args.min_btc_fee_rate)?;
-    if terms.btc_fee.to_sat() < floor {
+    if template.btc_fee.to_sat() < floor {
         return Err(format!(
             "btc_fee is {} sat, below the {floor} sat the node's fee rate asks of cancel and \
              refund",
-            terms.btc_fee.to_sat()
+            template.btc_fee.to_sat()
         )
         .into());
     }
     let nexus = args.nodes.nexus()?;
     args.nodes.check_nexus(&nexus)?;
     let floor = nex_fee_floor(&nexus, args.min_nex_fee)?;
-    if terms.nex_fee < floor {
+    if template.nex_fee < floor {
         return Err(format!(
             "nex_fee is {}, below {floor}, --min-nex-fee or the node's minRelayFee: a fee \
              the network does not relay leaves the NEX lock unmined",
-            terms.nex_fee
+            template.nex_fee
         )
         .into());
     }
     let redeem = args.nodes.payout(&bitcoin)?;
     let punish = args.nodes.payout(&bitcoin)?;
-    let seller = Seller::new(terms.clone(), key.nex_address(), redeem, punish)
-        .map_err(|refusal| format!("refused: {refusal:?}"))?;
     fs::create_dir_all(&args.dir)?;
-    let store = Store::new(&args.dir, terms.swap_id);
+    let store = Store::new(&args.dir, swap_id);
 
     let listener = args.listen.map(TcpListener::bind).transpose()?;
     let place = match (&listener, &args.relay) {
@@ -607,7 +618,8 @@ fn offer(args: OfferArgs) -> Result<Outcome> {
     let buyer_session = random32();
     let buyer = ivy::Config::new(SigningKey::from_bytes(&buyer_session)).peer_key();
     let offer = Offer::new(
-        terms,
+        quote,
+        template,
         args.nodes.btc_network,
         place,
         &session,
@@ -620,25 +632,78 @@ fn offer(args: OfferArgs) -> Result<Outcome> {
         bitcoin,
         nexus,
         store,
-        nex_key: Some(key),
+        nex_key: Some(key.clone()),
         bump: &args.bump,
+    };
+    // The seller fixes the terms at the amount the buyer asks for, then
+    // starts its machine on them.
+    let seller = |terms: Terms| {
+        Seller::new(terms, key.nex_address(), redeem, punish)
+            .map_err(|refusal| format!("refused: {refusal:?}"))
     };
     match (listener, &args.relay) {
         (_, Some(relay)) => {
             log(&format!(
                 "listing the offer on {relay}, waiting for the buyer"
             ));
-            let transport =
+            let mut transport =
                 Ivy::accept_relayed(relay, &offer.encode(), &config, buyer, wait, TIMEOUT)?;
-            start.run(seller, vec![], transport)
+            let terms = answer_request(&mut transport, &offer)?;
+            start.run(seller(terms)?, vec![], transport)
         }
         (Some(listener), None) => {
             log("waiting for the buyer");
-            let transport = Ivy::accept(listener, &config, buyer, wait, TIMEOUT)?;
-            start.run(seller, vec![], transport)
+            let mut transport = Ivy::accept(listener, &config, buyer, wait, TIMEOUT)?;
+            let terms = answer_request(&mut transport, &offer)?;
+            start.run(seller(terms)?, vec![], transport)
         }
         (None, None) => unreachable!("a place was found"),
     }
+}
+
+/// The terms the seller of `offer` fixes at the buyer's request, which
+/// comes first on `transport`, once it has answered it with them; or why
+/// it refused, once it has answered that.
+fn answer_request<T: Transport>(transport: &mut T, offer: &Offer) -> Result<Terms> {
+    let swap_id = offer.template.swap_id;
+    let message = transport
+        .recv(TIMEOUT)?
+        .and_then(|payload| Message::decode(&payload, swap_id));
+    let Some(Message::Request { btc_amount, price }) = message else {
+        return Err("the buyer sent no request".into());
+    };
+    let answer = offer.answer(btc_amount, price);
+    transport.send(&Message::Answer(answer.clone()).encode(swap_id))?;
+    match answer {
+        Answer::Terms(terms) => {
+            log(&format!(
+                "selling {} NEX for {btc_amount} sat",
+                terms.nex_amount
+            ));
+            Ok(terms)
+        }
+        Answer::Refused(why) => {
+            Err(format!("refused the buyer's request for {btc_amount} sat: {why}").into())
+        }
+    }
+}
+
+/// The terms the seller of `offer` fixes at the request `policy` makes on
+/// `transport`, if they are exactly the ones asked for.
+fn request_terms<T: Transport>(transport: &mut T, offer: &Offer, policy: &Policy) -> Result<Terms> {
+    let swap_id = offer.template.swap_id;
+    let request = Message::Request {
+        btc_amount: policy.btc_amount,
+        price: policy.price,
+    };
+    transport.send(&request.encode(swap_id))?;
+    let message = transport
+        .recv(TIMEOUT)?
+        .and_then(|payload| Message::decode(&payload, swap_id));
+    let Some(Message::Answer(answer)) = message else {
+        return Err("the seller sent no answer".into());
+    };
+    Ok(offer.check_answer(policy, &answer)?)
 }
 
 /// What a swap starts on, once the session is up.
@@ -687,7 +752,7 @@ fn take(args: TakeArgs) -> Result<Outcome> {
     };
     let offer = Offer::decode(&text)?;
     check_nex_address(&args.nex_address)?;
-    let store = Store::new(&args.dir, offer.terms.swap_id);
+    let store = Store::new(&args.dir, offer.template.swap_id);
     if store.path().exists() {
         return Err(resume_hint(
             store.path(),
@@ -700,21 +765,18 @@ fn take(args: TakeArgs) -> Result<Outcome> {
     args.nodes.check_nexus(&nexus)?;
     let nex_floor = nex_fee_floor(&nexus, args.policy.min_nex_fee)?;
     let (network, genesis) = (args.nodes.btc_network, &args.nodes.nexus_genesis);
-    check_offer(
-        &offer,
-        &args.policy.policy(),
-        network,
-        genesis,
-        floor,
-        nex_floor,
-    )?;
+    let policy = args.policy.policy(&offer);
+    check_offer(&offer, &policy, network, genesis, floor, nex_floor)?;
     let refund = args.nodes.payout(&bitcoin)?;
-    let (buyer, actions) = Buyer::start(offer.terms.clone(), refund, args.nex_address)
-        .map_err(|refusal| format!("refused: {refusal:?}"))?;
     fs::create_dir_all(&args.dir)?;
 
     let config = ivy::Config::new(SigningKey::from_bytes(&offer.buyer_session));
     log(&offer.describe());
+    log(&format!(
+        "taking {} sat for {} NEX",
+        policy.btc_amount,
+        offer.quote.nex_amount(policy.btc_amount)
+    ));
     let seller = offer.seller_key()?;
     let start = Start {
         bitcoin,
@@ -723,14 +785,23 @@ fn take(args: TakeArgs) -> Result<Outcome> {
         nex_key: None,
         bump: &args.bump,
     };
+    // The buyer asks for its amount, then starts its machine on the terms
+    // the seller fixes, once they are the ones asked for.
+    let buyer = |terms: Terms| {
+        Buyer::start(terms, refund, args.nex_address)
+            .map_err(|refusal| format!("refused: {refusal:?}"))
+    };
     match offer.place()? {
         Place::Address(address) => {
-            let transport = Ivy::connect(address, &config, seller, TIMEOUT)?;
+            let mut transport = Ivy::connect(address, &config, seller, TIMEOUT)?;
+            let (buyer, actions) = buyer(request_terms(&mut transport, &offer, &policy)?)?;
             start.run(buyer, actions, transport)
         }
         Place::Relay(relay) => {
-            let id = hex::encode(offer.terms.swap_id);
-            let transport = Ivy::<Relayed>::connect_relayed(&relay, &id, &config, seller, TIMEOUT)?;
+            let id = hex::encode(offer.template.swap_id);
+            let mut transport =
+                Ivy::<Relayed>::connect_relayed(&relay, &id, &config, seller, TIMEOUT)?;
+            let (buyer, actions) = buyer(request_terms(&mut transport, &offer, &policy)?)?;
             start.run(buyer, actions, transport)
         }
     }

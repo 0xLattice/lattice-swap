@@ -12,7 +12,8 @@
 //!
 //! For a buyer in a browser, without a wallet or nodes of its own: it reads
 //! an offer by [`decode_offer`] and judges it by [`check_offer`], talks to
-//! the seller over [`session::Ivy`], funds the lock from a key of its own
+//! the seller over [`session::Ivy`], asking it for the terms at its amount
+//! ([`offer_terms`], [`check_answer`]), funds the lock from a key of its own
 //! ([`wallet`]), builds its Nexus view by [`nexus_view`], and shows where
 //! it is by [`buyer_status`].
 
@@ -354,8 +355,9 @@ pub fn sign_nex(seed: &str, body: &str) -> Result<String> {
 }
 
 /// The offer in `text`, as the CLI's `take` reads one: it names where to
-/// find the seller, and the seller signed its terms (strictly). The offer
-/// as JSON.
+/// find the seller, and the seller signed its quote and terms (strictly).
+/// The offer as JSON: its `quote` holds the `price`, in satoshis a NEX, and
+/// the `min_btc_amount` and `max_btc_amount` a buyer picks between.
 #[wasm_bindgen(js_name = decodeOffer)]
 pub fn decode_offer(text: &str) -> Result<String> {
     self::text(&Offer::decode(text)?)
@@ -393,6 +395,36 @@ pub fn check_offer(input: &str) -> Result<Option<String>> {
         nex_floor,
     )
     .err())
+}
+
+/// The terms of a swap of `btc_amount` satoshis from `offer`, a decoded
+/// offer: the template at the NEX its price gives, rounded down, which the
+/// buyer's machine starts on. `{"offer", "btc_amount"}` in.
+#[wasm_bindgen(js_name = offerTerms)]
+pub fn offer_terms(input: &str) -> Result<String> {
+    #[derive(serde::Deserialize)]
+    struct Input {
+        offer: Offer,
+        btc_amount: u64,
+    }
+    let input: Input = parse(input)?;
+    text(&input.offer.terms(input.btc_amount))
+}
+
+/// Why the buyer refuses the seller's `answer` to the request `policy`
+/// makes of `offer`, as the CLI's `take` refuses it, or null: the terms
+/// must be exactly the ones asked for. `{"offer", "policy", "answer"}` in,
+/// `answer` as the `Answer` message carries it.
+#[wasm_bindgen(js_name = checkAnswer)]
+pub fn check_answer(input: &str) -> Result<Option<String>> {
+    #[derive(serde::Deserialize)]
+    struct Input {
+        offer: Offer,
+        policy: Policy,
+        answer: offer::Answer,
+    }
+    let input: Input = parse(input)?;
+    Ok(input.offer.check_answer(&input.policy, &input.answer).err())
 }
 
 /// A Nexus view from the node's answers, read in the order

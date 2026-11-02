@@ -1,9 +1,20 @@
 # The swap protocol
 
-A seller has NEX and wants BTC; a buyer has BTC and wants NEX. They agree
-on the terms off-band: the amounts, the fees, the timelocks `t1` and `t2`,
-how many confirmations each chain needs, and a `margin` of Bitcoin blocks of
-slack before a timelock.
+A seller has NEX and wants BTC; a buyer has BTC and wants NEX. The seller
+offers a quote, as eigenwallet's ASB quotes one (`BidQuote { price,
+min_quantity, max_quantity }`): a `price` in satoshis a NEX, and the least
+and most BTC it takes, `min_btc_amount` and `max_btc_amount`. Beside it, the
+offer fixes every other term: the fees, the timelocks `t1` and `t2`, how
+many confirmations each chain needs, a `margin` of Bitcoin blocks of slack
+before a timelock, the Bitcoin network and the Nexus genesis. The seller
+signs the quote, these terms and the network, tagged `lattice-swap offer 2`.
+An offer must work at every amount in its range: the range is not empty,
+and the terms below hold at both its ends.
+
+The buyer picks `btc_amount` in the range, and buys `nex_amount =
+floor(btc_amount / price)` NEX: rounded down, as eigenwallet's `Rate::quote`
+truncates its XMR amount, so what is left of `btc_amount` buys nothing. The
+seller fixes the terms at that amount when the buyer takes the offer.
 
 ## Keys
 
@@ -44,6 +55,16 @@ soon as its transaction is in the mempool.
 All messages travel on the ivy topic `lattice-swap/v1`. Each carries the
 swap id.
 
+0. B → S `Request`: `btc_amount` and the `price` the buyer read in the
+   offer, as eigenwallet's swap setup opens with a `SpotPriceRequest`. S
+   checks it against its current quote: at another price, or outside the
+   range, it answers `Answer` `Refused`, with why, and stops. Otherwise it
+   answers `Answer` `Terms`: the offer's terms at `btc_amount` and the
+   `nex_amount` its price gives, as eigenwallet's ASB answers a
+   `SpotPriceResponse`. B takes them only if they are exactly the ones it
+   asked for, at the signed price; then each starts its machine on them and
+   checks them as it would any terms. Neither machine sees these two
+   messages, and nothing is at stake before them.
 1. B → S `BuyerHello`, then S → B `SellerHello`. Each sends its Bitcoin key,
    its public share with the cross-curve proof, and its payout scripts.
 2. B → S `LockProposal`: the funding transaction without witnesses. Its txid

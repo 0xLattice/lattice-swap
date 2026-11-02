@@ -170,30 +170,46 @@ export function testOffer(relay) {
   return JSON.stringify(offer);
 }
 
-/** What `prepare` is given for the test offer. */
+/** What `prepare` is given for the test offer: the most it takes. */
 export const POLICY = {
-  btc_amount: 1_000_000, nex_amount: 500_000, max_t1: 20, min_t2: 20,
+  btc_amount: 1_000_000, price: 2, max_t1: 20, min_t2: 20,
   min_btc_confirmations: 1, min_nex_confirmations: 1, min_margin: 3,
   min_refund_window: 19, min_btc_fee_rate: 1,
 };
 
 /** The seller of `offer`, in swap-wasm, behind a session the driver opens:
- * `log` holds what the buyer sent, in order. */
-export function seller(offer) {
-  const terms = JSON.stringify(JSON.parse(offer).terms);
+ * `log` holds what the buyer sent, in order. It answers the buyer's
+ * request with `answer(request, terms)`, by default the terms at the
+ * amount asked for, then starts its machine on them; once it answers
+ * anything else, it says nothing more. */
+export function seller(offer, answer = (_request, terms) => ({ Terms: terms })) {
+  const decoded = JSON.parse(offer);
   const key = () => call('newBitcoinKey', 'regtest').script_pubkey;
-  let state = JSON.stringify(call('newSeller', terms, call('newNexKey').address, key(), key()));
+  let state = null;
   const log = [];
   const open = async (_offer, onMessage) => {
+    const reply = (message) => setTimeout(() => !session.closed && onMessage(JSON.stringify(message)), 1);
     const session = {
       closed: false,
       send(message) {
         if (session.closed) throw new Error('closed');
         log.push(JSON.parse(message));
+        const { Request } = JSON.parse(message);
+        if (Request) {
+          const terms = call('offerTerms', { offer: decoded, btc_amount: Request.btc_amount });
+          const answered = answer(Request, terms);
+          if (answered === null) return;
+          reply({ Answer: answered });
+          if (answered.Terms) {
+            state = JSON.stringify(call('newSeller', JSON.stringify(answered.Terms), call('newNexKey').address, key(), key()));
+          }
+          return;
+        }
+        if (state === null) return;
         let step = call('stepSeller', state, JSON.stringify({ Message: JSON.parse(message) }));
         state = JSON.stringify(step.state);
         for (const action of step.actions.filter((a) => a.Send)) {
-          setTimeout(() => !session.closed && onMessage(JSON.stringify(action.Send)), 1);
+          reply(action.Send);
           step = call('stepSeller', state, '"Sent"');
           state = JSON.stringify(step.state);
         }

@@ -11,8 +11,10 @@ before(loadWasm);
 const servers = [];
 after(() => servers.forEach((server) => server.close()));
 
-/** The test offer's terms. */
-const TERMS = JSON.parse(testOffer('http://relay.invalid')).terms;
+/** The test offer's terms at the policy's amount: the NEX its price
+ * gives, rounded down. */
+const OFFER = JSON.parse(testOffer('http://relay.invalid'));
+const TERMS = { ...OFFER.template, btc_amount: POLICY.btc_amount, nex_amount: Math.floor(POLICY.btc_amount / OFFER.quote.price) };
 
 /** The state's own transactions, as a restart from it would know them:
  * its funding, and once it cancels, cancel and refund. */
@@ -30,7 +32,7 @@ function known(state) {
 /** A wallet and a swap of the test offer through fakes, the store
  * `store`. Every send and broadcast is checked against what the store
  * holds at that moment; what it lacked is logged in `unsaved`. */
-async function world({ store = new MemoryStore(), policy = POLICY, chain = new Chain(), extra = {} } = {}) {
+async function world({ store = new MemoryStore(), policy = POLICY, chain = new Chain(), extra = {}, answer } = {}) {
   const unsaved = [];
   const w = { chain, store, unsaved };
   const saved = () => store.get(`swap:${TERMS.swap_id}`);
@@ -48,8 +50,8 @@ async function world({ store = new MemoryStore(), policy = POLICY, chain = new C
   w.a = a;
   w.offer = testOffer('http://relay.invalid');
   // The state each message must already be saved in when it goes out.
-  const expect = { BuyerHello: 'AwaitSellerHello', LockProposal: 'AwaitSellerSignatures', BuyerSignatures: 'SendingSignatures' };
-  w.seller = seller(w.offer);
+  const expect = { Request: 'AwaitSellerHello', BuyerHello: 'AwaitSellerHello', LockProposal: 'AwaitSellerSignatures', BuyerSignatures: 'SendingSignatures' };
+  w.seller = seller(w.offer, answer);
   const open = w.seller.open;
   w.seller.open = async (...args) => {
     const session = await open(...args);
@@ -57,7 +59,10 @@ async function world({ store = new MemoryStore(), policy = POLICY, chain = new C
     session.send = (message) => {
       const name = Object.keys(JSON.parse(message))[0];
       w.checked = saved().then((record) => {
-        if (!record.taken || kind(record.state) !== expect[name]) unsaved.push({ send: name, state: kind(record.state) });
+        // The request goes out before the swap is taken: nothing of it
+        // is at stake until the seller has answered.
+        const taken = name !== 'Request';
+        if (record.taken !== taken || kind(record.state) !== expect[name]) unsaved.push({ send: name, state: kind(record.state) });
       });
       send(message);
     };
@@ -146,7 +151,7 @@ test('nothing is sent or broadcast before the state that asks for it is saved', 
   await w.checked;
   assert.deepEqual(
     w.seller.log.map((message) => Object.keys(message)[0]),
-    ['BuyerHello', 'LockProposal', 'BuyerSignatures'],
+    ['Request', 'BuyerHello', 'LockProposal', 'BuyerSignatures'],
   );
   assert.deepEqual(w.unsaved, []);
   assert.equal(w.buyer.status().step, 'swapping');
@@ -180,7 +185,9 @@ test('the funding pays the backend’s estimate, floored at the relay minimum', 
 
 test('an offer the policy refuses is refused before anything of the swap is saved', async () => {
   const store = new MemoryStore();
-  await assert.rejects(world({ store, policy: { ...POLICY, nex_amount: POLICY.nex_amount + 1 } }), /^Error: refused: the offer/);
+  await assert.rejects(world({ store, policy: { ...POLICY, price: POLICY.price + 1 } }), /^Error: refused: the offer asks 2 sat a NEX/);
+  await assert.rejects(world({ store, policy: { ...POLICY, btc_amount: OFFER.quote.max_btc_amount + 1 } }), /^Error: refused: the offer takes 10000 to 1000000 sat/);
+  await assert.rejects(world({ store, policy: { ...POLICY, btc_amount: OFFER.quote.min_btc_amount - 1 } }), /^Error: refused: the offer takes/);
   assert.deepEqual(store.puts.map(([key]) => key), ['wallet']);
   // An offer whose fee is below the estimate is refused too, as the CLI's
   // `take` refuses it.
@@ -329,7 +336,14 @@ test('a swap that never took its offer is dropped when another is prepared', asy
 test('a seller that goes quiet before the lock aborts the swap, the deposit kept', async () => {
   const clock = { offset: 0 };
   const w = await world({ extra: { now: () => Date.now() + clock.offset } });
-  w.seller.open = async () => ({ closed: false, send() {}, close() {} });
+  // It answers the request, then says nothing.
+  w.seller.open = async (_offer, onMessage) => ({
+    closed: false,
+    send(message) {
+      if (JSON.parse(message).Request) setTimeout(() => onMessage(JSON.stringify({ Answer: { Terms: TERMS } })), 1);
+    },
+    close() {},
+  });
   deposit(w, 1_100_000);
   const run = running(w.buyer);
   await until(async () => (await w.store.get(`swap:${w.buyer.swapId}`)).taken);
@@ -406,6 +420,62 @@ test('an offer whose session will not open is given up once, nothing sent', asyn
   assert.match(w.buyer.status().warning, /^the offer is gone: the session ended$/);
   assert.equal(await w.store.get(`swap:${w.buyer.swapId}`), null, 'nothing kept of it');
   assert.equal(w.a.posted.length, 0);
+});
+
+test('the wallet is asked for the amount picked, and the seller for it at the signed price', async () => {
+  const policy = { ...POLICY, btc_amount: 500_001 };
+  const w = await world({ policy });
+  deposit(w, 600_000);
+  const run = running(w.buyer);
+  await until(() => w.a.posted.length > 0).catch((e) => assert.fail(`${e.message}: ${JSON.stringify(w.buyer.status())}`));
+  await run.stop();
+  assert.deepEqual(w.seller.log[0], { Request: { btc_amount: 500_001, price: 2 } });
+  assert.equal(parseTx(w.a.posted[0]).outputs[0].value, 500_001);
+  // Rounded down: the last satoshi buys nothing.
+  assert.equal(call('offerTerms', { offer: OFFER, btc_amount: 500_001 }).nex_amount, 250_000);
+  const { state } = await w.store.get(`swap:${w.buyer.swapId}`);
+  assert.equal(JSON.stringify(Object.values(JSON.parse(state))[0]).includes('"nex_amount":250000'), true);
+});
+
+test('the need is for the amount picked', async () => {
+  const w = await world({ policy: { ...POLICY, btc_amount: 500_000 } });
+  deposit(w, 100_000);
+  const run = running(w.buyer);
+  await until(() => w.buyer.status().need !== null);
+  await run.stop();
+  const { need } = w.buyer.status();
+  assert.ok(need > 500_000 && need < 501_000, `${need}`);
+});
+
+for (const [what, answer, warning] of [
+  ['refuses the amount', () => ({ Refused: { AmountAboveMaximum: { max: 5 } } }), /^refused by the seller: the most it takes is 5 sat$/],
+  ['answers other terms', (_request, terms) => ({ Terms: { ...terms, nex_amount: terms.nex_amount + 1 } }), /^refused: the seller's terms are not the ones asked for/],
+  ['answers at another price', (_request, terms) => ({ Terms: { ...terms, nex_amount: terms.nex_amount / 2 } }), /not the ones asked for/],
+]) {
+  test(`a seller that ${what} has its offer given up, nothing of the swap sent`, async () => {
+    const w = await world({ answer });
+    deposit(w, 1_100_000);
+    const run = running(w.buyer);
+    await until(() => w.buyer.status().step === 'offer-gone');
+    assert.equal(await run.done, null);
+    assert.match(w.buyer.status().warning, warning);
+    assert.deepEqual(w.seller.log.map((message) => Object.keys(message)[0]), ['Request']);
+    assert.equal(await w.store.get(`swap:${w.buyer.swapId}`), null, 'nothing kept of it');
+    assert.equal(w.a.posted.length, 0);
+  });
+}
+
+test('a seller that never answers the request has its offer given up', async () => {
+  const clock = { offset: 0 };
+  const w = await world({ answer: () => null, extra: { now: () => Date.now() + clock.offset } });
+  deposit(w, 1_100_000);
+  const run = running(w.buyer);
+  await until(() => w.seller.log.length > 0);
+  clock.offset += 61_000;
+  await until(() => w.buyer.status().step === 'offer-gone');
+  assert.equal(await run.done, null);
+  assert.match(w.buyer.status().warning, /the seller sent no answer/);
+  assert.equal(await w.store.get(`swap:${w.buyer.swapId}`), null);
 });
 
 test('a failed read of the wallet’s balance skips none of the swap’s views', async () => {

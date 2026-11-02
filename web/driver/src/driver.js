@@ -65,12 +65,14 @@ export class Buyer extends EventTarget {
   }
 
   /** A swap of `offer`, an offer's text from a relay's board, that the
-   * buyer agreed to by `policy` (`swap::offer::Policy`: the amounts, and
-   * any bound to hold other than the CLI's), funded from `wallet`: its
-   * record saved, nothing sent. The NEX goes to `nexAddress`, and a refund
-   * to the wallet. Refuses the offer as the CLI's `take` would, and while
-   * another swap runs. A swap prepared before that never took its offer is
-   * dropped: nothing was sent for it. */
+   * buyer agreed to by `policy` (`swap::offer::Policy`: `btc_amount`, in
+   * sat, in the offer's range, the `price` agreed to, and any bound to hold
+   * other than the CLI's), funded from `wallet`: its record saved, nothing
+   * sent. It buys the NEX the price gives for `btc_amount`, rounded down.
+   * The NEX goes to `nexAddress`, and a refund to the wallet. Refuses the
+   * offer as the CLI's `take` would, and while another swap runs. A swap
+   * prepared before that never took its offer is dropped: nothing was sent
+   * for it. */
   static async prepare(wallet, { offer, policy, nexAddress }) {
     const decoded = call('decodeOffer', offer);
     if (!safe(decoded) || !safe(policy)) throw new Error('refused: an amount JavaScript cannot hold exactly');
@@ -86,13 +88,14 @@ export class Buyer extends EventTarget {
       for (const id of await wallet.swaps()) {
         if (!(await store.get(swapKey(id))).taken) await store.delete(swapKey(id));
       }
-      const started = call('startBuyer', JSON.stringify(decoded.terms), wallet.key.script_pubkey, nexAddress);
+      const terms = call('offerTerms', { offer: decoded, btc_amount: policy.btc_amount });
+      const started = call('startBuyer', JSON.stringify(terms), wallet.key.script_pubkey, nexAddress);
       const record = {
-        swap_id: decoded.terms.swap_id,
+        swap_id: decoded.template.swap_id,
         offer: decoded,
         policy,
         state: JSON.stringify(started.state),
-        // The hello, sent once the offer is taken.
+        // The hello, sent once the seller has answered with these terms.
         pending: started.actions,
         taken: false,
       };
@@ -119,8 +122,9 @@ export class Buyer extends EventTarget {
    * - `step`: `fund-wallet` until the wallet can fund the lock and the
    *   offer is taken, then `swapping`, `finishing` once the redeem is
    *   signed, and `done`; or `refunding` and `refunded`; or `offer-gone`
-   *   if the session to the seller would not open, as the CLI's `take`
-   *   fails once: nothing was sent, and the buyer picks another offer;
+   *   if the session to the seller would not open, or the seller refused
+   *   the amount or answered other terms, as the CLI's `take` fails once:
+   *   nothing of the swap was sent, and the buyer picks another offer;
    * - `outcome`: once ended, the machine's: `swapped`, `refunded`,
    *   `punished`, `drained` or `aborted`;
    * - `wallet`: `{address, confirmed, unconfirmed}`, in sat, and `need`,
@@ -236,7 +240,7 @@ export class Buyer extends EventTarget {
         this.#gone = 'refused: this swap was dropped when another was prepared';
         return false;
       }
-      const amount = r.offer.terms.btc_amount;
+      const amount = r.policy.btc_amount;
       const fee_rate = await this.#wallet.feeRate();
       const { enough, need } = call('walletNeed', { utxos: await this.#wallet.spendable(), amount, fee_rate });
       this.#need = need;
@@ -253,6 +257,17 @@ export class Buyer extends EventTarget {
         await this.#c.store.delete(swapKey(r.swap_id));
         return false;
       }
+      // The amount asked for, as the CLI's `take` asks: the seller fixes
+      // the terms, which must be the ones the machine started on. Refused,
+      // or unanswered, the offer is given up as one whose session would not
+      // open: nothing of the swap was sent.
+      const declined = await this.#request();
+      if (declined !== null) {
+        this.#gone = declined;
+        this.#session.close();
+        await this.#c.store.delete(swapKey(r.swap_id));
+        return false;
+      }
       r.taken = true;
       await this.#save();
       return true;
@@ -262,6 +277,32 @@ export class Buyer extends EventTarget {
     const pending = r.pending;
     r.pending = [];
     for (const action of pending) await this.#act(action);
+  }
+
+  /** Sends the request for the policy's amount at its price, and waits up
+   * to `messageTimeout` for the seller's answer, the first message back:
+   * why the buyer refuses it, or null. */
+  async #request() {
+    const { offer, policy } = this.#r;
+    const { btc_amount, price } = policy;
+    try {
+      this.#session.send(JSON.stringify({ Request: { btc_amount, price } }));
+    } catch (e) {
+      return `the offer is gone: ${e.message}`;
+    }
+    const end = this.#c.now() + this.#c.messageTimeout;
+    while (this.#inbox.length === 0) {
+      if (this.#session.closed) return 'the offer is gone: the session ended';
+      if (this.#c.now() > end) return 'the offer is gone: the seller sent no answer';
+      await new Promise((resolve) => {
+        this.#wake = resolve;
+        setTimeout(resolve, Math.min(this.#c.poll, 100));
+      });
+      this.#wake = null;
+    }
+    const answer = JSON.parse(this.#inbox.shift()).Answer;
+    if (answer === undefined) return 'refused: the seller sent no answer';
+    return wasm.checkAnswer(JSON.stringify({ offer, policy, answer })) ?? null;
   }
 
   #receive(message) {

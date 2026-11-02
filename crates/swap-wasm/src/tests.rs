@@ -408,9 +408,26 @@ fn a_nexus_view_is_one_tips() {
 /// An offer signed as the CLI's `offer` signs it.
 fn signed_offer(relay: &str) -> Offer {
     let key = SigningKey::from_bytes(&[4; 32]);
-    let terms = parse(&terms()).unwrap();
+    let terms: Terms = parse(&terms()).unwrap();
+    // The terms above at the most it takes.
+    let quote = swap::offer::Quote {
+        price: 2,
+        min_btc_amount: 10_000,
+        max_btc_amount: 1_000_000,
+    };
+    let template = swap::offer::Template {
+        swap_id: terms.swap_id,
+        btc_fee: terms.btc_fee,
+        nex_fee: terms.nex_fee,
+        t1: terms.t1,
+        t2: terms.t2,
+        btc_confirmations: terms.btc_confirmations,
+        nex_confirmations: terms.nex_confirmations,
+        margin: terms.margin,
+        nexus_genesis: terms.nexus_genesis,
+    };
     let place = swap::offer::Place::Relay(relay.into());
-    Offer::new(terms, Network::Regtest, place, &key, [7; 32])
+    Offer::new(quote, template, Network::Regtest, place, &key, [7; 32])
 }
 
 #[test]
@@ -419,10 +436,22 @@ fn an_offer_is_read_only_as_its_seller_signed_it() {
     let decoded = json(&decode_offer(&offer.encode()).unwrap());
     assert_eq!(decoded, json(&text(&offer).unwrap()));
     let mut changed = offer.clone();
-    changed.terms.margin += 1;
+    changed.template.margin += 1;
     let refused = decode_offer(&changed.encode()).unwrap_err();
     assert!(refused.contains("not signed by its seller"), "{refused}");
     assert!(decode_offer("{}").is_err());
+}
+
+/// An offer of a fixed amount, as the seller signed one before quotes: the
+/// driver's test offer then. It is refused, not read as a quote.
+#[test]
+fn an_old_offer_is_refused() {
+    const OLD: &str = r#"{"terms":{"swap_id":"0101010101010101010101010101010101010101010101010101010101010101","btc_amount":1000000,"btc_fee":1000,"nex_amount":500000,"nex_fee":100,"t1":20,"t2":20,"btc_confirmations":1,"nex_confirmations":1,"margin":3,"nexus_genesis":"genesis"},"btc_network":"regtest","relay":"http://relay.invalid","seller":"ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c","buyer_session":"0707070707070707070707070707070707070707070707070707070707070707","signature":"6b23600d6a701e4f391b7207e1fa85898e48805367211616725d9cf4a6091d99d3e29f0d135b5300044b9036a005fc6f571d8318f89c7cef5ecc3e13ea8d1401"}"#;
+    let refused = decode_offer(OLD).unwrap_err();
+    assert!(
+        refused.starts_with("not an offer: missing field `quote`"),
+        "{refused}"
+    );
 }
 
 #[test]
@@ -441,16 +470,21 @@ fn an_offer_is_judged_by_the_clis_policy() {
     };
     // The bounds the regtest terms need, the rest the CLI's defaults.
     let policy = json!({
-        "btc_amount": 1_000_000, "nex_amount": 500_000, "max_t1": 20, "min_t2": 20,
+        "btc_amount": 1_000_000, "price": 2, "max_t1": 20, "min_t2": 20,
         "min_btc_confirmations": 1, "min_nex_confirmations": 1, "min_margin": 3,
         "min_refund_window": 19,
     });
     assert_eq!(check(policy.clone(), json!(1_000)), None);
     let mut other = policy.clone();
-    other["nex_amount"] = json!(1);
+    other["price"] = json!(1);
     assert!(check(other, json!(1_000))
         .unwrap()
-        .contains("sells 500000 NEX"));
+        .contains("asks 2 sat a NEX"));
+    let mut other = policy.clone();
+    other["btc_amount"] = json!(1_000_001);
+    assert!(check(other, json!(1_000))
+        .unwrap()
+        .contains("takes 10000 to 1000000 sat"));
     // A fee rate at which cancel and refund pay more than the offer's fee.
     let refused = check(policy.clone(), json!(100_000)).unwrap();
     assert!(refused.contains("below the"), "{refused}");
@@ -461,6 +495,32 @@ fn an_offer_is_judged_by_the_clis_policy() {
     let mut floored = policy;
     floored["min_btc_fee_rate"] = json!(1);
     assert_eq!(check(floored, Value::Null), None);
+}
+
+/// The terms the buyer starts on, and its check of the seller's answer, as
+/// the CLI's `take` makes them.
+#[test]
+fn the_buyer_takes_only_the_terms_it_asked_for() {
+    let offer = signed_offer("http://relay.example");
+    let terms = offer_terms(&json!({"offer": offer, "btc_amount": 1_000_001}).to_string());
+    let terms: Terms = parse(&terms.unwrap()).unwrap();
+    // Rounded down: the last satoshi buys nothing.
+    assert_eq!(terms.nex_amount, 500_000);
+    assert_eq!(terms.btc_amount, Amount::from_sat(1_000_001));
+    let policy = json!({"btc_amount": 1_000_000, "price": 2});
+    let check = |answer: Value| {
+        check_answer(&json!({"offer": offer, "policy": policy, "answer": answer}).to_string())
+            .unwrap()
+    };
+    let asked = offer.terms(1_000_000);
+    assert_eq!(check(json!({"Terms": asked})), None);
+    let mut other = asked.clone();
+    other.nex_amount -= 1;
+    assert!(check(json!({"Terms": other}))
+        .unwrap()
+        .contains("not the ones asked for"));
+    let refused = check(json!({"Refused": {"AmountAboveMaximum": {"max": 5}}})).unwrap();
+    assert!(refused.contains("the most it takes is 5 sat"), "{refused}");
 }
 
 /// The browser's session against the seller's side of ivy-core, the bytes
