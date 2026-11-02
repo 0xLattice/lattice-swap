@@ -172,7 +172,7 @@ export function testOffer(relay) {
 
 /** What `prepare` is given for the test offer: the most it takes. */
 export const POLICY = {
-  btc_amount: 1_000_000, price: 2, max_t1: 20, min_t2: 20,
+  btc_amount: 1_000_000, price: 2_000_000, max_t1: 20, min_t2: 20,
   min_btc_confirmations: 1, min_nex_confirmations: 1, min_margin: 3,
   min_refund_window: 19, min_btc_fee_rate: 1,
 };

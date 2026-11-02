@@ -356,8 +356,9 @@ pub fn sign_nex(seed: &str, body: &str) -> Result<String> {
 
 /// The offer in `text`, as the CLI's `take` reads one: it names where to
 /// find the seller, and the seller signed its quote and terms (strictly).
-/// The offer as JSON: its `quote` holds the `price`, in satoshis a NEX, and
-/// the `min_btc_amount` and `max_btc_amount` a buyer picks between.
+/// The offer as JSON: its `quote` holds the `price`, in satoshis a NEX of
+/// 1,000,000 base units, and the `min_btc_amount` and `max_btc_amount` a
+/// buyer picks between.
 #[wasm_bindgen(js_name = decodeOffer)]
 pub fn decode_offer(text: &str) -> Result<String> {
     self::text(&Offer::decode(text)?)
@@ -398,8 +399,8 @@ pub fn check_offer(input: &str) -> Result<Option<String>> {
 }
 
 /// The terms of a swap of `btc_amount` satoshis from `offer`, a decoded
-/// offer: the template at the NEX its price gives, rounded down, which the
-/// buyer's machine starts on. `{"offer", "btc_amount"}` in.
+/// offer: the template at the base units its price gives, rounded down,
+/// which the buyer's machine starts on. `{"offer", "btc_amount"}` in.
 #[wasm_bindgen(js_name = offerTerms)]
 pub fn offer_terms(input: &str) -> Result<String> {
     #[derive(serde::Deserialize)]

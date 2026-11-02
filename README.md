@@ -120,30 +120,33 @@ eigenwallet's sellers quote one, and waits for the buyer to dial:
 
 ```sh
 lattice-swap offer --nex-key-file ~/.lattice-swap/nex.key \
-  --price 50 --min-btc-amount 10000000 --max-btc-amount 50000000 \
+  --price 50000000 --min-btc-amount 10000000 --max-btc-amount 50000000 \
   --btc-fee 2000 --nex-fee 10 \
   --listen 0.0.0.0:7400 --advertise 203.0.113.5:7400 \
   --btc-wallet sell --btc-cookie ~/.bitcoin/.cookie \
   --nexus-url http://127.0.0.1:8080 --nexus-cookie ~/lattice/.cookie > offer
 ```
 
-The first line it prints is the offer: the quote, `--price` satoshis a NEX
-for `--min-btc-amount` to `--max-btc-amount` satoshis, the other terms,
+The first line it prints is the offer: the quote, `--price` sats per NEX,
+1 NEX = 1,000,000 base units, for `--min-btc-amount` to `--max-btc-amount`
+satoshis, the other terms,
 where the seller listens and its key, and a session key for the buyer. The offer is a secret: whoever holds
 it can take it, so write it where only you can read it (run `umask 077` first)
 and hand it over on a private channel. The buyer, who has BTC, takes it:
 
 ```sh
 lattice-swap take offer --nex-address <your Nexus address> \
-  --price 50 --btc-amount 20000000 \
+  --price 50000000 --btc-amount 20000000 \
   --btc-wallet buy --btc-cookie ~/.bitcoin/.cookie \
   --nexus-url http://127.0.0.1:8080 --nexus-cookie ~/lattice/.cookie
 ```
 
 `take` asks the seller for `--btc-amount` satoshis, or the most the offer
 takes if it is left out, as eigenwallet's CLI swaps up to its seller's
-maximum, and buys `floor(btc-amount / price)` NEX, rounded down as
-eigenwallet rounds: here 400000. The seller checks the amount against its
+maximum, and buys `floor(btc-amount × 1000000 / price)` base units, rounded
+down as eigenwallet rounds: here 400000, 0.4 NEX. What is left over, at
+most `ceil(price / 1000000) − 1` sat, buys nothing; eigenwallet truncates
+the same way. The seller checks the amount against its
 quote and answers with the terms at it, which the buyer takes only if they
 are the ones it asked for. Both then run until the swap ends and print its
 outcome. Each keeps its

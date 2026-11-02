@@ -43,13 +43,15 @@ const BTC_FEE: Amount = Amount::from_sat(1_000);
 /// regtest's missing estimate and as the cap: nothing is bumped, and each
 /// costs exactly `BTC_FEE`, but redeem, which pays two.
 const NO_BUMP: [&str; 4] = ["--fallback-fee-rate", "1", "--max-fee-rate", "1"];
-/// The seller's quote: satoshis a NEX, and the range it takes, which
-/// `BTC_AMOUNT` is inside of and below the top of.
-const PRICE: u64 = 50;
+/// The seller's quote: satoshis a NEX of 10^6 base units, and the range it
+/// takes, which `BTC_AMOUNT` is inside of and below the top of. A sat
+/// below 50 a base unit: `BTC_AMOUNT` buys 1000000.02 base units, so 1 sat
+/// of it buys nothing.
+const PRICE: u64 = 49_999_999;
 const MIN_BTC_AMOUNT: Amount = Amount::from_sat(10_000_000);
 const MAX_BTC_AMOUNT: Amount = Amount::from_sat(60_000_000);
-/// What `BTC_AMOUNT` buys at `PRICE`.
-const NEX_AMOUNT: u64 = 50_000_000 / PRICE;
+/// What `BTC_AMOUNT` buys at `PRICE`, rounded down.
+const NEX_AMOUNT: u64 = 1_000_000;
 /// What the buyer's wallet holds before a swap.
 const BUYER_BTC: Amount = Amount::from_sat(100_000_000);
 

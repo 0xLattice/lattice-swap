@@ -2,7 +2,8 @@
 
 A seller has NEX and wants BTC; a buyer has BTC and wants NEX. The seller
 offers a quote, as eigenwallet's ASB quotes one (`BidQuote { price,
-min_quantity, max_quantity }`): a `price` in satoshis a NEX, and the least
+min_quantity, max_quantity }`): a `price` in satoshis a NEX, one NEX being
+1,000,000 Nexus base units, as eigenwallet prices a whole XMR, and the least
 and most BTC it takes, `min_btc_amount` and `max_btc_amount`. Beside it, the
 offer fixes every other term: the fees, the timelocks `t1` and `t2`, how
 many confirmations each chain needs, a `margin` of Bitcoin blocks of slack
@@ -12,8 +13,11 @@ An offer must work at every amount in its range: the range is not empty,
 and the terms below hold at both its ends.
 
 The buyer picks `btc_amount` in the range, and buys `nex_amount =
-floor(btc_amount / price)` NEX: rounded down, as eigenwallet's `Rate::quote`
-truncates its XMR amount, so what is left of `btc_amount` buys nothing. The
+floor(btc_amount × 1000000 / price)` base units, computed without overflow:
+rounded down, as eigenwallet's `Rate::quote` truncates its XMR amount, so
+what is left of `btc_amount`, at most `ceil(price / 1000000) − 1` sat, buys
+nothing. `nex_amount` never falls as `btc_amount` grows, so terms that
+work at both ends of the range work in between. The
 seller fixes the terms at that amount when the buyer takes the offer.
 
 ## Keys

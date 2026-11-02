@@ -31,7 +31,7 @@ fn offer_args(extra: &[&str]) -> OfferArgs {
     let mut args = vec![
         "offer",
         "--price",
-        "50",
+        "50000000",
         "--min-btc-amount",
         "10000000",
         "--max-btc-amount",
@@ -247,7 +247,7 @@ fn offer_listens_or_uses_a_relay() {
     let base: Vec<&str> = [
         "offer",
         "--price",
-        "50",
+        "50000000",
         "--min-btc-amount",
         "10000000",
         "--max-btc-amount",
@@ -303,7 +303,7 @@ fn an_alias_of_a_nexus_address_is_refused() {
 }
 
 fn policy(extra: &[&str]) -> (PolicyArgs, Network) {
-    let mut args = vec!["take", "offer", "--nex-address", "b", "--price", "50"];
+    let mut args = vec!["take", "offer", "--nex-address", "b", "--price", "50000000"];
     args.extend(extra);
     match parse(&args).unwrap().command {
         Command::Take(args) => (args.policy, args.nodes.btc_network),
@@ -444,7 +444,7 @@ fn a_quote_works_across_its_whole_range() {
     assert_eq!(low.check(), Ok(()));
     // At the most, the debit must fit a signed amount.
     let mut high = agreed();
-    high.quote.price = 1;
+    high.quote.price = 1_000_000;
     high.quote.max_btc_amount = i64::MAX as u64 - 1_000;
     assert_eq!(high.check(), Ok(()));
     high.quote.max_btc_amount += 1;
@@ -459,21 +459,45 @@ fn a_quote_works_across_its_whole_range() {
     assert!(free.check().is_err());
 }
 
-/// The NEX an amount buys is rounded down, as eigenwallet's `Rate::quote`
-/// truncates: what is left buys nothing.
+/// The base units an amount buys are rounded down, as eigenwallet's
+/// `Rate::quote` truncates: what is left, at most `ceil(price / 10^6) - 1`
+/// sat, buys nothing.
 #[test]
 fn the_nex_is_rounded_down() {
+    assert_eq!(swap::offer::BASE_UNITS_PER_NEX, 1_000_000);
+    // 3 sat a NEX: a satoshi buys 333333 1/3 base units.
     let quote = Quote {
-        price: 50,
+        price: 3,
         min_btc_amount: 0,
         max_btc_amount: u64::MAX,
     };
-    assert_eq!(quote.nex_amount(49), 0);
-    assert_eq!(quote.nex_amount(50), 1);
-    assert_eq!(quote.nex_amount(99), 1);
-    assert_eq!(quote.nex_amount(100), 2);
-    assert_eq!(quote.nex_amount(u64::MAX), u64::MAX / 50);
+    assert_eq!(quote.nex_amount(0), 0);
+    assert_eq!(quote.nex_amount(1), 333_333);
+    assert_eq!(quote.nex_amount(2), 666_666);
+    assert_eq!(quote.nex_amount(3), 1_000_000);
+    assert_eq!(quote.nex_amount(10), 3_333_333);
+    // Above a satoshi a base unit, the leftover reaches ceil(price / 10^6)
+    // - 1 sat: at 2500001 sat a NEX, a base unit costs 2.500001 sat, and 2
+    // sat buy none.
+    let dear = Quote {
+        price: 2_500_001,
+        ..quote.clone()
+    };
+    assert_eq!(dear.nex_amount(2), 0);
+    assert_eq!(dear.nex_amount(3), 1);
+    assert_eq!(dear.nex_amount(5), 1);
+    assert_eq!(dear.nex_amount(6), 2);
+    // The product does not overflow: u64::MAX sat at 1 sat a base unit.
+    let unit = Quote {
+        price: 1_000_000,
+        ..quote.clone()
+    };
+    assert_eq!(unit.nex_amount(u64::MAX), u64::MAX);
+    // Beyond u64, at most u64::MAX, which no terms take.
+    assert_eq!(quote.nex_amount(u64::MAX / 2), u64::MAX);
     assert_eq!(Quote { price: 0, ..quote }.nex_amount(100), 0);
+    // The agreed offer, at 50000000 sat a NEX, 50 sat a base unit: 49 sat
+    // left over.
     let terms = agreed().terms(10_000_049);
     assert_eq!(
         (terms.btc_amount.to_sat(), terms.nex_amount),
@@ -515,11 +539,11 @@ fn the_seller_answers_only_a_request_its_quote_holds() {
     use swap::offer::Declined;
     let offer = agreed();
     assert_eq!(
-        offer.answer(10_000_000, 50),
+        offer.answer(10_000_000, 50_000_000),
         Answer::Terms(offer.terms(10_000_000))
     );
     assert_eq!(
-        offer.answer(50_000_000, 50),
+        offer.answer(50_000_000, 50_000_000),
         Answer::Terms(offer.terms(50_000_000))
     );
     let refused = |btc, price| match offer.answer(btc, price) {
@@ -527,20 +551,20 @@ fn the_seller_answers_only_a_request_its_quote_holds() {
         Answer::Terms(terms) => panic!("{btc} at {price}: {terms:?}"),
     };
     assert_eq!(
-        refused(9_999_999, 50),
+        refused(9_999_999, 50_000_000),
         Declined::AmountBelowMinimum { min: 10_000_000 }
     );
     assert_eq!(
-        refused(50_000_001, 50),
+        refused(50_000_001, 50_000_000),
         Declined::AmountAboveMaximum { max: 50_000_000 }
     );
     assert_eq!(
-        refused(10_000_000, 49),
-        Declined::PriceChanged { price: 50 }
+        refused(10_000_000, 49_999_999),
+        Declined::PriceChanged { price: 50_000_000 }
     );
     assert_eq!(
-        refused(10_000_000, 51),
-        Declined::PriceChanged { price: 50 }
+        refused(10_000_000, 50_000_001),
+        Declined::PriceChanged { price: 50_000_000 }
     );
 }
 
@@ -578,17 +602,20 @@ fn the_buyer_takes_only_the_terms_it_asked_for() {
     }
     // Terms at another price than the one signed, though the seller's own.
     let mut repriced = offer.clone();
-    repriced.quote.price = 40;
+    repriced.quote.price = 40_000_000;
     let terms = repriced.terms(20_000_000);
     assert!(offer.check_answer(&policy, &Answer::Terms(terms)).is_err());
     let other = Policy {
-        price: 40,
+        price: 40_000_000,
         ..policy.clone()
     };
     assert!(offer.check_answer(&other, &Answer::Terms(asked)).is_err());
-    let declined = Answer::Refused(swap::offer::Declined::PriceChanged { price: 60 });
+    let declined = Answer::Refused(swap::offer::Declined::PriceChanged { price: 60_000_000 });
     let refused = offer.check_answer(&policy, &declined).unwrap_err();
-    assert_eq!(refused, "refused by the seller: the price is 60 sat a NEX");
+    assert_eq!(
+        refused,
+        "refused by the seller: the price is 60000000 sat a NEX"
+    );
 }
 
 /// A session that hands out `inbox` and keeps what is sent.
@@ -627,14 +654,14 @@ fn the_terms_are_fixed_before_the_machines_start() {
     let request = |btc_amount, price| Message::Request { btc_amount, price };
 
     // The seller answers a request in its quote with the terms at it.
-    let mut seller = session(vec![request(20_000_000, 50)]);
+    let mut seller = session(vec![request(20_000_000, 50_000_000)]);
     let terms = answer_request(&mut seller, &offer).unwrap();
     assert_eq!(terms, offer.terms(20_000_000));
     let answered = Message::Answer(Answer::Terms(terms.clone()));
     assert_eq!(seller.sent.len(), 1);
     assert_eq!(seller.sent[0].encode(swap_id), answered.encode(swap_id));
     // And refuses, saying why, one outside it.
-    let mut seller = session(vec![request(50_000_001, 50)]);
+    let mut seller = session(vec![request(50_000_001, 50_000_000)]);
     let refused = answer_request(&mut seller, &offer).unwrap_err().to_string();
     assert!(
         refused.contains("the most it takes is 50000000 sat"),
@@ -644,7 +671,7 @@ fn the_terms_are_fixed_before_the_machines_start() {
         seller.sent[..],
         [Message::Answer(Answer::Refused(_))]
     ));
-    let mut seller = session(vec![request(20_000_000, 49)]);
+    let mut seller = session(vec![request(20_000_000, 49_999_999)]);
     assert!(answer_request(&mut seller, &offer).is_err());
     // A buyer that opens with anything else is refused.
     let mut seller = session(vec![]);
@@ -656,7 +683,7 @@ fn the_terms_are_fixed_before_the_machines_start() {
     assert_eq!(request_terms(&mut buyer, &offer, &policy).unwrap(), terms);
     assert_eq!(
         buyer.sent[0].encode(swap_id),
-        request(20_000_000, 50).encode(swap_id)
+        request(20_000_000, 50_000_000).encode(swap_id)
     );
     let mut other = terms.clone();
     other.nex_amount += 1;
@@ -1058,7 +1085,7 @@ fn take_refusal_on(
     fs::write(file.path(), offer.encode()).unwrap();
     let path = file.path().to_str().unwrap();
     let mut args = vec!["take", path, "--nex-address", address];
-    args.extend(["--price", "50"]);
+    args.extend(["--price", "50000000"]);
     args.extend(extra);
     refusal_on(&args, btc_url, nexus_url)
 }
@@ -1190,11 +1217,11 @@ fn an_amount_that_cannot_pay_redeem_is_refused() {
     assert!(refused.contains("at 2545 sat, btc_amount"), "{refused}");
     let (policy, network) = policy(&["--btc-amount", "20545"]);
     let mut offer = agreed();
-    offer.quote.price = 1;
+    offer.quote.price = 1_000_000;
     offer.quote.min_btc_amount = 2 * 10_000 + 545;
     offer.quote.max_btc_amount = 2 * 10_000 + 545;
     let policy = Policy {
-        price: 1,
+        price: 1_000_000,
         ..policy.policy(&offer)
     };
     let refused = check_offer(&offer, &policy, network, MAINNET, FLOOR, NEX_FLOOR).unwrap_err();
@@ -1692,7 +1719,7 @@ fn offer_take_and_resume_check_the_nexus_node() {
         &[
             "offer",
             "--price",
-            "50",
+            "50000000",
             "--min-btc-amount",
             "10000000",
             "--max-btc-amount",
@@ -1791,7 +1818,7 @@ fn offer_take_and_resume_refuse_another_nexus() {
         let mut args = vec![
             "offer",
             "--price",
-            "50",
+            "50000000",
             "--min-btc-amount",
             "10000000",
             "--max-btc-amount",

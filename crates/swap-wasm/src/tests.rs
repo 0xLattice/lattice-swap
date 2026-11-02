@@ -411,7 +411,7 @@ fn signed_offer(relay: &str) -> Offer {
     let terms: Terms = parse(&terms()).unwrap();
     // The terms above at the most it takes.
     let quote = swap::offer::Quote {
-        price: 2,
+        price: 2_000_000,
         min_btc_amount: 10_000,
         max_btc_amount: 1_000_000,
     };
@@ -470,16 +470,16 @@ fn an_offer_is_judged_by_the_clis_policy() {
     };
     // The bounds the regtest terms need, the rest the CLI's defaults.
     let policy = json!({
-        "btc_amount": 1_000_000, "price": 2, "max_t1": 20, "min_t2": 20,
+        "btc_amount": 1_000_000, "price": 2_000_000, "max_t1": 20, "min_t2": 20,
         "min_btc_confirmations": 1, "min_nex_confirmations": 1, "min_margin": 3,
         "min_refund_window": 19,
     });
     assert_eq!(check(policy.clone(), json!(1_000)), None);
     let mut other = policy.clone();
-    other["price"] = json!(1);
+    other["price"] = json!(1_999_999);
     assert!(check(other, json!(1_000))
         .unwrap()
-        .contains("asks 2 sat a NEX"));
+        .contains("asks 2000000 sat a NEX, not 1999999"));
     let mut other = policy.clone();
     other["btc_amount"] = json!(1_000_001);
     assert!(check(other, json!(1_000))
@@ -507,7 +507,7 @@ fn the_buyer_takes_only_the_terms_it_asked_for() {
     // Rounded down: the last satoshi buys nothing.
     assert_eq!(terms.nex_amount, 500_000);
     assert_eq!(terms.btc_amount, Amount::from_sat(1_000_001));
-    let policy = json!({"btc_amount": 1_000_000, "price": 2});
+    let policy = json!({"btc_amount": 1_000_000, "price": 2_000_000});
     let check = |answer: Value| {
         check_answer(&json!({"offer": offer, "policy": policy, "answer": answer}).to_string())
             .unwrap()

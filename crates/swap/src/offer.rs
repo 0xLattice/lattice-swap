@@ -10,6 +10,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{btc_fee_at, Terms};
 
+/// The Nexus base units a price is quoted for: one NEX as shown, as
+/// eigenwallet quotes a price for one whole XMR, not one piconero.
+pub const BASE_UNITS_PER_NEX: u64 = 1_000_000;
+
 /// The seller's price and the BTC it takes at it, as eigenwallet's ASB
 /// quotes one (`BidQuote { price, min_quantity, max_quantity }`,
 /// eigenwallet/core swap-p2p/src/protocols/quote.rs): the buyer picks an
@@ -17,8 +21,8 @@ use crate::{btc_fee_at, Terms};
 /// takes the offer.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Quote {
-    /// Satoshis a NEX, as `BidQuote::price` is the BTC one XMR costs: NEX
-    /// has no smaller unit.
+    /// Satoshis a NEX, [`BASE_UNITS_PER_NEX`] base units, as `BidQuote::price` is the BTC
+    /// one XMR costs.
     pub price: u64,
     /// The least BTC the seller takes, in satoshis.
     pub min_btc_amount: u64,
@@ -27,13 +31,19 @@ pub struct Quote {
 }
 
 impl Quote {
-    /// The NEX `btc_amount` satoshis buy at the price, rounded down, as
-    /// eigenwallet's `Rate::quote` truncates its XMR amount
-    /// (swap-feed/src/rate.rs, `Decimal::to_u64`): what is left of
-    /// `btc_amount` buys nothing. 0 at a price of 0, which no terms that
-    /// work take.
+    /// The Nexus base units `btc_amount` satoshis buy at the price,
+    /// `floor(btc_amount * BASE_UNITS_PER_NEX / price)`, as eigenwallet's
+    /// `Rate::quote` truncates its XMR amount (swap-feed/src/rate.rs,
+    /// `Decimal::to_u64`): what is left of `btc_amount`, at most
+    /// `ceil(price / BASE_UNITS_PER_NEX) - 1` satoshis, buys nothing. In
+    /// u128, so the product cannot overflow; a result beyond u64 is
+    /// u64::MAX, and 0 at a price of 0, which no terms that work take. It
+    /// never falls as `btc_amount` grows.
     pub fn nex_amount(&self, btc_amount: u64) -> u64 {
-        btc_amount.checked_div(self.price).unwrap_or(0)
+        let units = u128::from(btc_amount) * u128::from(BASE_UNITS_PER_NEX);
+        units
+            .checked_div(u128::from(self.price))
+            .map_or(0, |units| u64::try_from(units).unwrap_or(u64::MAX))
     }
 }
 
@@ -76,7 +86,8 @@ impl Template {
     /// Whether every amount in `quote`'s range can be swapped: the range
     /// is not empty, and the terms work at both its ends, and so in
     /// between, since [`Terms::check`] bounds the amounts only from below
-    /// and the debit from above. If not, why.
+    /// and the debit from above, and [`Quote::nex_amount`] never falls as
+    /// the BTC grows. If not, why.
     pub fn check(&self, quote: &Quote) -> Result<(), String> {
         if quote.min_btc_amount > quote.max_btc_amount {
             return Err(format!(
@@ -246,8 +257,8 @@ impl Offer {
         };
         if policy.price != self.quote.price || *terms != self.terms(policy.btc_amount) {
             return Err(format!(
-                "refused: the seller's terms are not the ones asked for: {} sat for {} NEX at \
-                 {} sat a NEX",
+                "refused: the seller's terms are not the ones asked for: {} sat for {} base \
+                 units at {} sat a NEX",
                 policy.btc_amount,
                 self.quote.nex_amount(policy.btc_amount),
                 self.quote.price
@@ -261,8 +272,8 @@ impl Offer {
     pub fn describe(&self) -> String {
         let (q, t) = (&self.quote, &self.template);
         format!(
-            "{} sat a NEX, {} to {} sat, on {}: fees {} sat and {} NEX, t1 {}, t2 {}, {} \
-             Bitcoin and {} Nexus confirmations, margin {}; {}",
+            "{} sat a NEX, {} to {} sat, on {}: fees {} sat and {} base units, t1 {}, t2 {}, \
+             {} Bitcoin and {} Nexus confirmations, margin {}; {}",
             q.price,
             q.min_btc_amount,
             q.max_btc_amount,
@@ -330,7 +341,8 @@ pub struct Policy {
     /// The BTC to pay, in satoshis: what the buyer asks the seller for, in
     /// the offer's range.
     pub btc_amount: u64,
-    /// The price agreed to, in satoshis a NEX.
+    /// The price agreed to, in satoshis a NEX of [`BASE_UNITS_PER_NEX`]
+    /// base units.
     pub price: u64,
     #[serde(flatten)]
     pub bounds: Bounds,

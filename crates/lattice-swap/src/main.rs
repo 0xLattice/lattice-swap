@@ -82,7 +82,7 @@ enum Command {
 /// Defaults are this tool's settings, not protocol rules.
 #[derive(Args)]
 struct TermsArgs {
-    /// The price, in satoshis a NEX.
+    /// The price, in sats per NEX, 1 NEX = 1,000,000 base units.
     #[arg(long)]
     price: u64,
     /// The least BTC to receive, in satoshis.
@@ -429,7 +429,7 @@ struct PolicyArgs {
     /// takes if left out, as eigenwallet swaps up to its seller's maximum.
     #[arg(long)]
     btc_amount: Option<u64>,
-    /// The price agreed to, in satoshis a NEX.
+    /// The price agreed to, in sats per NEX, 1 NEX = 1,000,000 base units.
     #[arg(long)]
     price: u64,
     /// The most each Bitcoin swap transaction may pay, in satoshis.
@@ -677,7 +677,7 @@ fn answer_request<T: Transport>(transport: &mut T, offer: &Offer) -> Result<Term
     match answer {
         Answer::Terms(terms) => {
             log(&format!(
-                "selling {} NEX for {btc_amount} sat",
+                "selling {} base units for {btc_amount} sat",
                 terms.nex_amount
             ));
             Ok(terms)
@@ -773,7 +773,7 @@ fn take(args: TakeArgs) -> Result<Outcome> {
     let config = ivy::Config::new(SigningKey::from_bytes(&offer.buyer_session));
     log(&offer.describe());
     log(&format!(
-        "taking {} sat for {} NEX",
+        "taking {} sat for {} base units",
         policy.btc_amount,
         offer.quote.nex_amount(policy.btc_amount)
     ));

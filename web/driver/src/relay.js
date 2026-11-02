@@ -4,8 +4,8 @@
 import { wasm } from './wasm.js';
 
 /** The offers `relay` lists, each as its text, which `decodeOffer` reads:
- * its `quote` holds the `price`, in sat a NEX, and the `min_btc_amount`
- * and `max_btc_amount` a buyer picks between. */
+ * its `quote` holds the `price`, in sat a NEX of 1,000,000 base units,
+ * and the `min_btc_amount` and `max_btc_amount` a buyer picks between. */
 export async function offers(relay, fetchImpl = globalThis.fetch) {
   const response = await fetchImpl(`${relay.replace(/\/+$/, '')}/offers`, { cache: 'no-store' });
   if (!response.ok) throw new Error(`${relay}/offers: ${response.status}`);

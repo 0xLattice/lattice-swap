@@ -11,10 +11,10 @@ before(loadWasm);
 const servers = [];
 after(() => servers.forEach((server) => server.close()));
 
-/** The test offer's terms at the policy's amount: the NEX its price
- * gives, rounded down. */
+/** The test offer's terms at the policy's amount: the base units its
+ * price, in sat a NEX of 10^6 base units, gives, rounded down. */
 const OFFER = JSON.parse(testOffer('http://relay.invalid'));
-const TERMS = { ...OFFER.template, btc_amount: POLICY.btc_amount, nex_amount: Math.floor(POLICY.btc_amount / OFFER.quote.price) };
+const TERMS = { ...OFFER.template, btc_amount: POLICY.btc_amount, nex_amount: Math.floor((POLICY.btc_amount * 1_000_000) / OFFER.quote.price) };
 
 /** The state's own transactions, as a restart from it would know them:
  * its funding, and once it cancels, cancel and refund. */
@@ -185,7 +185,7 @@ test('the funding pays the backend’s estimate, floored at the relay minimum', 
 
 test('an offer the policy refuses is refused before anything of the swap is saved', async () => {
   const store = new MemoryStore();
-  await assert.rejects(world({ store, policy: { ...POLICY, price: POLICY.price + 1 } }), /^Error: refused: the offer asks 2 sat a NEX/);
+  await assert.rejects(world({ store, policy: { ...POLICY, price: POLICY.price + 1 } }), /^Error: refused: the offer asks 2000000 sat a NEX/);
   await assert.rejects(world({ store, policy: { ...POLICY, btc_amount: OFFER.quote.max_btc_amount + 1 } }), /^Error: refused: the offer takes 10000 to 1000000 sat/);
   await assert.rejects(world({ store, policy: { ...POLICY, btc_amount: OFFER.quote.min_btc_amount - 1 } }), /^Error: refused: the offer takes/);
   assert.deepEqual(store.puts.map(([key]) => key), ['wallet']);
@@ -429,7 +429,7 @@ test('the wallet is asked for the amount picked, and the seller for it at the si
   const run = running(w.buyer);
   await until(() => w.a.posted.length > 0).catch((e) => assert.fail(`${e.message}: ${JSON.stringify(w.buyer.status())}`));
   await run.stop();
-  assert.deepEqual(w.seller.log[0], { Request: { btc_amount: 500_001, price: 2 } });
+  assert.deepEqual(w.seller.log[0], { Request: { btc_amount: 500_001, price: 2_000_000 } });
   assert.equal(parseTx(w.a.posted[0]).outputs[0].value, 500_001);
   // Rounded down: the last satoshi buys nothing.
   assert.equal(call('offerTerms', { offer: OFFER, btc_amount: 500_001 }).nex_amount, 250_000);

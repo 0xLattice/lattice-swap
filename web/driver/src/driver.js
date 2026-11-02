@@ -66,9 +66,10 @@ export class Buyer extends EventTarget {
 
   /** A swap of `offer`, an offer's text from a relay's board, that the
    * buyer agreed to by `policy` (`swap::offer::Policy`: `btc_amount`, in
-   * sat, in the offer's range, the `price` agreed to, and any bound to hold
-   * other than the CLI's), funded from `wallet`: its record saved, nothing
-   * sent. It buys the NEX the price gives for `btc_amount`, rounded down.
+   * sat, in the offer's range, the `price` agreed to, in sat a NEX of
+   * 1,000,000 base units, and any bound to hold other than the CLI's),
+   * funded from `wallet`: its record saved, nothing sent. It buys
+   * `floor(btc_amount * 1000000 / price)` base units.
    * The NEX goes to `nexAddress`, and a refund to the wallet. Refuses the
    * offer as the CLI's `take` would, and while another swap runs. A swap
    * prepared before that never took its offer is dropped: nothing was sent
