@@ -33,9 +33,9 @@ curve25519-dalek = "4"
 futures-util = { version = "0.3", default-features = false, features = ["sink"], optional = true }
 ed25519-dalek = "2"
 hex = { version = "0.4", features = ["serde"] }
-ivy = { git = "https://github.com/0xLattice/ivy-rs", rev = "e020256", optional = true }
+ivy = { git = "https://github.com/0xLattice/ivy-rs", rev = "284ad81", optional = true }
 # `ivy` does not re-export the peer key type, which an offer names.
-ivy-core = { git = "https://github.com/0xLattice/ivy-rs", rev = "e020256" }
+ivy-core = { git = "https://github.com/0xLattice/ivy-rs", rev = "284ad81" }
 rand_core = { version = "0.6", features = ["getrandom"] }
 schnorr_fun = { version = "0.13", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
