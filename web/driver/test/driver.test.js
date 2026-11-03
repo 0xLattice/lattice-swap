@@ -4,6 +4,7 @@ import 'fake-indexeddb/auto';
 
 import { Buyer, IndexedDBStore, MemoryStore, Wallet } from '../src/index.js';
 import { call } from '../src/wasm.js';
+import { PINGS_MISSED, Session } from '../src/relay.js';
 import { Chain, esplora, kind, Locks, loadWasm, nexus, parseTx, POLICY, seller, testOffer, until } from './fakes.js';
 
 before(loadWasm);
@@ -303,6 +304,79 @@ test('a page reloaded once the lock is out meets the seller again', async () => 
   await again.stop();
   await w.checked;
   assert.deepEqual(w.unsaved, []);
+});
+
+test('a run stopped and started again meets the seller again', async () => {
+  const { w, run, funding } = await funded();
+  await run.stop();
+  sellerLocksNex(w, funding);
+  const again = running(w.buyer);
+  await cidArrives(w);
+  await again.stop();
+  await w.checked;
+  assert.deepEqual(w.unsaved, []);
+});
+
+test('a rejoin still waiting when the run stops is given up', async () => {
+  const { w, run } = await funded();
+  let waiting = null;
+  w.seller.open = (_offer, _onMessage, options) => {
+    waiting = options;
+    return new Promise(() => {});
+  };
+  w.session.close();
+  await until(() => waiting !== null);
+  const { state } = await w.store.get(`swap:${w.buyer.swapId}`);
+  assert.deepEqual(waiting.rejoin, call('buyerRejoin', state), 'at the rendezvous, under the rejoin key');
+  assert.equal(waiting.signal.aborted, false);
+  await run.stop();
+  assert.equal(waiting.signal.aborted, true);
+});
+
+test('a session waiting at its rendezvous closes its socket once aborted', async () => {
+  const sockets = [];
+  class Socket {
+    constructor(url) {
+      this.url = url;
+      sockets.push(this);
+    }
+    send() {}
+    close() {
+      this.closed = true;
+    }
+  }
+  const halt = new AbortController();
+  const rejoin = { id: '01'.repeat(32), key: '02'.repeat(32) };
+  const opening = Session.open(OFFER, () => {}, { WebSocket: Socket, rejoin, signal: halt.signal });
+  assert.match(sockets[0].url, new RegExp(`/rejoin/${rejoin.id}$`));
+  halt.abort();
+  await assert.rejects(opening, /aborted/);
+  assert.equal(sockets[0].closed, true);
+});
+
+test('a session whose pings go unanswered ends; one that answers stays', async () => {
+  const socket = {
+    send() {},
+    close() {
+      this.closed = true;
+    },
+  };
+  const ivy = { pings: 0, isOpen: () => true, ping: () => (ivy.pings += 1), outbound: () => new Uint8Array(), receive: () => [] };
+  const ping = 20;
+  const session = new Session(socket, ivy, () => {}, { ping });
+  // The seller answers each ping: the session stays, quiet as it is.
+  const answering = Date.now();
+  while (Date.now() - answering < ping * PINGS_MISSED * 3) {
+    await pause(ping / 2);
+    socket.onmessage({ data: new ArrayBuffer(1) });
+  }
+  assert.equal(session.closed, false);
+  assert.ok(ivy.pings >= PINGS_MISSED, `${ivy.pings} pings`);
+  // It stops answering, its socket still open.
+  const silent = Date.now();
+  await until(() => session.closed);
+  assert.ok(Date.now() - silent >= ping * (PINGS_MISSED - 1), 'not before its pings go unanswered');
+  assert.equal(socket.closed, true);
 });
 
 test('the page must stay open only while the redeem is signed and unsettled', async () => {

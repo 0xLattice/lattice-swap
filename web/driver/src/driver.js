@@ -72,8 +72,10 @@ export class Buyer extends EventTarget {
   #rejoining = null;
   #rejoinedAt = -Infinity;
   #rejoined = false;
-  /** Whether {@link Buyer#run} has returned. */
+  /** Whether {@link Buyer#run} has returned, and what aborts a rejoin it
+   * left in flight. */
   #stopped = false;
+  #halt = new AbortController();
 
   constructor(wallet, record, nexusChecked) {
     super();
@@ -264,6 +266,8 @@ export class Buyer extends EventTarget {
    * again.
    * @returns {Promise<string | null>} */
   async run(signal) {
+    this.#stopped = false;
+    this.#halt = new AbortController();
     while (!signal?.aborted) {
       let done = null;
       try {
@@ -285,6 +289,7 @@ export class Buyer extends EventTarget {
       this.#wake = null;
     }
     this.#stopped = true;
+    this.#halt.abort();
     this.#session?.close();
     return ended(this.#r.state) ? this.status().outcome : null;
   }
@@ -315,16 +320,19 @@ export class Buyer extends EventTarget {
    * the chains meanwhile. A session it opened is first sent the last
    * message again, which the seller ignores if it has it. */
   async #rejoin() {
-    const rejoin = call('buyerRejoin', this.#r.state);
     if (this.#rejoined) {
       this.#rejoined = false;
-      if (rejoin?.resend) await this.#act({ Send: rejoin.resend });
+      const resend = call('buyerResend', this.#r.state);
+      if (resend) await this.#act({ Send: resend });
     }
-    if (rejoin === null || this.#rejoining || (this.#session && !this.#session.closed)) return;
+    if (this.#rejoining || (this.#session && !this.#session.closed)) return;
     if (this.#c.now() - this.#rejoinedAt < REJOIN_PAUSE) return;
+    const rejoin = call('buyerRejoin', this.#r.state);
+    if (rejoin === null) return;
     this.#rejoinedAt = this.#c.now();
     const open = this.#c.openSession ?? Session.open;
-    this.#rejoining = open(this.#r.offer, (message) => this.#receive(message), { WebSocket: this.#c.WebSocket, rejoin: rejoin.id })
+    const options = { WebSocket: this.#c.WebSocket, rejoin, signal: this.#halt.signal };
+    this.#rejoining = open(this.#r.offer, (message) => this.#receive(message), options)
       .then(
         (session) => {
           if (this.#stopped) return session.close();

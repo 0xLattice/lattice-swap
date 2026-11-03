@@ -18,10 +18,12 @@
 //!   their session is lost. The first to come waits; once the other comes,
 //!   the relay says `paired` to both and pipes them. The rendezvous is a
 //!   hash only the two parties can work out (`swap::Rejoin`), so no one
-//!   else, the swap id read from the board, can take either's place; and
-//!   one who did would still fail the buyer's handshake, which checks the
-//!   seller's key, and could make the seller do nothing: once the lock is
-//!   agreed it acts only on the buyer's signatures.
+//!   else, the swap id read from the board, can take either's place. Doing
+//!   nothing is the harm here: one who held the seller's session in the
+//!   buyer's place would keep the two apart until the buyer refunds. So
+//!   the handshake is checked too, past the relay's pairing: the buyer's
+//!   checks the seller's offer key, and the seller's a rejoin key derived
+//!   from the same secret, not the offer's public `buyer_session`.
 //!
 //! Every answer lets any web page read it (`Access-Control-Allow-Origin:
 //! *`), so a buyer's page can list the offers.

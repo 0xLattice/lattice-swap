@@ -721,19 +721,19 @@ impl SessionFile {
 
     /// Opens sessions to the counterparty for [`Driver::reconnect`]: the
     /// seller's on `listener` if it listens, else on the one it listened
-    /// on.
+    /// on. The buyer comes back under the rejoin key ([`swap::Rejoin`]),
+    /// and the seller takes no other.
     fn reconnect(&self, listener: Option<TcpListener>) -> Result<Reconnect<Session>> {
         let offer = &self.offer;
-        let buyer_session = offer.buyer_session;
         let place = offer.place()?;
         let Some(key) = &self.key else {
             let seller = offer.seller_key()?;
-            return Ok(swap::transport::in_background(move |id| {
-                let config = ivy::Config::new(SigningKey::from_bytes(&buyer_session));
+            return Ok(swap::transport::in_background(move |rejoin| {
+                let config = ivy::Config::new(SigningKey::from_bytes(&rejoin.key));
                 Ok(match &place {
                     Place::Relay(relay) => Box::new(Ivy::connect_rejoined(
                         relay,
-                        id,
+                        rejoin.id,
                         &config,
                         seller,
                         REJOIN_WAIT,
@@ -747,14 +747,14 @@ impl SessionFile {
         };
         let mut seed = [0u8; 32];
         hex::decode_to_slice(key, &mut seed).map_err(|_| "the session key is not hex")?;
-        let buyer = ivy::Config::new(SigningKey::from_bytes(&buyer_session)).peer_key();
         let listener = match (listener, self.listen) {
             (Some(listener), _) => Some(listener),
             (None, Some(listen)) => Some(TcpListener::bind(listen)?),
             (None, None) => None,
         };
-        Ok(swap::transport::in_background(move |id| {
+        Ok(swap::transport::in_background(move |rejoin| {
             let config = ivy::Config::new(SigningKey::from_bytes(&seed));
+            let buyer = ivy::Config::new(SigningKey::from_bytes(&rejoin.key)).peer_key();
             Ok(match (&listener, &place) {
                 (Some(listener), _) => Box::new(Ivy::accept(
                     listener.try_clone()?,
@@ -765,7 +765,7 @@ impl SessionFile {
                 )?) as Session,
                 (None, Place::Relay(relay)) => Box::new(Ivy::accept_rejoined(
                     relay,
-                    id,
+                    rejoin.id,
                     &config,
                     buyer,
                     REJOIN_WAIT,

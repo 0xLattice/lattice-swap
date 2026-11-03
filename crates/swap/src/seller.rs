@@ -531,7 +531,22 @@ impl Machine for Seller {
     fn rejoin(&self) -> Option<Rejoin> {
         use Seller::*;
         match self {
-            AwaitLockProposal(setup) => setup.rejoin(Some(hello(setup))),
+            AwaitLockProposal(setup) | AwaitBuyerSignatures { setup, .. } => Some(setup.rejoin()),
+            AwaitFunding { locked, .. }
+            | LockingNex { locked, .. }
+            | AwaitRedeemSignature { locked, .. } => Some(locked.setup.rejoin()),
+            AwaitBuyerHello(_)
+            | Redeeming { .. }
+            | Cancelling { .. }
+            | ClaimingNex(_)
+            | Done(_) => None,
+        }
+    }
+
+    fn resend(&self) -> Option<Message> {
+        use Seller::*;
+        match self {
+            AwaitLockProposal(setup) => Some(hello(setup)),
             AwaitBuyerSignatures {
                 setup,
                 lock,
@@ -541,18 +556,12 @@ impl Machine for Seller {
                     .swap()
                     .sign(*lock, Spend::Cancel, &setup.secrets.key());
                 let refund = refund.clone();
-                setup.rejoin(Some(Message::SellerSignatures { cancel, refund }))
+                Some(Message::SellerSignatures { cancel, refund })
             }
-            AwaitFunding { locked, .. } | LockingNex { locked, .. } => locked.setup.rejoin(None),
-            AwaitRedeemSignature { locked, nex_lock } => {
-                let cid = nex_lock.cid();
-                locked.setup.rejoin(Some(Message::NexLocked { cid }))
-            }
-            AwaitBuyerHello(_)
-            | Redeeming { .. }
-            | Cancelling { .. }
-            | ClaimingNex(_)
-            | Done(_) => None,
+            AwaitRedeemSignature { nex_lock, .. } => Some(Message::NexLocked {
+                cid: nex_lock.cid(),
+            }),
+            _ => None,
         }
     }
 

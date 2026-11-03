@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::{Sink, Stream};
 use ivy::{Config, Connection};
+use ivy_core::Message as Record;
 pub use ivy_core::PeerKey;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
@@ -18,7 +19,7 @@ use tokio::time::{sleep, timeout};
 use tokio_tungstenite::tungstenite::{self, Message as Frame};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-use crate::TOPIC;
+use crate::{Rejoin, TOPIC};
 
 /// The most handshakes [`Ivy::accept`] runs at once.
 pub const HANDSHAKES: usize = 64;
@@ -46,6 +47,13 @@ impl<T: Transport + ?Sized> Transport for Box<T> {
     }
 }
 
+/// How often [`Ivy::recv`] pings the counterparty while it waits.
+pub const PING: Duration = Duration::from_secs(15);
+/// How many pings in a row may go unanswered before [`Ivy::recv`] counts
+/// the session lost: as OpenSSH's `ServerAliveInterval` and its default
+/// `ServerAliveCountMax`.
+pub const PINGS_MISSED: u32 = 3;
+
 /// An ivy session over TCP, or over a relay's WebSocket ([`Relayed`]),
 /// with its own single-threaded runtime so the blocking driver can use it.
 /// Messages on other topics are skipped.
@@ -53,6 +61,25 @@ pub struct Ivy<S = TcpStream> {
     runtime: Runtime,
     connection: Connection<S>,
     send_timeout: Duration,
+    /// How often a ping goes out: [`PING`] unless a test sets its own.
+    pub ping: Duration,
+    /// When the last one went out.
+    pinged: Instant,
+    /// Since when a ping has gone out with nothing heard after it.
+    unanswered: Option<Instant>,
+}
+
+impl<S> Ivy<S> {
+    fn new(runtime: Runtime, connection: Connection<S>, send_timeout: Duration) -> Self {
+        Self {
+            runtime,
+            connection,
+            send_timeout,
+            ping: PING,
+            pinged: Instant::now(),
+            unanswered: None,
+        }
+    }
 }
 
 impl Ivy {
@@ -70,11 +97,7 @@ impl Ivy {
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timed out"))??;
             ivy::connect(stream, config, peer).await
         })?;
-        Ok(Self {
-            runtime,
-            connection,
-            send_timeout,
-        })
+        Ok(Self::new(runtime, connection, send_timeout))
     }
 
     /// Takes connections on `listener` until one completes the handshake
@@ -142,11 +165,7 @@ impl Ivy {
             })
             .await
         })?;
-        Ok(Self {
-            runtime,
-            connection,
-            send_timeout,
-        })
+        Ok(Self::new(runtime, connection, send_timeout))
     }
 }
 
@@ -184,18 +203,53 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Transport for Ivy<S> {
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "send timed out"))?
     }
 
+    /// Pings the counterparty every [`Ivy::ping`] meanwhile, and fails once
+    /// [`PINGS_MISSED`] pings in a row go unanswered: a session whose other
+    /// end is gone without a word, a laptop asleep or a NAT that forgot it,
+    /// reads as quiet and not as closed, and only a keepalive tells the
+    /// two apart, as libp2p's ping, which eigenwallet runs, and SSH's
+    /// `ServerAliveInterval` do.
     fn recv(&mut self, wait: Duration) -> io::Result<Option<Vec<u8>>> {
         let deadline = Instant::now() + wait;
         loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            // `recv` is cancel-safe: a message cut off by the deadline is
-            // kept for the next call.
-            let recv = self.connection.recv();
+            let now = Instant::now();
+            if now >= self.pinged + self.ping {
+                let ping = self.connection.send_message(&Record::Ping(0));
+                self.runtime
+                    .block_on(async { timeout(self.send_timeout, ping).await })
+                    .map_err(|_| timed_out("a ping timed out"))??;
+                self.pinged = now;
+                self.unanswered.get_or_insert(now);
+            }
+            let left = deadline
+                .min(self.pinged + self.ping)
+                .saturating_duration_since(now);
+            // `recv_message` is cancel-safe: a message cut off by the
+            // deadline is kept for the next call.
+            let recv = self.connection.recv_message();
             match self.runtime.block_on(async { timeout(left, recv).await }) {
-                Err(_) => return Ok(None),
+                Err(_) => {
+                    let missed = self.ping * PINGS_MISSED;
+                    if self
+                        .unanswered
+                        .is_some_and(|since| since.elapsed() >= missed)
+                    {
+                        return Err(timed_out("the counterparty stopped answering"));
+                    }
+                    if Instant::now() >= deadline {
+                        return Ok(None);
+                    }
+                }
                 Ok(Err(e)) => return Err(e),
-                Ok(Ok((topic, payload))) if topic == TOPIC => return Ok(Some(payload)),
-                Ok(Ok(_)) => continue,
+                Ok(Ok(message)) => {
+                    self.unanswered = None;
+                    match message {
+                        Record::PeerMessage { topic, payload } if topic == TOPIC => {
+                            return Ok(Some(payload))
+                        }
+                        _ => continue,
+                    }
+                }
             }
         }
     }
@@ -262,11 +316,7 @@ impl Ivy<Relayed> {
                 }
             }
         })?;
-        Ok(Self {
-            runtime,
-            connection,
-            send_timeout,
-        })
+        Ok(Self::new(runtime, connection, send_timeout))
     }
 
     /// Asks the relay at `relay` to pair this party with the seller that
@@ -284,11 +334,7 @@ impl Ivy<Relayed> {
             let socket = dial(&url, send_timeout).await?;
             ivy::connect(Relayed::new(socket), config, peer).await
         })?;
-        Ok(Self {
-            runtime,
-            connection,
-            send_timeout,
-        })
+        Ok(Self::new(runtime, connection, send_timeout))
     }
 
     /// Meets the buyer at rendezvous `id` on the relay at `relay`
@@ -312,11 +358,7 @@ impl Ivy<Relayed> {
                 .await
                 .map_err(|_| timed_out("the handshake timed out"))?
         })?;
-        Ok(Self {
-            runtime,
-            connection,
-            send_timeout,
-        })
+        Ok(Self::new(runtime, connection, send_timeout))
     }
 
     /// Meets the seller, which must hold `peer`'s key, at rendezvous `id`
@@ -337,11 +379,7 @@ impl Ivy<Relayed> {
                 .await
                 .map_err(|_| timed_out("the handshake timed out"))?
         })?;
-        Ok(Self {
-            runtime,
-            connection,
-            send_timeout,
-        })
+        Ok(Self::new(runtime, connection, send_timeout))
     }
 }
 
@@ -365,28 +403,31 @@ async fn meet(
 /// How long [`in_background`] waits after a failed attempt.
 pub const RETRY: Duration = Duration::from_secs(5);
 
-/// `connect`, which opens a session given the rendezvous id and may block,
-/// as [`Driver::reconnect`] takes it: on its own thread, one attempt at a
-/// time and the next [`RETRY`] after a failure, so the driver goes on
+/// `connect`, which opens a session given how to meet ([`Rejoin`]) and may
+/// block, as [`Driver::reconnect`] takes it: on its own thread, one attempt
+/// at a time and the next [`RETRY`] after a failure, so the driver goes on
 /// watching the chains meanwhile.
 ///
 /// [`Driver::reconnect`]: crate::driver::Driver::reconnect
 pub fn in_background<T: Send + 'static>(
-    connect: impl Fn([u8; 32]) -> io::Result<T> + Send + Sync + 'static,
+    connect: impl Fn(&Rejoin) -> io::Result<T> + Send + Sync + 'static,
 ) -> crate::driver::Reconnect<T> {
     let connect = std::sync::Arc::new(connect);
-    let mut attempt: Option<std::thread::JoinHandle<Option<T>>> = None;
-    Box::new(move |id| {
-        if attempt.as_ref().is_some_and(|a| !a.is_finished()) {
+    let mut attempt: Option<std::thread::JoinHandle<io::Result<T>>> = None;
+    let mut failed: Option<Instant> = None;
+    Box::new(move |rejoin| {
+        if let Some(done) = attempt.take_if(|a| a.is_finished()) {
+            let result = done
+                .join()
+                .unwrap_or_else(|_| Err(io::Error::other("the attempt panicked")));
+            failed = result.is_err().then(Instant::now);
+            return Some(result);
+        }
+        if attempt.is_some() || failed.is_some_and(|at| at.elapsed() < RETRY) {
             return None;
         }
-        if let Some(Ok(Some(session))) = attempt.take().map(|a| a.join()) {
-            return Some(session);
-        }
-        let connect = connect.clone();
-        attempt = Some(std::thread::spawn(move || {
-            connect(id).inspect_err(|_| std::thread::sleep(RETRY)).ok()
-        }));
+        let (connect, rejoin) = (connect.clone(), rejoin.clone());
+        attempt = Some(std::thread::spawn(move || connect(&rejoin)));
         None
     })
 }

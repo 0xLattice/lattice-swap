@@ -212,7 +212,9 @@ export function seller(offer, answer = (_request, terms) => ({ Terms: terms })) 
     }
   };
   const open = async (_offer, onMessage, { rejoin = null } = {}) => {
-    if (rejoin !== null && (state === null || call('sellerRejoin', state)?.id !== rejoin)) throw new Error('no one came');
+    // Only the buyer comes to the seller's rendezvous, under its rejoin key.
+    const at = state === null ? null : call('sellerRejoin', state);
+    if (rejoin !== null && (at?.id !== rejoin.id || at.key !== rejoin.key)) throw new Error('no one came');
     reply = (message) => setTimeout(() => !session.closed && onMessage(JSON.stringify(message)), 1);
     const session = {
       closed: false,
@@ -237,7 +239,7 @@ export function seller(offer, answer = (_request, terms) => ({ Terms: terms })) 
         session.closed = true;
       },
     };
-    const again = rejoin === null ? null : call('sellerRejoin', state).resend;
+    const again = rejoin === null ? null : call('sellerResend', state);
     if (again) reply(again);
     return session;
   };

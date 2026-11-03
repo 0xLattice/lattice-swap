@@ -92,10 +92,14 @@ two meet at a rendezvous, the SHA-256 of a tag, the swap id and the
 Diffie-Hellman of their Bitcoin keys, which only they can work out. On each
 new session each sends again the last message it sent; a machine ignores a
 message it is not waiting for, so a copy it has already applied changes
-nothing. The session authenticates the seller's offer key, and once the
-lock is agreed every message the seller acts on is a signature by the
-buyer's Bitcoin key, which it verifies: one who met the seller anyway could
-make it do nothing.
+nothing. A new session authenticates the seller's offer key, and the
+buyer's rejoin key, an Ed25519 seed hashed from the same secret under
+another tag: the offer's `buyer_session` is public on a relay, and one who
+held the seller's session with it would keep the two apart until B
+refunds. Each side pings the other every 15 seconds and counts the session
+lost once three pings in a row go unanswered, as SSH's
+`ServerAliveInterval` does, so a connection gone silent without closing,
+a laptop asleep or a NAT that forgot it, is met again too.
 
 ## When something goes wrong
 

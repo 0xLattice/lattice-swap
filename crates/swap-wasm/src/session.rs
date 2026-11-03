@@ -54,8 +54,9 @@ pub struct Ivy {
 #[wasm_bindgen]
 impl Ivy {
     /// Opens the handshake to the seller whose key `peer` is, as the
-    /// session key `session_key` (hex), both as the offer names them, for
-    /// the swap `swap_id` (hex): its hello is the first outbound.
+    /// session key `session_key` (hex), both as the offer names them or, on
+    /// a rejoin, `session_key` the `key` of `buyerRejoin`, for the swap
+    /// `swap_id` (hex): its hello is the first outbound.
     #[wasm_bindgen(constructor)]
     pub fn new(session_key: &str, peer: &str, swap_id: &str) -> Result<Ivy> {
         let mut seed = [0u8; 32];
@@ -133,6 +134,18 @@ impl Ivy {
         self.inbound.drain(..self.read_from);
         self.read_from = 0;
         Ok(messages)
+    }
+
+    /// Seals a keepalive ping onto the outbound, as the CLI's session pings
+    /// (`swap::transport::PING`): the seller answers it, and the page ends a
+    /// session that stops answering.
+    pub fn ping(&mut self) -> Result<()> {
+        let session = self.session.as_mut().ok_or("the session is not open")?;
+        let ping = session
+            .seal(&Record::Ping(0))
+            .map_err(|e| format!("ivy: {e:?}"))?;
+        self.outbound.extend_from_slice(&frame(&ping));
+        Ok(())
     }
 
     /// Seals `message`, a swap message as JSON, as the CLI sends it, onto

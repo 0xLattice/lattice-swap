@@ -14,7 +14,7 @@ use swap_nexus_tx::rpc::Client;
 use crate::bitcoind::{self, Bitcoin};
 use crate::transport::Transport;
 use crate::{view, SecretBytes, Spent};
-use crate::{Action, BitcoinView, Event, Machine, Message, NexusView, NexusWatch, Outcome};
+use crate::{Action, BitcoinView, Event, Machine, Message, NexusView, NexusWatch, Outcome, Rejoin};
 
 pub use crate::STATE_VERSION;
 
@@ -142,9 +142,10 @@ impl Store {
     }
 }
 
-/// Gives a new session given the rendezvous id, at once if one is open:
-/// see [`Driver::reconnect`].
-pub type Reconnect<T> = Box<dyn FnMut([u8; 32]) -> Option<T> + Send>;
+/// Answers at once: a new session given how to meet ([`Rejoin`]) once one
+/// is open, why an attempt failed once one has, or else nothing yet. See
+/// [`Driver::reconnect`].
+pub type Reconnect<T> = Box<dyn FnMut(&Rejoin) -> Option<io::Result<T>> + Send>;
 
 /// Feeds a machine what its nodes and its counterparty show, and does what
 /// it asks. The state is saved after every step that changes it, before
@@ -186,10 +187,9 @@ pub struct Driver<M, B, T> {
     /// and from `reconnect`, if set, while the machine still needs one.
     transport: Option<T>,
     /// A new session to the counterparty, while the machine has none and
-    /// [`Machine::rejoin`] asks for one: given the rendezvous id, it
-    /// answers at once, with a session once one is open. Each new one is
-    /// first sent the message the machine would have the counterparty hold
-    /// again. See [`crate::transport::in_background`].
+    /// [`Machine::rejoin`] asks for one. Each new one is first sent
+    /// [`Machine::resend`]; a failed attempt is logged, as the views' are.
+    /// See [`crate::transport::in_background`].
     pub reconnect: Option<Reconnect<T>>,
     store: Store,
     /// How long one round waits for a message; also the polling interval.
@@ -240,6 +240,8 @@ pub struct Driver<M, B, T> {
     /// The last failure to submit a Nexus transaction, and when it was
     /// logged.
     submit_failed: Option<(String, SystemTime)>,
+    /// The last failed attempt to rejoin, and when it was logged.
+    rejoin_failed: Option<(String, SystemTime)>,
     /// The tip, and when this driver first saw it, in seconds since the
     /// Unix epoch. Kept in memory only: after a restart, the tip is first
     /// seen then.
@@ -310,6 +312,7 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
             view_failed: None,
             stale_since: None,
             submit_failed: None,
+            rejoin_failed: None,
             first_seen: None,
             _lock: lock,
         }
@@ -371,11 +374,20 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
         let Some(rejoin) = self.state.rejoin() else {
             return Ok(());
         };
-        if let Some(transport) = reconnect(rejoin.id) {
-            warn("session rejoined");
-            self.transport = Some(transport);
-            if let Some(message) = rejoin.resend {
-                self.act(Action::Send(message))?;
+        match reconnect(&rejoin) {
+            None => {}
+            Some(Err(e)) => warn_again(
+                &mut self.rejoin_failed,
+                format!("rejoin: {e}"),
+                (self.clock)(),
+            ),
+            Some(Ok(transport)) => {
+                warn("session rejoined");
+                self.rejoin_failed = None;
+                self.transport = Some(transport);
+                if let Some(message) = self.state.resend() {
+                    self.act(Action::Send(message))?;
+                }
             }
         }
         Ok(())

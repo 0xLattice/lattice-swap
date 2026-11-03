@@ -2009,3 +2009,72 @@ fn a_session_file_is_saved_beside_the_swap_file() {
     assert_eq!(loaded.key, saved.key);
     assert_eq!(loaded.listen, saved.listen);
 }
+
+/// Polls `reconnect` until it opens a session, failing after a while.
+fn rejoined(reconnect: &mut Reconnect<Session>, rejoin: &swap::Rejoin) -> Session {
+    for _ in 0..1_000 {
+        if let Some(Ok(session)) = reconnect(rejoin) {
+            return session;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("never rejoined");
+}
+
+/// Over TCP, a seller resumed from its session file listens again where
+/// it did, and the buyer, dialing as `take` saved it, comes back under its
+/// rejoin key. A stranger holding the offer, its `buyer_session` key among
+/// it, is refused, and the seller waits on for the buyer.
+#[test]
+fn a_resumed_seller_takes_the_buyer_back_over_tcp_and_no_one_else() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::new(directory.path(), [7; 32]);
+    let listen = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let key = SigningKey::from_bytes(&random32());
+    let offer = offer_of(
+        &small_args(40),
+        Network::Regtest,
+        Place::Address(listen),
+        &key,
+    );
+    SessionFile {
+        offer: offer.clone(),
+        key: Some(hex::encode(key.to_bytes())),
+        listen: Some(listen),
+    }
+    .save(&store)
+    .unwrap();
+    let mut seller = SessionFile::load(&store)
+        .unwrap()
+        .unwrap()
+        .reconnect(None)
+        .unwrap();
+    let rejoin = swap::Rejoin {
+        id: [1; 32],
+        key: [2; 32],
+    };
+    assert!(seller(&rejoin).is_none(), "listening");
+
+    let stranger = ivy::Config::new(SigningKey::from_bytes(&offer.buyer_session));
+    let seller_key = offer.seller_key().unwrap();
+    assert!(Ivy::connect(listen, &stranger, seller_key, TIMEOUT).is_err());
+    assert!(seller(&rejoin).is_none(), "still waiting");
+
+    let mut buyer = SessionFile {
+        offer,
+        key: None,
+        listen: None,
+    }
+    .reconnect(None)
+    .unwrap();
+    let mut buyer = rejoined(&mut buyer, &rejoin);
+    let mut seller = rejoined(&mut seller, &rejoin);
+    buyer.send(b"again").unwrap();
+    assert_eq!(
+        seller.recv(TIMEOUT).unwrap().as_deref(),
+        Some(&b"again"[..])
+    );
+}

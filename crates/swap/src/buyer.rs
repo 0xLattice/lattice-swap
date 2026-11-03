@@ -283,26 +283,29 @@ impl Machine for Buyer {
     fn rejoin(&self) -> Option<Rejoin> {
         use Buyer::*;
         match self {
-            AwaitFunded(setup) => setup.rejoin(None),
-            AwaitSellerSignatures {
-                setup,
-                funding,
-                lock,
-            } => setup.rejoin(Some(proposal(funding, *lock))),
+            AwaitFunded(setup) | AwaitSellerSignatures { setup, .. } => Some(setup.rejoin()),
+            SendingSignatures(locked)
+            | AwaitNexLock { locked, .. }
+            | AwaitRedeem { locked, .. } => Some(locked.setup.rejoin()),
+            AwaitSellerHello(_) | Cancelling { .. } | ClaimingNex(_) | Done(_) => None,
+        }
+    }
+
+    fn resend(&self) -> Option<Message> {
+        use Buyer::*;
+        match self {
+            AwaitSellerSignatures { funding, lock, .. } => Some(proposal(funding, *lock)),
             SendingSignatures(locked) | AwaitNexLock { locked, .. } => {
                 let setup = &locked.setup;
                 let cancel = setup
                     .swap()
                     .sign(locked.lock, Spend::Cancel, &setup.secrets.key());
-                setup.rejoin(Some(Message::BuyerSignatures { cancel }))
+                Some(Message::BuyerSignatures { cancel })
             }
-            AwaitRedeem { locked, redeem } => {
-                let redeem = redeem.clone();
-                locked
-                    .setup
-                    .rejoin(Some(Message::RedeemSignature { redeem }))
-            }
-            AwaitSellerHello(_) | Cancelling { .. } | ClaimingNex(_) | Done(_) => None,
+            AwaitRedeem { redeem, .. } => Some(Message::RedeemSignature {
+                redeem: redeem.clone(),
+            }),
+            _ => None,
         }
     }
 

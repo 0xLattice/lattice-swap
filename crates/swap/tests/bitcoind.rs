@@ -346,6 +346,10 @@ impl Machine for Redeems {
         None
     }
 
+    fn resend(&self) -> Option<swap::Message> {
+        None
+    }
+
     fn watch(&self) -> Watch {
         Watch {
             bitcoin: Some((self.swap(), self.lock)),

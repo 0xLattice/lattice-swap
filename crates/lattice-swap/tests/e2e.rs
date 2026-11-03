@@ -791,6 +791,46 @@ fn a_buyer_killed_after_the_lock_rejoins_through_the_relay_to_the_swap() {
     );
 }
 
+/// The seller, listening on TCP, killed once the buyer's BTC lock is in a
+/// block, before its NEX lock lands. `resume` reads its session file,
+/// listens again where it did, and takes the buyer back, which dials it
+/// again under its rejoin key; the CID reaches the buyer and the swap
+/// completes.
+#[test]
+#[ignore = "needs Docker and NEXUS_NODE_IMAGE"]
+fn a_seller_killed_after_the_lock_resumes_and_the_buyer_rejoins_over_tcp() {
+    let world = World::new();
+    let (mut seller, mut buyer, swap_id, seller_out) = world.start_on(20, 1, None);
+    // No Nexus block until the seller is gone: the NEX lock waits in the
+    // pool.
+    world.drive(
+        false,
+        || false,
+        || world.state("seller", &swap_id) == "LockingNex",
+    );
+    assert_eq!(world.state("buyer", &swap_id), "AwaitNexLock");
+    kill(&mut seller);
+    seller_out.join().unwrap();
+
+    let mut seller = world.resume("seller", &swap_id);
+    let (mut seller_done, mut buyer_done) = (None, None);
+    world.drive(
+        false,
+        || true,
+        || {
+            seller_done = seller_done.or(seller.0.try_wait().unwrap());
+            buyer_done = buyer_done.or(buyer.0.try_wait().unwrap());
+            seller_done.is_some() && buyer_done.is_some()
+        },
+    );
+    assert_eq!(stdout(&mut seller.0), "outcome: Swapped\n");
+    assert_eq!(stdout(&mut buyer.0), "outcome: Swapped\n");
+    assert_eq!(
+        world.nexus.balance(&world.buyer_nex),
+        NEX_AMOUNT - world.nex_fee
+    );
+}
+
 /// The browser's buyer: web/driver in Node, its wallet and swap kept in
 /// files.
 fn browser(mode: &str, config: &std::path::Path) -> Party {
