@@ -4,7 +4,8 @@
 //! The seller runs `offer`: it listens, or lists the offer on a relay, and
 //! prints an offer for the buyer. The buyer runs `take` on that offer, which
 //! dials the seller, or reaches it through the relay. Each side then runs
-//! its [`Driver`] until the swap ends,
+//! its [`Driver`] until the swap ends, meeting the other again whenever
+//! their session is lost, and
 //! saving its state to a swap file that `resume` carries on from after a
 //! restart and `status` reads.
 
@@ -21,9 +22,10 @@ use bitcoin::{Address, Amount, FeeRate, Network, ScriptBuf};
 use clap::{Args, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use rand_core::{OsRng, RngCore};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use swap::bitcoind::{Bitcoin, Bitcoind};
-use swap::driver::{Driver, Store};
+use swap::driver::{Driver, Reconnect, Store};
 use swap::offer::{self, check_offer, Answer, Bounds, Offer, Place, Policy, Quote, Template};
 use swap::transport::{Ivy, Relayed, Transport};
 use swap::{Buyer, Machine, Message, Outcome, SecretBytes, Seller, Terms};
@@ -66,10 +68,10 @@ enum Command {
     /// Buy NEX with BTC: dials the seller an offer names, or reaches it
     /// through the offer's relay, and runs the swap to its end.
     Take(TakeArgs),
-    /// Carries on a swap from its swap file until it ends. There is no
-    /// session: the rest runs from the chains alone, and a swap still
-    /// waiting on a message cancels and refunds once its timelocks allow,
-    /// so `refund` is this same command.
+    /// Carries on a swap from its swap file until it ends, from the chains
+    /// and, while the swap still needs one, a new session to the other
+    /// party. A swap still waiting on a message cancels and refunds once its
+    /// timelocks allow, so `refund` is this same command.
     #[command(visible_alias = "refund")]
     Resume(SwapFileArgs),
     /// Prints a swap's state and outcome from its swap file. Asks no node.
@@ -641,6 +643,11 @@ fn offer(args: OfferArgs) -> Result<Outcome> {
         Seller::new(terms, key.nex_address(), redeem, punish)
             .map_err(|refusal| format!("refused: {refusal:?}"))
     };
+    let rejoin = SessionFile {
+        listen: listener.as_ref().map(TcpListener::local_addr).transpose()?,
+        offer: offer.clone(),
+        key: Some(hex::encode(session.to_bytes())),
+    };
     match (listener, &args.relay) {
         (_, Some(relay)) => {
             log(&format!(
@@ -649,15 +656,126 @@ fn offer(args: OfferArgs) -> Result<Outcome> {
             let mut transport =
                 Ivy::accept_relayed(relay, &offer.encode(), &config, buyer, wait, TIMEOUT)?;
             let terms = answer_request(&mut transport, &offer)?;
-            start.run(seller(terms)?, vec![], transport)
+            start.run(seller(terms)?, vec![], Box::new(transport), rejoin, None)
         }
         (Some(listener), None) => {
             log("waiting for the buyer");
+            let kept = listener.try_clone()?;
             let mut transport = Ivy::accept(listener, &config, buyer, wait, TIMEOUT)?;
             let terms = answer_request(&mut transport, &offer)?;
-            start.run(seller(terms)?, vec![], transport)
+            start.run(
+                seller(terms)?,
+                vec![],
+                Box::new(transport),
+                rejoin,
+                Some(kept),
+            )
         }
         (None, None) => unreachable!("a place was found"),
+    }
+}
+
+/// A session of either kind.
+type Session = Box<dyn Transport + Send>;
+
+/// How long one attempt to rejoin waits for the counterparty, at the relay
+/// or listening, before the next.
+const REJOIN_WAIT: Duration = Duration::from_secs(60);
+
+/// How a party meets its counterparty again once their session is lost,
+/// saved beside the swap file, as `<swap id>.session`, so `resume` can:
+/// the offer, and for the seller the session key it names, in hex, and the
+/// address it listened on, if not on a relay. The seller dials no one: it
+/// listens again, or waits at the relay; the buyer dials the seller, or
+/// comes to the relay. Readable by its owner alone.
+#[derive(Serialize, Deserialize)]
+struct SessionFile {
+    offer: Offer,
+    key: Option<String>,
+    listen: Option<SocketAddr>,
+}
+
+impl SessionFile {
+    fn path(store: &Store) -> PathBuf {
+        store.path().with_extension("session")
+    }
+
+    fn save(&self, store: &Store) -> Result<()> {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(Self::path(store))?;
+        file.write_all(&serde_json::to_vec(self)?)?;
+        Ok(file.sync_all()?)
+    }
+
+    /// `None` for a swap saved without one.
+    fn load(store: &Store) -> Result<Option<Self>> {
+        match fs::read(Self::path(store)) {
+            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Opens sessions to the counterparty for [`Driver::reconnect`]: the
+    /// seller's on `listener` if it listens, else on the one it listened
+    /// on.
+    fn reconnect(&self, listener: Option<TcpListener>) -> Result<Reconnect<Session>> {
+        let offer = &self.offer;
+        let buyer_session = offer.buyer_session;
+        let place = offer.place()?;
+        let Some(key) = &self.key else {
+            let seller = offer.seller_key()?;
+            return Ok(swap::transport::in_background(move |id| {
+                let config = ivy::Config::new(SigningKey::from_bytes(&buyer_session));
+                Ok(match &place {
+                    Place::Relay(relay) => Box::new(Ivy::connect_rejoined(
+                        relay,
+                        id,
+                        &config,
+                        seller,
+                        REJOIN_WAIT,
+                        TIMEOUT,
+                    )?) as Session,
+                    Place::Address(address) => {
+                        Box::new(Ivy::connect(*address, &config, seller, TIMEOUT)?)
+                    }
+                })
+            }));
+        };
+        let mut seed = [0u8; 32];
+        hex::decode_to_slice(key, &mut seed).map_err(|_| "the session key is not hex")?;
+        let buyer = ivy::Config::new(SigningKey::from_bytes(&buyer_session)).peer_key();
+        let listener = match (listener, self.listen) {
+            (Some(listener), _) => Some(listener),
+            (None, Some(listen)) => Some(TcpListener::bind(listen)?),
+            (None, None) => None,
+        };
+        Ok(swap::transport::in_background(move |id| {
+            let config = ivy::Config::new(SigningKey::from_bytes(&seed));
+            Ok(match (&listener, &place) {
+                (Some(listener), _) => Box::new(Ivy::accept(
+                    listener.try_clone()?,
+                    &config,
+                    buyer,
+                    REJOIN_WAIT,
+                    TIMEOUT,
+                )?) as Session,
+                (None, Place::Relay(relay)) => Box::new(Ivy::accept_rejoined(
+                    relay,
+                    id,
+                    &config,
+                    buyer,
+                    REJOIN_WAIT,
+                    TIMEOUT,
+                )?),
+                (None, Place::Address(_)) => {
+                    return Err(io::Error::other("the seller listens nowhere"))
+                }
+            })
+        }))
     }
 }
 
@@ -717,15 +835,20 @@ struct Start<'a> {
 
 impl Start<'_> {
     /// Runs `machine`, which asks for `actions` first, over `transport` to
-    /// the swap's end.
-    fn run<M: Machine, T: Transport>(
+    /// the swap's end, meeting the counterparty again by `rejoin` whenever
+    /// the session is lost: the seller on `listener`, if it listens.
+    fn run<M: Machine>(
         self,
         machine: M,
         actions: Vec<swap::Action>,
-        transport: T,
+        transport: Session,
+        rejoin: SessionFile,
+        listener: Option<TcpListener>,
     ) -> Result<Outcome> {
         let swap_file = self.store.path().to_path_buf();
         log(&format!("swap file {}", swap_file.display()));
+        let reconnect = rejoin.reconnect(listener)?;
+        rejoin.save(&self.store)?;
         let driver = Driver::start(
             machine,
             actions,
@@ -736,6 +859,7 @@ impl Start<'_> {
         );
         let driver = driver.map(|mut driver| {
             driver.nex_key = self.nex_key;
+            driver.reconnect = Some(reconnect);
             driver
         });
         run(&swap_file, driver, self.bump)
@@ -791,20 +915,22 @@ fn take(args: TakeArgs) -> Result<Outcome> {
         Buyer::start(terms, refund, args.nex_address)
             .map_err(|refusal| format!("refused: {refusal:?}"))
     };
-    match offer.place()? {
-        Place::Address(address) => {
-            let mut transport = Ivy::connect(address, &config, seller, TIMEOUT)?;
-            let (buyer, actions) = buyer(request_terms(&mut transport, &offer, &policy)?)?;
-            start.run(buyer, actions, transport)
-        }
+    let mut transport: Session = match offer.place()? {
+        Place::Address(address) => Box::new(Ivy::connect(address, &config, seller, TIMEOUT)?),
         Place::Relay(relay) => {
             let id = hex::encode(offer.template.swap_id);
-            let mut transport =
-                Ivy::<Relayed>::connect_relayed(&relay, &id, &config, seller, TIMEOUT)?;
-            let (buyer, actions) = buyer(request_terms(&mut transport, &offer, &policy)?)?;
-            start.run(buyer, actions, transport)
+            Box::new(Ivy::<Relayed>::connect_relayed(
+                &relay, &id, &config, seller, TIMEOUT,
+            )?)
         }
-    }
+    };
+    let (buyer, actions) = buyer(request_terms(&mut transport, &offer, &policy)?)?;
+    let rejoin = SessionFile {
+        offer,
+        key: None,
+        listen: None,
+    };
+    start.run(buyer, actions, transport, rejoin, None)
 }
 
 fn resume(args: SwapFileArgs) -> Result<Outcome> {
@@ -829,11 +955,13 @@ fn resume(args: SwapFileArgs) -> Result<Outcome> {
             if seller.outcome().is_none() {
                 args.nodes.check_nexus(&nexus)?;
             }
-            let driver = Driver::<Seller, _, Ivy>::resume(bitcoin, nexus, None, store);
+            let reconnect = reconnect(&store, seller.rejoin().is_some());
+            let driver = Driver::<Seller, _, Session>::resume(bitcoin, nexus, None, store);
             run(
                 &swap_file,
                 driver.map(|mut driver| {
                     driver.nex_key = key;
+                    driver.reconnect = reconnect;
                     driver
                 }),
                 &args.bump,
@@ -845,11 +973,43 @@ fn resume(args: SwapFileArgs) -> Result<Outcome> {
             if buyer.outcome().is_none() {
                 args.nodes.check_nexus(&nexus)?;
             }
+            let reconnect = reconnect(&store, buyer.rejoin().is_some());
+            let driver = Driver::<Buyer, _, Session>::resume(bitcoin, nexus, None, store);
             run(
                 &swap_file,
-                Driver::<Buyer, _, Ivy>::resume(bitcoin, nexus, None, store),
+                driver.map(|mut driver| {
+                    driver.reconnect = reconnect;
+                    driver
+                }),
                 &args.bump,
             )
+        }
+    }
+}
+
+/// How a resumed swap that still needs its session meets the counterparty
+/// again: by what `take` or `offer` saved beside its swap file. Without
+/// it, or if the seller cannot listen where it did, the swap goes on from
+/// the chains alone.
+fn reconnect(store: &Store, needed: bool) -> Option<Reconnect<Session>> {
+    if !needed {
+        return None;
+    }
+    let rejoin = SessionFile::load(store).and_then(|rejoin| match rejoin {
+        Some(rejoin) => rejoin.reconnect(None).map(Some),
+        None => Ok(None),
+    });
+    match rejoin {
+        Ok(Some(reconnect)) => Some(reconnect),
+        Ok(None) => {
+            log("no session file: the swap goes on from the chains");
+            None
+        }
+        Err(e) => {
+            log(&format!(
+                "cannot rejoin, the swap goes on from the chains: {e}"
+            ));
+            None
         }
     }
 }

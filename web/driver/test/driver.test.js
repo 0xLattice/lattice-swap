@@ -50,8 +50,10 @@ async function world({ store = new MemoryStore(), policy = POLICY, chain = new C
   servers.push(a, node);
   w.a = a;
   w.offer = testOffer('http://relay.invalid');
-  // The state each message must already be saved in when it goes out.
-  const expect = { Request: 'AwaitSellerHello', BuyerHello: 'AwaitSellerHello', LockProposal: 'AwaitSellerSignatures', BuyerSignatures: 'SendingSignatures' };
+  // The states each message must already be saved in when it goes out: the
+  // cancel signature goes again on a session met again once the funding is
+  // out.
+  const expect = { Request: ['AwaitSellerHello'], BuyerHello: ['AwaitSellerHello'], LockProposal: ['AwaitSellerSignatures'], BuyerSignatures: ['SendingSignatures', 'AwaitNexLock'] };
   w.seller = seller(w.offer, answer);
   const open = w.seller.open;
   w.seller.open = async (...args) => {
@@ -63,7 +65,7 @@ async function world({ store = new MemoryStore(), policy = POLICY, chain = new C
         // The request goes out before the swap is taken: nothing of it
         // is at stake until the seller has answered.
         const taken = name !== 'Request';
-        if (record.taken !== taken || kind(record.state) !== expect[name]) unsaved.push({ send: name, state: kind(record.state) });
+        if (record.taken !== taken || !expect[name].includes(kind(record.state))) unsaved.push({ send: name, state: kind(record.state) });
       });
       send(message);
     };
@@ -247,6 +249,59 @@ test('the refund lands in the wallet, and the deadlines show where it is', async
   assert.equal(w.buyer.status().step, 'refunded');
   assert.equal(w.buyer.status().mustStayOpen, false);
   assert.deepEqual(w.buyer.status().deadlines, { cancel: null, refund: null, punish: null });
+  assert.deepEqual(w.unsaved, []);
+});
+
+/** The seller, its lock `funding` confirmed, locks its NEX and sends the
+ * CID into whatever session is open, at once. */
+function sellerLocksNex(w, funding) {
+  confirm(w, funding);
+  w.seller.step({ Bitcoin: { height: w.chain.height, funding: 1, lock_spend: null, cancel_spend: null, stale: null } });
+  const health = { phase: 'active', height: 10, best_header_height: 10, tip: 'tip' };
+  const view = (watched) => ({
+    Nexus: { health, own: { balance: 10_000_000, nonce: 3 }, lock: { balance: 0, nonce: 0 }, min_relay_fee: 0, watched, block_at: null },
+  });
+  w.seller.step(view(null));
+  const { body } = JSON.parse(w.seller.state()).LockingNex.nex_lock;
+  w.seller.step(view([{ body, block: { height: 10, hash: 'tip' } }, 1]));
+  assert.equal(kind(w.seller.state()), 'AwaitRedeemSignature');
+}
+
+/** The buyer's saved state, once it holds the NEX lock's CID. */
+async function cidArrives(w) {
+  const cid = async () => JSON.parse((await w.store.get(`swap:${w.buyer.swapId}`)).state).AwaitNexLock?.cid;
+  await until(async () => (await cid()) != null).catch((e) => assert.fail(`${e.message}: ${JSON.stringify(w.buyer.status())}`));
+}
+
+test('a session lost once the lock is out is met again, and the NEX lock it missed arrives', async () => {
+  const { w, run, funding } = await funded();
+  // The page's session drops, and the seller's CID goes with it: the
+  // buyer, with none, would never read Nexus.
+  w.session.close();
+  sellerLocksNex(w, funding);
+  // The page meets the seller at their rendezvous, the only place the fake
+  // seller answers, sends its cancel signature again, which the seller has
+  // and ignores, and is sent the CID again.
+  await cidArrives(w);
+  const resent = w.seller.log.filter((message) => message.BuyerSignatures);
+  assert.equal(resent.length, 2);
+  assert.equal(kind(w.seller.state()), 'AwaitRedeemSignature');
+  assert.equal(w.buyer.status().step, 'swapping');
+  await run.stop();
+  await w.checked;
+  assert.deepEqual(w.unsaved, []);
+});
+
+test('a page reloaded once the lock is out meets the seller again', async () => {
+  const { w, run, funding } = await funded();
+  await run.stop();
+  assert.equal(w.session.closed, true, 'closed with the page');
+  sellerLocksNex(w, funding);
+  w.buyer = await Buyer.resume(w.wallet, w.buyer.swapId);
+  const again = running(w.buyer);
+  await cidArrives(w);
+  await again.stop();
+  await w.checked;
   assert.deepEqual(w.unsaved, []);
 });
 

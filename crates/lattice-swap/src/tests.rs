@@ -1977,3 +1977,35 @@ fn offer_and_take_refuse_a_nex_fee_below_the_floor() {
         "{refused}"
     );
 }
+
+/// What a swap meets its counterparty again by is saved beside its swap
+/// file, readable by its owner alone, once, and read back as saved; a swap
+/// saved without one has none.
+#[test]
+fn a_session_file_is_saved_beside_the_swap_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::new(directory.path(), [7; 32]);
+    assert!(SessionFile::load(&store).unwrap().is_none());
+    let key = SigningKey::from_bytes(&random32());
+    let offer = offer_of(&small_args(40), Network::Regtest, address(), &key);
+    let saved = SessionFile {
+        offer: offer.clone(),
+        key: Some(hex::encode(key.to_bytes())),
+        listen: Some("127.0.0.1:7000".parse().unwrap()),
+    };
+    saved.save(&store).unwrap();
+    assert!(saved.save(&store).is_err(), "never replaced");
+    let path = directory
+        .path()
+        .join(format!("{}.session", "07".repeat(32)));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+    let loaded = SessionFile::load(&store).unwrap().unwrap();
+    assert_eq!(loaded.offer, offer);
+    assert_eq!(loaded.key, saved.key);
+    assert_eq!(loaded.listen, saved.listen);
+}

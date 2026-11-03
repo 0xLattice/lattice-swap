@@ -6,6 +6,8 @@ use std::cell::RefCell;
 #[cfg(feature = "native")]
 use std::rc::Rc;
 #[cfg(feature = "native")]
+use std::sync::{Arc, Mutex};
+#[cfg(feature = "native")]
 use std::time::{Duration, SystemTime};
 
 use super::*;
@@ -1696,6 +1698,10 @@ impl<R: Machine> Machine for Watching<R> {
     fn own_spends(&self) -> &'static [Spend] {
         self.role.own_spends()
     }
+
+    fn rejoin(&self) -> Option<Rejoin> {
+        None
+    }
 }
 
 /// Runs `machine`'s driver for one poll at each of `heights`, and returns
@@ -2614,6 +2620,10 @@ impl Machine for Submitting {
     }
     fn own_spends(&self) -> &'static [Spend] {
         self.watching.own_spends()
+    }
+
+    fn rejoin(&self) -> Option<Rejoin> {
+        None
     }
 }
 
@@ -3589,4 +3599,178 @@ fn a_stored_random_nonce_adaptor_still_recovers() {
     };
     let (stored, _) = stored.step(btc(3, Some((redeem, 0)), None));
     assert!(matches!(stored, Buyer::ClaimingNex(_)));
+}
+
+/// The session drops once the BTC is locked, and the seller's `NexLocked`
+/// goes with it: the buyer, with no CID, never reads Nexus. Both meet again
+/// at one rendezvous, each sends its last message again, and the swap
+/// completes; a copy the other side has already applied changes nothing.
+#[test]
+fn a_session_lost_after_the_lock_is_rejoined_and_the_swap_completes() {
+    let (seller, buyer, nex_lock) = locked().nex_signed();
+    let (seller, actions) =
+        seller.step(nexus(account(500_000, 0), mined(nex_lock.body.clone(), 1)));
+    assert!(matches!(sent(&actions), Message::NexLocked { .. }), "lost");
+    assert!(matches!(seller, Seller::AwaitRedeemSignature { .. }));
+    assert!(matches!(buyer, Buyer::AwaitNexLock { cid: None, .. }));
+    assert!(buyer.watch().nexus.is_none());
+
+    // From the swap files, as after a restart.
+    let (seller, buyer) = (restart(&seller), restart(&buyer));
+    let (to_seller, to_buyer) = (buyer.rejoin().unwrap(), seller.rejoin().unwrap());
+    assert_eq!(to_seller.id, to_buyer.id, "one rendezvous");
+    let resent = to_seller.resend.unwrap();
+    assert!(matches!(resent, Message::BuyerSignatures { .. }));
+    let (again, none) = seller.clone().step(message(resent));
+    assert!(none.is_empty());
+    assert_eq!(json(&again), json(&seller), "applied already");
+    let cid = to_buyer.resend.unwrap();
+    let (buyer, none) = buyer.step(message(cid.clone()));
+    assert!(none.is_empty());
+    assert!(buyer.watch().nexus.is_some(), "the buyer reads Nexus");
+    let (again, _) = buyer.clone().step(message(cid));
+    assert_eq!(json(&again), json(&buyer));
+
+    // The redeem signature is lost too: the buyer sends it again.
+    let (buyer, actions) = buyer.step(nexus(account(500_000, 0), mined(nex_lock.body.clone(), 1)));
+    assert!(
+        matches!(sent(&actions), Message::RedeemSignature { .. }),
+        "lost"
+    );
+    let rejoin = buyer.rejoin().unwrap();
+    assert_eq!(rejoin.id, to_buyer.id);
+    let resent = rejoin.resend.unwrap();
+    let (seller, none) = seller.step(message(resent.clone()));
+    assert!(none.is_empty());
+    assert!(seller.rejoin().is_none(), "the seller holds the redeem");
+    let (again, _) = seller.clone().step(message(resent));
+    assert_eq!(json(&again), json(&seller));
+    let (seller, actions) = seller.step(btc(2, None, None));
+    let [redeem] = &broadcasts(&actions)[..] else {
+        panic!("the seller redeems");
+    };
+    let (buyer, _) = buyer.step(btc(3, Some((redeem, 0)), None));
+    assert!(buyer.rejoin().is_none(), "the buyer claims from the chains");
+    let (buyer, actions) = buyer.step(nexus(account(500_000, 0), None));
+    let claim = submitted(&actions);
+    let (buyer, _) = buyer.step(nexus(account(0, 1), mined(claim.body.clone(), 1)));
+    assert_eq!(buyer.outcome(), Some(Outcome::Swapped));
+    let (seller, _) = seller.step(btc(4, Some((redeem, 1)), None));
+    assert_eq!(seller.outcome(), Some(Outcome::Swapped));
+}
+
+fn json<T: Serialize>(value: &T) -> String {
+    serde_json::to_string(value).unwrap()
+}
+
+/// From the hellos on, each side's rejoin sends again the last message it
+/// sent: the buyer's cancel signature among them, whose send the funding
+/// waits on. The rendezvous is the two parties' alone: another pair on the
+/// same swap id meets elsewhere.
+#[test]
+fn each_side_sends_its_last_message_again_from_the_hellos_on() {
+    let seller = new_seller(terms());
+    let (buyer, actions) = Buyer::start(terms(), payout(3), BUYER_NEX.into()).unwrap();
+    assert!(
+        seller.rejoin().is_none() && buyer.rejoin().is_none(),
+        "nothing at stake"
+    );
+    let (seller, actions) = seller.step(message(sent(&actions)));
+    let hello = seller.rejoin().unwrap().resend;
+    assert!(matches!(hello, Some(Message::SellerHello { .. })));
+    let (buyer, actions) = buyer.step(message(sent(&actions)));
+    assert!(buyer.rejoin().unwrap().resend.is_none(), "funding");
+    let (buyer, actions) = buyer.step(Event::Funded(funding(&actions)));
+    let proposal = sent(&actions);
+    assert_eq!(
+        json(&buyer.rejoin().unwrap().resend),
+        json(&Some(&proposal))
+    );
+    let (seller, actions) = seller.step(message(proposal));
+    assert!(matches!(sent(&actions), Message::SellerSignatures { .. }));
+    // Signed again, as valid: the buyer takes them.
+    let signatures = seller.rejoin().unwrap().resend.unwrap();
+    let (buyer, actions) = buyer.step(message(signatures));
+    // The buyer's signatures never went out: they go on the new session,
+    // and then the funding.
+    assert!(matches!(sent(&actions), Message::BuyerSignatures { .. }));
+    let rejoin = buyer.rejoin().unwrap();
+    assert!(matches!(
+        rejoin.resend,
+        Some(Message::BuyerSignatures { .. })
+    ));
+    let (buyer, actions) = buyer.step(Event::Sent);
+    assert_eq!(broadcasts(&actions).len(), 1);
+    let (seller, none) = seller.step(message(rejoin.resend.unwrap()));
+    assert!(none.is_empty());
+    assert!(matches!(seller, Seller::AwaitFunding { .. }));
+    assert!(seller.rejoin().unwrap().resend.is_none());
+    let id = buyer.rejoin().unwrap().id;
+    assert_eq!(seller.rejoin().unwrap().id, id);
+    assert_ne!(id, terms().swap_id);
+
+    let (other, _, _) = hellos();
+    assert_ne!(other.rejoin().unwrap().id, id);
+}
+
+/// Hands the driver `inbox`, a message at a time, and keeps what it sends.
+#[cfg(feature = "native")]
+struct Recording {
+    inbox: Vec<Vec<u8>>,
+    sent: Arc<Mutex<Vec<Message>>>,
+}
+
+#[cfg(feature = "native")]
+impl Transport for Recording {
+    fn send(&mut self, payload: &[u8]) -> std::io::Result<()> {
+        let message = Message::decode(payload, terms().swap_id).unwrap();
+        self.sent.lock().unwrap().push(message);
+        Ok(())
+    }
+    fn recv(&mut self, _: Duration) -> std::io::Result<Option<Vec<u8>>> {
+        Ok(self.inbox.pop())
+    }
+}
+
+/// A buyer resumed with no session while it waits for the NEX lock's CID,
+/// which the seller sent into the lost one: its driver meets the seller at
+/// the rendezvous, sends its cancel signature again and takes the CID.
+#[cfg(feature = "native")]
+#[test]
+fn the_driver_rejoins_a_lost_session() {
+    let (seller, buyer, nex_lock) = locked().nex_signed();
+    let (seller, _) = seller.step(nexus(account(500_000, 0), mined(nex_lock.body.clone(), 1)));
+    let from_seller = seller.rejoin().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::new(directory.path(), terms().swap_id);
+    let client = Client::new("http://127.0.0.1:9", "", Duration::from_secs(1));
+    let node = Fake::default();
+    let mut driver = Driver::start(buyer, vec![], node, client, None, store).unwrap();
+    driver.poll = Duration::from_millis(1);
+    let sent = Arc::new(Mutex::new(vec![]));
+    let mut session = Some(Recording {
+        inbox: vec![from_seller.resend.unwrap().encode(terms().swap_id)],
+        sent: sent.clone(),
+    });
+    let ids = Arc::new(Mutex::new(vec![]));
+    let asked = ids.clone();
+    driver.reconnect = Some(Box::new(move |id| {
+        let mut asked = asked.lock().unwrap();
+        asked.push(id);
+        // Not at the first ask: the attempt takes a while.
+        session.take_if(|_| asked.len() > 2)
+    }));
+    let polls = std::cell::Cell::new(0);
+    let stopped = driver.run_until(|buyer| {
+        polls.set(polls.get() + 1);
+        assert!(polls.get() < 1_000, "never rejoined");
+        matches!(buyer, Buyer::AwaitNexLock { cid: Some(_), .. })
+    });
+    assert!(stopped.unwrap().is_none());
+    assert!(ids.lock().unwrap().iter().all(|id| *id == from_seller.id));
+    let sent = sent.lock().unwrap();
+    assert!(
+        matches!(sent[..], [Message::BuyerSignatures { .. }]),
+        "{sent:?}"
+    );
 }

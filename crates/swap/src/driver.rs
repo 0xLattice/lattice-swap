@@ -142,6 +142,10 @@ impl Store {
     }
 }
 
+/// Gives a new session given the rendezvous id, at once if one is open:
+/// see [`Driver::reconnect`].
+pub type Reconnect<T> = Box<dyn FnMut([u8; 32]) -> Option<T> + Send>;
+
 /// Feeds a machine what its nodes and its counterparty show, and does what
 /// it asks. The state is saved after every step that changes it, before
 /// any of the step's actions, so nothing is sent, broadcast or submitted
@@ -178,8 +182,15 @@ pub struct Driver<M, B, T> {
     state: M,
     bitcoin: B,
     nexus: Client,
-    /// `None` once the session failed; the swap goes on from the chains.
+    /// `None` once the session failed; the swap goes on from the chains,
+    /// and from `reconnect`, if set, while the machine still needs one.
     transport: Option<T>,
+    /// A new session to the counterparty, while the machine has none and
+    /// [`Machine::rejoin`] asks for one: given the rendezvous id, it
+    /// answers at once, with a session once one is open. Each new one is
+    /// first sent the message the machine would have the counterparty hold
+    /// again. See [`crate::transport::in_background`].
+    pub reconnect: Option<Reconnect<T>>,
     store: Store,
     /// How long one round waits for a message; also the polling interval.
     pub poll: Duration,
@@ -284,6 +295,7 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
             bitcoin,
             nexus,
             transport,
+            reconnect: None,
             store,
             poll: Duration::from_millis(250),
             message_timeout: Duration::from_secs(60),
@@ -334,6 +346,7 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
             if stop(&self.state) {
                 return Ok(None);
             }
+            self.rejoin()?;
             if let Some(message) = self.receive() {
                 self.apply(Event::Message(message))?;
             }
@@ -347,6 +360,25 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
                 since = Instant::now();
             }
         }
+    }
+
+    /// Takes a new session from `reconnect` while the machine needs one
+    /// and has none, and sends again what the counterparty may have missed.
+    fn rejoin(&mut self) -> io::Result<()> {
+        let (None, Some(reconnect)) = (&self.transport, &mut self.reconnect) else {
+            return Ok(());
+        };
+        let Some(rejoin) = self.state.rejoin() else {
+            return Ok(());
+        };
+        if let Some(transport) = reconnect(rejoin.id) {
+            warn("session rejoined");
+            self.transport = Some(transport);
+            if let Some(message) = rejoin.resend {
+                self.act(Action::Send(message))?;
+            }
+        }
+        Ok(())
     }
 
     fn receive(&mut self) -> Option<Message> {

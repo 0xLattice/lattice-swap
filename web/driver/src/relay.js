@@ -25,12 +25,14 @@ export function socketUrl(relay, path) {
  * the seller, or a record that fails, `closed` holds and nothing more is
  * sent or received. */
 export class Session {
-  /** Opens it, and waits up to `timeout` ms for the handshake. */
-  static async open(offer, onMessage, { WebSocket = globalThis.WebSocket, timeout = 30_000 } = {}) {
+  /** Opens it, and waits up to `timeout` ms for the handshake: by taking
+   * the offer, or, given `rejoin`, a rendezvous in hex (`buyerRejoin`), by
+   * meeting the seller there again once the relay says it has come. */
+  static async open(offer, onMessage, { WebSocket = globalThis.WebSocket, timeout = 30_000, rejoin = null } = {}) {
     const swapId = offer.template.swap_id;
-    const socket = new WebSocket(socketUrl(offer.relay, `take/${swapId}`));
+    const socket = new WebSocket(socketUrl(offer.relay, rejoin === null ? `take/${swapId}` : `rejoin/${rejoin}`));
     socket.binaryType = 'arraybuffer';
-    const session = new Session(socket, new wasm.Ivy(offer.buyer_session, offer.seller, swapId), onMessage);
+    const session = new Session(socket, new wasm.Ivy(offer.buyer_session, offer.seller, swapId), onMessage, rejoin === null);
     await new Promise((resolve, reject) => {
       const timer = setTimeout(() => fail(new Error('the handshake timed out')), timeout);
       const fail = (e) => {
@@ -49,10 +51,13 @@ export class Session {
     return session;
   }
 
-  constructor(socket, ivy, onMessage) {
+  constructor(socket, ivy, onMessage, paired = true) {
     this.socket = socket;
     this.ivy = ivy;
     this.closed = false;
+    /** Whether the relay pipes this socket to the seller: at a rendezvous,
+     * only once it says `paired`. */
+    this.paired = paired;
     socket.onmessage = (event) => this.#receive(event.data);
     socket.onclose = () => this.close();
     socket.onerror = () => this.close();
@@ -62,7 +67,11 @@ export class Session {
   #receive(data) {
     if (this.closed) return;
     // The relay speaks text only before it pairs: none belongs in a session.
-    if (typeof data === 'string') return this.close();
+    if (typeof data === 'string') {
+      if (data !== 'paired' || this.paired) return this.close();
+      this.paired = true;
+      return this.flush();
+    }
     let messages;
     try {
       messages = this.ivy.receive(new Uint8Array(data));
@@ -78,8 +87,9 @@ export class Session {
     for (const message of messages) this.onMessage(message);
   }
 
-  /** Writes what the session has queued. */
+  /** Writes what the session has queued, once paired. */
   flush() {
+    if (!this.paired) return;
     for (let bytes = this.ivy.outbound(); bytes.length > 0; bytes = this.ivy.outbound()) {
       this.socket.send(bytes);
     }

@@ -14,6 +14,14 @@
 //!   the session's bytes, as binary messages, to and from the buyer.
 //! - `GET /take/<swap id>`, a WebSocket: pairs the buyer with the seller of
 //!   that offer, which leaves the board; 404 if none is listed.
+//! - `GET /rejoin/<rendezvous>`, a WebSocket: how the two meet again once
+//!   their session is lost. The first to come waits; once the other comes,
+//!   the relay says `paired` to both and pipes them. The rendezvous is a
+//!   hash only the two parties can work out (`swap::Rejoin`), so no one
+//!   else, the swap id read from the board, can take either's place; and
+//!   one who did would still fail the buyer's handshake, which checks the
+//!   seller's key, and could make the seller do nothing: once the lock is
+//!   agreed it acts only on the buyer's signatures.
 //!
 //! Every answer lets any web page read it (`Access-Control-Allow-Origin:
 //! *`), so a buyer's page can list the offers.
@@ -32,7 +40,7 @@ use axum::routing::get;
 use axum::Router;
 use tokio::time::{interval, timeout, MissedTickBehavior};
 
-use board::Board;
+use board::{Board, Meeting, Ticket};
 
 /// The most bytes one WebSocket message may hold: a piece of the session,
 /// which the CLI sends at most 64 KiB at a time. The relay holds a message
@@ -56,6 +64,8 @@ pub const SILENCE: Duration = PING.saturating_mul(2);
 /// The relay's state, shared by every connection.
 pub struct Relay {
     pub board: Arc<Board<WebSocket>>,
+    /// The parties waiting at a rendezvous, unlisted.
+    pub rejoins: Arc<Board<WebSocket>>,
 }
 
 /// The relay's routes.
@@ -64,6 +74,7 @@ pub fn router(relay: Arc<Relay>) -> Router {
         .route("/offers", get(offers))
         .route("/sell", get(sell))
         .route("/take/{id}", get(take))
+        .route("/rejoin/{id}", get(rejoin))
         .layer(axum::middleware::map_response(readable))
         .with_state(relay)
 }
@@ -106,33 +117,77 @@ async fn seller(relay: Arc<Relay>, mut socket: WebSocket) {
     if socket.send(Message::Text("listed".into())).await.is_err() {
         return;
     }
-    let mut ping = pinger();
-    let mut heard = Instant::now();
-    let buyer = loop {
-        tokio::select! {
-            buyer = &mut ticket.taker => match buyer {
-                Ok(buyer) => break buyer,
-                Err(_) => return,
-            },
-            message = socket.recv() => match message {
-                Some(Ok(Message::Ping(_) | Message::Pong(_))) => heard = Instant::now(),
-                // The seller left, or said something out of turn.
-                _ => return,
-            },
-            _ = ping.tick() => {
-                if heard.elapsed() > SILENCE
-                    || socket.send(Message::Ping(Bytes::new())).await.is_err()
-                {
-                    return;
-                }
-            }
-        }
+    let Some(buyer) = taken(&mut socket, &mut ticket).await else {
+        return;
     };
     if socket.send(Message::Text("paired".into())).await.is_err() {
         return;
     }
     // The seller keeps its slot while the two swap.
     pipe(socket, buyer).await;
+    drop(ticket);
+}
+
+/// The other party's connection, once one comes for `ticket`; `None` if
+/// the one waiting on `socket` leaves, says anything out of turn, or goes
+/// silent.
+async fn taken(socket: &mut WebSocket, ticket: &mut Ticket<WebSocket>) -> Option<WebSocket> {
+    let mut ping = pinger();
+    let mut heard = Instant::now();
+    loop {
+        tokio::select! {
+            other = &mut ticket.taker => return other.ok(),
+            message = socket.recv() => match message {
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => heard = Instant::now(),
+                _ => return None,
+            },
+            _ = ping.tick() => {
+                if heard.elapsed() > SILENCE
+                    || socket.send(Message::Ping(Bytes::new())).await.is_err()
+                {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+async fn rejoin(
+    Path(id): Path<String>,
+    socket: WebSocketUpgrade,
+    State(relay): State<Arc<Relay>>,
+) -> Response {
+    socket
+        .max_message_size(MAX_MESSAGE)
+        .on_upgrade(move |socket| meet(relay, id, socket))
+}
+
+/// Meets the other party at rendezvous `id`, or waits for it there, then
+/// pipes the two.
+async fn meet(relay: Arc<Relay>, id: String, mut socket: WebSocket) {
+    let mut ticket = match relay.rejoins.meet(&id) {
+        Ok(Meeting::Waiting(ticket)) => ticket,
+        // If it left meanwhile, this socket is dropped, and closes.
+        Ok(Meeting::Arrived(waiting)) => {
+            let _ = waiting.send(socket);
+            return;
+        }
+        Err(refusal) => {
+            let _ = socket
+                .send(Message::Text(format!("refused: {refusal}").into()))
+                .await;
+            return;
+        }
+    };
+    let Some(mut other) = taken(&mut socket, &mut ticket).await else {
+        return;
+    };
+    for socket in [&mut socket, &mut other] {
+        if socket.send(Message::Text("paired".into())).await.is_err() {
+            return;
+        }
+    }
+    pipe(socket, other).await;
     drop(ticket);
 }
 

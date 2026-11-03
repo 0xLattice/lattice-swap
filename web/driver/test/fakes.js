@@ -186,14 +186,34 @@ export const POLICY = {
  * `log` holds what the buyer sent, in order. It answers the buyer's
  * request with `answer(request, terms)`, by default the terms at the
  * amount asked for, then starts its machine on them; once it answers
- * anything else, it says nothing more. */
+ * anything else, it says nothing more. A session opened at a rendezvous
+ * reaches it only at its own (`sellerRejoin`), and is first sent its last
+ * message again. `step(event)` feeds its machine what its chains show,
+ * signing its NEX lock with its own key: what it sends goes into the
+ * session open, if one is, and is lost otherwise. `state()` is its
+ * state. */
 export function seller(offer, answer = (_request, terms) => ({ Terms: terms })) {
   const decoded = JSON.parse(offer);
   const key = () => call('newBitcoinKey', 'regtest').script_pubkey;
+  const nexKey = call('newNexKey');
   let state = null;
+  let reply = () => {};
   const log = [];
-  const open = async (_offer, onMessage) => {
-    const reply = (message) => setTimeout(() => !session.closed && onMessage(JSON.stringify(message)), 1);
+  const step = (event) => {
+    let stepped = call('stepSeller', state, JSON.stringify(event));
+    state = JSON.stringify(stepped.state);
+    for (const action of stepped.actions) {
+      if (action.Send) {
+        reply(action.Send);
+        step('Sent');
+      } else if (action.SignNex) {
+        step({ NexSigned: call('signNex', nexKey.seed, JSON.stringify(action.SignNex)) });
+      }
+    }
+  };
+  const open = async (_offer, onMessage, { rejoin = null } = {}) => {
+    if (rejoin !== null && (state === null || call('sellerRejoin', state)?.id !== rejoin)) throw new Error('no one came');
+    reply = (message) => setTimeout(() => !session.closed && onMessage(JSON.stringify(message)), 1);
     const session = {
       closed: false,
       send(message) {
@@ -206,26 +226,22 @@ export function seller(offer, answer = (_request, terms) => ({ Terms: terms })) 
           if (answered === null) return;
           reply({ Answer: answered });
           if (answered.Terms) {
-            state = JSON.stringify(call('newSeller', JSON.stringify(answered.Terms), call('newNexKey').address, key(), key()));
+            state = JSON.stringify(call('newSeller', JSON.stringify(answered.Terms), nexKey.address, key(), key()));
           }
           return;
         }
         if (state === null) return;
-        let step = call('stepSeller', state, JSON.stringify({ Message: JSON.parse(message) }));
-        state = JSON.stringify(step.state);
-        for (const action of step.actions.filter((a) => a.Send)) {
-          reply(action.Send);
-          step = call('stepSeller', state, '"Sent"');
-          state = JSON.stringify(step.state);
-        }
+        step({ Message: JSON.parse(message) });
       },
       close() {
         session.closed = true;
       },
     };
+    const again = rejoin === null ? null : call('sellerRejoin', state).resend;
+    if (again) reply(again);
     return session;
   };
-  return { open, log };
+  return { open, log, step, state: () => state };
 }
 
 /** Polls `done` until it holds, failing after `ms`. */

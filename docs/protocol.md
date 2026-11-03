@@ -85,6 +85,18 @@ swap id.
    least `nex_amount` and has never signed, and that its node is synced.
 6. S redeems the BTC, which reveals `s`. B claims the NEX.
 
+A lost session ends nothing. From the hellos until S holds the redeem
+signature, S stays reachable and B reaches it again, as eigenwallet's ASB
+listens for the whole swap and its CLI dials it again; through a relay, the
+two meet at a rendezvous, the SHA-256 of a tag, the swap id and the
+Diffie-Hellman of their Bitcoin keys, which only they can work out. On each
+new session each sends again the last message it sent; a machine ignores a
+message it is not waiting for, so a copy it has already applied changes
+nothing. The session authenticates the seller's offer key, and once the
+lock is agreed every message the seller acts on is a signature by the
+buyer's Bitcoin key, which it verifies: one who met the seller anyway could
+make it do nothing.
+
 ## When something goes wrong
 
 - If S never redeems, B cancels after `t1` and refunds, which reveals `b`.

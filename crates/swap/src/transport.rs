@@ -35,6 +35,17 @@ pub trait Transport {
     fn recv(&mut self, wait: Duration) -> io::Result<Option<Vec<u8>>>;
 }
 
+/// A session of either kind, as one driver's.
+impl<T: Transport + ?Sized> Transport for Box<T> {
+    fn send(&mut self, payload: &[u8]) -> io::Result<()> {
+        (**self).send(payload)
+    }
+
+    fn recv(&mut self, wait: Duration) -> io::Result<Option<Vec<u8>>> {
+        (**self).recv(wait)
+    }
+}
+
 /// An ivy session over TCP, or over a relay's WebSocket ([`Relayed`]),
 /// with its own single-threaded runtime so the blocking driver can use it.
 /// Messages on other topics are skipped.
@@ -279,6 +290,105 @@ impl Ivy<Relayed> {
             send_timeout,
         })
     }
+
+    /// Meets the buyer at rendezvous `id` on the relay at `relay`
+    /// ([`Machine::rejoin`]), waiting there at most `wait`, and completes the
+    /// handshake as [`Ivy::accept_relayed`] does.
+    ///
+    /// [`Machine::rejoin`]: crate::Machine::rejoin
+    pub fn accept_rejoined(
+        relay: &str,
+        id: [u8; 32],
+        config: &Config,
+        peer: PeerKey,
+        wait: Duration,
+        send_timeout: Duration,
+    ) -> io::Result<Self> {
+        let runtime = runtime()?;
+        let connection = runtime.block_on(async {
+            let socket = meet(relay, id, wait, send_timeout).await?;
+            let accept = ivy::accept(Relayed::new(socket), config, |key| *key == peer);
+            timeout(send_timeout, accept)
+                .await
+                .map_err(|_| timed_out("the handshake timed out"))?
+        })?;
+        Ok(Self {
+            runtime,
+            connection,
+            send_timeout,
+        })
+    }
+
+    /// Meets the seller, which must hold `peer`'s key, at rendezvous `id`
+    /// on the relay at `relay`, waiting there at most `wait`.
+    pub fn connect_rejoined(
+        relay: &str,
+        id: [u8; 32],
+        config: &Config,
+        peer: PeerKey,
+        wait: Duration,
+        send_timeout: Duration,
+    ) -> io::Result<Self> {
+        let runtime = runtime()?;
+        let connection = runtime.block_on(async {
+            let socket = meet(relay, id, wait, send_timeout).await?;
+            let connect = ivy::connect(Relayed::new(socket), config, peer);
+            timeout(send_timeout, connect)
+                .await
+                .map_err(|_| timed_out("the handshake timed out"))?
+        })?;
+        Ok(Self {
+            runtime,
+            connection,
+            send_timeout,
+        })
+    }
+}
+
+/// The relay's socket at rendezvous `id`, once the other party has come.
+async fn meet(
+    relay: &str,
+    id: [u8; 32],
+    wait: Duration,
+    send_timeout: Duration,
+) -> io::Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
+    let url = relay_url(relay, &format!("rejoin/{}", hex::encode(id)))?;
+    let mut socket = dial(&url, send_timeout).await?;
+    match timeout(wait, text(&mut socket)).await {
+        Err(_) => Err(timed_out("the counterparty did not come")),
+        Ok(Ok(reply)) if reply == "paired" => Ok(socket),
+        Ok(Ok(reply)) => Err(io::Error::other(format!("the relay: {reply}"))),
+        Ok(Err(e)) => Err(e),
+    }
+}
+
+/// How long [`in_background`] waits after a failed attempt.
+pub const RETRY: Duration = Duration::from_secs(5);
+
+/// `connect`, which opens a session given the rendezvous id and may block,
+/// as [`Driver::reconnect`] takes it: on its own thread, one attempt at a
+/// time and the next [`RETRY`] after a failure, so the driver goes on
+/// watching the chains meanwhile.
+///
+/// [`Driver::reconnect`]: crate::driver::Driver::reconnect
+pub fn in_background<T: Send + 'static>(
+    connect: impl Fn([u8; 32]) -> io::Result<T> + Send + Sync + 'static,
+) -> crate::driver::Reconnect<T> {
+    let connect = std::sync::Arc::new(connect);
+    let mut attempt: Option<std::thread::JoinHandle<Option<T>>> = None;
+    Box::new(move |id| {
+        if attempt.as_ref().is_some_and(|a| !a.is_finished()) {
+            return None;
+        }
+        if let Some(Ok(Some(session))) = attempt.take().map(|a| a.join()) {
+            return Some(session);
+        }
+        let connect = connect.clone();
+        attempt = Some(std::thread::spawn(move || {
+            connect(id).inspect_err(|_| std::thread::sleep(RETRY)).ok()
+        }));
+        None
+    })
 }
 
 /// `path` at the relay at `relay`, as a WebSocket URL.

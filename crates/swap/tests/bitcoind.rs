@@ -342,6 +342,10 @@ impl Machine for Redeems {
         false
     }
 
+    fn rejoin(&self) -> Option<swap::Rejoin> {
+        None
+    }
+
     fn watch(&self) -> Watch {
         Watch {
             bitcoin: Some((self.swap(), self.lock)),

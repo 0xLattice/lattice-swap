@@ -169,6 +169,22 @@ fn watch<M: Machine>(state: &str) -> Result<String> {
     }))
 }
 
+/// How a seller's `state` meets the buyer again once their session is
+/// lost ([`Machine::rejoin`]): `{"id", "resend"}`, `id` the rendezvous in
+/// hex and `resend` the message to send again on the new session, or null;
+/// null while it needs no session.
+#[wasm_bindgen(js_name = sellerRejoin)]
+pub fn seller_rejoin(state: &str) -> Result<String> {
+    text(&parse::<Seller>(state)?.rejoin())
+}
+
+/// How a buyer's `state` meets the seller again, as [`seller_rejoin`]:
+/// `id` is the rendezvous at the offer's relay.
+#[wasm_bindgen(js_name = buyerRejoin)]
+pub fn buyer_rejoin(state: &str) -> Result<String> {
+    text(&parse::<Buyer>(state)?.rejoin())
+}
+
 /// Why a Bitcoin view is stale, as the driver judges it: `{"tip",
 /// "first_seen", "max_tip_age", "now"}` in, the last two in seconds and
 /// `first_seen` the `[hash, seconds]` the last call returned or null;

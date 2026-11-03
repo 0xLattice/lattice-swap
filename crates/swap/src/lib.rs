@@ -875,6 +875,26 @@ pub trait Machine: Clone + Serialize + serde::de::DeserializeOwned {
     /// CPFP from their payout while they wait unconfirmed. Never cancel,
     /// whose output only both parties together can spend.
     fn own_spends(&self) -> &'static [Spend];
+    /// While this side still awaits a message or has one to send, how it
+    /// meets the counterparty again once the session is gone.
+    fn rejoin(&self) -> Option<Rejoin>;
+}
+
+/// How a side gets a lost session back, as eigenwallet's ASB keeps
+/// listening for the whole swap, and its CLI, on a lost connection or on
+/// `resume`, dials the seller again by its peer id, each side sending again
+/// what the other has not acknowledged. Only once the hellos are out:
+/// before, nothing is at stake, and a quiet counterparty aborts.
+#[derive(Clone, Debug, Serialize)]
+pub struct Rejoin {
+    /// Where the two meet on a relay: see [`Setup::rendezvous`].
+    #[serde(with = "hex::serde")]
+    pub id: [u8; 32],
+    /// The last message this side sent, which the counterparty may have
+    /// missed: sent again on every new session. Each machine ignores a
+    /// message it is not waiting for, so a copy it has already applied
+    /// changes nothing.
+    pub resend: Option<Message>,
 }
 
 /// What a driver should watch for a machine in its current state.
@@ -898,6 +918,29 @@ pub struct NexusWatch {
 }
 
 impl Setup {
+    /// The rendezvous the two parties meet at again: a hash of the swap id
+    /// and the Diffie-Hellman of their Bitcoin keys, which only they can
+    /// work out. A relay pairs the two who come to it, as a Tor rendezvous
+    /// point joins the two circuits that bring the same cookie
+    /// (rend-spec-v3, `RENDEZVOUS_COOKIE`): no one else, the swap id read
+    /// from the board, can stand in for either.
+    fn rendezvous(&self) -> [u8; 32] {
+        let key = self.secrets.key();
+        let shared = schnorr_fun::fun::g!({ key.secret_key() } * { self.other_key }).normalize();
+        let mut engine = bitcoin::hashes::sha256::Hash::engine();
+        bitcoin::hashes::HashEngine::input(&mut engine, b"lattice-swap rejoin");
+        bitcoin::hashes::HashEngine::input(&mut engine, &self.terms.swap_id);
+        bitcoin::hashes::HashEngine::input(&mut engine, &shared.to_bytes());
+        bitcoin::hashes::sha256::Hash::from_engine(engine).to_byte_array()
+    }
+
+    fn rejoin(&self, resend: Option<Message>) -> Option<Rejoin> {
+        Some(Rejoin {
+            id: self.rendezvous(),
+            resend,
+        })
+    }
+
     fn watch_nexus(&self, cid: Option<String>) -> Option<NexusWatch> {
         Some(NexusWatch {
             lock_address: self.lock_address(),

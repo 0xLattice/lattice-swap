@@ -84,6 +84,7 @@ fn wait_for<T>(what: &str, mut poll: impl FnMut() -> Option<T>) -> T {
 fn relay() -> (String, Arc<Relay>) {
     let relay = Arc::new(Relay {
         board: Board::new(10),
+        rejoins: Board::new(10),
     });
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -748,6 +749,48 @@ fn happy_path_through_a_relay() {
     assert!(relay.board.offers().is_empty());
 }
 
+/// The buyer killed once its BTC lock is in a block, before the seller's
+/// NEX lock lands: the CID the seller sends goes nowhere. `resume` meets the
+/// seller again at the relay, gets the CID, and the swap completes.
+#[test]
+#[ignore = "needs Docker and NEXUS_NODE_IMAGE"]
+fn a_buyer_killed_after_the_lock_rejoins_through_the_relay_to_the_swap() {
+    let world = World::new();
+    let (url, _relay) = relay();
+    let (mut seller, mut buyer, swap_id, seller_out) = world.start_on(20, 1, Some(&url));
+    // No Nexus block until the buyer is gone: the NEX lock waits in the pool.
+    world.drive(
+        false,
+        || false,
+        || world.state("seller", &swap_id) == "LockingNex",
+    );
+    assert_eq!(world.state("buyer", &swap_id), "AwaitNexLock");
+    kill(&mut buyer);
+    world.drive(
+        false,
+        || true,
+        || world.state("seller", &swap_id) == "AwaitRedeemSignature",
+    );
+
+    let mut buyer = world.resume("buyer", &swap_id);
+    let (mut seller_done, mut buyer_done) = (None, None);
+    world.drive(
+        false,
+        || true,
+        || {
+            seller_done = seller_done.or(seller.0.try_wait().unwrap());
+            buyer_done = buyer_done.or(buyer.0.try_wait().unwrap());
+            seller_done.is_some() && buyer_done.is_some()
+        },
+    );
+    assert_eq!(seller_out.join().unwrap(), "outcome: Swapped\n");
+    assert_eq!(stdout(&mut buyer.0), "outcome: Swapped\n");
+    assert_eq!(
+        world.nexus.balance(&world.buyer_nex),
+        NEX_AMOUNT - world.nex_fee
+    );
+}
+
 /// The browser's buyer: web/driver in Node, its wallet and swap kept in
 /// files.
 fn browser(mode: &str, config: &std::path::Path) -> Party {
@@ -897,6 +940,52 @@ fn the_browser_refunds_to_its_wallet_when_the_seller_goes() {
     assert!(held >= BTC_AMOUNT - BTC_FEE * 2, "{held}");
     assert!(held < BTC_AMOUNT, "{held}");
     assert_eq!(world.nexus.balance(&world.buyer_nex), 0);
+}
+
+/// The browser's page closed once its BTC lock is in a block, before the
+/// seller's NEX lock lands, and opened again from its recovery file: it
+/// meets the seller again at the relay, gets the CID it missed, and swaps.
+#[test]
+#[ignore = "needs Docker, NEXUS_NODE_IMAGE and web/driver built"]
+fn the_browser_reloaded_after_the_lock_rejoins_to_the_swap() {
+    let world = World::new();
+    let (url, _relay) = relay();
+    let (mut seller, offer, swap_id, seller_out) = world.offer_on(20, 1, Some(&url));
+    let config = world.browser_config(&offer, 20);
+    let (mut buyer, _, _) = world.browser_take(&config);
+    world.drive(
+        false,
+        || false,
+        || world.state("seller", &swap_id) == "LockingNex",
+    );
+    assert_eq!(world.browser_state(&swap_id), "AwaitNexLock");
+    wait_for("the recovery file", || {
+        world.dir("browser").join("backup").exists().then_some(())
+    });
+    kill(&mut buyer);
+    world.drive(
+        false,
+        || true,
+        || world.state("seller", &swap_id) == "AwaitRedeemSignature",
+    );
+
+    let mut buyer = browser("restore", &config);
+    let (mut seller_done, mut buyer_done) = (None, None);
+    world.drive(
+        false,
+        || true,
+        || {
+            seller_done = seller_done.or(seller.0.try_wait().unwrap());
+            buyer_done = buyer_done.or(buyer.0.try_wait().unwrap());
+            seller_done.is_some() && buyer_done.is_some()
+        },
+    );
+    assert_eq!(seller_out.join().unwrap(), "outcome: Swapped\n");
+    assert_eq!(stdout(&mut buyer.0), "outcome: swapped\n");
+    assert_eq!(
+        world.nexus.balance(&world.buyer_nex),
+        NEX_AMOUNT - world.nex_fee
+    );
 }
 
 /// The browser killed once it has seen the redeem and is claiming the NEX:
