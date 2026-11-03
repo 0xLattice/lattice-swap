@@ -317,6 +317,18 @@ test('a run stopped and started again meets the seller again', async () => {
   assert.deepEqual(w.unsaved, []);
 });
 
+test('a second run of a Buyer while one runs is refused, the first unharmed', async () => {
+  const { w, run, funding } = await funded();
+  // Bounded: an unrefused second run would run on.
+  await assert.rejects(Promise.race([w.buyer.run(), pause(1_000)]), /running already/);
+  w.session.close();
+  sellerLocksNex(w, funding);
+  await cidArrives(w);
+  await run.stop();
+  const again = running(w.buyer);
+  await again.stop();
+});
+
 test('a rejoin still waiting when the run stops is given up', async () => {
   const { w, run } = await funded();
   let waiting = null;

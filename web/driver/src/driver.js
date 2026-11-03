@@ -72,9 +72,9 @@ export class Buyer extends EventTarget {
   #rejoining = null;
   #rejoinedAt = -Infinity;
   #rejoined = false;
-  /** Whether {@link Buyer#run} has returned, and what aborts a rejoin it
-   * left in flight. */
-  #stopped = false;
+  /** Whether {@link Buyer#run} is running, and what aborts a rejoin it
+   * leaves in flight once it returns. */
+  #running = false;
   #halt = new AbortController();
 
   constructor(wallet, record, nexusChecked) {
@@ -263,10 +263,11 @@ export class Buyer extends EventTarget {
    * `signal` aborts: the outcome, once it ends. A `status` event follows
    * every change of {@link Buyer#status}. A failed round, a backend's or
    * the Nexus check's, is the status's `warning`, and the next round tries
-   * again.
+   * again. Refuses while a run of this Buyer is running already.
    * @returns {Promise<string | null>} */
   async run(signal) {
-    this.#stopped = false;
+    if (this.#running) throw new Error('refused: this swap is running already');
+    this.#running = true;
     this.#halt = new AbortController();
     while (!signal?.aborted) {
       let done = null;
@@ -288,7 +289,7 @@ export class Buyer extends EventTarget {
       });
       this.#wake = null;
     }
-    this.#stopped = true;
+    this.#running = false;
     this.#halt.abort();
     this.#session?.close();
     return ended(this.#r.state) ? this.status().outcome : null;
@@ -335,7 +336,7 @@ export class Buyer extends EventTarget {
     this.#rejoining = open(this.#r.offer, (message) => this.#receive(message), options)
       .then(
         (session) => {
-          if (this.#stopped) return session.close();
+          if (!this.#running) return session.close();
           this.#session = session;
           this.#rejoined = true;
         },

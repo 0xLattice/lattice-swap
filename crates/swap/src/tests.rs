@@ -3845,7 +3845,7 @@ fn a_session_half_open_is_lost_once_its_pings_go_unanswered() {
     let seller = std::thread::spawn(move || {
         let wait = Duration::from_secs(10);
         let mut seller = Ivy::accept(listener, &config(1), buyer_key, wait, wait).unwrap();
-        seller.ping = ping;
+        seller.set_ping(ping);
         // Waits as a driver does, a poll at a time, until the session fails.
         loop {
             if let Err(e) = seller.recv(Duration::from_millis(10)) {
@@ -3860,7 +3860,7 @@ fn a_session_half_open_is_lost_once_its_pings_go_unanswered() {
         Duration::from_secs(10),
     )
     .unwrap();
-    buyer.ping = ping;
+    buyer.set_ping(ping);
     let quiet = std::time::Instant::now();
     while quiet.elapsed() < ping * PINGS_MISSED * 4 {
         assert!(buyer.recv(Duration::from_millis(10)).unwrap().is_none());
@@ -3912,4 +3912,48 @@ fn a_failed_rejoin_is_told_and_tried_again_only_after_a_pause() {
         std::thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(*attempts.lock().unwrap(), 1);
+}
+
+/// A driver busy elsewhere, on a slow node's calls say, for far longer than
+/// the counterparty waits for its pings to be answered, keeps its session:
+/// the session's own thread answers them meanwhile, and holds what arrives
+/// until the driver comes back for it.
+#[cfg(feature = "native")]
+#[test]
+fn a_session_stays_while_its_driver_is_busy_elsewhere() {
+    use crate::transport::{Ivy, PINGS_MISSED};
+    use ed25519_dalek::SigningKey;
+    let config = |seed| ivy::Config::new(SigningKey::from_bytes(&[seed; 32]));
+    let ping = Duration::from_millis(50);
+    let busy = ping * PINGS_MISSED * 6;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let buyer_key = config(2).peer_key();
+    let seller = std::thread::spawn(move || {
+        let wait = Duration::from_secs(10);
+        let mut seller = Ivy::accept(listener, &config(1), buyer_key, wait, wait).unwrap();
+        seller.set_ping(ping);
+        let waiting = std::time::Instant::now();
+        while waiting.elapsed() < busy {
+            assert!(seller.recv(Duration::from_millis(10)).unwrap().is_none());
+        }
+        seller.send(b"still here").unwrap();
+        seller.recv(wait).unwrap()
+    });
+    let mut buyer = Ivy::connect(
+        address,
+        &config(2),
+        config(1).peer_key(),
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    buyer.set_ping(ping);
+    std::thread::sleep(busy + ping * PINGS_MISSED);
+    let wait = Duration::from_secs(10);
+    assert_eq!(
+        buyer.recv(wait).unwrap().as_deref(),
+        Some(&b"still here"[..])
+    );
+    buyer.send(b"back").unwrap();
+    assert_eq!(seller.join().unwrap().as_deref(), Some(&b"back"[..]));
 }

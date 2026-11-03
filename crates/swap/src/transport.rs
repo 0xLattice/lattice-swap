@@ -47,37 +47,126 @@ impl<T: Transport + ?Sized> Transport for Box<T> {
     }
 }
 
-/// How often [`Ivy::recv`] pings the counterparty while it waits.
+/// How often an [`Ivy`] session pings the counterparty.
 pub const PING: Duration = Duration::from_secs(15);
-/// How many pings in a row may go unanswered before [`Ivy::recv`] counts
-/// the session lost: as OpenSSH's `ServerAliveInterval` and its default
+/// How many pings in a row may go unanswered before an [`Ivy`] session
+/// counts as lost: as OpenSSH's `ServerAliveInterval` and its default
 /// `ServerAliveCountMax`.
 pub const PINGS_MISSED: u32 = 3;
+/// The most messages an [`Ivy`] session holds that [`Ivy::recv`] has not
+/// taken: past them it stops reading, so a peer that floods it costs it
+/// no more.
+pub const INBOX: usize = 16;
 
 /// An ivy session over TCP, or over a relay's WebSocket ([`Relayed`]),
-/// with its own single-threaded runtime so the blocking driver can use it.
-/// Messages on other topics are skipped.
+/// for the blocking driver. Messages on other topics are skipped.
+///
+/// The session runs on a thread of its own, which reads it all the time:
+/// it answers the counterparty's pings, and holds what arrives for
+/// [`Ivy::recv`], however long the driver is busy elsewhere, a slow node
+/// among it, as libp2p's swarm answers pings apart from the application in
+/// eigenwallet. It pings the counterparty every [`PING`], and ends the
+/// session once [`PINGS_MISSED`] pings in a row go unanswered: one whose
+/// other end is gone without a word, a laptop asleep or a NAT that forgot
+/// it, reads as quiet and not as closed, and only a keepalive tells the two
+/// apart. The next call then fails, and so does every one after.
 pub struct Ivy<S = TcpStream> {
-    runtime: Runtime,
-    connection: Connection<S>,
+    commands: tokio::sync::mpsc::UnboundedSender<Command>,
+    inbox: std::sync::mpsc::Receiver<io::Result<Vec<u8>>>,
     send_timeout: Duration,
-    /// How often a ping goes out: [`PING`] unless a test sets its own.
-    pub ping: Duration,
-    /// When the last one went out.
-    pinged: Instant,
-    /// Since when a ping has gone out with nothing heard after it.
-    unanswered: Option<Instant>,
+    _stream: std::marker::PhantomData<fn() -> S>,
 }
 
-impl<S> Ivy<S> {
+enum Command {
+    Send(Vec<u8>, std::sync::mpsc::Sender<io::Result<()>>),
+    Ping(Duration),
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Ivy<S> {
+    /// Hands `connection`, with `runtime`, whose reactor it is on, to the
+    /// session's own thread.
     fn new(runtime: Runtime, connection: Connection<S>, send_timeout: Duration) -> Self {
+        let (commands, received) = tokio::sync::mpsc::unbounded_channel();
+        let (deliver, inbox) = std::sync::mpsc::sync_channel(INBOX);
+        std::thread::spawn(move || {
+            let ended = runtime.block_on(serve(connection, received, &deliver, send_timeout));
+            // Told last: the driver may be busy, and nothing else waits.
+            if let Err(e) = ended {
+                _ = deliver.send(Err(e));
+            }
+        });
         Self {
-            runtime,
-            connection,
+            commands,
+            inbox,
             send_timeout,
-            ping: PING,
-            pinged: Instant::now(),
-            unanswered: None,
+            _stream: std::marker::PhantomData,
+        }
+    }
+
+    /// Pings every `ping` instead of every [`PING`], for the tests.
+    pub fn set_ping(&mut self, ping: Duration) {
+        _ = self.commands.send(Command::Ping(ping));
+    }
+}
+
+/// Runs the session until it fails, or until its [`Ivy`] is dropped.
+async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
+    mut connection: Connection<S>,
+    mut commands: tokio::sync::mpsc::UnboundedReceiver<Command>,
+    deliver: &std::sync::mpsc::SyncSender<io::Result<Vec<u8>>>,
+    send_timeout: Duration,
+) -> io::Result<()> {
+    let mut ping = PING;
+    let mut pinged = tokio::time::Instant::now();
+    // Since when a ping has gone out with nothing heard after it.
+    let mut unanswered: Option<tokio::time::Instant> = None;
+    loop {
+        tokio::select! {
+            command = commands.recv() => match command {
+                None => return Ok(()),
+                Some(Command::Ping(every)) => ping = every,
+                Some(Command::Send(payload, done)) => {
+                    let sent = timeout(send_timeout, connection.send(TOPIC, &payload))
+                        .await
+                        .unwrap_or_else(|_| Err(timed_out("send timed out")));
+                    let failed = sent.as_ref().err().map(|e| io::Error::new(e.kind(), e.to_string()));
+                    _ = done.send(sent);
+                    if let Some(e) = failed {
+                        return Err(e);
+                    }
+                }
+            },
+            // Cancel-safe: a message cut off is kept for the next call.
+            message = connection.recv_message() => {
+                unanswered = None;
+                let Record::PeerMessage { topic, payload } = message? else {
+                    continue;
+                };
+                if topic != TOPIC {
+                    continue;
+                }
+                let mut held = Ok(payload);
+                loop {
+                    match deliver.try_send(held) {
+                        Ok(()) => break,
+                        Err(std::sync::mpsc::TrySendError::Full(again)) => {
+                            held = again;
+                            sleep(Duration::from_millis(10)).await;
+                        }
+                        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return Ok(()),
+                    }
+                }
+            }
+            () = tokio::time::sleep_until(pinged + ping) => {
+                if unanswered.is_some_and(|since| since.elapsed() >= ping * PINGS_MISSED) {
+                    return Err(timed_out("the counterparty stopped answering"));
+                }
+                timeout(send_timeout, connection.send_message(&Record::Ping(0)))
+                    .await
+                    .map_err(|_| timed_out("a ping timed out"))??;
+                pinged = tokio::time::Instant::now();
+                unanswered.get_or_insert(pinged);
+            }
         }
     }
 }
@@ -194,65 +283,31 @@ fn runtime() -> io::Result<Runtime> {
         .build()
 }
 
-impl<S: AsyncRead + AsyncWrite + Unpin> Transport for Ivy<S> {
+impl<S> Transport for Ivy<S> {
     fn send(&mut self, payload: &[u8]) -> io::Result<()> {
-        // The timer is made inside the runtime, which drives it.
-        let send = self.connection.send(TOPIC, payload);
-        self.runtime
-            .block_on(async { timeout(self.send_timeout, send).await })
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "send timed out"))?
-    }
-
-    /// Pings the counterparty every [`Ivy::ping`] meanwhile, and fails once
-    /// [`PINGS_MISSED`] pings in a row go unanswered: a session whose other
-    /// end is gone without a word, a laptop asleep or a NAT that forgot it,
-    /// reads as quiet and not as closed, and only a keepalive tells the
-    /// two apart, as libp2p's ping, which eigenwallet runs, and SSH's
-    /// `ServerAliveInterval` do.
-    fn recv(&mut self, wait: Duration) -> io::Result<Option<Vec<u8>>> {
-        let deadline = Instant::now() + wait;
-        loop {
-            let now = Instant::now();
-            if now >= self.pinged + self.ping {
-                let ping = self.connection.send_message(&Record::Ping(0));
-                self.runtime
-                    .block_on(async { timeout(self.send_timeout, ping).await })
-                    .map_err(|_| timed_out("a ping timed out"))??;
-                self.pinged = now;
-                self.unanswered.get_or_insert(now);
-            }
-            let left = deadline
-                .min(self.pinged + self.ping)
-                .saturating_duration_since(now);
-            // `recv_message` is cancel-safe: a message cut off by the
-            // deadline is kept for the next call.
-            let recv = self.connection.recv_message();
-            match self.runtime.block_on(async { timeout(left, recv).await }) {
-                Err(_) => {
-                    let missed = self.ping * PINGS_MISSED;
-                    if self
-                        .unanswered
-                        .is_some_and(|since| since.elapsed() >= missed)
-                    {
-                        return Err(timed_out("the counterparty stopped answering"));
-                    }
-                    if Instant::now() >= deadline {
-                        return Ok(None);
-                    }
-                }
-                Ok(Err(e)) => return Err(e),
-                Ok(Ok(message)) => {
-                    self.unanswered = None;
-                    match message {
-                        Record::PeerMessage { topic, payload } if topic == TOPIC => {
-                            return Ok(Some(payload))
-                        }
-                        _ => continue,
-                    }
-                }
-            }
+        let (done, sent) = std::sync::mpsc::channel();
+        self.commands
+            .send(Command::Send(payload.to_vec(), done))
+            .map_err(|_| ended())?;
+        // The session's own deadline comes first.
+        match sent.recv_timeout(self.send_timeout + Duration::from_secs(1)) {
+            Ok(sent) => sent,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(timed_out("send timed out")),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(ended()),
         }
     }
+
+    fn recv(&mut self, wait: Duration) -> io::Result<Option<Vec<u8>>> {
+        match self.inbox.recv_timeout(wait) {
+            Ok(received) => received.map(Some),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(None),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(ended()),
+        }
+    }
+}
+
+fn ended() -> io::Error {
+    io::Error::new(io::ErrorKind::ConnectionAborted, "the session ended")
 }
 
 /// The most bytes [`Relayed`] puts in one WebSocket message. A relay holds

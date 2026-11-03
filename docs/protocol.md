@@ -99,7 +99,10 @@ held the seller's session with it would keep the two apart until B
 refunds. Each side pings the other every 15 seconds and counts the session
 lost once three pings in a row go unanswered, as SSH's
 `ServerAliveInterval` does, so a connection gone silent without closing,
-a laptop asleep or a NAT that forgot it, is met again too.
+a laptop asleep or a NAT that forgot it, is met again too. Pings are
+answered by the session itself, on its own thread in the CLI, however
+long the driver is busy with its nodes, as libp2p's swarm answers them
+in eigenwallet.
 
 ## When something goes wrong
 
