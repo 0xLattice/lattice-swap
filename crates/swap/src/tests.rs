@@ -4482,3 +4482,218 @@ fn an_unread_child_of_punish_holds_back_only_giving_s() {
     let stopped = driver.run_until(|seller| matches!(seller, Seller::Punished { .. }));
     assert!(stopped.unwrap().is_none());
 }
+
+/// One deposit of `value` to the wallet.
+fn deposit(value: u64) -> Vec<wallet::Utxo> {
+    vec![wallet::Utxo {
+        txid: Txid::from_byte_array([9; 32]),
+        vout: 1,
+        value,
+    }]
+}
+
+/// Whether input `i` of `tx` is signed by `key`, spending `value`.
+fn signed_by(tx: &Transaction, i: usize, key: &wallet::Key, value: u64) -> bool {
+    use bitcoin::secp256k1::{Message as Digest, Secp256k1};
+    use bitcoin::sighash::{EcdsaSighashType, SighashCache};
+    let private = bitcoin::PrivateKey::from_wif(&key.wif).unwrap();
+    let secp = Secp256k1::new();
+    let public = bitcoin::CompressedPublicKey::from_private_key(&secp, &private).unwrap();
+    let sighash = SighashCache::new(tx)
+        .p2wpkh_signature_hash(
+            i,
+            &key.script_pubkey,
+            Amount::from_sat(value),
+            EcdsaSighashType::All,
+        )
+        .unwrap();
+    let witness = &tx.input[i].witness;
+    let signature = bitcoin::ecdsa::Signature::from_slice(witness.nth(0).unwrap()).unwrap();
+    witness.nth(1) == Some(&public.to_bytes()[..])
+        && secp
+            .verify_ecdsa(
+                &Digest::from_digest(sighash.to_byte_array()),
+                &signature.signature,
+                &public.0,
+            )
+            .is_ok()
+}
+
+#[test]
+fn a_wallet_key_is_for_its_network_only() {
+    let key = wallet::Key::new("regtest").unwrap();
+    assert!(key.address.starts_with("bcrt1q"), "{}", key.address);
+    assert!(key.script_pubkey.is_p2wpkh());
+    let again = wallet::Key::of(&format!(" {}\n", key.wif), "regtest").unwrap();
+    assert_eq!(
+        (again.wif, again.script_pubkey, again.address),
+        (key.wif.clone(), key.script_pubkey, key.address)
+    );
+    assert!(wallet::Key::of(&key.wif, "bitcoin").is_err());
+    assert!(wallet::Key::of("nonsense", "regtest").is_err());
+    assert!(wallet::Key::new("nowhere").is_err());
+    assert_ne!(wallet::Key::new("regtest").unwrap().wif, key.wif);
+}
+
+/// The wallet funds the lock as the buyer's machine asks: the agreed
+/// amount at the lock, the largest outputs first, the change back to the
+/// wallet, below dust to the fee.
+#[test]
+fn the_wallet_funds_the_lock_and_keeps_its_change() {
+    let (_, buyer, actions) = hellos();
+    let [Action::FundLock {
+        script_pubkey: lock,
+        amount,
+    }] = &actions[..]
+    else {
+        panic!("a funding request");
+    };
+    let amount = amount.to_sat();
+    let key = wallet::Key::new("regtest").unwrap();
+    let fund = |utxos, rate| wallet::fund(&key.wif, utxos, lock.clone(), amount, rate);
+    assert!(wallet::need(deposit(1_100_000), amount, 5).0);
+    let funded = fund(deposit(1_100_000), 5).unwrap();
+    let tx = &funded.tx;
+    assert!(signed_by(tx, 0, &key, 1_100_000));
+    assert_eq!(
+        tx.input[0].sequence,
+        bitcoin::Sequence::ENABLE_RBF_NO_LOCKTIME
+    );
+    assert_eq!(tx.output[0].value.to_sat(), amount);
+    assert_eq!(&tx.output[0].script_pubkey, lock);
+    assert_eq!(tx.output[1].script_pubkey, key.script_pubkey);
+    assert!(funded.fee >= 5 * tx.vsize() as u64, "{}", funded.fee);
+    assert!(funded.fee < 6 * tx.vsize() as u64, "{}", funded.fee);
+    assert_eq!(tx.output[1].value.to_sat(), 1_100_000 - amount - funded.fee);
+    let (buyer, _) = buyer.step(Event::Funded(funded.tx.clone()));
+    assert!(matches!(buyer, Buyer::AwaitSellerSignatures { .. }));
+
+    // Largest first: the large output alone, the small one kept.
+    let utxo = |n: u8, value| wallet::Utxo {
+        txid: Txid::from_byte_array([n; 32]),
+        vout: 0,
+        value,
+    };
+    let one = fund(vec![utxo(8, 5_000), utxo(9, 1_100_000)], 5).unwrap();
+    assert_eq!(
+        one.tx
+            .input
+            .iter()
+            .map(|i| i.previous_output.txid)
+            .collect::<Vec<_>>(),
+        [Txid::from_byte_array([9; 32])]
+    );
+    // At 100 sat/vB a 5,000 sat output costs more to spend than it holds:
+    // the one that pays alone is enough, whatever the order.
+    let alone = (amount..)
+        .step_by(100)
+        .find(|value| fund(deposit(*value), 100).is_ok())
+        .unwrap();
+    assert!(wallet::need(vec![utxo(8, 5_000), utxo(9, alone)], amount, 100).0);
+    // Both when one is not enough, each signed.
+    let both = fund(vec![utxo(8, 600_000), utxo(9, 700_000)], 5).unwrap();
+    assert_eq!(both.tx.input.len(), 2);
+    assert_eq!(
+        both.tx.input[0].previous_output.txid,
+        Txid::from_byte_array([9; 32])
+    );
+    assert!(signed_by(&both.tx, 0, &key, 700_000));
+    assert!(signed_by(&both.tx, 1, &key, 600_000));
+
+    // Change below dust goes to the fee.
+    let exact = fund(deposit(amount + 1_000), 5).unwrap();
+    assert_eq!(exact.tx.output.len(), 1);
+    assert_eq!(exact.fee, 1_000);
+    // Too little: refused, and what the wallet would need.
+    assert!(fund(deposit(amount + 100), 5).is_err());
+    let (enough, least) = wallet::need(deposit(amount + 100), amount, 5);
+    assert!(!enough);
+    assert!(least > amount + 100 && least < amount + 5 * 200, "{least}");
+    assert_eq!(
+        wallet::need(vec![], amount, 5),
+        (false, least),
+        "as for one deposit"
+    );
+    assert!(fund(vec![], 5).is_err());
+}
+
+/// A withdrawal sends everything, less its fee, to the address asked.
+#[test]
+fn a_withdrawal_sweeps_the_wallet() {
+    let key = wallet::Key::new("regtest").unwrap();
+    let to = payout(4);
+    let swept = wallet::sweep(&key.wif, &deposit(50_000), to.clone(), 10).unwrap();
+    let tx = &swept.tx;
+    assert!(signed_by(tx, 0, &key, 50_000));
+    assert_eq!(tx.output.len(), 1);
+    assert_eq!(tx.output[0].script_pubkey, to);
+    assert_eq!(tx.output[0].value.to_sat(), 50_000 - swept.fee);
+    assert!(swept.fee >= 10 * tx.vsize() as u64 && swept.fee < 11 * tx.vsize() as u64);
+    // What is left past the fee would be dust.
+    let dust = deposit(swept.fee + 100);
+    assert!(wallet::sweep(&key.wif, &dust, to.clone(), 10).is_err());
+    assert!(wallet::sweep(&key.wif, &[], to, 10).is_err());
+}
+
+/// A buyer's status: its phase, what a backup covers, and once the lock is
+/// in a block its deadlines, from the lock until cancel is in a block, then
+/// from cancel.
+#[test]
+fn a_buyer_shows_where_its_swap_is_and_its_deadlines() {
+    let status = |buyer: &Buyer, view: Option<&BitcoinView>| status::buyer_status(buyer, view);
+    let view = |event: Event| match event {
+        Event::Bitcoin(view) => view,
+        _ => unreachable!(),
+    };
+    let (_, swapping, _) = hellos();
+    let shown = status(&swapping, None);
+    assert_eq!(shown["phase"], "swapping");
+    assert_eq!(shown["must_stay_open"], false);
+    assert_eq!(shown["backup_covers"], "wallet");
+    assert_eq!(shown["terms"], serde_json::to_value(terms()).unwrap());
+    assert_eq!(
+        shown["deadlines"],
+        serde_json::json!({"cancel": null, "refund": null, "punish": null})
+    );
+
+    let Locked { buyer, .. } = locked();
+    let (t1, t2) = (20, 10);
+    // Three deep at 103: in block 101.
+    let three = view(btc(3, None, None));
+    let shown = status(&buyer, Some(&three));
+    assert_eq!(shown["backup_covers"], "lock");
+    assert_eq!(shown["confirmations"]["funding"], 3);
+    assert_eq!(
+        shown["deadlines"],
+        serde_json::json!({"cancel": 101 + t1, "refund": 101 + t1 + 1, "punish": 101 + t1 + t2})
+    );
+    let unmined = view(btc(0, None, None));
+    assert_eq!(
+        status(&buyer, Some(&unmined))["deadlines"],
+        serde_json::json!({"cancel": null, "refund": null, "punish": null})
+    );
+
+    // Cancel two deep at 125: in block 124, later than it could be.
+    let (cancel, _) = cancel_and_refund(buyer.clone());
+    let cancelled = BitcoinView {
+        height: 125,
+        funding: Some(25),
+        lock_spend: Some(Spent {
+            tx: cancel,
+            confirmations: 2,
+        }),
+        ..view(btc(25, None, None))
+    };
+    let shown = status(&buyer, Some(&cancelled));
+    assert_eq!(shown["confirmations"]["lock_spend"], 2);
+    assert_eq!(
+        shown["deadlines"],
+        serde_json::json!({"cancel": 101 + t1, "refund": 124 + 1, "punish": 124 + t2})
+    );
+
+    let done = |outcome| status(&Buyer::Done(outcome), None);
+    assert_eq!(done(Outcome::Swapped)["phase"], "swapped");
+    assert_eq!(done(Outcome::Swapped)["terms"], serde_json::Value::Null);
+    assert_eq!(done(Outcome::Refunded)["phase"], "refunded");
+    assert_eq!(done(Outcome::Drained)["phase"], "drained");
+}

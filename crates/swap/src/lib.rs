@@ -60,9 +60,11 @@ mod buyer;
 pub mod driver;
 pub mod offer;
 mod seller;
+pub mod status;
 #[cfg(feature = "native")]
 pub mod transport;
 pub mod view;
+pub mod wallet;
 
 pub use buyer::Buyer;
 pub use seller::{Claiming, Seller};
