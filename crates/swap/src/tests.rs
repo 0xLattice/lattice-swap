@@ -3957,3 +3957,34 @@ fn a_session_stays_while_its_driver_is_busy_elsewhere() {
     buyer.send(b"back").unwrap();
     assert_eq!(seller.join().unwrap().as_deref(), Some(&b"back"[..]));
 }
+
+/// A session dropped, as a rejoin replaces one, closes its connection at
+/// once: its thread ends, and the counterparty hears it end.
+#[cfg(feature = "native")]
+#[test]
+fn a_session_dropped_closes_its_connection() {
+    use crate::transport::Ivy;
+    use ed25519_dalek::SigningKey;
+    let config = |seed| ivy::Config::new(SigningKey::from_bytes(&[seed; 32]));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let buyer_key = config(2).peer_key();
+    let wait = Duration::from_secs(10);
+    let seller =
+        std::thread::spawn(move || Ivy::accept(listener, &config(1), buyer_key, wait, wait));
+    let buyer = Ivy::connect(address, &config(2), config(1).peer_key(), wait).unwrap();
+    let mut seller = seller.join().unwrap().unwrap();
+    drop(buyer);
+    let dropped = std::time::Instant::now();
+    let e = loop {
+        assert!(dropped.elapsed() < Duration::from_secs(2), "still open");
+        if let Err(e) = seller.recv(Duration::from_millis(10)) {
+            break e;
+        }
+    };
+    assert_ne!(
+        e.kind(),
+        std::io::ErrorKind::TimedOut,
+        "closed, not gone quiet: {e}"
+    );
+}

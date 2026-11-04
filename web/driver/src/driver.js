@@ -269,29 +269,32 @@ export class Buyer extends EventTarget {
     if (this.#running) throw new Error('refused: this swap is running already');
     this.#running = true;
     this.#halt = new AbortController();
-    while (!signal?.aborted) {
-      let done = null;
-      try {
-        done = await this.#round();
-        this.#warning = null;
-      } catch (e) {
-        this.#warning = e.message;
+    try {
+      while (!signal?.aborted) {
+        let done = null;
+        try {
+          done = await this.#round();
+          this.#warning = null;
+        } catch (e) {
+          this.#warning = e.message;
+        }
+        this.#announce();
+        if (done) break;
+        await new Promise((resolve) => {
+          const timer = setTimeout(resolve, this.#c.poll);
+          this.#wake = () => {
+            clearTimeout(timer);
+            resolve();
+          };
+          signal?.addEventListener('abort', this.#wake, { once: true });
+        });
+        this.#wake = null;
       }
-      this.#announce();
-      if (done) break;
-      await new Promise((resolve) => {
-        const timer = setTimeout(resolve, this.#c.poll);
-        this.#wake = () => {
-          clearTimeout(timer);
-          resolve();
-        };
-        signal?.addEventListener('abort', this.#wake, { once: true });
-      });
-      this.#wake = null;
+    } finally {
+      this.#running = false;
+      this.#halt.abort();
+      this.#session?.close();
     }
-    this.#running = false;
-    this.#halt.abort();
-    this.#session?.close();
     return ended(this.#r.state) ? this.status().outcome : null;
   }
 

@@ -329,6 +329,16 @@ test('a second run of a Buyer while one runs is refused, the first unharmed', as
   await again.stop();
 });
 
+test('a run that fails outside its rounds lets the next run start', async () => {
+  const w = await world();
+  w.buyer.status = () => {
+    throw new Error('status failed');
+  };
+  await assert.rejects(w.buyer.run(), /status failed/);
+  delete w.buyer.status;
+  await running(w.buyer).stop();
+});
+
 test('a rejoin still waiting when the run stops is given up', async () => {
   const { w, run } = await funded();
   let waiting = null;

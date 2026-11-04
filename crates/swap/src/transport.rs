@@ -78,29 +78,39 @@ pub struct Ivy<S = TcpStream> {
 }
 
 enum Command {
-    Send(Vec<u8>, std::sync::mpsc::Sender<io::Result<()>>),
+    /// A payload, where to say how its send went, and when [`Ivy::send`]
+    /// gives up on it: it is written by then or never.
+    Send(
+        Vec<u8>,
+        std::sync::mpsc::Sender<io::Result<()>>,
+        std::time::Instant,
+    ),
     Ping(Duration),
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Ivy<S> {
     /// Hands `connection`, with `runtime`, whose reactor it is on, to the
     /// session's own thread.
-    fn new(runtime: Runtime, connection: Connection<S>, send_timeout: Duration) -> Self {
+    fn new(
+        runtime: Runtime,
+        connection: Connection<S>,
+        send_timeout: Duration,
+    ) -> io::Result<Self> {
         let (commands, received) = tokio::sync::mpsc::unbounded_channel();
         let (deliver, inbox) = std::sync::mpsc::sync_channel(INBOX);
-        std::thread::spawn(move || {
+        std::thread::Builder::new().spawn(move || {
             let ended = runtime.block_on(serve(connection, received, &deliver, send_timeout));
             // Told last: the driver may be busy, and nothing else waits.
             if let Err(e) = ended {
                 _ = deliver.send(Err(e));
             }
-        });
-        Self {
+        })?;
+        Ok(Self {
             commands,
             inbox,
             send_timeout,
             _stream: std::marker::PhantomData,
-        }
+        })
     }
 
     /// Pings every `ping` instead of every [`PING`], for the tests.
@@ -125,10 +135,18 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
             command = commands.recv() => match command {
                 None => return Ok(()),
                 Some(Command::Ping(every)) => ping = every,
-                Some(Command::Send(payload, done)) => {
-                    let sent = timeout(send_timeout, connection.send(TOPIC, &payload))
-                        .await
-                        .unwrap_or_else(|_| Err(timed_out("send timed out")));
+                Some(Command::Send(payload, done, deadline)) => {
+                    let deadline = tokio::time::Instant::from_std(deadline);
+                    // Never begun past its deadline, so nothing is written
+                    // once its caller has been told it failed; one cut off
+                    // ends the session, which would finish writing it.
+                    let sent = if tokio::time::Instant::now() >= deadline {
+                        Err(timed_out("send timed out"))
+                    } else {
+                        tokio::time::timeout_at(deadline, connection.send(TOPIC, &payload))
+                            .await
+                            .unwrap_or_else(|_| Err(timed_out("send timed out")))
+                    };
                     let failed = sent.as_ref().err().map(|e| io::Error::new(e.kind(), e.to_string()));
                     _ = done.send(sent);
                     if let Some(e) = failed {
@@ -149,6 +167,9 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                 loop {
                     match deliver.try_send(held) {
                         Ok(()) => break,
+                        // A full inbox stalls pings and sends too: only a
+                        // peer that floods it gets here, and it may lose
+                        // the session it floods.
                         Err(std::sync::mpsc::TrySendError::Full(again)) => {
                             held = again;
                             sleep(Duration::from_millis(10)).await;
@@ -186,7 +207,7 @@ impl Ivy {
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timed out"))??;
             ivy::connect(stream, config, peer).await
         })?;
-        Ok(Self::new(runtime, connection, send_timeout))
+        Self::new(runtime, connection, send_timeout)
     }
 
     /// Takes connections on `listener` until one completes the handshake
@@ -254,7 +275,7 @@ impl Ivy {
             })
             .await
         })?;
-        Ok(Self::new(runtime, connection, send_timeout))
+        Self::new(runtime, connection, send_timeout)
     }
 }
 
@@ -286,8 +307,9 @@ fn runtime() -> io::Result<Runtime> {
 impl<S> Transport for Ivy<S> {
     fn send(&mut self, payload: &[u8]) -> io::Result<()> {
         let (done, sent) = std::sync::mpsc::channel();
+        let deadline = Instant::now() + self.send_timeout;
         self.commands
-            .send(Command::Send(payload.to_vec(), done))
+            .send(Command::Send(payload.to_vec(), done, deadline))
             .map_err(|_| ended())?;
         // The session's own deadline comes first.
         match sent.recv_timeout(self.send_timeout + Duration::from_secs(1)) {
@@ -371,7 +393,7 @@ impl Ivy<Relayed> {
                 }
             }
         })?;
-        Ok(Self::new(runtime, connection, send_timeout))
+        Self::new(runtime, connection, send_timeout)
     }
 
     /// Asks the relay at `relay` to pair this party with the seller that
@@ -389,7 +411,7 @@ impl Ivy<Relayed> {
             let socket = dial(&url, send_timeout).await?;
             ivy::connect(Relayed::new(socket), config, peer).await
         })?;
-        Ok(Self::new(runtime, connection, send_timeout))
+        Self::new(runtime, connection, send_timeout)
     }
 
     /// Meets the buyer at rendezvous `id` on the relay at `relay`
@@ -413,7 +435,7 @@ impl Ivy<Relayed> {
                 .await
                 .map_err(|_| timed_out("the handshake timed out"))?
         })?;
-        Ok(Self::new(runtime, connection, send_timeout))
+        Self::new(runtime, connection, send_timeout)
     }
 
     /// Meets the seller, which must hold `peer`'s key, at rendezvous `id`
@@ -434,7 +456,7 @@ impl Ivy<Relayed> {
                 .await
                 .map_err(|_| timed_out("the handshake timed out"))?
         })?;
-        Ok(Self::new(runtime, connection, send_timeout))
+        Self::new(runtime, connection, send_timeout)
     }
 }
 
