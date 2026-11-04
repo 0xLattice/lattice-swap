@@ -465,15 +465,28 @@ fn start(
     world: &World,
     buyer_stop: impl Fn(&Buyer) -> bool + Send + 'static,
 ) -> (Party<Seller>, Party<Buyer>, Arc<Mutex<Option<String>>>) {
+    start_with(world, |_| false, buyer_stop)
+}
+
+/// [`start`], `seller_stop` ending the seller early.
+fn start_with(
+    world: &World,
+    seller_stop: impl Fn(&Seller) -> bool + Send + 'static,
+    buyer_stop: impl Fn(&Buyer) -> bool + Send + 'static,
+) -> (Party<Seller>, Party<Buyer>, Arc<Mutex<Option<String>>>) {
     let session = Session::new();
     let seller_at = (
         session.listener.local_addr().unwrap(),
         seller_peer(&session),
     );
     let buyer_key = session.buyer.peer_key();
-    let seller = spawn_seller(world, session.listener, session.seller, buyer_key, |_| {
-        false
-    });
+    let seller = spawn_seller(
+        world,
+        session.listener,
+        session.seller,
+        buyer_key,
+        seller_stop,
+    );
     let lock = Arc::new(Mutex::new(None));
     let slot = lock.clone();
     let buyer = spawn_buyer(world, seller_at, session.buyer, move |state| {
@@ -601,14 +614,22 @@ fn buyer_never_sends_redeem_signature() {
 #[ignore = "needs Docker and NEXUS_NODE_IMAGE"]
 fn buyer_offline_after_the_lock_is_punished() {
     let world = World::new(2);
-    let (seller, buyer, lock) = start(&world, |state| matches!(state, Buyer::AwaitNexLock { .. }));
+    // The seller stops once punished, where it would wait to give `s`.
+    let (seller, buyer, lock) = start_with(
+        &world,
+        |state| matches!(state, Seller::Punished { .. }),
+        |state| matches!(state, Buyer::AwaitNexLock { .. }),
+    );
     world.drive(Pace::Steady, true, || finished(&seller));
-    assert_eq!(outcome(seller).0, Some(Outcome::Punished));
+    assert!(matches!(outcome(seller).1, Seller::Punished { .. }));
     assert_eq!(outcome(buyer).0, None, "the buyer went offline");
-    // Back online, the buyer finds it was punished.
+    // Back online, the buyer finds it was punished, and with no seller to
+    // ask for `s`, its run ends so.
     let buyer = resume_buyer(&world);
     world.drive(Pace::OnDemand, false, || finished(&buyer));
-    assert_eq!(outcome(buyer).0, Some(Outcome::Punished));
+    let (ended, state) = outcome(buyer);
+    assert_eq!(ended, Some(Outcome::Punished));
+    assert!(matches!(state, Buyer::Punished { .. }), "its secrets kept");
 
     let fee = world.terms.nex_fee;
     let n = &world.nexus;
@@ -617,7 +638,8 @@ fn buyer_offline_after_the_lock_is_punished() {
         n.balance(&world.seller_nex.nex_address()),
         2 * REWARD - NEX_AMOUNT - fee
     );
-    // Neither party can ever move it: nobody learned the other's share.
+    // Nobody learned the other's share: the NEX stays until the seller
+    // gives `s`.
     assert_eq!(n.balance(&lock_address(&lock)), NEX_AMOUNT);
     assert_eq!(btc_balance(&world.seller_wallet), BTC_AMOUNT - BTC_FEE * 2);
     assert_eq!(
