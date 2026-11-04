@@ -559,6 +559,7 @@ fn a_punished_buyer_is_given_s_and_claims_the_nex() {
         ..
     } = punished(None);
     assert!(matches!(seller, Seller::Punished { .. }));
+    assert_eq!(status::buyer_status(&buyer, None)["phase"], "asking");
     let (seller, actions) = seller.step(message(ask));
     let answer = sent(&actions);
     assert!(matches!(
@@ -572,6 +573,7 @@ fn a_punished_buyer_is_given_s_and_claims_the_nex() {
     let (buyer, none) = buyer.step(message(answer));
     assert!(none.is_empty());
     assert!(matches!(buyer, Buyer::ClaimingNex(_)));
+    assert_eq!(status::buyer_status(&buyer, None)["phase"], "finishing");
     let (buyer, actions) = restart(&buyer).step(nexus(account(500_000, 0), None));
     let claim = submitted(&actions);
     assert_eq!(

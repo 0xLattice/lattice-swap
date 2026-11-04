@@ -360,6 +360,7 @@ test('a punished page asks the seller for s once a resume, and claims the NEX wi
   sellerSees(w, view({ tx: cancel, confirmations: TERMS.t2 + 1 }, { tx: punish, confirmations: 1 }));
   assert.equal(kind(w.seller.state()), 'Punished');
   w.buyer = await Buyer.resume(w.wallet, w.buyer.swapId);
+  assert.equal(w.buyer.status().step, 'asking');
   const again = running(w.buyer);
   const state = async () => kind((await w.store.get(`swap:${w.buyer.swapId}`)).state);
   await until(async () => (await state()) === 'ClaimingNex').catch((e) => assert.fail(`${e.message}: ${JSON.stringify(w.buyer.status())}`));

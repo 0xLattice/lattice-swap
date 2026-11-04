@@ -12,7 +12,7 @@ use crate::{BitcoinView, Buyer, Machine, Outcome, Spent};
 /// - `phase` is `swapping` until the redeem is signed, `finishing` from
 ///   then, `refunding` once it cancels, then the outcome: `swapped`,
 ///   `refunded`, `punished`, `drained` or `aborted`. A punished buyer
-///   asking the seller for `s`, or claiming with it, is `finishing`.
+///   asking the seller for `s` is `asking`; claiming with it, `finishing`.
 /// - `must_stay_open` is [`Buyer::must_stay_open`].
 /// - `confirmations`: `{"funding", "lock_spend", "cancel_spend"}` as the
 ///   view shows them, each null where it shows none.
@@ -29,9 +29,8 @@ use crate::{BitcoinView, Buyer, Machine, Outcome, Spent};
 ///   ends; null once it has.
 pub fn buyer_status(buyer: &Buyer, view: Option<&BitcoinView>) -> Value {
     let phase = match buyer {
-        Buyer::AwaitRedeem { .. } | Buyer::ClaimingNex(_) | Buyer::AskingShare { .. } => {
-            "finishing"
-        }
+        Buyer::AwaitRedeem { .. } | Buyer::ClaimingNex(_) => "finishing",
+        Buyer::AskingShare { .. } => "asking",
         Buyer::Cancelling { .. } => "refunding",
         Buyer::Done(outcome) => self::outcome(outcome),
         Buyer::Punished { .. } => "punished",

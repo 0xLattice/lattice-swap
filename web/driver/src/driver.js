@@ -31,6 +31,7 @@ const kind = (state) => Object.keys(JSON.parse(state))[0];
 const STEPS = {
   swapping: 'swapping',
   finishing: 'finishing',
+  asking: 'asking',
   refunding: 'refunding',
   refunded: 'refunded',
   swapped: 'done',
@@ -161,7 +162,9 @@ export class Buyer extends EventTarget {
   /** Where the swap is, for a page to show:
    * - `step`: `fund-wallet` until the wallet can fund the lock and the
    *   offer is taken, then `swapping`, `finishing` once the redeem is
-   *   signed, and `done`; or `refunding` and `refunded`; or `offer-gone`
+   *   signed, and `done`; or `refunding` and `refunded`; or `asking`,
+   *   punished and resumed, while it asks the seller for `s`, then
+   *   `finishing` once given it; or `offer-gone`
    *   if the session to the seller would not open, or the seller refused
    *   the amount or answered other terms, as the CLI's `take` fails once:
    *   nothing of the swap was sent, and the buyer picks another offer; or
