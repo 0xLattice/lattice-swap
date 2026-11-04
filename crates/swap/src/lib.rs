@@ -27,7 +27,9 @@
 //!
 //! If S never redeems, B cancels after `t1` and refunds, which reveals
 //! `b`, and S claims its NEX back. If B never refunds, S punishes after
-//! `t2` and keeps the BTC.
+//! `t2` and keeps the BTC; then, as eigenwallet's ASB redeems the XMR
+//! cooperatively after a punish, B -> S `ShareRequest` and S -> B
+//! `ShareAnswer`, `s`, for B to claim the NEX: see [`Seller::Punished`].
 //!
 //! A seller that signed a NEX lock at nonce `n` and then learned `b` keeps
 //! the shares and waits in `ClaimingNex` while the lock address holds less
@@ -288,7 +290,36 @@ pub enum Message {
     RedeemSignature {
         redeem: EncryptedSignature,
     },
+    /// B -> S, once punished: asks for `s`, as eigenwallet's CLI asks its
+    /// ASB in `cooperative_xmr_redeem_after_punish`.
+    ShareRequest,
+    /// S -> B: `s`, with which the buyer claims the NEX; or why not.
+    ShareAnswer(ShareAnswer),
 }
+
+/// The seller's answer to [`Message::ShareRequest`], as eigenwallet's
+/// `cooperative_xmr_redeem_after_punish::Response`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShareAnswer {
+    Share(#[serde(with = "hex::serde")] [u8; 32]),
+    Refused(ShareRefusal),
+}
+
+/// Why the seller keeps `s`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShareRefusal {
+    /// It is not in [`Seller::Punished`]: its punish is not
+    /// `btc_confirmations` deep, or the swap ended otherwise.
+    NotPunished,
+}
+
+/// The seller enters [`Seller::Punished`], to give `s`, only if the swap
+/// cost it at most `btc_amount / MAX_LOSS_PART` of the BTC, as eigenwallet's
+/// ASB refuses a cooperative redeem once it lost more than a quarter of the
+/// swap amount (`check_max_loss_under_tolerance(4)`): one who drove its fees
+/// up, then had the NEX all the same, would grief it for free. Past that it
+/// ends `Punished` at once, and no one answers.
+pub const MAX_LOSS_PART: u64 = 4;
 
 #[derive(Serialize, Deserialize)]
 struct Envelope {
@@ -369,6 +400,17 @@ pub struct BitcoinView {
     /// show the redeem window open after it closed: on it the seller starts
     /// no redeem and locks no NEX.
     pub stale: Option<String>,
+    /// What spends the seller's punish's payout, output 0, once the punish
+    /// is in a block: the child that bumped it, if one did, which the
+    /// seller counts among what the swap cost it. The native driver reads
+    /// it for a party whose own spends include punish; other views leave it
+    /// out.
+    #[serde(default)]
+    pub punish_child: Option<Spent>,
+    /// The driver failed to read [`BitcoinView::punish_child`]: what the
+    /// swap cost is unknown, so the seller does not yet weigh giving `s`.
+    #[serde(default)]
+    pub punish_child_unread: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -680,6 +722,34 @@ fn lock_passed(terms: &Terms, nonce: u64, view: &NexusView) -> bool {
     view.lock.balance < terms.nex_amount && view.own.nonce > nonce
 }
 
+/// A lock signed at the seller's `nonce`, which its nonce moved past
+/// without crediting the lock address, can never land, unless a reorg takes
+/// back what moved the nonce. That must hold `nex_confirmations` blocks of
+/// the tip. A reorg below the tip it was first seen at, even one between
+/// two views, replaces that block: the count starts again. `passed_at`, the
+/// tip it was first seen at, is reported in [`NexusView::block_at`].
+fn never_lands(
+    passed_at: &mut Option<(u64, String)>,
+    terms: &Terms,
+    nonce: u64,
+    view: &NexusView,
+) -> bool {
+    if !lock_passed(terms, nonce, view) {
+        *passed_at = None;
+        return false;
+    }
+    let reorged = passed_at
+        .as_ref()
+        .is_some_and(|(_, tip)| view.block_at.as_ref() != Some(tip));
+    if reorged || passed_at.is_none() {
+        let tip = view.health.tip.clone();
+        *passed_at = tip.map(|tip| (view.health.height, tip));
+    }
+    passed_at.as_ref().is_some_and(|(since, _)| {
+        view.health.height >= since.saturating_add(terms.nex_confirmations)
+    })
+}
+
 /// The node is active and has executed the best chain it knows.
 fn synced(health: &Health) -> bool {
     health.phase == "active" && health.best_header_height == Some(health.height)
@@ -719,7 +789,9 @@ pub struct Claim {
     /// CID.
     claim: Option<swap_nexus_tx::Transaction>,
     /// The seller's punish is `btc_confirmations` deep: the BTC is its own,
-    /// and however the claim ends, the swap ends `Punished`.
+    /// and however the claim ends, the seller's swap ends `Punished`; the
+    /// buyer's, claiming with the `s` the seller gave it after, ends
+    /// `Swapped` if the claim lands and `Punished` otherwise.
     #[serde(default)]
     punished: bool,
 }
@@ -800,29 +872,7 @@ impl Claim {
         let short = view.lock.balance < terms.nex_amount;
         let empty = match self.lock {
             Lock::Unsigned => short,
-            // The seller's nonce moved past its lock, which did not credit
-            // the lock address: the lock can never land, unless a reorg takes
-            // back what moved the nonce. That must hold `nex_confirmations`
-            // blocks of the tip. A reorg below the tip it was first seen at,
-            // even one between two views, replaces that block: the count
-            // starts again.
-            Lock::Signed(nonce) if lock_passed(terms, nonce, &view) => {
-                let reorged = self
-                    .passed_at
-                    .as_ref()
-                    .is_some_and(|(_, tip)| view.block_at.as_ref() != Some(tip));
-                if reorged || self.passed_at.is_none() {
-                    let tip = view.health.tip.clone();
-                    self.passed_at = tip.map(|tip| (view.health.height, tip));
-                }
-                self.passed_at.as_ref().is_some_and(|(since, _)| {
-                    view.health.height >= since.saturating_add(terms.nex_confirmations)
-                })
-            }
-            Lock::Signed(_) => {
-                self.passed_at = None;
-                false
-            }
+            Lock::Signed(nonce) => never_lands(&mut self.passed_at, terms, nonce, &view),
             Lock::Seen => false,
         };
         if empty {
@@ -883,6 +933,12 @@ pub trait Machine: Clone + Serialize + serde::de::DeserializeOwned {
     /// Each machine ignores a message it is not waiting for, so a copy it
     /// has already applied changes nothing.
     fn resend(&self) -> Option<Message>;
+    /// The state a driver carries on from when it resumes a saved swap: the
+    /// saved one, but for a punished buyer, which asks the seller for `s`
+    /// once again on every resume, as eigenwallet's CLI does.
+    fn resumed(self) -> Self {
+        self
+    }
 }
 
 /// How a side gets a lost session back, as eigenwallet's ASB keeps

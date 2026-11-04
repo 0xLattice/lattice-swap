@@ -684,6 +684,71 @@ fn killed_before_the_redeem_both_resume_to_a_refund() {
     );
 }
 
+/// The buyer gone before it signed the redeem, and past `t2`: the seller
+/// cancels, punishes, and stays. The buyer's `resume` finds itself punished,
+/// meets the seller again, is given `s` and claims the NEX with it, as
+/// eigenwallet's CLI redeems cooperatively after a punish; the seller ends
+/// once the lock address has signed.
+#[test]
+#[ignore = "needs Docker and NEXUS_NODE_IMAGE"]
+fn a_punished_buyer_resumes_and_is_given_the_nex() {
+    let world = World::new();
+    // As in `killed_before_the_redeem_both_resume_to_a_refund`: the NEX
+    // lock stays one deep of two, so the buyer never signs the redeem.
+    let (mut seller, mut buyer, swap_id, seller_out) = world.start(24, 2);
+    world.drive(
+        false,
+        || true,
+        || world.state("seller", &swap_id) == "AwaitRedeemSignature",
+    );
+    assert_eq!(world.state("buyer", &swap_id), "AwaitNexLock");
+    kill(&mut buyer);
+
+    // Time passes without the buyer: cancel at t1, punish at t2.
+    world.drive(
+        true,
+        || false,
+        || world.state("seller", &swap_id) == "Punished",
+    );
+    let mut rounds = 0;
+    world.drive(
+        true,
+        || false,
+        || {
+            rounds += 1;
+            rounds > 5
+        },
+    );
+    assert!(
+        seller.0.try_wait().unwrap().is_none(),
+        "the punished seller stays"
+    );
+
+    let mut buyer = world.resume("buyer", &swap_id);
+    let (mut seller_done, mut buyer_done) = (None, None);
+    // Steady: the claim must reach two deep, past an empty pool.
+    world.drive(
+        true,
+        || true,
+        || {
+            seller_done = seller_done.or(seller.0.try_wait().unwrap());
+            buyer_done = buyer_done.or(buyer.0.try_wait().unwrap());
+            seller_done.is_some() && buyer_done.is_some()
+        },
+    );
+    assert!(buyer_done.unwrap().success(), "{buyer_done:?}");
+    assert_eq!(stdout(&mut buyer.0), "outcome: Swapped\n");
+    assert_eq!(seller_done.unwrap().code(), Some(4));
+    assert_eq!(seller_out.join().unwrap(), "outcome: Punished\n");
+    assert_eq!(
+        world.nexus.balance(&world.buyer_nex),
+        NEX_AMOUNT - world.nex_fee
+    );
+    // Punish pays the BTC less cancel's fee and its own.
+    let seller_wallet = wallet_client(&world.bitcoind, "seller");
+    assert_eq!(btc_balance(&seller_wallet), BTC_AMOUNT - BTC_FEE * 2);
+}
+
 /// The buyer killed once it has seen the redeem and is claiming the NEX:
 /// `resume` carries on from that claim to the swap.
 #[test]

@@ -246,6 +246,8 @@ pub struct Driver<M, B, T> {
     /// Unix epoch. Kept in memory only: after a restart, the tip is first
     /// seen then.
     first_seen: Option<(BlockHash, u64)>,
+    /// The punish's child as last read, and the tip it was read at.
+    punish_child: Option<(BlockHash, Option<Spent>)>,
     /// Held while the driver lives: see [`Store`].
     _lock: File,
 }
@@ -270,7 +272,8 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
         Ok(driver)
     }
 
-    /// The swap saved in `store`, carried on from where it stopped.
+    /// The swap saved in `store`, carried on from where it stopped
+    /// ([`Machine::resumed`]).
     pub fn resume(
         bitcoin: B,
         nexus: Client,
@@ -278,10 +281,17 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
         store: Store,
     ) -> io::Result<Self> {
         let lock = store.lock()?;
-        let state = store
+        let state: M = store
             .load()?
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no saved swap"))?;
-        Ok(Self::with(state, bitcoin, nexus, transport, store, lock))
+        Ok(Self::with(
+            state.resumed(),
+            bitcoin,
+            nexus,
+            transport,
+            store,
+            lock,
+        ))
     }
 
     fn with(
@@ -314,6 +324,7 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
             submit_failed: None,
             rejoin_failed: None,
             first_seen: None,
+            punish_child: None,
             _lock: lock,
         }
     }
@@ -430,7 +441,27 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
             &mut self.first_seen,
         );
         match view {
-            Ok(view) => {
+            Ok(mut view) => {
+                // Read once a tip, and only for the seller, whose loss it
+                // counts: a search walks blocks.
+                if self.state.own_spends().contains(&Spend::Punish) {
+                    let tip = self.first_seen.map(|(hash, _)| hash);
+                    match &self.punish_child {
+                        Some((at, child)) if Some(*at) == tip => view.punish_child = child.clone(),
+                        _ => match punish_child(&self.bitcoin, &swap, lock, &view) {
+                            Ok(child) => {
+                                view.punish_child = child.clone();
+                                self.punish_child = tip.map(|tip| (tip, child));
+                            }
+                            // The rest of the view still stands: the seller
+                            // weighs giving `s` once the child is read.
+                            Err(e) => {
+                                warn_again(&mut self.view_failed, e.to_string(), now);
+                                view.punish_child_unread = true;
+                            }
+                        },
+                    }
+                }
                 match &view.stale {
                     // A node lags its headers for a moment at every block:
                     // logged only once it lasts.
@@ -442,7 +473,11 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
                     }
                     None => {
                         self.stale_since = None;
-                        self.view_failed = None;
+                        // A failed read of the child is warned of again
+                        // only after a while.
+                        if !view.punish_child_unread {
+                            self.view_failed = None;
+                        }
                     }
                 }
                 let height = view.height;
@@ -805,7 +840,29 @@ pub fn bitcoin_view(
         lock_spend,
         cancel_spend,
         stale,
+        punish_child: None,
+        punish_child_unread: false,
     })
+}
+
+/// What spends the payout of the swap's punish, output 0, once that punish
+/// is in a block ([`BitcoinView::punish_child`]): searched for from the
+/// punish's block up.
+fn punish_child(
+    bitcoin: &impl Bitcoin,
+    swap: &Swap,
+    lock: OutPoint,
+    view: &BitcoinView,
+) -> bitcoind::Result<Option<Spent>> {
+    let punish = view::Lookups::new(swap, lock).cancel_spends[1];
+    let Some(spent) = (view.cancel_spend.as_ref())
+        .filter(|spent| spent.confirmations > 0 && spent.tx.compute_txid() == punish)
+    else {
+        return Ok(None);
+    };
+    let mined = (view.height + 1).saturating_sub(spent.confirmations);
+    let child = bitcoin.spender(OutPoint::new(punish, 0), mined)?;
+    Ok(child.map(|(tx, confirmations)| Spent { tx, confirmations }))
 }
 
 /// The lock account is read before the watched transaction: a lock that

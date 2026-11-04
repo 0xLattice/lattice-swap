@@ -34,6 +34,25 @@ pub enum Buyer {
         redeem: Option<EncryptedSignature>,
     },
     ClaimingNex(Claim),
+    /// The seller's punish is `btc_confirmations` deep: the BTC is its,
+    /// and the NEX, if it was locked, waits at the lock address, which only
+    /// `s` and `b` together spend. Asks the seller for `s` and claims the
+    /// NEX with it, as eigenwallet's CLI asks its ASB to redeem the XMR
+    /// cooperatively after a punish. `seen`: the buyer saw the NEX lock
+    /// confirmed. `again`: refused as not yet punished, once, and asked
+    /// again: the seller's view of the punish may lag ours.
+    AskingShare {
+        setup: Setup,
+        seen: bool,
+        #[serde(default)]
+        again: bool,
+    },
+    /// Punished, and the seller gave no `s` this time: the swap has ended
+    /// for this run, but keeps the secrets, so that a resume asks again.
+    Punished {
+        setup: Setup,
+        seen: bool,
+    },
     Done(Outcome),
 }
 
@@ -241,11 +260,53 @@ impl Machine for Buyer {
             (Cancelling { locked, redeem }, Event::Bitcoin(view)) => {
                 locked.cancelling(redeem, view)
             }
-            (ClaimingNex(claim), event) => match claim.step(event) {
-                Claimed::Pending(claim, actions) => (ClaimingNex(claim), actions),
-                Claimed::Done => (Done(Outcome::Swapped), vec![]),
-                Claimed::Empty | Claimed::Drained => (Done(Outcome::Drained), vec![]),
+            (ClaimingNex(claim), event) => {
+                // Claiming with `s` after a punish, the secrets are kept: a
+                // lock read empty, never seen, may yet show the NEX to a
+                // later resume.
+                let punished = claim.punished.then(|| claim.setup.clone());
+                match (claim.step(event), punished) {
+                    (Claimed::Pending(claim, actions), _) => (ClaimingNex(claim), actions),
+                    (Claimed::Done, _) => (Done(Outcome::Swapped), vec![]),
+                    (Claimed::Empty, Some(setup)) => (Punished { setup, seen: false }, vec![]),
+                    (Claimed::Drained, Some(_)) => (Done(Outcome::Punished), vec![]),
+                    (Claimed::Empty | Claimed::Drained, None) => (Done(Outcome::Drained), vec![]),
+                }
+            }
+            // Only `s` itself: the share the seller proved at the start.
+            (
+                AskingShare { setup, seen, .. },
+                Event::Message(Message::ShareAnswer(ShareAnswer::Share(share))),
+            ) => match KeyShare::from_bytes(share) {
+                Some(key)
+                    if secp256k1_point(&key) == setup.other_secp256k1
+                        && key.public().compress().to_bytes() == setup.other_ed25519 =>
+                {
+                    let lock = if seen { Lock::Seen } else { Lock::Unsigned };
+                    let mut claim = Claim::new(setup, share, lock);
+                    claim.punished = true;
+                    (ClaimingNex(claim), vec![])
+                }
+                _ => (Punished { setup, seen }, vec![]),
             },
+            (
+                AskingShare {
+                    setup,
+                    seen,
+                    again: false,
+                },
+                Event::Message(Message::ShareAnswer(ShareAnswer::Refused(
+                    ShareRefusal::NotPunished,
+                ))),
+            ) => {
+                let again = true;
+                let ask = vec![Action::Send(Message::ShareRequest)];
+                (AskingShare { setup, seen, again }, ask)
+            }
+            (
+                AskingShare { setup, seen, .. },
+                Event::Message(Message::ShareAnswer(ShareAnswer::Refused(_))) | Event::Timeout,
+            ) => (Punished { setup, seen }, vec![]),
             (
                 AwaitSellerHello(_)
                 | AwaitFunded(_)
@@ -260,6 +321,7 @@ impl Machine for Buyer {
     fn outcome(&self) -> Option<Outcome> {
         match self {
             Buyer::Done(outcome) => Some(*outcome),
+            Buyer::Punished { .. } => Some(Outcome::Punished),
             _ => None,
         }
     }
@@ -271,6 +333,7 @@ impl Machine for Buyer {
                 | Buyer::AwaitFunded(_)
                 | Buyer::AwaitSellerSignatures { .. }
                 | Buyer::SendingSignatures(_)
+                | Buyer::AskingShare { .. }
         )
     }
 
@@ -279,15 +342,22 @@ impl Machine for Buyer {
     }
 
     /// Until the seller can redeem: it may still need the cancel signature,
-    /// which it waits for before it locks NEX, or the redeem one.
+    /// which it waits for before it locks NEX, or the redeem one. Again
+    /// once punished, to ask for `s`.
     fn rejoin(&self) -> Option<Rejoin> {
         use Buyer::*;
         match self {
-            AwaitFunded(setup) | AwaitSellerSignatures { setup, .. } => Some(setup.rejoin()),
+            AwaitFunded(setup)
+            | AwaitSellerSignatures { setup, .. }
+            | AskingShare { setup, .. } => Some(setup.rejoin()),
             SendingSignatures(locked)
             | AwaitNexLock { locked, .. }
             | AwaitRedeem { locked, .. } => Some(locked.setup.rejoin()),
-            AwaitSellerHello(_) | Cancelling { .. } | ClaimingNex(_) | Done(_) => None,
+            AwaitSellerHello(_)
+            | Cancelling { .. }
+            | ClaimingNex(_)
+            | Punished { .. }
+            | Done(_) => None,
         }
     }
 
@@ -305,7 +375,19 @@ impl Machine for Buyer {
             AwaitRedeem { redeem, .. } => Some(Message::RedeemSignature {
                 redeem: redeem.clone(),
             }),
+            AskingShare { .. } => Some(Message::ShareRequest),
             _ => None,
+        }
+    }
+
+    fn resumed(self) -> Self {
+        match self {
+            Buyer::Punished { setup, seen } => Buyer::AskingShare {
+                setup,
+                seen,
+                again: false,
+            },
+            state => state,
         }
     }
 
@@ -330,6 +412,8 @@ impl Machine for Buyer {
             | AwaitFunded(_)
             | AwaitSellerSignatures { .. }
             | SendingSignatures(_)
+            | AskingShare { .. }
+            | Punished { .. }
             | Done(_) => Watch {
                 bitcoin: None,
                 nexus: None,
@@ -351,6 +435,7 @@ impl Buyer {
             | AwaitRedeem { locked, .. }
             | Cancelling { locked, .. } => Some(&locked.setup.terms),
             ClaimingNex(claim) => Some(&claim.setup.terms),
+            AskingShare { setup, .. } | Punished { setup, .. } => Some(&setup.terms),
             Done(_) => None,
         }
     }
@@ -380,6 +465,7 @@ impl Buyer {
             | AwaitRedeem { locked, .. }
             | Cancelling { locked, .. } => Some(locked.setup.lock_address()),
             ClaimingNex(claim) => Some(claim.setup.lock_address()),
+            AskingShare { setup, .. } | Punished { setup, .. } => Some(setup.lock_address()),
             AwaitSellerHello(_) | Done(_) => None,
         }
     }
@@ -441,14 +527,26 @@ impl BuyerLocked {
             // tell whether another copy sent it, so the depth holds always.
             Some((_, cancel_depth)) => match &view.cancel_spend {
                 Some(spent) if spent.confirmations >= terms.btc_confirmations => {
-                    let outcome = match setup.spend(self.lock, &view.cancel_spend) {
-                        Some((Spend::Refund, _)) => Outcome::Refunded,
+                    return match setup.spend(self.lock, &view.cancel_spend) {
+                        Some((Spend::Refund, _)) => (Buyer::Done(Outcome::Refunded), vec![]),
                         // Anything but our refund is the seller's punish: its
                         // leaf takes the seller's signature alone, on any
-                        // transaction.
-                        _ => Outcome::Punished,
+                        // transaction. The BTC is the seller's: `s` can
+                        // only give us the NEX.
+                        _ => {
+                            let seen = redeem.is_some();
+                            let setup = self.setup;
+                            let ask = vec![Action::Send(Message::ShareRequest)];
+                            (
+                                Buyer::AskingShare {
+                                    setup,
+                                    seen,
+                                    again: false,
+                                },
+                                ask,
+                            )
+                        }
                     };
-                    return (Buyer::Done(outcome), vec![]);
                 }
                 Some(spent) if spent.confirmations > 0 => {}
                 // A spend still in the mempool may yet be replaced by the

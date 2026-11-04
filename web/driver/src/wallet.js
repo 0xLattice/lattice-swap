@@ -333,7 +333,8 @@ export class Wallet {
   }
 }
 
-/** Whether a buyer's state has ended. */
+/** Whether a buyer's state has ended: `Punished` keeps its secrets, for
+ * a resume to ask the seller for `s` again. */
 export function ended(state) {
-  return Object.keys(JSON.parse(state))[0] === 'Done';
+  return ['Done', 'Punished'].includes(Object.keys(JSON.parse(state))[0]);
 }
