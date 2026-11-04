@@ -1097,10 +1097,14 @@ test('an outspend naming an unrelated transaction leaves the page on its refund 
   // Real and in a block, but spending nothing of the swap.
   const unrelated = `02000000 01 ${'11'.repeat(32)} 00000000 00 ffffffff 01 0100000000000000 00 00000000`.replaceAll(' ', '');
   confirm(w, unrelated);
-  w.chain.spends.set(`${parseTx(cancel).txid}:0`, parseTx(unrelated).txid);
 
+  // The page comes back to cancel in a block and is on its refund path.
   w.buyer = await Buyer.resume(w.wallet, w.buyer.swapId);
   const again = running(w.buyer);
+  const state = async () => kind((await w.store.get(`swap:${w.buyer.swapId}`)).state);
+  await until(async () => (await state()) === 'Cancelling').catch((e) => assert.fail(`${e.message}: ${JSON.stringify(w.buyer.status())}`));
+  // Then its Esplora names the unrelated transaction as cancel's spender.
+  w.chain.spends.set(`${parseTx(cancel).txid}:0`, parseTx(unrelated).txid);
   await until(() => /does not spend/.test(w.buyer.status().warning ?? '')).catch((e) =>
     assert.fail(`${e.message}: ${JSON.stringify(w.buyer.status())}`),
   );
