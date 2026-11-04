@@ -8,7 +8,7 @@ use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use bitcoin::ScriptBuf;
+use bitcoin::{Network, ScriptBuf};
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -17,7 +17,7 @@ use swap_nexus_tx::rpc::{self, Client};
 
 use crate::bitcoind::Bitcoin;
 use crate::driver::{Driver, Reconnect, Store};
-use crate::offer::{Offer, Place, Policy};
+use crate::offer::{check_offer, Offer, Place, Policy};
 use crate::transport::{Ivy, Relayed, Transport};
 use crate::{Action, Buyer, Machine, Message, Seller, Terms};
 
@@ -174,20 +174,35 @@ pub fn start<M: Machine, B: Bitcoin>(
     Ok(driver)
 }
 
-/// Takes `offer` as `policy` says, which [`crate::offer::check_offer`]
-/// passed: dials the seller, or reaches it through the offer's relay, asks
-/// for the policy's amount, and starts the buyer on the terms the seller
-/// fixes, once they are the ones asked for, refunding to `refund` and paid
-/// the NEX at `nex_address`.
+/// Takes `offer` as `policy` says, once [`check_offer`] passes it on
+/// `network` and the Nexus of `nexus_genesis` at the fee floors, and
+/// `nex_address` is a Nexus address: dials the seller, or reaches it
+/// through the offer's relay, asks for the policy's amount, and starts the
+/// buyer on the terms the seller fixes, once they are the ones asked for,
+/// refunding to `refund` and paid the NEX at `nex_address`.
+#[allow(clippy::too_many_arguments)]
 pub fn take<B: Bitcoin>(
     offer: Offer,
     policy: &Policy,
+    network: Network,
+    nexus_genesis: &str,
+    btc_fee_floor: u64,
+    nex_fee_floor: u64,
     refund: ScriptBuf,
     nex_address: String,
     bitcoin: B,
     nexus: Client,
     store: Store,
 ) -> Result<Driver<Buyer, B, Session>> {
+    check_nex_address(&nex_address)?;
+    check_offer(
+        &offer,
+        policy,
+        network,
+        nexus_genesis,
+        btc_fee_floor,
+        nex_fee_floor,
+    )?;
     let config = ivy::Config::new(SigningKey::from_bytes(&offer.buyer_session));
     let seller = offer.seller_key()?;
     let mut transport: Session = match offer.place()? {

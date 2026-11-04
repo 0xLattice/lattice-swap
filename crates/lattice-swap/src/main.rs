@@ -754,6 +754,10 @@ fn take(args: TakeArgs) -> Result<Outcome> {
     let driver = swap::session::take(
         offer,
         &policy,
+        network,
+        genesis,
+        floor,
+        nex_floor,
         refund,
         args.nex_address,
         bitcoin,
