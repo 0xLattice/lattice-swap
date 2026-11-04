@@ -27,11 +27,20 @@ pub struct Utxo {
 
 /// The wallet key, as its WIF, and the P2WPKH output it owns, as its
 /// script and address.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Key {
     pub wif: String,
     pub script_pubkey: ScriptBuf,
     pub address: String,
+}
+
+/// Its address alone: the WIF stays out of logs and panics.
+impl std::fmt::Debug for Key {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Key")
+            .field("address", &self.address)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Key {

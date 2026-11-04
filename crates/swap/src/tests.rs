@@ -4527,12 +4527,20 @@ fn a_wallet_key_is_for_its_network_only() {
     let again = wallet::Key::of(&format!(" {}\n", key.wif), "regtest").unwrap();
     assert_eq!(
         (again.wif, again.script_pubkey, again.address),
-        (key.wif.clone(), key.script_pubkey, key.address)
+        (
+            key.wif.clone(),
+            key.script_pubkey.clone(),
+            key.address.clone()
+        )
     );
     assert!(wallet::Key::of(&key.wif, "bitcoin").is_err());
     assert!(wallet::Key::of("nonsense", "regtest").is_err());
     assert!(wallet::Key::new("nowhere").is_err());
     assert_ne!(wallet::Key::new("regtest").unwrap().wif, key.wif);
+    // Debug shows the address, never the WIF.
+    let shown = format!("{key:?}");
+    assert!(shown.contains(&key.address), "{shown}");
+    assert!(!shown.contains(&key.wif), "{shown}");
 }
 
 /// The wallet funds the lock as the buyer's machine asks: the agreed
