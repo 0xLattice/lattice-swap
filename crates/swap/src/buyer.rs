@@ -84,6 +84,18 @@ impl Buyer {
     }
 }
 
+/// The lock proposal: `funding` without its witnesses.
+fn proposal(funding: &Transaction, lock: OutPoint) -> Message {
+    let mut unsigned = funding.clone();
+    for input in &mut unsigned.input {
+        input.witness.clear();
+    }
+    Message::LockProposal {
+        funding: unsigned,
+        lock,
+    }
+}
+
 fn abort(refusal: Refusal) -> (Buyer, Vec<Action>) {
     (Buyer::Done(Outcome::Aborted(refusal)), vec![])
 }
@@ -133,14 +145,7 @@ impl Machine for Buyer {
                 let Some(lock) = lock_output(&setup.swap(), &funding).filter(|_| segwit) else {
                     return abort(Refusal::Funding);
                 };
-                let mut unsigned = funding.clone();
-                for input in &mut unsigned.input {
-                    input.witness.clear();
-                }
-                let proposal = Message::LockProposal {
-                    funding: unsigned,
-                    lock,
-                };
+                let proposal = proposal(&funding, lock);
                 (
                     AwaitSellerSignatures {
                         setup,
@@ -271,6 +276,37 @@ impl Machine for Buyer {
 
     fn own_spends(&self) -> &'static [Spend] {
         &[Spend::Refund]
+    }
+
+    /// Until the seller can redeem: it may still need the cancel signature,
+    /// which it waits for before it locks NEX, or the redeem one.
+    fn rejoin(&self) -> Option<Rejoin> {
+        use Buyer::*;
+        match self {
+            AwaitFunded(setup) | AwaitSellerSignatures { setup, .. } => Some(setup.rejoin()),
+            SendingSignatures(locked)
+            | AwaitNexLock { locked, .. }
+            | AwaitRedeem { locked, .. } => Some(locked.setup.rejoin()),
+            AwaitSellerHello(_) | Cancelling { .. } | ClaimingNex(_) | Done(_) => None,
+        }
+    }
+
+    fn resend(&self) -> Option<Message> {
+        use Buyer::*;
+        match self {
+            AwaitSellerSignatures { funding, lock, .. } => Some(proposal(funding, *lock)),
+            SendingSignatures(locked) | AwaitNexLock { locked, .. } => {
+                let setup = &locked.setup;
+                let cancel = setup
+                    .swap()
+                    .sign(locked.lock, Spend::Cancel, &setup.secrets.key());
+                Some(Message::BuyerSignatures { cancel })
+            }
+            AwaitRedeem { redeem, .. } => Some(Message::RedeemSignature {
+                redeem: redeem.clone(),
+            }),
+            _ => None,
+        }
     }
 
     fn watch(&self) -> Watch {

@@ -4,6 +4,7 @@ import 'fake-indexeddb/auto';
 
 import { Buyer, IndexedDBStore, MemoryStore, Wallet } from '../src/index.js';
 import { call } from '../src/wasm.js';
+import { PINGS_MISSED, Session } from '../src/relay.js';
 import { Chain, esplora, kind, Locks, loadWasm, nexus, parseTx, POLICY, seller, testOffer, until } from './fakes.js';
 
 before(loadWasm);
@@ -50,8 +51,10 @@ async function world({ store = new MemoryStore(), policy = POLICY, chain = new C
   servers.push(a, node);
   w.a = a;
   w.offer = testOffer('http://relay.invalid');
-  // The state each message must already be saved in when it goes out.
-  const expect = { Request: 'AwaitSellerHello', BuyerHello: 'AwaitSellerHello', LockProposal: 'AwaitSellerSignatures', BuyerSignatures: 'SendingSignatures' };
+  // The states each message must already be saved in when it goes out: the
+  // cancel signature goes again on a session met again once the funding is
+  // out.
+  const expect = { Request: ['AwaitSellerHello'], BuyerHello: ['AwaitSellerHello'], LockProposal: ['AwaitSellerSignatures'], BuyerSignatures: ['SendingSignatures', 'AwaitNexLock'] };
   w.seller = seller(w.offer, answer);
   const open = w.seller.open;
   w.seller.open = async (...args) => {
@@ -63,7 +66,7 @@ async function world({ store = new MemoryStore(), policy = POLICY, chain = new C
         // The request goes out before the swap is taken: nothing of it
         // is at stake until the seller has answered.
         const taken = name !== 'Request';
-        if (record.taken !== taken || kind(record.state) !== expect[name]) unsaved.push({ send: name, state: kind(record.state) });
+        if (record.taken !== taken || !expect[name].includes(kind(record.state))) unsaved.push({ send: name, state: kind(record.state) });
       });
       send(message);
     };
@@ -248,6 +251,154 @@ test('the refund lands in the wallet, and the deadlines show where it is', async
   assert.equal(w.buyer.status().mustStayOpen, false);
   assert.deepEqual(w.buyer.status().deadlines, { cancel: null, refund: null, punish: null });
   assert.deepEqual(w.unsaved, []);
+});
+
+/** The seller, its lock `funding` confirmed, locks its NEX and sends the
+ * CID into whatever session is open, at once. */
+function sellerLocksNex(w, funding) {
+  confirm(w, funding);
+  w.seller.step({ Bitcoin: { height: w.chain.height, funding: 1, lock_spend: null, cancel_spend: null, stale: null } });
+  const health = { phase: 'active', height: 10, best_header_height: 10, tip: 'tip' };
+  const view = (watched) => ({
+    Nexus: { health, own: { balance: 10_000_000, nonce: 3 }, lock: { balance: 0, nonce: 0 }, min_relay_fee: 0, watched, block_at: null },
+  });
+  w.seller.step(view(null));
+  const { body } = JSON.parse(w.seller.state()).LockingNex.nex_lock;
+  w.seller.step(view([{ body, block: { height: 10, hash: 'tip' } }, 1]));
+  assert.equal(kind(w.seller.state()), 'AwaitRedeemSignature');
+}
+
+/** The buyer's saved state, once it holds the NEX lock's CID. */
+async function cidArrives(w) {
+  const cid = async () => JSON.parse((await w.store.get(`swap:${w.buyer.swapId}`)).state).AwaitNexLock?.cid;
+  await until(async () => (await cid()) != null).catch((e) => assert.fail(`${e.message}: ${JSON.stringify(w.buyer.status())}`));
+}
+
+test('a session lost once the lock is out is met again, and the NEX lock it missed arrives', async () => {
+  const { w, run, funding } = await funded();
+  // The page's session drops, and the seller's CID goes with it: the
+  // buyer, with none, would never read Nexus.
+  w.session.close();
+  sellerLocksNex(w, funding);
+  // The page meets the seller at their rendezvous, the only place the fake
+  // seller answers, sends its cancel signature again, which the seller has
+  // and ignores, and is sent the CID again.
+  await cidArrives(w);
+  const resent = w.seller.log.filter((message) => message.BuyerSignatures);
+  assert.equal(resent.length, 2);
+  assert.equal(kind(w.seller.state()), 'AwaitRedeemSignature');
+  assert.equal(w.buyer.status().step, 'swapping');
+  await run.stop();
+  await w.checked;
+  assert.deepEqual(w.unsaved, []);
+});
+
+test('a page reloaded once the lock is out meets the seller again', async () => {
+  const { w, run, funding } = await funded();
+  await run.stop();
+  assert.equal(w.session.closed, true, 'closed with the page');
+  sellerLocksNex(w, funding);
+  w.buyer = await Buyer.resume(w.wallet, w.buyer.swapId);
+  const again = running(w.buyer);
+  await cidArrives(w);
+  await again.stop();
+  await w.checked;
+  assert.deepEqual(w.unsaved, []);
+});
+
+test('a run stopped and started again meets the seller again', async () => {
+  const { w, run, funding } = await funded();
+  await run.stop();
+  sellerLocksNex(w, funding);
+  const again = running(w.buyer);
+  await cidArrives(w);
+  await again.stop();
+  await w.checked;
+  assert.deepEqual(w.unsaved, []);
+});
+
+test('a second run of a Buyer while one runs is refused, the first unharmed', async () => {
+  const { w, run, funding } = await funded();
+  // Bounded: an unrefused second run would run on.
+  await assert.rejects(Promise.race([w.buyer.run(), pause(1_000)]), /running already/);
+  w.session.close();
+  sellerLocksNex(w, funding);
+  await cidArrives(w);
+  await run.stop();
+  const again = running(w.buyer);
+  await again.stop();
+});
+
+test('a run that fails outside its rounds lets the next run start', async () => {
+  const w = await world();
+  w.buyer.status = () => {
+    throw new Error('status failed');
+  };
+  await assert.rejects(w.buyer.run(), /status failed/);
+  delete w.buyer.status;
+  await running(w.buyer).stop();
+});
+
+test('a rejoin still waiting when the run stops is given up', async () => {
+  const { w, run } = await funded();
+  let waiting = null;
+  w.seller.open = (_offer, _onMessage, options) => {
+    waiting = options;
+    return new Promise(() => {});
+  };
+  w.session.close();
+  await until(() => waiting !== null);
+  const { state } = await w.store.get(`swap:${w.buyer.swapId}`);
+  assert.deepEqual(waiting.rejoin, call('buyerRejoin', state), 'at the rendezvous, under the rejoin key');
+  assert.equal(waiting.signal.aborted, false);
+  await run.stop();
+  assert.equal(waiting.signal.aborted, true);
+});
+
+test('a session waiting at its rendezvous closes its socket once aborted', async () => {
+  const sockets = [];
+  class Socket {
+    constructor(url) {
+      this.url = url;
+      sockets.push(this);
+    }
+    send() {}
+    close() {
+      this.closed = true;
+    }
+  }
+  const halt = new AbortController();
+  const rejoin = { id: '01'.repeat(32), key: '02'.repeat(32) };
+  const opening = Session.open(OFFER, () => {}, { WebSocket: Socket, rejoin, signal: halt.signal });
+  assert.match(sockets[0].url, new RegExp(`/rejoin/${rejoin.id}$`));
+  halt.abort();
+  await assert.rejects(opening, /aborted/);
+  assert.equal(sockets[0].closed, true);
+});
+
+test('a session whose pings go unanswered ends; one that answers stays', async () => {
+  const socket = {
+    send() {},
+    close() {
+      this.closed = true;
+    },
+  };
+  const ivy = { pings: 0, isOpen: () => true, ping: () => (ivy.pings += 1), outbound: () => new Uint8Array(), receive: () => [] };
+  const ping = 20;
+  const session = new Session(socket, ivy, () => {}, { ping });
+  // The seller answers each ping: the session stays, quiet as it is.
+  const answering = Date.now();
+  while (Date.now() - answering < ping * PINGS_MISSED * 3) {
+    await pause(ping / 2);
+    socket.onmessage({ data: new ArrayBuffer(1) });
+  }
+  assert.equal(session.closed, false);
+  assert.ok(ivy.pings >= PINGS_MISSED, `${ivy.pings} pings`);
+  // It stops answering, its socket still open.
+  const silent = Date.now();
+  await until(() => session.closed);
+  assert.ok(Date.now() - silent >= ping * (PINGS_MISSED - 1), 'not before its pings go unanswered');
+  assert.equal(socket.closed, true);
 });
 
 test('the page must stay open only while the redeem is signed and unsettled', async () => {

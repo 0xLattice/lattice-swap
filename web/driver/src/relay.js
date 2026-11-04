@@ -20,55 +20,97 @@ export function socketUrl(relay, path) {
   throw new Error(`${relay} is not an http:// or https:// URL`);
 }
 
+/** How often a session pings the seller, and how many pings in a row may
+ * go unanswered before it ends: as the CLI's `swap::transport::PING` and
+ * `PINGS_MISSED`. A socket whose other end is gone without a word, a
+ * laptop asleep or a network changed, stays open; only a keepalive tells
+ * it from a quiet one, as libp2p's ping and SSH's `ServerAliveInterval` do. */
+export const PING = 15_000;
+export const PINGS_MISSED = 3;
+
 /** The ivy session to the seller of `offer`, through the relay it names:
  * messages arrive at `onMessage`, as JSON. Once it ends, by the relay or
- * the seller, or a record that fails, `closed` holds and nothing more is
- * sent or received. */
+ * the seller, a record that fails, or pings that go unanswered, `closed`
+ * holds and nothing more is sent or received. */
 export class Session {
-  /** Opens it, and waits up to `timeout` ms for the handshake. */
-  static async open(offer, onMessage, { WebSocket = globalThis.WebSocket, timeout = 30_000 } = {}) {
+  /** Opens it, and waits up to `timeout` ms for the handshake: by taking
+   * the offer, or, given `rejoin` (`buyerRejoin`), by meeting the seller
+   * again at its rendezvous, under its key, once the relay says it has
+   * come. `signal` aborts the wait. */
+  static async open(offer, onMessage, { WebSocket = globalThis.WebSocket, timeout = 30_000, rejoin = null, signal = null, ping = PING } = {}) {
     const swapId = offer.template.swap_id;
-    const socket = new WebSocket(socketUrl(offer.relay, `take/${swapId}`));
+    const socket = new WebSocket(socketUrl(offer.relay, rejoin === null ? `take/${swapId}` : `rejoin/${rejoin.id}`));
     socket.binaryType = 'arraybuffer';
-    const session = new Session(socket, new wasm.Ivy(offer.buyer_session, offer.seller, swapId), onMessage);
+    const key = rejoin === null ? offer.buyer_session : rejoin.key;
+    const session = new Session(socket, new wasm.Ivy(key, offer.seller, swapId), onMessage, { paired: rejoin === null, ping });
     await new Promise((resolve, reject) => {
       const timer = setTimeout(() => fail(new Error('the handshake timed out')), timeout);
+      const aborted = () => fail(new Error('aborted'));
       const fail = (e) => {
         clearTimeout(timer);
+        signal?.removeEventListener('abort', aborted);
+        // Why it failed, not that closing it ended it.
+        session.failed = null;
         session.close();
         reject(e);
       };
       session.opened = () => {
         clearTimeout(timer);
+        signal?.removeEventListener('abort', aborted);
         session.failed = null;
         resolve();
       };
       session.failed = fail;
+      if (signal?.aborted) return aborted();
+      signal?.addEventListener('abort', aborted, { once: true });
       socket.onopen = () => session.flush();
     });
     return session;
   }
 
-  constructor(socket, ivy, onMessage) {
+  constructor(socket, ivy, onMessage, { paired = true, ping = PING } = {}) {
     this.socket = socket;
     this.ivy = ivy;
     this.closed = false;
+    /** Whether the relay pipes this socket to the seller: at a rendezvous,
+     * only once it says `paired`. */
+    this.paired = paired;
     socket.onmessage = (event) => this.#receive(event.data);
     socket.onclose = () => this.close();
     socket.onerror = () => this.close();
     this.onMessage = onMessage;
+    /** Pings sent since the seller was last heard. */
+    this.unanswered = 0;
+    this.pinger = setInterval(() => this.#ping(), ping);
+  }
+
+  #ping() {
+    if (!this.ivy.isOpen()) return;
+    if (this.unanswered >= PINGS_MISSED) return this.close();
+    try {
+      this.ivy.ping();
+    } catch {
+      return this.close();
+    }
+    this.unanswered += 1;
+    this.flush();
   }
 
   #receive(data) {
     if (this.closed) return;
     // The relay speaks text only before it pairs: none belongs in a session.
-    if (typeof data === 'string') return this.close();
+    if (typeof data === 'string') {
+      if (data !== 'paired' || this.paired) return this.close();
+      this.paired = true;
+      return this.flush();
+    }
     let messages;
     try {
       messages = this.ivy.receive(new Uint8Array(data));
     } catch {
       return this.close();
     }
+    this.unanswered = 0;
     this.flush();
     if (this.ivy.isOpen() && this.opened) {
       const opened = this.opened;
@@ -78,8 +120,9 @@ export class Session {
     for (const message of messages) this.onMessage(message);
   }
 
-  /** Writes what the session has queued. */
+  /** Writes what the session has queued, once paired. */
   flush() {
+    if (!this.paired) return;
     for (let bytes = this.ivy.outbound(); bytes.length > 0; bytes = this.ivy.outbound()) {
       this.socket.send(bytes);
     }
@@ -95,6 +138,7 @@ export class Session {
   close() {
     if (this.closed) return;
     this.closed = true;
+    clearInterval(this.pinger);
     try {
       this.socket.close();
     } catch {

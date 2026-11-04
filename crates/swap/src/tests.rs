@@ -6,6 +6,8 @@ use std::cell::RefCell;
 #[cfg(feature = "native")]
 use std::rc::Rc;
 #[cfg(feature = "native")]
+use std::sync::{Arc, Mutex};
+#[cfg(feature = "native")]
 use std::time::{Duration, SystemTime};
 
 use super::*;
@@ -1696,6 +1698,14 @@ impl<R: Machine> Machine for Watching<R> {
     fn own_spends(&self) -> &'static [Spend] {
         self.role.own_spends()
     }
+
+    fn rejoin(&self) -> Option<Rejoin> {
+        None
+    }
+
+    fn resend(&self) -> Option<Message> {
+        None
+    }
 }
 
 /// Runs `machine`'s driver for one poll at each of `heights`, and returns
@@ -2614,6 +2624,14 @@ impl Machine for Submitting {
     }
     fn own_spends(&self) -> &'static [Spend] {
         self.watching.own_spends()
+    }
+
+    fn rejoin(&self) -> Option<Rejoin> {
+        None
+    }
+
+    fn resend(&self) -> Option<Message> {
+        None
     }
 }
 
@@ -3589,4 +3607,384 @@ fn a_stored_random_nonce_adaptor_still_recovers() {
     };
     let (stored, _) = stored.step(btc(3, Some((redeem, 0)), None));
     assert!(matches!(stored, Buyer::ClaimingNex(_)));
+}
+
+/// The session drops once the BTC is locked, and the seller's `NexLocked`
+/// goes with it: the buyer, with no CID, never reads Nexus. Both meet again
+/// at one rendezvous, each sends its last message again, and the swap
+/// completes; a copy the other side has already applied changes nothing.
+#[test]
+fn a_session_lost_after_the_lock_is_rejoined_and_the_swap_completes() {
+    let (seller, buyer, nex_lock) = locked().nex_signed();
+    let (seller, actions) =
+        seller.step(nexus(account(500_000, 0), mined(nex_lock.body.clone(), 1)));
+    assert!(matches!(sent(&actions), Message::NexLocked { .. }), "lost");
+    assert!(matches!(seller, Seller::AwaitRedeemSignature { .. }));
+    assert!(matches!(buyer, Buyer::AwaitNexLock { cid: None, .. }));
+    assert!(buyer.watch().nexus.is_none());
+
+    // From the swap files, as after a restart.
+    let (seller, buyer) = (restart(&seller), restart(&buyer));
+    let (to_seller, to_buyer) = (buyer.rejoin().unwrap(), seller.rejoin().unwrap());
+    assert_eq!(to_seller.id, to_buyer.id, "one rendezvous");
+    assert_eq!(to_seller.key, to_buyer.key, "one rejoin key");
+    let resent = buyer.resend().unwrap();
+    assert!(matches!(resent, Message::BuyerSignatures { .. }));
+    let (again, none) = seller.clone().step(message(resent));
+    assert!(none.is_empty());
+    assert_eq!(json(&again), json(&seller), "applied already");
+    let cid = seller.resend().unwrap();
+    let (buyer, none) = buyer.step(message(cid.clone()));
+    assert!(none.is_empty());
+    assert!(buyer.watch().nexus.is_some(), "the buyer reads Nexus");
+    let (again, _) = buyer.clone().step(message(cid));
+    assert_eq!(json(&again), json(&buyer));
+
+    // The redeem signature is lost too: the buyer sends it again.
+    let (buyer, actions) = buyer.step(nexus(account(500_000, 0), mined(nex_lock.body.clone(), 1)));
+    assert!(
+        matches!(sent(&actions), Message::RedeemSignature { .. }),
+        "lost"
+    );
+    assert_eq!(buyer.rejoin().unwrap().id, to_buyer.id);
+    let resent = buyer.resend().unwrap();
+    let (seller, none) = seller.step(message(resent.clone()));
+    assert!(none.is_empty());
+    assert!(seller.rejoin().is_none(), "the seller holds the redeem");
+    let (again, _) = seller.clone().step(message(resent));
+    assert_eq!(json(&again), json(&seller));
+    let (seller, actions) = seller.step(btc(2, None, None));
+    let [redeem] = &broadcasts(&actions)[..] else {
+        panic!("the seller redeems");
+    };
+    let (buyer, _) = buyer.step(btc(3, Some((redeem, 0)), None));
+    assert!(buyer.rejoin().is_none(), "the buyer claims from the chains");
+    let (buyer, actions) = buyer.step(nexus(account(500_000, 0), None));
+    let claim = submitted(&actions);
+    let (buyer, _) = buyer.step(nexus(account(0, 1), mined(claim.body.clone(), 1)));
+    assert_eq!(buyer.outcome(), Some(Outcome::Swapped));
+    let (seller, _) = seller.step(btc(4, Some((redeem, 1)), None));
+    assert_eq!(seller.outcome(), Some(Outcome::Swapped));
+}
+
+fn json<T: Serialize>(value: &T) -> String {
+    serde_json::to_string(value).unwrap()
+}
+
+/// From the hellos on, each side's rejoin sends again the last message it
+/// sent: the buyer's cancel signature among them, whose send the funding
+/// waits on. The rendezvous is the two parties' alone: another pair on the
+/// same swap id meets elsewhere.
+#[test]
+fn each_side_sends_its_last_message_again_from_the_hellos_on() {
+    let seller = new_seller(terms());
+    let (buyer, actions) = Buyer::start(terms(), payout(3), BUYER_NEX.into()).unwrap();
+    assert!(
+        seller.rejoin().is_none() && buyer.rejoin().is_none(),
+        "nothing at stake"
+    );
+    let (seller, actions) = seller.step(message(sent(&actions)));
+    assert!(seller.rejoin().is_some());
+    let hello = seller.resend();
+    assert!(matches!(hello, Some(Message::SellerHello { .. })));
+    let (buyer, actions) = buyer.step(message(sent(&actions)));
+    assert!(buyer.rejoin().is_some());
+    assert!(buyer.resend().is_none(), "funding");
+    let (buyer, actions) = buyer.step(Event::Funded(funding(&actions)));
+    let proposal = sent(&actions);
+    assert_eq!(json(&buyer.resend()), json(&Some(&proposal)));
+    let (seller, actions) = seller.step(message(proposal));
+    assert!(matches!(sent(&actions), Message::SellerSignatures { .. }));
+    // Signed again, as valid: the buyer takes them.
+    let signatures = seller.resend().unwrap();
+    let (buyer, actions) = buyer.step(message(signatures));
+    // The buyer's signatures never went out: they go on the new session,
+    // and then the funding.
+    assert!(matches!(sent(&actions), Message::BuyerSignatures { .. }));
+    let resent = buyer.resend();
+    assert!(matches!(resent, Some(Message::BuyerSignatures { .. })));
+    let (buyer, actions) = buyer.step(Event::Sent);
+    assert_eq!(broadcasts(&actions).len(), 1);
+    let (seller, none) = seller.step(message(resent.unwrap()));
+    assert!(none.is_empty());
+    assert!(matches!(seller, Seller::AwaitFunding { .. }));
+    assert!(seller.rejoin().is_some() && seller.resend().is_none());
+    let (id, key) = (buyer.rejoin().unwrap().id, buyer.rejoin().unwrap().key);
+    assert_eq!(seller.rejoin().unwrap().id, id);
+    assert_eq!(seller.rejoin().unwrap().key, key);
+    assert_ne!(id, terms().swap_id);
+    assert_ne!(key, id);
+
+    let (other, _, _) = hellos();
+    assert_ne!(other.rejoin().unwrap().id, id);
+    assert_ne!(other.rejoin().unwrap().key, key);
+}
+
+/// Hands the driver `inbox`, a message at a time, and keeps what it sends.
+#[cfg(feature = "native")]
+struct Recording {
+    inbox: Vec<Vec<u8>>,
+    sent: Arc<Mutex<Vec<Message>>>,
+}
+
+#[cfg(feature = "native")]
+impl Transport for Recording {
+    fn send(&mut self, payload: &[u8]) -> std::io::Result<()> {
+        let message = Message::decode(payload, terms().swap_id).unwrap();
+        self.sent.lock().unwrap().push(message);
+        Ok(())
+    }
+    fn recv(&mut self, _: Duration) -> std::io::Result<Option<Vec<u8>>> {
+        Ok(self.inbox.pop())
+    }
+}
+
+/// A buyer resumed with no session while it waits for the NEX lock's CID,
+/// which the seller sent into the lost one: its driver meets the seller at
+/// the rendezvous, sends its cancel signature again and takes the CID.
+#[cfg(feature = "native")]
+#[test]
+fn the_driver_rejoins_a_lost_session() {
+    let (seller, buyer, nex_lock) = locked().nex_signed();
+    let (seller, _) = seller.step(nexus(account(500_000, 0), mined(nex_lock.body.clone(), 1)));
+    let from_seller = seller.rejoin().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::new(directory.path(), terms().swap_id);
+    let client = Client::new("http://127.0.0.1:9", "", Duration::from_secs(1));
+    let node = Fake::default();
+    let mut driver = Driver::start(buyer, vec![], node, client, None, store).unwrap();
+    driver.poll = Duration::from_millis(1);
+    let sent = Arc::new(Mutex::new(vec![]));
+    let mut session = Some(Recording {
+        inbox: vec![seller.resend().unwrap().encode(terms().swap_id)],
+        sent: sent.clone(),
+    });
+    clear_warnings();
+    let ids = Arc::new(Mutex::new(vec![]));
+    let asked = ids.clone();
+    driver.reconnect = Some(Box::new(move |rejoin| {
+        let mut asked = asked.lock().unwrap();
+        asked.push(rejoin.id);
+        // Not at the first ask: the attempt takes a while, and the first
+        // two fail alike.
+        match asked.len() {
+            1 => None,
+            2 | 3 => Some(Err(std::io::Error::other("no one came"))),
+            _ => session.take().map(Ok),
+        }
+    }));
+    let polls = std::cell::Cell::new(0);
+    let stopped = driver.run_until(|buyer| {
+        polls.set(polls.get() + 1);
+        assert!(polls.get() < 1_000, "never rejoined");
+        matches!(buyer, Buyer::AwaitNexLock { cid: Some(_), .. })
+    });
+    assert!(stopped.unwrap().is_none());
+    assert!(ids.lock().unwrap().iter().all(|id| *id == from_seller.id));
+    assert_eq!(
+        warnings("rejoin: no one came"),
+        1,
+        "logged, not at every poll"
+    );
+    assert_eq!(warnings("session rejoined"), 1);
+    let sent = sent.lock().unwrap();
+    assert!(
+        matches!(sent[..], [Message::BuyerSignatures { .. }]),
+        "{sent:?}"
+    );
+}
+
+/// A TCP proxy to `to`, at the address it returns, that passes bytes
+/// either way until `cut` is set, and then drops them, closing nothing: a
+/// session half open, as once a laptop sleeps or a NAT forgets it.
+#[cfg(feature = "native")]
+fn cut_off(
+    to: std::net::SocketAddr,
+    cut: Arc<std::sync::atomic::AtomicBool>,
+) -> std::net::SocketAddr {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let (from, _) = listener.accept().unwrap();
+        let to = std::net::TcpStream::connect(to).unwrap();
+        for (mut from, mut to) in [
+            (from.try_clone().unwrap(), to.try_clone().unwrap()),
+            (to, from),
+        ] {
+            let cut = cut.clone();
+            std::thread::spawn(move || {
+                let mut buffer = [0; 4096];
+                while let Ok(n @ 1..) = from.read(&mut buffer) {
+                    if !cut.load(std::sync::atomic::Ordering::SeqCst) {
+                        _ = to.write_all(&buffer[..n]);
+                    }
+                }
+                // Held open while the test runs.
+                std::thread::sleep(Duration::from_secs(60));
+            });
+        }
+    });
+    address
+}
+
+/// A quiet session stays while each side answers the other's pings; once
+/// the path between them drops everything without closing, each side's
+/// pings go unanswered, and it counts the session lost.
+#[cfg(feature = "native")]
+#[test]
+fn a_session_half_open_is_lost_once_its_pings_go_unanswered() {
+    use crate::transport::{Ivy, PINGS_MISSED};
+    use ed25519_dalek::SigningKey;
+    let config = |seed| ivy::Config::new(SigningKey::from_bytes(&[seed; 32]));
+    let ping = Duration::from_millis(50);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let cut = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let proxy = cut_off(listener.local_addr().unwrap(), cut.clone());
+    let buyer_key = config(2).peer_key();
+    let seller = std::thread::spawn(move || {
+        let wait = Duration::from_secs(10);
+        let mut seller = Ivy::accept(listener, &config(1), buyer_key, wait, wait).unwrap();
+        seller.set_ping(ping);
+        // Waits as a driver does, a poll at a time, until the session fails.
+        loop {
+            if let Err(e) = seller.recv(Duration::from_millis(10)) {
+                return e;
+            }
+        }
+    });
+    let mut buyer = Ivy::connect(
+        proxy,
+        &config(2),
+        config(1).peer_key(),
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    buyer.set_ping(ping);
+    let quiet = std::time::Instant::now();
+    while quiet.elapsed() < ping * PINGS_MISSED * 4 {
+        assert!(buyer.recv(Duration::from_millis(10)).unwrap().is_none());
+    }
+
+    cut.store(true, std::sync::atomic::Ordering::SeqCst);
+    let lost = std::time::Instant::now();
+    let e = loop {
+        assert!(lost.elapsed() < Duration::from_secs(5), "never lost");
+        if let Err(e) = buyer.recv(Duration::from_millis(10)) {
+            break e;
+        }
+    };
+    assert_eq!(e.kind(), std::io::ErrorKind::TimedOut, "{e}");
+    assert!(
+        lost.elapsed() >= ping * (PINGS_MISSED - 1),
+        "not before its pings go unanswered"
+    );
+    assert_eq!(seller.join().unwrap().kind(), std::io::ErrorKind::TimedOut);
+}
+
+/// A failed attempt is handed back, for the driver to log, and the next
+/// waits [`crate::transport::RETRY`].
+#[cfg(feature = "native")]
+#[test]
+fn a_failed_rejoin_is_told_and_tried_again_only_after_a_pause() {
+    let attempts = Arc::new(Mutex::new(0));
+    let counted = attempts.clone();
+    let mut reconnect = crate::transport::in_background(move |_| -> std::io::Result<()> {
+        *counted.lock().unwrap() += 1;
+        Err(std::io::Error::other("no one came"))
+    });
+    let rejoin = Rejoin {
+        id: [1; 32],
+        key: [2; 32],
+    };
+    let asked = std::time::Instant::now();
+    let failed = loop {
+        assert!(asked.elapsed() < Duration::from_secs(5), "never told");
+        if let Some(result) = reconnect(&rejoin) {
+            break result;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    assert_eq!(failed.unwrap_err().to_string(), "no one came");
+    let paused = std::time::Instant::now();
+    while paused.elapsed() < Duration::from_millis(500) {
+        assert!(reconnect(&rejoin).is_none());
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(*attempts.lock().unwrap(), 1);
+}
+
+/// A driver busy elsewhere, on a slow node's calls say, for far longer than
+/// the counterparty waits for its pings to be answered, keeps its session:
+/// the session's own thread answers them meanwhile, and holds what arrives
+/// until the driver comes back for it.
+#[cfg(feature = "native")]
+#[test]
+fn a_session_stays_while_its_driver_is_busy_elsewhere() {
+    use crate::transport::{Ivy, PINGS_MISSED};
+    use ed25519_dalek::SigningKey;
+    let config = |seed| ivy::Config::new(SigningKey::from_bytes(&[seed; 32]));
+    let ping = Duration::from_millis(50);
+    let busy = ping * PINGS_MISSED * 6;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let buyer_key = config(2).peer_key();
+    let seller = std::thread::spawn(move || {
+        let wait = Duration::from_secs(10);
+        let mut seller = Ivy::accept(listener, &config(1), buyer_key, wait, wait).unwrap();
+        seller.set_ping(ping);
+        let waiting = std::time::Instant::now();
+        while waiting.elapsed() < busy {
+            assert!(seller.recv(Duration::from_millis(10)).unwrap().is_none());
+        }
+        seller.send(b"still here").unwrap();
+        seller.recv(wait).unwrap()
+    });
+    let mut buyer = Ivy::connect(
+        address,
+        &config(2),
+        config(1).peer_key(),
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    buyer.set_ping(ping);
+    std::thread::sleep(busy + ping * PINGS_MISSED);
+    let wait = Duration::from_secs(10);
+    assert_eq!(
+        buyer.recv(wait).unwrap().as_deref(),
+        Some(&b"still here"[..])
+    );
+    buyer.send(b"back").unwrap();
+    assert_eq!(seller.join().unwrap().as_deref(), Some(&b"back"[..]));
+}
+
+/// A session dropped, as a rejoin replaces one, closes its connection at
+/// once: its thread ends, and the counterparty hears it end.
+#[cfg(feature = "native")]
+#[test]
+fn a_session_dropped_closes_its_connection() {
+    use crate::transport::Ivy;
+    use ed25519_dalek::SigningKey;
+    let config = |seed| ivy::Config::new(SigningKey::from_bytes(&[seed; 32]));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let buyer_key = config(2).peer_key();
+    let wait = Duration::from_secs(10);
+    let seller =
+        std::thread::spawn(move || Ivy::accept(listener, &config(1), buyer_key, wait, wait));
+    let buyer = Ivy::connect(address, &config(2), config(1).peer_key(), wait).unwrap();
+    let mut seller = seller.join().unwrap().unwrap();
+    drop(buyer);
+    let dropped = std::time::Instant::now();
+    let e = loop {
+        assert!(dropped.elapsed() < Duration::from_secs(2), "still open");
+        if let Err(e) = seller.recv(Duration::from_millis(10)) {
+            break e;
+        }
+    };
+    assert_ne!(
+        e.kind(),
+        std::io::ErrorKind::TimedOut,
+        "closed, not gone quiet: {e}"
+    );
 }

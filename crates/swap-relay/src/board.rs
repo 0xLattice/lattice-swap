@@ -47,6 +47,8 @@ struct Listing<T> {
 pub enum Refusal {
     /// Not an offer: no swap id in its template.
     NotAnOffer(String),
+    /// A rendezvous that is not 32 bytes in lowercase hex.
+    NotARendezvous,
     /// An offer of that swap id is listed already.
     Listed,
     /// The board holds as many sellers as it may.
@@ -57,6 +59,7 @@ impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Refusal::NotAnOffer(why) => write!(f, "not an offer: {why}"),
+            Refusal::NotARendezvous => write!(f, "a rendezvous is 32 bytes of lowercase hex"),
             Refusal::Listed => write!(f, "an offer of this swap id is listed already"),
             Refusal::Full => write!(f, "the board is full"),
         }
@@ -100,14 +103,26 @@ pub fn offer_id(offer: &str) -> Result<String, String> {
     let id = offer["template"]["swap_id"]
         .as_str()
         .ok_or("its template names no swap id")?;
-    let hex = id.len() == 64
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-    if !hex {
+    if !is_id(id) {
         return Err(format!("swap id {id} is not 32 bytes of lowercase hex"));
     }
     Ok(id.to_string())
+}
+
+/// 32 bytes in lowercase hex, as a swap id or a rendezvous is.
+fn is_id(id: &str) -> bool {
+    id.len() == 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// What [`Board::meet`] found.
+pub enum Meeting<T> {
+    /// No one: wait there for the other party.
+    Waiting(Ticket<T>),
+    /// The party waiting there, which leaves: the way to hand it this one.
+    Arrived(oneshot::Sender<T>),
 }
 
 impl<T> Board<T> {
@@ -133,6 +148,29 @@ impl<T> Board<T> {
         if inner.listed.contains_key(&id) {
             return Err(Refusal::Listed);
         }
+        self.insert(&mut inner, id, offer)
+    }
+
+    /// Meets the other party at rendezvous `id`, held here unlisted: the
+    /// one waiting there, or, if none is, a ticket to wait for the next.
+    pub fn meet(self: &Arc<Self>, id: &str) -> Result<Meeting<T>, Refusal> {
+        if !is_id(id) {
+            return Err(Refusal::NotARendezvous);
+        }
+        let mut inner = self.inner.lock().expect("the board's lock");
+        if let Some(waiting) = inner.listed.remove(id) {
+            return Ok(Meeting::Arrived(waiting.taker));
+        }
+        self.insert(&mut inner, id.to_string(), String::new())
+            .map(Meeting::Waiting)
+    }
+
+    fn insert(
+        self: &Arc<Self>,
+        inner: &mut Inner<T>,
+        id: String,
+        offer: String,
+    ) -> Result<Ticket<T>, Refusal> {
         if inner.held >= self.max {
             return Err(Refusal::Full);
         }
@@ -262,6 +300,30 @@ mod tests {
         ));
         assert_eq!(sized(MAX_OFFER).len(), MAX_OFFER);
         board.list(sized(MAX_OFFER)).unwrap();
+    }
+
+    /// The first to come to a rendezvous waits there, unlisted; the second
+    /// meets it, and the next waits anew. Only its ticket withdraws it.
+    #[test]
+    fn two_meet_at_a_rendezvous() {
+        let board = Board::<u32>::new(2);
+        let id = hex::encode([9; 32]);
+        let Ok(Meeting::Waiting(mut first)) = board.meet(&id) else {
+            panic!("no one there yet");
+        };
+        let Ok(Meeting::Arrived(waiting)) = board.meet(&id) else {
+            panic!("the first waits there");
+        };
+        waiting.send(7).unwrap();
+        assert_eq!(first.taker.try_recv().unwrap(), 7);
+        let Ok(Meeting::Waiting(third)) = board.meet(&id) else {
+            panic!("the two left");
+        };
+        drop(first);
+        assert!(board.contains(&id));
+        drop(third);
+        assert!(!board.contains(&id));
+        assert!(matches!(board.meet("AB"), Err(Refusal::NotARendezvous)));
     }
 
     #[test]

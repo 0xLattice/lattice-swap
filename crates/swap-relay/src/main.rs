@@ -15,7 +15,8 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1:7500")]
     listen: SocketAddr,
     /// The most sellers held at once, their offers listed or swapping: each
-    /// holds a connection, and its offer is kept in memory.
+    /// holds a connection, and its offer is kept in memory. As many parties
+    /// again may wait at a rendezvous or swap through one.
     #[arg(long, default_value_t = 10_000)]
     max_offers: usize,
 }
@@ -34,6 +35,7 @@ fn main() -> ExitCode {
 fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let relay = Arc::new(Relay {
         board: Board::new(args.max_offers),
+        rejoins: Board::new(args.max_offers),
     });
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {

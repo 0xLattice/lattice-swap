@@ -19,6 +19,10 @@ import { ended, isRunning, swapKey } from './wallet.js';
 /** About ten minutes a Bitcoin block. */
 const BLOCK_MS = 600_000;
 
+/** The least time between two attempts to meet the seller again, as the
+ * CLI's `swap::transport::RETRY`. */
+const REJOIN_PAUSE = 5_000;
+
 /** The variant a state is in: what the native driver times a quiet
  * counterparty by. */
 const kind = (state) => Object.keys(JSON.parse(state))[0];
@@ -62,6 +66,16 @@ export class Buyer extends EventTarget {
   #doneTerms = null;
   /** Whether {@link Buyer#cancel} dropped the swap before it was taken. */
   #cancelled = false;
+  /** The attempt to meet the seller again, while one runs; when the last
+   * began; and whether a session it opened has yet to be sent the last
+   * message again. */
+  #rejoining = null;
+  #rejoinedAt = -Infinity;
+  #rejoined = false;
+  /** Whether {@link Buyer#run} is running, and what aborts a rejoin it
+   * leaves in flight once it returns. */
+  #running = false;
+  #halt = new AbortController();
 
   constructor(wallet, record, nexusChecked) {
     super();
@@ -119,7 +133,8 @@ export class Buyer extends EventTarget {
 
   /** The swap `swapId` in the wallet's store, carried on from where it
    * stopped. Its session, if it had one, is gone: the swap goes on from
-   * the chains, as after `lattice-swap resume`. Reads no backend: the
+   * the chains and, while it needs one, a new session to the seller, as
+   * after `lattice-swap resume`. Reads no backend: the
    * Nexus node is checked by `run`, the first round it is needed, and a
    * failed check is a round's warning, retried the next, as eigenwallet
    * resumes a swap and retries its backends. A refunding swap watches no
@@ -248,30 +263,38 @@ export class Buyer extends EventTarget {
    * `signal` aborts: the outcome, once it ends. A `status` event follows
    * every change of {@link Buyer#status}. A failed round, a backend's or
    * the Nexus check's, is the status's `warning`, and the next round tries
-   * again.
+   * again. Refuses while a run of this Buyer is running already.
    * @returns {Promise<string | null>} */
   async run(signal) {
-    while (!signal?.aborted) {
-      let done = null;
-      try {
-        done = await this.#round();
-        this.#warning = null;
-      } catch (e) {
-        this.#warning = e.message;
+    if (this.#running) throw new Error('refused: this swap is running already');
+    this.#running = true;
+    this.#halt = new AbortController();
+    try {
+      while (!signal?.aborted) {
+        let done = null;
+        try {
+          done = await this.#round();
+          this.#warning = null;
+        } catch (e) {
+          this.#warning = e.message;
+        }
+        this.#announce();
+        if (done) break;
+        await new Promise((resolve) => {
+          const timer = setTimeout(resolve, this.#c.poll);
+          this.#wake = () => {
+            clearTimeout(timer);
+            resolve();
+          };
+          signal?.addEventListener('abort', this.#wake, { once: true });
+        });
+        this.#wake = null;
       }
-      this.#announce();
-      if (done) break;
-      await new Promise((resolve) => {
-        const timer = setTimeout(resolve, this.#c.poll);
-        this.#wake = () => {
-          clearTimeout(timer);
-          resolve();
-        };
-        signal?.addEventListener('abort', this.#wake, { once: true });
-      });
-      this.#wake = null;
+    } finally {
+      this.#running = false;
+      this.#halt.abort();
+      this.#session?.close();
     }
-    this.#session?.close();
     return ended(this.#r.state) ? this.status().outcome : null;
   }
 
@@ -284,6 +307,7 @@ export class Buyer extends EventTarget {
       await this.#take();
       return this.#gone !== null || this.#cancelled;
     }
+    await this.#rejoin();
     for (const message of this.#inbox.splice(0)) await this.#apply({ Message: JSON.parse(message) });
     if (this.#awaits() && this.#c.now() - this.#since > this.#c.messageTimeout) await this.#apply('Timeout');
     await this.#observeBitcoin();
@@ -291,6 +315,40 @@ export class Buyer extends EventTarget {
     // Last: the balance is shown, and a failed read of it skips nothing.
     this.#balance = await this.#wallet.balance();
     return ended(this.#r.state);
+  }
+
+  /** While the swap needs its session and has none, meets the seller
+   * again at the offer's relay (`Buyer::rejoin`), as the CLI does: in the
+   * background, one attempt at a time, the next at least
+   * {@link REJOIN_PAUSE} after the last began, so the rounds go on reading
+   * the chains meanwhile. A session it opened is first sent the last
+   * message again, which the seller ignores if it has it. */
+  async #rejoin() {
+    if (this.#rejoined) {
+      this.#rejoined = false;
+      const resend = call('buyerResend', this.#r.state);
+      if (resend) await this.#act({ Send: resend });
+    }
+    if (this.#rejoining || (this.#session && !this.#session.closed)) return;
+    if (this.#c.now() - this.#rejoinedAt < REJOIN_PAUSE) return;
+    const rejoin = call('buyerRejoin', this.#r.state);
+    if (rejoin === null) return;
+    this.#rejoinedAt = this.#c.now();
+    const open = this.#c.openSession ?? Session.open;
+    const options = { WebSocket: this.#c.WebSocket, rejoin, signal: this.#halt.signal };
+    this.#rejoining = open(this.#r.offer, (message) => this.#receive(message), options)
+      .then(
+        (session) => {
+          if (!this.#running) return session.close();
+          this.#session = session;
+          this.#rejoined = true;
+        },
+        () => {},
+      )
+      .finally(() => {
+        this.#rejoining = null;
+        this.#wake?.();
+      });
   }
 
   #awaits() {

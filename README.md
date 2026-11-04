@@ -156,8 +156,18 @@ which only its owner may read, or `LATTICE_SWAP_NEX_KEY`, never from an
 argument. The seller gives `--advertise` when it listens on an unspecified
 address such as `0.0.0.0`.
 
+A lost session, a dropped connection or a restart, does not end the swap.
+As eigenwallet's seller keeps listening for the whole swap and its buyer
+dials it again, the seller stays reachable while it still awaits a message
+or has one to send, listening again or waiting at the relay, and the buyer
+reaches it again; on each new session each side sends again its last
+message, which the other ignores if it has it. What they need for that,
+the offer and the seller's session key, is kept beside the swap file in
+`<swap id>.session`, which only its owner may read.
+
 - `lattice-swap resume <swap file>` carries on after a restart, from the
-  chains alone, with the same flags: the node flags, and `--max-fee-rate`,
+  chains and, while the swap still needs it, a new session to the
+  counterparty, with the same flags: the node flags, and `--max-fee-rate`,
   `--fallback-fee-rate`, `--max-fee-fraction` and `--max-tip-age`, which are
   not saved. A
   seller also needs its Nexus key until the NEX lock is signed; a key given
@@ -234,8 +244,13 @@ swap-relay --listen 0.0.0.0:7500
 
 It serves `GET /offers`, the offers listed; `GET /sell` and
 `GET /take/<swap id>`, the WebSockets a seller waits on and a buyer pairs
-through. An offer is listed while its seller stays connected, until a
-buyer takes it. Put TLS in front of it for `https://`. Each bound says what
+through; and `GET /rejoin/<rendezvous>`, where the two meet again once
+their session is lost. An offer is listed while its seller stays
+connected, until a buyer takes it. The rendezvous is a hash of the swap id
+and the Diffie-Hellman of the two parties' swap keys, which no one else can
+work out, as a Tor rendezvous point joins the two circuits that bring the
+same cookie: a stranger who read the swap id from the board cannot take
+either party's place. Put TLS in front of it for `https://`. Each bound says what
 it protects: `--max-offers`, 10000 by default, the sellers held at once,
 listed or swapping, each a connection and its offer in memory; an offer at
 most 4 KiB, the board's memory; one WebSocket message at most 64 KiB, which
@@ -251,9 +266,10 @@ lattice-swap offer --relay https://relay.example ... > offer
 curl -s https://relay.example/offers
 ```
 
-`take` on an offer that names a relay reaches the seller through it. The
-relay holds nothing of the swap: a buyer that gives up must itself be
-online, with `resume`, to refund between cancel and `t2`.
+`take` on an offer that names a relay reaches the seller through it, and
+both meet there again whenever their session is lost. The relay holds
+nothing of the swap: a buyer that gives up must itself be online, with
+`resume`, to refund between cancel and `t2`.
 
 ## License
 

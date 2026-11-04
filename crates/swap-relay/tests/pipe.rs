@@ -17,6 +17,7 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 fn relay(max_offers: usize) -> String {
     let relay = Arc::new(Relay {
         board: Board::new(max_offers),
+        rejoins: Board::new(max_offers),
     });
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -152,4 +153,81 @@ fn a_seller_that_goes_frees_its_slot() {
         assert_eq!(waited.kind(), io::ErrorKind::TimedOut, "{waited}");
         wait_listed(&url, 0);
     }
+}
+
+/// The seller, key 1, waiting at rendezvous `id` for the buyer of key 2.
+fn rejoining_seller(url: &str, id: [u8; 32]) -> thread::JoinHandle<io::Result<Ivy<Relayed>>> {
+    let url = url.to_string();
+    thread::spawn(move || Ivy::accept_rejoined(&url, id, &config(1), key(2), TIMEOUT, TIMEOUT))
+}
+
+/// Once a swap's session is lost, its two parties meet again at their
+/// rendezvous, whichever comes first, and talk end to end; the offer stays
+/// off the board.
+#[test]
+fn the_two_parties_rejoin_at_their_rendezvous() {
+    let url = relay(10);
+    let rendezvous = [8; 32];
+    for seller_first in [true, false] {
+        let (seller, mut buyer) = if seller_first {
+            let seller = rejoining_seller(&url, rendezvous);
+            thread::sleep(Duration::from_millis(100));
+            let buyer =
+                Ivy::connect_rejoined(&url, rendezvous, &config(2), key(1), TIMEOUT, TIMEOUT);
+            (seller, buyer.unwrap())
+        } else {
+            let at = url.clone();
+            let buyer = thread::spawn(move || {
+                Ivy::connect_rejoined(&at, rendezvous, &config(2), key(1), TIMEOUT, TIMEOUT)
+            });
+            thread::sleep(Duration::from_millis(100));
+            let seller = rejoining_seller(&url, rendezvous);
+            (seller, buyer.join().unwrap().unwrap())
+        };
+        let mut seller = seller.join().unwrap().unwrap();
+        buyer.send(b"signatures").unwrap();
+        assert_eq!(seller.recv(TIMEOUT).unwrap().unwrap(), b"signatures");
+        seller.send(b"cid").unwrap();
+        assert_eq!(buyer.recv(TIMEOUT).unwrap().unwrap(), b"cid");
+        assert!(offers(&url).is_empty());
+    }
+}
+
+/// A stranger who read the swap id from the board, or the whole offer,
+/// cannot stand in for the buyer: the swap id is not the rendezvous, so the
+/// seller waiting there never meets it, and the buyer that comes does.
+#[test]
+fn a_stranger_cannot_rejoin_a_swap() {
+    let url = relay(10);
+    let (swap_id, rendezvous) = ([1; 32], [8; 32]);
+    let seller = rejoining_seller(&url, rendezvous);
+    thread::sleep(Duration::from_millis(100));
+    let wait = Duration::from_millis(500);
+    // The buyer's session key, as an offer on the board shows it, and the
+    // seller's key: at the swap id, at another rendezvous, no one comes.
+    for at in [swap_id, [9; 32]] {
+        let stranger = Ivy::connect_rejoined(&url, at, &config(2), key(1), wait, TIMEOUT);
+        assert_eq!(stranger.err().unwrap().kind(), io::ErrorKind::TimedOut);
+    }
+    let mut buyer =
+        Ivy::connect_rejoined(&url, rendezvous, &config(2), key(1), TIMEOUT, TIMEOUT).unwrap();
+    let mut seller = seller.join().unwrap().unwrap();
+    seller.send(b"cid").unwrap();
+    assert_eq!(buyer.recv(TIMEOUT).unwrap().unwrap(), b"cid");
+}
+
+/// One who reached the rendezvous anyway, without the seller's key, fails
+/// the buyer's handshake.
+#[test]
+fn only_the_seller_passes_a_rejoin_handshake() {
+    let url = relay(10);
+    let rendezvous = [8; 32];
+    let at = url.clone();
+    let impostor = thread::spawn(move || {
+        Ivy::accept_rejoined(&at, rendezvous, &config(3), key(2), TIMEOUT, TIMEOUT)
+    });
+    thread::sleep(Duration::from_millis(100));
+    let buyer = Ivy::connect_rejoined(&url, rendezvous, &config(2), key(1), TIMEOUT, TIMEOUT);
+    assert!(buyer.is_err());
+    assert!(impostor.join().unwrap().is_err());
 }

@@ -875,6 +875,36 @@ pub trait Machine: Clone + Serialize + serde::de::DeserializeOwned {
     /// CPFP from their payout while they wait unconfirmed. Never cancel,
     /// whose output only both parties together can spend.
     fn own_spends(&self) -> &'static [Spend];
+    /// While this side still awaits a message or has one to send, how it
+    /// meets the counterparty again once the session is gone.
+    fn rejoin(&self) -> Option<Rejoin>;
+    /// The last message this side sent, which the counterparty may have
+    /// missed: sent again on every new session [`Machine::rejoin`] opens.
+    /// Each machine ignores a message it is not waiting for, so a copy it
+    /// has already applied changes nothing.
+    fn resend(&self) -> Option<Message>;
+}
+
+/// How a side gets a lost session back, as eigenwallet's ASB keeps
+/// listening for the whole swap, and its CLI, on a lost connection or on
+/// `resume`, dials the seller again by its peer id, each side sending again
+/// what the other has not acknowledged ([`Machine::resend`]). Only once the
+/// hellos are out: before, nothing is at stake, and a quiet counterparty
+/// aborts. Both fields come from a secret only the two parties share: see
+/// [`Setup::rejoin`].
+#[derive(Clone, Serialize)]
+pub struct Rejoin {
+    /// Where the two meet on a relay.
+    #[serde(with = "hex::serde")]
+    pub id: [u8; 32],
+    /// The buyer's session key on a rejoin, an Ed25519 seed: the seller
+    /// takes a rejoined session only from its key, as a Tor onion service
+    /// with client authorization answers only the clients it was given
+    /// keys for. The offer's `buyer_session` will not do: on a relay the
+    /// offer is public, and anyone holding it could take the seller's
+    /// place for the buyer and hold the session while the refund nears.
+    #[serde(with = "hex::serde")]
+    pub key: [u8; 32],
 }
 
 /// What a driver should watch for a machine in its current state.
@@ -898,6 +928,28 @@ pub struct NexusWatch {
 }
 
 impl Setup {
+    /// How the two parties meet again ([`Rejoin`]): hashes, each under its
+    /// own tag, of the swap id and the Diffie-Hellman of their Bitcoin keys,
+    /// which only they can work out. A relay pairs the two who come to the
+    /// same `id`, as a Tor rendezvous point joins the two circuits that
+    /// bring the same cookie (rend-spec-v3, `RENDEZVOUS_COOKIE`): no one
+    /// else, the swap id read from the board, can stand in for either.
+    fn rejoin(&self) -> Rejoin {
+        let key = self.secrets.key();
+        let shared = schnorr_fun::fun::g!({ key.secret_key() } * { self.other_key }).normalize();
+        let hash = |tag: &[u8]| {
+            let mut engine = bitcoin::hashes::sha256::Hash::engine();
+            bitcoin::hashes::HashEngine::input(&mut engine, tag);
+            bitcoin::hashes::HashEngine::input(&mut engine, &self.terms.swap_id);
+            bitcoin::hashes::HashEngine::input(&mut engine, &shared.to_bytes());
+            bitcoin::hashes::sha256::Hash::from_engine(engine).to_byte_array()
+        };
+        Rejoin {
+            id: hash(b"lattice-swap rejoin"),
+            key: hash(b"lattice-swap rejoin key"),
+        }
+    }
+
     fn watch_nexus(&self, cid: Option<String>) -> Option<NexusWatch> {
         Some(NexusWatch {
             lock_address: self.lock_address(),
