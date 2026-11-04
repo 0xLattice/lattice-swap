@@ -4705,3 +4705,153 @@ fn a_buyer_shows_where_its_swap_is_and_its_deadlines() {
     assert_eq!(done(Outcome::Refunded)["phase"], "refunded");
     assert_eq!(done(Outcome::Drained)["phase"], "drained");
 }
+
+/// A recovery file, as the browser writes one, of the wallet `wif` on
+/// regtest holding `swaps`.
+#[cfg(feature = "native")]
+fn recovery(wif: &str, swaps: Vec<serde_json::Value>) -> String {
+    json!({"format": "lattice-swap-wallet", "network": "regtest", "wallet": wif, "swaps": swaps})
+        .to_string()
+}
+
+/// A browser's record of a swap of id `n`s in `state`, as its recovery
+/// file holds it.
+#[cfg(feature = "native")]
+fn recorded(
+    n: u8,
+    state: &impl serde::Serialize,
+    pending: &[Action],
+    taken: bool,
+) -> serde_json::Value {
+    let template = offer::Template {
+        swap_id: [n; 32],
+        btc_fee: Amount::from_sat(1_000),
+        nex_fee: 100,
+        t1: 20,
+        t2: 10,
+        btc_confirmations: 1,
+        nex_confirmations: 1,
+        margin: 3,
+        nexus_genesis: swap_nexus_tx::MAINNET_GENESIS.into(),
+    };
+    let quote = offer::Quote {
+        price: 2_000_000,
+        min_btc_amount: 100_000,
+        max_btc_amount: 2_000_000,
+    };
+    let offer = offer::Offer::new(
+        quote,
+        template,
+        bitcoin::Network::Regtest,
+        offer::Place::Relay("http://relay.invalid".into()),
+        &ed25519_dalek::SigningKey::from_bytes(&[3; 32]),
+        [4; 32],
+    );
+    json!({
+        "swap_id": hex::encode([n; 32]),
+        "offer": offer,
+        "policy": {"btc_amount": 1_000_000, "price": 2_000_000, "max_t1": 20},
+        "state": state,
+        "pending": pending,
+        "taken": taken,
+        "nex_address": BUYER_NEX,
+        "version": STATE_VERSION,
+    })
+}
+
+#[cfg(feature = "native")]
+fn app_config(dir: &std::path::Path) -> app::Config {
+    let unreachable = "http://127.0.0.1:9".to_string();
+    app::Config::new(
+        dir.into(),
+        bitcoin::Network::Regtest,
+        unreachable.clone(),
+        unreachable,
+        dir.join("cookie"),
+        swap_nexus_tx::MAINNET_GENESIS.into(),
+    )
+}
+
+/// A browser's recovery file restores natively, asking no backend: the
+/// wallet key, a swap that took its offer as the driver's swap file and
+/// session file, one that did not as its record; backed up, it is the same
+/// file. What the browser's restore refuses is refused.
+#[cfg(feature = "native")]
+#[test]
+fn a_recovery_file_restores_natively_and_backs_up_as_it_was() {
+    let key = wallet::Key::new("regtest").unwrap();
+    let Locked { buyer, seller } = locked();
+    let (fresh, hello) =
+        Buyer::start(terms(), key.script_pubkey.clone(), BUYER_NEX.into()).unwrap();
+    let taken = recorded(1, &buyer, &[], true);
+    let untaken = recorded(2, &fresh, &hello, false);
+    let file = recovery(&key.wif, vec![taken.clone(), untaken.clone()]);
+    let dir = tempfile::tempdir().unwrap();
+    let config = || app_config(dir.path());
+
+    let wallet = app::Wallet::restore(config(), &file).unwrap();
+    assert_eq!(wallet.address(), key.address);
+    let ids = [hex::encode([1; 32]), hex::encode([2; 32])];
+    assert_eq!(wallet.swaps().unwrap(), ids);
+    assert_eq!(wallet.running().unwrap().as_ref(), Some(&ids[0]));
+    let store = Store::new(dir.path(), [1; 32]);
+    let saved: Buyer = store.load().unwrap().unwrap();
+    assert_eq!(serde_json::to_value(saved).unwrap(), taken["state"]);
+    let session = session::SessionFile::load(&store).unwrap().unwrap();
+    assert_eq!(serde_json::to_value(session.offer).unwrap(), taken["offer"]);
+    assert!(!Store::new(dir.path(), [2; 32]).path().exists());
+    let (name, backup) = wallet.backup().unwrap();
+    assert_eq!(name, format!("lattice-swap-{}.json", key.address));
+    let json = |text: &str| serde_json::from_str::<serde_json::Value>(text).unwrap();
+    assert_eq!(json(&backup), json(&file));
+    // Opened again, the same wallet; restored again, nothing changes.
+    let opened = app::Wallet::open(config()).unwrap();
+    assert_eq!(opened.address(), key.address);
+    app::Wallet::restore(config(), &file).unwrap();
+    assert_eq!(json(&opened.backup().unwrap().1), json(&file));
+    // Once it ends, it runs no more, and is left out.
+    let done = json!({"version": STATE_VERSION, "state": {"Done": "Swapped"}});
+    std::fs::write(store.path(), done.to_string()).unwrap();
+    assert_eq!(wallet.running().unwrap(), None);
+    let swaps = json(&wallet.backup().unwrap().1)["swaps"].clone();
+    assert_eq!(swaps, json!([untaken]));
+    std::fs::write(
+        store.path(),
+        json!({"version": STATE_VERSION, "state": taken["state"]}).to_string(),
+    )
+    .unwrap();
+
+    let refused = |config: app::Config, file: &str| {
+        app::Wallet::restore(config, file)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default()
+    };
+    let fresh_dir = || tempfile::tempdir().unwrap();
+    let d = fresh_dir();
+    assert!(refused(app_config(d.path()), "{}").contains("not a recovery file"));
+    let other_format = file.replace("lattice-swap-wallet", "lattice-swap-other");
+    assert!(refused(app_config(d.path()), &other_format).contains("not a recovery file"));
+    let signet = file.replace("\"regtest\"", "\"signet\"");
+    assert!(refused(app_config(d.path()), &signet).contains("for signet"));
+    let mut versioned = taken.clone();
+    versioned["version"] = (STATE_VERSION - 1).into();
+    let old = recovery(&key.wif, vec![versioned]);
+    assert!(refused(app_config(d.path()), &old).contains("state version"));
+    let sellers = recovery(&key.wif, vec![recorded(4, &seller, &[], true)]);
+    assert!(refused(app_config(d.path()), &sellers).contains("not a buyer"));
+    // A swap that ended beside one that runs: one runs.
+    let done = recorded(6, &Buyer::Done(Outcome::Refunded), &[], true);
+    let ended = recovery(&key.wif, vec![taken.clone(), done]);
+    app::Wallet::restore(app_config(d.path()), &ended).unwrap();
+    // Another wallet's directory.
+    let elsewhere = fresh_dir();
+    app::Wallet::open(app_config(elsewhere.path())).unwrap();
+    assert!(refused(app_config(elsewhere.path()), &file).contains("another wallet"));
+    // A second swap that would run beside the one this directory runs.
+    let second = recovery(&key.wif, vec![recorded(5, &buyer, &[], true)]);
+    assert!(refused(config(), &second).contains("both run"));
+    // Held untaken here, taken in the file.
+    let ahead = recovery(&key.wif, vec![recorded(2, &buyer, &[], true)]);
+    assert!(refused(config(), &ahead).contains("untaken"));
+}

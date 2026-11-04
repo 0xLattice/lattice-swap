@@ -61,7 +61,7 @@ impl Store {
 
     /// Saves the state of a new swap; fails if the file exists, so a swap
     /// started twice keeps its first secrets.
-    fn create<M: Machine>(&self, state: &M) -> io::Result<()> {
+    pub fn create<M: Machine>(&self, state: &M) -> io::Result<()> {
         let temporary = self.write_temporary(state)?;
         // A hard link, unlike a rename, never replaces its target.
         let linked = fs::hard_link(&temporary, &self.path);

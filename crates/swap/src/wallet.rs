@@ -103,8 +103,7 @@ fn fee(inputs: usize, outputs: &[usize], rate: u64) -> u64 {
 
 /// `inputs`, all the wallet's, into `outputs`, signed.
 fn signed(wif: &str, inputs: &[Utxo], outputs: Vec<TxOut>) -> Result<Signed, String> {
-    let (key, public, script) = key(wif)?;
-    let mut tx = Transaction {
+    let tx = Transaction {
         version: Version::TWO,
         lock_time: absolute::LockTime::ZERO,
         input: inputs
@@ -117,25 +116,36 @@ fn signed(wif: &str, inputs: &[Utxo], outputs: Vec<TxOut>) -> Result<Signed, Str
             .collect(),
         output: outputs,
     };
+    let values: Vec<u64> = inputs.iter().map(|utxo| utxo.value).collect();
+    let tx = sign(wif, tx, &values)?;
+    let fee = total(inputs) - tx.output.iter().map(|out| out.value.to_sat()).sum::<u64>();
+    Ok(Signed { tx, fee })
+}
+
+/// `tx`, every input of which spends an output of the wallet's of the value
+/// `values` gives it, signed: the wallet's funding and sweeps, and a CPFP
+/// child of a payout to the wallet.
+pub fn sign(wif: &str, mut tx: Transaction, values: &[u64]) -> Result<Transaction, String> {
+    let (key, public, script) = key(wif)?;
+    if values.len() != tx.input.len() {
+        return Err(format!(
+            "{} inputs, {} values",
+            tx.input.len(),
+            values.len()
+        ));
+    }
     let secp = Secp256k1::signing_only();
     let mut cache = SighashCache::new(tx.clone());
-    for (i, utxo) in inputs.iter().enumerate() {
+    for (i, value) in values.iter().enumerate() {
         let sighash = cache
-            .p2wpkh_signature_hash(
-                i,
-                &script,
-                Amount::from_sat(utxo.value),
-                EcdsaSighashType::All,
-            )
+            .p2wpkh_signature_hash(i, &script, Amount::from_sat(*value), EcdsaSighashType::All)
             .map_err(|e| e.to_string())?;
         let signature = bitcoin::ecdsa::Signature::sighash_all(
             secp.sign_ecdsa(&Digest::from_digest(sighash.to_byte_array()), &key.inner),
         );
         tx.input[i].witness = Witness::p2wpkh(&signature, &public);
     }
-    let spent = total(inputs);
-    let fee = spent - tx.output.iter().map(|out| out.value.to_sat()).sum::<u64>();
-    Ok(Signed { tx, fee })
+    Ok(tx)
 }
 
 fn total(utxos: &[Utxo]) -> u64 {

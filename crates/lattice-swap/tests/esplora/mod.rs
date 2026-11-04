@@ -1,6 +1,6 @@
 //! A small Esplora over bitcoind, for tests: the calls the browser's swap
-//! driver makes, answered as Esplora answers them, `/tx/{txid}/status`
-//! unconfirmed even for a txid never seen.
+//! driver and the native `swap::esplora` make, answered as Esplora answers
+//! them, `/tx/{txid}/status` unconfirmed even for a txid never seen.
 
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
@@ -105,8 +105,19 @@ pub fn esplora(node: Bitcoind) -> String {
             get(
                 |State(node): State<Shared>, Path(txid): Path<String>| async move {
                     let answer = ask(&node, move |n| {
-                        let tx = n.call("getrawtransaction", json!([txid, true])).ok()?;
-                        Some(json!({"txid": tx["txid"], "status": status(n, &tx)}))
+                        let tx = n.call("getrawtransaction", json!([txid, 2])).ok()?;
+                        // In the mempool, its entry holds the fee.
+                        let fee = match n.call("getmempoolentry", json!([txid])) {
+                            Ok(entry) => entry["fees"]["base"].as_f64(),
+                            Err(_) => tx["fee"].as_f64(),
+                        };
+                        let fee = (fee? * 1e8).round() as u64;
+                        Some(json!({
+                            "txid": tx["txid"],
+                            "status": status(n, &tx),
+                            "fee": fee,
+                            "weight": tx["weight"],
+                        }))
                     });
                     match answer.await {
                         Some(tx) => Json(tx).into_response(),
@@ -195,13 +206,27 @@ pub fn esplora(node: Bitcoind) -> String {
                 }
             }),
         )
+        // A child and its parent, as `submitpackage` takes them.
+        .route(
+            "/txs/package",
+            post(
+                |State(node): State<Shared>, Json(package): Json<Value>| async move {
+                    let sent = ask(&node, move |n| n.call("submitpackage", json!([package])));
+                    match sent.await {
+                        Ok(result) => Json(result).into_response(),
+                        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+                    }
+                },
+            ),
+        )
         .with_state(Arc::new(node));
     serve(router)
 }
 
-/// The confirmed outputs paying `address`, as Esplora lists them; the
-/// mempool's are left out, which the driver never spends. bitcoind runs
-/// one scan at a time.
+/// The outputs paying `address`, as Esplora lists them: those in a block,
+/// then the mempool's, unconfirmed, which the drivers never spend (a
+/// mempool spend of one in a block is not looked for). bitcoind runs one
+/// scan at a time.
 fn utxos(node: &Bitcoind, address: &str) -> Value {
     static SCAN: Mutex<()> = Mutex::new(());
     let _scan = SCAN.lock().unwrap();
@@ -223,5 +248,21 @@ fn utxos(node: &Bitcoind, address: &str) -> Value {
             })
         })
         .collect();
+    let mut utxos = utxos;
+    let pool = node.call("getrawmempool", json!([])).unwrap();
+    for txid in pool.as_array().unwrap() {
+        let tx = node.call("getrawtransaction", json!([txid, true])).unwrap();
+        for output in tx["vout"].as_array().unwrap() {
+            if output["scriptPubKey"]["address"] == address {
+                let sats = (output["value"].as_f64().unwrap() * 1e8).round() as u64;
+                utxos.push(json!({
+                    "txid": txid,
+                    "vout": output["n"],
+                    "value": sats,
+                    "status": {"confirmed": false},
+                }));
+            }
+        }
+    }
     Value::Array(utxos)
 }
