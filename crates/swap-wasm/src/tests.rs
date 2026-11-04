@@ -2,7 +2,8 @@
 
 use super::*;
 use bitcoin::hashes::Hash;
-use bitcoin::{Amount, OutPoint, Txid};
+use bitcoin::secp256k1::Secp256k1;
+use bitcoin::{Amount, CompressedPublicKey, OutPoint, PrivateKey, Txid};
 use ed25519_dalek::SigningKey;
 use session::Ivy;
 use swap::Terms;
