@@ -833,6 +833,17 @@ pub fn bitcoin_view(
             .spender(lookups.cancel_output, from)?
             .map(|(tx, confirmations)| Spent { tx, confirmations });
     }
+    for (spent, outpoint) in [
+        (&lock_spend, lookups.lock),
+        (&cancel_spend, lookups.cancel_output),
+    ] {
+        if let Some(spent) = spent.as_ref().filter(|s| !view::spends(&s.tx, outpoint)) {
+            return Err(bitcoind::Error(format!(
+                "{} does not spend {outpoint}",
+                spent.tx.compute_txid()
+            )));
+        }
+    }
     // Each depth was read against the tip of its read: one tip, or none.
     if bitcoin.tip()?.hash != tip.hash {
         return Ok(None);

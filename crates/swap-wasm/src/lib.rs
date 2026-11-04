@@ -370,6 +370,17 @@ pub fn txid_of(hex: &str) -> Result<String> {
     Ok(tx.compute_txid().to_string())
 }
 
+/// Whether the Bitcoin transaction `hex` spends `outpoint` (`txid:vout`):
+/// what an Esplora names as a spend of the lock or of cancel's output is
+/// checked to be one ([`swap::view::spends`]).
+#[wasm_bindgen(js_name = spendsOutpoint)]
+pub fn spends_outpoint(hex: &str, outpoint: &str) -> Result<bool> {
+    let tx: bitcoin::Transaction =
+        bitcoin::consensus::encode::deserialize_hex(hex.trim()).map_err(|e| e.to_string())?;
+    let outpoint = bitcoin::OutPoint::from_str(outpoint).map_err(|e| e.to_string())?;
+    Ok(view::spends(&tx, outpoint))
+}
+
 /// Answers a seller's `SignNex`: the body signed with the Nexus key whose
 /// seed is `seed`, as the transaction for `NexSigned`.
 #[wasm_bindgen(js_name = signNex)]

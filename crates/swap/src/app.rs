@@ -530,7 +530,7 @@ impl Wallet {
                     )
                     .into())
                 }
-                Some(held) if held.taken && !store.path().exists() => {
+                Some(held) if held.taken && record.taken && !store.path().exists() => {
                     added.push((record, state, offer))
                 }
                 Some(_) => {}

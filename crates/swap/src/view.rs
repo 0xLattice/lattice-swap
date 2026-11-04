@@ -9,7 +9,7 @@
 //! account, the lock account, then the watched transaction, and the health
 //! again: it is one view only if [`one_tip`] holds for the two.
 
-use bitcoin::{BlockHash, OutPoint, Txid};
+use bitcoin::{BlockHash, OutPoint, Transaction, Txid};
 use serde::{Deserialize, Serialize};
 use swap_bitcoin::{Spend, Swap};
 use swap_nexus_tx::rpc::Health;
@@ -119,6 +119,16 @@ impl Lookups {
         let mined = (height + 1).saturating_sub(*confirmations);
         Some(mined.saturating_add(self.t2.into()))
     }
+}
+
+/// Whether `tx` spends `outpoint`. A backend is trusted for where a
+/// transaction is, never for what it is: one it names as a spend of the
+/// lock or of cancel's output must be one, or an unrelated transaction
+/// named as cancel's spender would read as the seller's punish.
+pub fn spends(tx: &Transaction, outpoint: OutPoint) -> bool {
+    tx.input
+        .iter()
+        .any(|input| input.previous_output == outpoint)
 }
 
 /// Two reads of a Nexus node's health are at one tip: every read between

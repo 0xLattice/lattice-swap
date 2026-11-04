@@ -33,6 +33,12 @@ export async function bitcoinView(esplora, lookups) {
     const spender = await esplora.spender(txid, vout);
     cancelSpend = spender === null ? null : await spent([spender]);
   }
+  // Trusted for where a transaction is, never for what it is: a spend of
+  // the lock or of cancel's output must spend it, or an unrelated
+  // transaction named as cancel's spender would read as the seller's punish.
+  for (const [spent, outpoint] of [[lockSpend, lookups.lock], [cancelSpend, lookups.cancel_output]]) {
+    if (spent && !wasm.spendsOutpoint(spent.tx, outpoint)) throw new Error(`${wasm.txidOf(spent.tx)} does not spend ${outpoint}`);
+  }
   const after = await esplora.tip();
   if (after.hash !== tip.hash) return null;
   const view = {

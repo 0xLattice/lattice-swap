@@ -4849,6 +4849,19 @@ fn a_recovery_file_restores_natively_and_backs_up_as_it_was() {
     assert!(session::SessionFile::load(&store).unwrap().is_some());
     assert_eq!(wallet.running().unwrap().as_ref(), Some(&ids[0]));
     drop(wallet);
+    // An older file that holds that swap untaken changes nothing of it,
+    // even while its swap file is missing.
+    std::fs::remove_file(store.path()).unwrap();
+    std::fs::remove_file(dir.path().join(format!("{}.session", ids[0]))).unwrap();
+    let (older, older_hello) =
+        Buyer::start(terms(), key.script_pubkey.clone(), BUYER_NEX.into()).unwrap();
+    let older = recovery(&key.wif, vec![recorded(1, &older, &older_hello, false)]);
+    app::Wallet::restore(config(), &older).unwrap();
+    let held = read(&dir.path().join(format!("{}.record", ids[0])));
+    assert_eq!(held["taken"], true);
+    assert!(!store.path().exists());
+    app::Wallet::restore(config(), &file).unwrap();
+    assert_eq!(read(store.path()), store_file);
 
     let refused = |config: app::Config, file: &str| {
         app::Wallet::restore(config, file)
@@ -5062,4 +5075,63 @@ fn a_swap_cancels_until_it_takes_its_offer() {
     let buy = wallet.resume(&id).unwrap();
     buy.cancel().unwrap();
     assert_eq!(buy.run(|| false).map_err(|e| e.to_string()), Ok(None));
+}
+
+/// An Esplora that names an unrelated transaction, real and in a block, as
+/// what spends cancel's output: the view is refused, a round's failure,
+/// and the buyer stays on its refund path, never reading it as the
+/// seller's punish. A transaction that does spend it stands.
+#[cfg(feature = "native")]
+#[test]
+fn a_spend_that_spends_nothing_of_the_swap_is_refused() {
+    let (_, buyer, _) = locked().nex_locked();
+    let (cancelling, actions) = buyer.step(btc(20, None, None));
+    assert!(matches!(cancelling, Buyer::Cancelling { .. }));
+    let [cancel] = &broadcasts(&actions)[..] else {
+        panic!("cancel");
+    };
+    let (swap, lock) = cancelling.watch().bitcoin.unwrap();
+    let cancel_output = OutPoint::new(cancel.compute_txid(), 0);
+    let spending = |previous_output| Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output,
+            ..Default::default()
+        }],
+        output: vec![],
+    };
+    let unrelated = spending(OutPoint::new(Txid::from_byte_array([5; 32]), 0));
+    let node = |spender: &Transaction| {
+        let node = funded_node(lock, 131);
+        {
+            let mut node = node.0.borrow_mut();
+            node.mined.push((cancel.clone(), 121));
+            node.mined.push((spender.clone(), 131));
+            node.spenders.push((cancel_output, spender.clone(), 131));
+        }
+        node
+    };
+    let max = Duration::from_secs(90 * 60);
+    let view = |node: &Fake| crate::driver::bitcoin_view(node, &swap, lock, max, now(), &mut None);
+    let refused = view(&node(&unrelated)).unwrap_err().to_string();
+    assert!(refused.contains("does not spend"), "{refused}");
+    let spends = spending(cancel_output);
+    let seen = view(&node(&spends)).unwrap().unwrap().cancel_spend.unwrap();
+    assert_eq!(seen.tx, spends);
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::new(directory.path(), terms().swap_id);
+    let client = Client::new("http://127.0.0.1:9", "", Duration::from_secs(1));
+    let mut driver =
+        Driver::<_, _, Offline>::start(cancelling, vec![], node(&unrelated), client, None, store)
+            .unwrap();
+    driver.poll = Duration::from_millis(1);
+    let rounds = std::cell::Cell::new(0);
+    let stopped = driver.run_until(|buyer| {
+        rounds.set(rounds.get() + 1);
+        !matches!(buyer, Buyer::Cancelling { .. }) || rounds.get() > 20
+    });
+    assert_eq!(stopped.unwrap(), None);
+    assert!(matches!(driver.state(), Buyer::Cancelling { .. }));
 }
