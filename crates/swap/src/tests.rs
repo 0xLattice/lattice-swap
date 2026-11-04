@@ -1810,6 +1810,8 @@ struct Node {
     tip_age: u64,
     /// Fail every read of the tip.
     down: bool,
+    /// A block lands after each read of the tip.
+    mining: bool,
     /// A swap file, whose state's name is read into `saved` at every
     /// broadcast.
     store: Option<std::path::PathBuf>,
@@ -1845,17 +1847,21 @@ impl Bitcoin for Fake {
         Ok(())
     }
     fn tip(&self) -> crate::bitcoind::Result<crate::bitcoind::Tip> {
-        let node = self.0.borrow();
+        let mut node = self.0.borrow_mut();
         if node.down {
             return Err(crate::bitcoind::Error("connection refused".into()));
         }
         let now = now().duration_since(std::time::UNIX_EPOCH).unwrap();
-        Ok(crate::bitcoind::Tip {
+        let tip = crate::bitcoind::Tip {
             height: node.height,
             headers: node.height + node.headers_ahead,
             time: now.as_secs() - node.tip_age,
             hash: BlockHash::from_byte_array([node.height as u8; 32]),
-        })
+        };
+        if node.mining {
+            node.height += 1;
+        }
+        Ok(tip)
     }
     fn transaction(&self, txid: Txid) -> crate::bitcoind::Result<Option<(Transaction, u32)>> {
         let node = self.0.borrow();
@@ -2841,6 +2847,7 @@ fn a_tip_is_as_old_as_it_was_first_seen() {
     let view = |first_seen: &mut Option<(BlockHash, u64)>| {
         crate::driver::bitcoin_view(&node, &swap, lock, max, now(), first_seen)
             .unwrap()
+            .unwrap()
             .stale
     };
     let stale = view(&mut Some((tip, secs - 91 * 60))).unwrap();
@@ -2851,6 +2858,12 @@ fn a_tip_is_as_old_as_it_was_first_seen() {
     let (hash, at) = first_seen.unwrap();
     assert_eq!(hash, tip);
     assert_eq!(at, secs);
+    // A block while it is read: no view, and the tip is not first seen.
+    node.0.borrow_mut().mining = true;
+    let mut first_seen = None;
+    let moved = crate::driver::bitcoin_view(&node, &swap, lock, max, now(), &mut first_seen);
+    assert!(moved.unwrap().is_none());
+    assert_eq!(first_seen, None);
 }
 
 /// The driver keeps when it first saw the tip from view to view: a tip
@@ -4805,10 +4818,12 @@ fn a_recovery_file_restores_natively_and_backs_up_as_it_was() {
     let json = |text: &str| serde_json::from_str::<serde_json::Value>(text).unwrap();
     assert_eq!(json(&backup), json(&file));
     // Opened again, the same wallet; restored again, nothing changes.
+    drop(wallet);
     let opened = app::Wallet::open(config()).unwrap();
     assert_eq!(opened.address(), key.address);
-    app::Wallet::restore(config(), &file).unwrap();
-    assert_eq!(json(&opened.backup().unwrap().1), json(&file));
+    drop(opened);
+    let wallet = app::Wallet::restore(config(), &file).unwrap();
+    assert_eq!(json(&wallet.backup().unwrap().1), json(&file));
     // Once it ends, it runs no more, and is left out.
     let done = json!({"version": STATE_VERSION, "state": {"Done": "Swapped"}});
     std::fs::write(store.path(), done.to_string()).unwrap();
@@ -4820,6 +4835,20 @@ fn a_recovery_file_restores_natively_and_backs_up_as_it_was() {
         json!({"version": STATE_VERSION, "state": taken["state"]}).to_string(),
     )
     .unwrap();
+    drop(wallet);
+    // A restore that stopped once the record was saved: the swap is
+    // listed, and restored again, it gets its swap file and session.
+    let read = |path: &std::path::Path| {
+        serde_json::from_slice::<serde_json::Value>(&std::fs::read(path).unwrap()).unwrap()
+    };
+    let store_file = read(store.path());
+    std::fs::remove_file(store.path()).unwrap();
+    std::fs::remove_file(dir.path().join(format!("{}.session", ids[0]))).unwrap();
+    let wallet = app::Wallet::restore(config(), &file).unwrap();
+    assert_eq!(read(store.path()), store_file);
+    assert!(session::SessionFile::load(&store).unwrap().is_some());
+    assert_eq!(wallet.running().unwrap().as_ref(), Some(&ids[0]));
+    drop(wallet);
 
     let refused = |config: app::Config, file: &str| {
         app::Wallet::restore(config, file)
@@ -4840,6 +4869,16 @@ fn a_recovery_file_restores_natively_and_backs_up_as_it_was() {
     assert!(refused(app_config(d.path()), &old).contains("state version"));
     let sellers = recovery(&key.wif, vec![recorded(4, &seller, &[], true)]);
     assert!(refused(app_config(d.path()), &sellers).contains("not a buyer"));
+    // Its id names its files: its offer's, once.
+    for id in ["../escaped".into(), hex::encode([9; 32])] {
+        let mut renamed = untaken.clone();
+        renamed["swap_id"] = id.into();
+        let file = recovery(&key.wif, vec![renamed]);
+        assert!(refused(app_config(d.path()), &file).contains("is not its offer"));
+    }
+    let twice = recovery(&key.wif, vec![untaken.clone(), untaken.clone()]);
+    assert!(refused(app_config(d.path()), &twice).contains("in the file twice"));
+    assert!(!d.path().join("wallet.json").exists());
     // A swap that ended beside one that runs: one runs.
     let done = recorded(6, &Buyer::Done(Outcome::Refunded), &[], true);
     let ended = recovery(&key.wif, vec![taken.clone(), done]);
@@ -4854,4 +4893,173 @@ fn a_recovery_file_restores_natively_and_backs_up_as_it_was() {
     // Held untaken here, taken in the file.
     let ahead = recovery(&key.wif, vec![recorded(2, &buyer, &[], true)]);
     assert!(refused(config(), &ahead).contains("untaken"));
+}
+
+/// The `setup` a buyer's state holds, wherever it holds it.
+#[cfg(feature = "native")]
+fn setup_of(state: &serde_json::Value) -> Option<serde_json::Value> {
+    let fields = state.as_object()?;
+    fields
+        .get("setup")
+        .cloned()
+        .or_else(|| fields.values().find_map(setup_of))
+}
+
+/// One wallet holds its directory at a time, across processes as the
+/// browser's Web Lock across tabs: a second open or restore is refused
+/// until the first is dropped.
+#[cfg(feature = "native")]
+#[test]
+fn one_wallet_holds_its_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = || app_config(dir.path());
+    let wallet = app::Wallet::open(config()).unwrap();
+    let refused = |result: crate::session::Result<_>| result.err().unwrap().to_string();
+    assert!(refused(app::Wallet::open(config())).contains("open elsewhere"));
+    let (_, file) = wallet.backup().unwrap();
+    assert!(refused(app::Wallet::restore(config(), &file)).contains("open elsewhere"));
+    let address = wallet.address().to_string();
+    drop(wallet);
+    let again = app::Wallet::open(config()).unwrap();
+    assert_eq!(again.address(), address);
+    drop(again);
+    app::Wallet::restore(config(), &file).unwrap();
+}
+
+/// The key file is put, never put over: a second key leaves the first,
+/// and nothing is left beside it.
+#[cfg(feature = "native")]
+#[test]
+fn a_wallet_key_file_is_never_overwritten() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = app_config(dir.path());
+    let first = wallet::Key::new("regtest").unwrap();
+    let second = wallet::Key::new("regtest").unwrap();
+    assert_eq!(app::put_key(&config, &first).unwrap().wif, first.wif);
+    assert_eq!(app::put_key(&config, &second).unwrap().wif, first.wif);
+    let mut names: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["wallet.json"]);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(dir.path().join("wallet.json"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+}
+
+/// A taken swap resumes only on the config's Nexus, through a node that
+/// passes the check the CLI's `resume` makes; a punished one is listed
+/// apart from the one that runs, for a launch to resume it and ask for
+/// `s`; and the wallet withdraws nothing while a swap runs.
+#[cfg(feature = "native")]
+#[test]
+fn a_taken_swap_resumes_on_its_nexus_and_a_punished_one_is_listed() {
+    let key = wallet::Key::new("regtest").unwrap();
+    let Locked { buyer, .. } = locked();
+    let taken = recorded(1, &buyer, &[], true);
+    let mut punished = recorded(3, &buyer, &[], true);
+    let setup = setup_of(&serde_json::to_value(&buyer).unwrap()).unwrap();
+    punished["state"] = json!({"Punished": {"setup": setup, "seen": false}});
+    serde_json::from_value::<Buyer>(punished["state"].clone()).unwrap();
+    let file = recovery(&key.wif, vec![taken]);
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("cookie"), "__cookie__:x").unwrap();
+    let wallet = app::Wallet::restore(app_config(dir.path()), &file).unwrap();
+    let running = hex::encode([1; 32]);
+    let refused = wallet
+        .withdraw("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080")
+        .unwrap_err();
+    assert!(refused.to_string().contains("is running"), "{refused}");
+
+    // Punished: kept by its swap file as the driver leaves it.
+    let ended = Store::new(dir.path(), [3; 32]);
+    let record = json!({
+        "swap_id": punished["swap_id"], "offer": punished["offer"],
+        "policy": punished["policy"], "state": punished["state"].to_string(),
+        "pending": [], "taken": true, "nex_address": BUYER_NEX,
+    });
+    std::fs::write(
+        dir.path().join(format!("{}.record", hex::encode([3; 32]))),
+        record.to_string(),
+    )
+    .unwrap();
+    let state: Buyer = serde_json::from_value(punished["state"].clone()).unwrap();
+    ended.create(&state).unwrap();
+    assert_eq!(wallet.punished().unwrap(), [hex::encode([3; 32])]);
+    assert_eq!(wallet.running().unwrap(), Some(running.clone()));
+
+    // Each run stops at its second look at `stop`.
+    let run = |wallet: &std::sync::Arc<app::Wallet>, id: &str| {
+        let looks = std::cell::Cell::new(0);
+        let buy = wallet.resume(id).unwrap();
+        buy.run(|| {
+            looks.set(looks.get() + 1);
+            looks.get() > 1
+        })
+        .map_err(|e| e.to_string())
+    };
+    // The node is checked first: one that cannot be reached refuses.
+    let failed = run(&wallet, &running).unwrap_err();
+    assert!(failed.contains("127.0.0.1:9"), "{failed}");
+    let failed = run(&wallet, &hex::encode([3; 32])).unwrap_err();
+    assert!(failed.contains("127.0.0.1:9"), "{failed}");
+    drop(wallet);
+    // Another Nexus than the swap's.
+    let mut config = app_config(dir.path());
+    config.nexus_genesis = swap_nexus_tx::cid(b"dev");
+    let wallet = app::Wallet::open(config).unwrap();
+    let failed = run(&wallet, &running).unwrap_err();
+    assert!(
+        failed.contains("trades on the Nexus of genesis"),
+        "{failed}"
+    );
+}
+
+/// A swap not yet taken cancels, and its run then never takes it, even
+/// one waiting on the wallet; a taken one refuses.
+#[cfg(feature = "native")]
+#[test]
+fn a_swap_cancels_until_it_takes_its_offer() {
+    let key = wallet::Key::new("regtest").unwrap();
+    let Locked { buyer, .. } = locked();
+    let (fresh, hello) =
+        Buyer::start(terms(), key.script_pubkey.clone(), BUYER_NEX.into()).unwrap();
+    let file = recovery(
+        &key.wif,
+        vec![
+            recorded(1, &buyer, &[], true),
+            recorded(2, &fresh, &hello, false),
+        ],
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = app_config(dir.path());
+    config.poll = Duration::from_millis(20);
+    let wallet = app::Wallet::restore(config, &file).unwrap();
+    let taken = wallet.resume(&hex::encode([1; 32])).unwrap();
+    let refused = taken.cancel().unwrap_err().to_string();
+    assert!(refused.contains("has taken its offer"), "{refused}");
+
+    // Waiting on a wallet it cannot read, cancelled from another thread.
+    let id = hex::encode([2; 32]);
+    let buy = std::sync::Arc::new(wallet.resume(&id).unwrap());
+    let running = buy.clone();
+    let run = std::thread::spawn(move || running.run(|| false).map_err(|e| e.to_string()));
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(!run.is_finished());
+    buy.cancel().unwrap();
+    assert_eq!(run.join().unwrap(), Ok(None));
+    assert!(!wallet.swaps().unwrap().contains(&id));
+    // Cancelled before it runs: it never looks at the wallet.
+    drop((buy, taken, wallet));
+    let wallet = app::Wallet::restore(app_config(dir.path()), &file).unwrap();
+    let buy = wallet.resume(&id).unwrap();
+    buy.cancel().unwrap();
+    assert_eq!(buy.run(|| false).map_err(|e| e.to_string()), Ok(None));
 }

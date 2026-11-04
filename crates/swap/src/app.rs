@@ -11,7 +11,8 @@
 //! drops it while it has not taken its offer. One swap runs at a time, and
 //! the wallet withdraws nothing while one does. A swap that has taken its
 //! offer carries on after a restart from [`Wallet::running`] and
-//! [`Wallet::resume`].
+//! [`Wallet::resume`]; a punished one, from [`Wallet::punished`], asks the
+//! seller for `s` once each launch it is resumed.
 //!
 //! Everything is kept in one directory: the wallet key as `wallet.json`,
 //! each swap's record as `<swap id>.record`, as the browser keeps them in
@@ -19,7 +20,7 @@
 //! and session file beside it. The recovery file, [`Wallet::backup`] and
 //! [`Wallet::restore`], is the browser's, so a wallet and its swaps move
 //! between the two either way. `wallet.json` is itself a recovery file
-//! holding no swap.
+//! holding no swap. One [`Wallet`] holds the directory at a time.
 
 use std::fs;
 use std::io::{self, Write};
@@ -60,6 +61,8 @@ pub fn default_esplora(network: Network) -> Option<&'static str> {
 const FORMAT: &str = "lattice-swap-wallet";
 /// The wallet key's file.
 const WALLET: &str = "wallet.json";
+/// The file whose lock a [`Wallet`] holds the directory by.
+const LOCK: &str = "wallet.lock";
 /// The blocks the offer's fee floor reads an estimate for, as the CLI's.
 const FEE_TARGET: &str = "6";
 /// About ten minutes a Bitcoin block.
@@ -149,6 +152,78 @@ fn ended(state: &Value) -> bool {
         || state.get("Punished").is_some()
 }
 
+/// The directory held for one [`Wallet`], as bitcoind holds its data
+/// directory by the lock on its `.lock` file and refuses to start beside
+/// another, and as the browser holds its wallet by a Web Lock. Released
+/// when the file is dropped, or its process ends.
+fn hold(config: &Config) -> Result<fs::File> {
+    fs::create_dir_all(&config.dir)?;
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(config.dir.join(LOCK))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(fs::TryLockError::WouldBlock) => Err(format!(
+            "refused: the wallet in {} is open elsewhere",
+            config.dir.display()
+        )
+        .into()),
+        Err(fs::TryLockError::Error(e)) => Err(e.into()),
+    }
+}
+
+/// The key in the directory's `wallet.json`, if it holds one.
+fn read_key(config: &Config) -> Result<Option<Key>> {
+    let path = config.dir.join(WALLET);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let held: Recovery =
+        serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    if held.network != config.network {
+        return Err(format!(
+            "{} is a wallet for {}, not {}",
+            path.display(),
+            held.network,
+            config.network
+        )
+        .into());
+    }
+    Ok(Some(Key::of(&held.wallet, &config.network.to_string())?))
+}
+
+/// `key` saved as the directory's `wallet.json` unless it holds one
+/// already, never over it, as git puts an object file: written whole to a
+/// temporary file, then linked to its name, which fails if the name is
+/// taken, the directory synced. The key the directory then holds.
+pub(crate) fn put_key(config: &Config, key: &Key) -> Result<Key> {
+    let temporary = config.dir.join(format!("{WALLET}.tmp"));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(&temporary)?;
+    file.write_all(&serde_json::to_vec(&Recovery {
+        format: FORMAT.into(),
+        network: config.network,
+        wallet: key.wif.clone(),
+        swaps: vec![],
+    })?)?;
+    file.sync_all()?;
+    match fs::hard_link(&temporary, config.dir.join(WALLET)) {
+        Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e.into()),
+        _ => {}
+    }
+    fs::remove_file(&temporary)?;
+    #[cfg(unix)]
+    fs::File::open(&config.dir)?.sync_all()?;
+    Ok(read_key(config)?.ok_or("wallet.json is gone")?)
+}
+
 /// A buyer's state as a swap file holds it, as the CLI's `resume` reads
 /// one: refused if it is a seller's.
 fn buyer_state(state: Value) -> Result<Buyer> {
@@ -181,58 +256,28 @@ pub struct Wallet {
     /// Held while the wallet's outputs are counted on, as the browser's
     /// swap lock and eigenwallet's `SwapLock`: a withdrawal, a swap
     /// prepared, or one taking its offer until it is saved as taken.
+    /// Across processes, [`hold`] keeps any other `Wallet` out of the
+    /// directory.
     lock: Mutex<()>,
+    _held: fs::File,
 }
 
 impl Wallet {
     /// The wallet in `config.dir`, its key made and saved first if there is
     /// none.
+    /// Refused while another `Wallet` holds the directory.
     pub fn open(config: Config) -> Result<Arc<Self>> {
-        fs::create_dir_all(&config.dir)?;
-        let path = config.dir.join(WALLET);
-        if !path.exists() {
-            let key = Key::new(&config.network.to_string())?;
-            // Never over a key made since: as Bitcoin Core's `createwallet`
-            // refuses to overwrite a wallet.
-            let mut options = fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-            match options.open(&path) {
-                Ok(mut file) => {
-                    file.write_all(&Self::key_file(&config, &key)?)?;
-                    file.sync_all()?;
-                }
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(e) => return Err(e.into()),
-            }
-        }
-        let held: Recovery = serde_json::from_slice(&fs::read(&path)?)
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-        if held.network != config.network {
-            return Err(format!(
-                "{} is a wallet for {}, not {}",
-                path.display(),
-                held.network,
-                config.network
-            )
-            .into());
-        }
-        let key = Key::of(&held.wallet, &config.network.to_string())?;
+        let held = hold(&config)?;
+        let key = match read_key(&config)? {
+            Some(key) => key,
+            None => put_key(&config, &Key::new(&config.network.to_string())?)?,
+        };
         Ok(Arc::new(Self {
             config,
             key,
             lock: Mutex::new(()),
+            _held: held,
         }))
-    }
-
-    fn key_file(config: &Config, key: &Key) -> Result<Vec<u8>> {
-        Ok(serde_json::to_vec(&Recovery {
-            format: FORMAT.into(),
-            network: config.network,
-            wallet: key.wif.clone(),
-            swaps: vec![],
-        })?)
     }
 
     /// Where the buyer deposits.
@@ -342,6 +387,22 @@ impl Wallet {
         Ok(None)
     }
 
+    /// The swaps that ended punished, which keep their secrets: resumed,
+    /// each asks the seller for `s` once more, as the CLI's `resume` and
+    /// the browser's `Buyer.resume` ask, and as eigenwallet asks its ASB
+    /// to redeem cooperatively on every resume.
+    pub fn punished(&self) -> Result<Vec<String>> {
+        let mut ids = vec![];
+        for id in self.swaps()? {
+            if let Some(record) = self.record(&id)? {
+                if self.state(&record)?.get("Punished").is_some() {
+                    ids.push(id);
+                }
+            }
+        }
+        Ok(ids)
+    }
+
     /// Sends the whole spendable balance to `address`, less its fee: the
     /// txid. Not while a swap runs, whose funding spends the same outputs.
     pub fn withdraw(&self, address: &str) -> Result<Txid> {
@@ -410,15 +471,13 @@ impl Wallet {
             );
         }
         let key = Key::of(&backup.wallet, &config.network.to_string())?;
-        fs::create_dir_all(&config.dir)?;
-        let path = config.dir.join(WALLET);
-        if path.exists() {
-            let held = Wallet::open(config.clone())?;
-            if held.key.wif != key.wif {
-                return Err("refused: the directory holds another wallet".into());
-            }
+        let held = hold(&config)?;
+        let another = || Err("refused: the directory holds another wallet".into());
+        if read_key(&config)?.is_some_and(|held| held.wif != key.wif) {
+            return another();
         }
         let mut restored = vec![];
+        let mut ids = std::collections::BTreeSet::new();
         for mut swap in backup.swaps {
             // The state version and side checked as the CLI's `resume`
             // checks them.
@@ -440,18 +499,30 @@ impl Wallet {
                 fields.remove("version");
             }
             let record: Record = serde_json::from_value(swap)?;
-            restored.push((record, state));
+            // Its id names its files: the offer's, once each.
+            let offer = Offer::decode(&record.offer.to_string())?;
+            if record.swap_id != hex::encode(offer.template.swap_id) {
+                return Err(format!("swap {:?} is not its offer's", record.swap_id).into());
+            }
+            if !ids.insert(record.swap_id.clone()) {
+                return Err(format!("swap {} is in the file twice", record.swap_id).into());
+            }
+            restored.push((record, state, offer));
         }
         let wallet = Arc::new(Self {
             config: config.clone(),
             key: key.clone(),
             lock: Mutex::new(()),
+            _held: held,
         });
         let _lock = wallet.exclusive();
+        // Those it lacks, and taken ones whose swap file a restore that
+        // stopped part way never made.
         let mut added = vec![];
-        for (record, state) in restored {
+        for (record, state, offer) in restored {
+            let store = wallet.store(&record.swap_id)?;
             match wallet.record(&record.swap_id)? {
-                None => added.push((record, state)),
+                None => added.push((record, state, offer)),
                 Some(held) if !wallet.taken(&held)? && record.taken => {
                     return Err(format!(
                         "refused: the directory holds swap {} untaken, and the file holds it taken",
@@ -459,33 +530,36 @@ impl Wallet {
                     )
                     .into())
                 }
+                Some(held) if held.taken && !store.path().exists() => {
+                    added.push((record, state, offer))
+                }
                 Some(_) => {}
             }
         }
-        let mut runs = vec![];
-        if let Some(running) = wallet.running()? {
-            runs.push(running);
-        }
-        for (record, _) in &added {
+        let mut runs = std::collections::BTreeSet::new();
+        runs.extend(wallet.running()?);
+        for (record, _, _) in &added {
             if record.taken {
-                runs.push(record.swap_id.clone());
+                runs.insert(record.swap_id.clone());
             }
         }
         if runs.len() > 1 {
+            let runs: Vec<_> = runs.into_iter().collect();
             return Err(format!(
                 "refused: swaps {} would both run; one swap at a time",
                 runs.join(" and ")
             )
             .into());
         }
-        if !path.exists() {
-            write(&path, &Self::key_file(&config, &key)?)?;
+        if put_key(&config, &key)?.wif != key.wif {
+            return another();
         }
-        for (record, state) in added {
+        // The record first: a swap is listed before it can run.
+        for (record, state, offer) in added {
+            wallet.save(&record)?;
             if record.taken {
                 let store = wallet.store(&record.swap_id)?;
                 store.create(&state)?;
-                let offer: Offer = serde_json::from_value(record.offer.clone())?;
                 SessionFile {
                     offer,
                     key: None,
@@ -493,10 +567,9 @@ impl Wallet {
                 }
                 .save(&store)?;
             }
-            wallet.save(&record)?;
         }
         drop(_lock);
-        Wallet::open(config)
+        Ok(wallet)
     }
 
     /// Why this wallet refuses `offer` under `policy`, as the CLI's `take`
@@ -658,8 +731,23 @@ impl Buy {
                 return Ok(None);
             }
             if wallet.taken(&record)? {
+                // As the CLI's `resume` checks a swap and its node, and
+                // the browser's `#checkNexus`.
+                let buyer: Buyer = serde_json::from_value(wallet.state(&record)?)?;
+                let genesis = &wallet.config.nexus_genesis;
+                if let Some(terms) = buyer.terms().filter(|t| &t.nexus_genesis != genesis) {
+                    return Err(format!(
+                        "refused: swap {} trades on the Nexus of genesis {}, not {genesis}",
+                        record.swap_id, terms.nexus_genesis
+                    )
+                    .into());
+                }
+                let nexus = wallet.nexus()?;
+                if buyer.resumed().outcome().is_none() {
+                    wallet.check_nexus(&nexus)?;
+                }
                 let store = wallet.store(&record.swap_id)?;
-                break session::resume::<Buyer, _>(wallet.esplora(), wallet.nexus()?, store)?;
+                break session::resume::<Buyer, _>(wallet.esplora(), nexus, store)?;
             }
             match self.take() {
                 Ok(Some(driver)) => break driver,
@@ -782,21 +870,20 @@ impl Buy {
             true => None,
             false => Some(wallet.need(policy.btc_amount)?.1),
         };
-        let (view, tip) = match buyer.watch().bitcoin {
-            Some((swap, lock)) => {
-                let view = bitcoin_view(
-                    &esplora,
-                    &swap,
-                    lock,
-                    wallet.config.max_tip_age,
-                    SystemTime::now(),
-                    &mut None,
-                )?;
-                let height = view.height;
-                (Some(view), Some(height))
-            }
-            None => (None, None),
+        // None while the tip moves under the read, as the browser's
+        // status keeps no view until it reads one.
+        let view = match buyer.watch().bitcoin {
+            Some((swap, lock)) => bitcoin_view(
+                &esplora,
+                &swap,
+                lock,
+                wallet.config.max_tip_age,
+                SystemTime::now(),
+                &mut None,
+            )?,
+            None => None,
         };
+        let tip = view.as_ref().map(|view| view.height);
         let machine = crate::status::buyer_status(&buyer, view.as_ref());
         let offer: Offer = serde_json::from_value(record.offer.clone())?;
         let terms = match buyer.terms() {

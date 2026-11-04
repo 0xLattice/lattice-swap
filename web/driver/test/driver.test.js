@@ -4,6 +4,7 @@ import 'fake-indexeddb/auto';
 
 import { Buyer, IndexedDBStore, MemoryStore, Wallet } from '../src/index.js';
 import { call } from '../src/wasm.js';
+import { Esplora } from '../src/esplora.js';
 import { PINGS_MISSED, Session } from '../src/relay.js';
 import { Chain, esplora, kind, Locks, loadWasm, nexus, parseTx, POLICY, seller, testOffer, until } from './fakes.js';
 
@@ -1060,5 +1061,23 @@ test('Wallet.exists with no store given closes the one it opens', async () => {
     });
   } finally {
     globalThis.indexedDB = indexedDB;
+  }
+});
+
+test('an Esplora that answers a txid with another transaction is refused', async () => {
+  const chain = new Chain();
+  // One input, one output of 1 sat to an empty script.
+  const hex = `02000000 01 ${'11'.repeat(32)} 00000000 00 ffffffff 01 0100000000000000 00 00000000`.replaceAll(' ', '');
+  const { txid } = parseTx(hex);
+  const forged = 'ff'.repeat(32);
+  chain.txs.set(txid, { hex, height: null });
+  chain.txs.set(forged, { hex, height: null });
+  const server = await esplora(chain);
+  try {
+    const backend = new Esplora(server.url);
+    assert.deepEqual(await backend.transaction(txid), { hex, height: null });
+    await assert.rejects(backend.transaction(forged), /another transaction/);
+  } finally {
+    server.close();
   }
 });

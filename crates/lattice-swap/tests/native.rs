@@ -2,6 +2,8 @@
 //! over a regtest bitcoind: what it reads, its single-key wallet's funding,
 //! and its fee bumps through `POST /txs/package`.
 
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpListener;
 use std::time::Duration;
 
 use bitcoin::hashes::Hash;
@@ -10,6 +12,7 @@ use bitcoin::{absolute, Amount, FeeRate, OutPoint, ScriptBuf, Sequence};
 use bitcoin::{Transaction, TxIn, TxOut, WPubkeyHash, Witness};
 use corepc_node::{Conf, Node};
 use serde_json::json;
+use swap::app::{Config, Wallet};
 use swap::bitcoind::{Bitcoin, Bitcoind};
 use swap::esplora::Esplora;
 use swap::wallet::{self, Key};
@@ -169,4 +172,91 @@ fn esplora_reads_funds_and_bumps() {
     let elsewhere = parent(&key, payout, low.output[0].value.to_sat(), lock, 200);
     let refused = esplora.bump(&elsewhere, Amount::from_sat(200), ten, max);
     assert!(refused.is_err_and(|e| e.0.contains("not this wallet's")));
+}
+
+/// The app's wallet withdraws its whole spendable balance, less the fee,
+/// to an address on its network only.
+#[test]
+fn the_wallet_withdraws_all_it_can_spend() {
+    let mut conf = Conf::default();
+    conf.args.push("-txindex");
+    let node = Node::from_downloaded_with_conf(&conf).expect("start bitcoind");
+    mine(&node, 101);
+    let rpc = bitcoind(&node);
+    let dir = tempfile::tempdir().unwrap();
+    let unreachable = "http://127.0.0.1:9".to_string();
+    let config = Config::new(
+        dir.path().into(),
+        bitcoin::Network::Regtest,
+        esplora::esplora(bitcoind(&node)),
+        unreachable,
+        dir.path().join("cookie"),
+        swap_nexus_tx::MAINNET_GENESIS.into(),
+    );
+    let wallet = Wallet::open(config).unwrap();
+    let empty = wallet.withdraw(&node.client.new_address().unwrap().to_string());
+    assert!(empty.unwrap_err().to_string().contains("nothing spendable"));
+    for _ in 0..2 {
+        rpc.call("sendtoaddress", json!([wallet.address(), 0.5]))
+            .unwrap();
+    }
+    mine(&node, 1);
+    assert_eq!(wallet.balance().unwrap(), (100_000_000, 0));
+    let mainnet = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+    assert!(wallet.withdraw(mainnet).is_err());
+    let to = node.client.new_address().unwrap();
+    let txid = wallet.withdraw(&to.to_string()).unwrap();
+    let tx = rpc
+        .call("getrawtransaction", json!([txid.to_string(), true]))
+        .unwrap();
+    assert_eq!(tx["vin"].as_array().unwrap().len(), 2);
+    let [out] = &tx["vout"].as_array().unwrap()[..] else {
+        panic!("one output: {tx}");
+    };
+    assert_eq!(out["scriptPubKey"]["address"], to.to_string());
+    let paid = (out["value"].as_f64().unwrap() * 1e8).round() as u64;
+    assert!(paid < 100_000_000 && paid > 100_000_000 - 1_000, "{paid}");
+    mine(&node, 1);
+    assert_eq!(wallet.balance().unwrap(), (0, 0));
+}
+
+/// An Esplora that answers `/tx/{txid}/hex` with another transaction: it
+/// is trusted for where a transaction is, never for what it is.
+#[test]
+fn esplora_refuses_another_transaction_for_a_txid() {
+    let other = Transaction {
+        version: Version::TWO,
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![],
+        output: vec![TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: ScriptBuf::new(),
+        }],
+    };
+    let hex = bitcoin::consensus::encode::serialize_hex(&other);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).unwrap();
+            let body = match line.split(' ').nth(1).unwrap() {
+                path if path.ends_with("/hex") => hex.clone(),
+                _ => json!({"status": {"confirmed": false}, "fee": 0, "weight": 400}).to_string(),
+            };
+            let answer = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(answer.as_bytes()).unwrap();
+        }
+    });
+    let key = Key::new("regtest").unwrap();
+    let esplora = Esplora::new(&url, key, TIMEOUT);
+    let asked = bitcoin::Txid::from_byte_array([9; 32]);
+    let refused = esplora.transaction(asked).unwrap_err();
+    assert!(refused.0.contains("another transaction"), "{refused}");
+    let (seen, depth) = esplora.transaction(other.compute_txid()).unwrap().unwrap();
+    assert_eq!((seen, depth), (other, 0));
 }

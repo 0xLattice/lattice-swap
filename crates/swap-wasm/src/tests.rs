@@ -894,6 +894,18 @@ fn an_address_pays_its_script_on_its_network_only() {
     assert_eq!(script_of(address, "regtest").unwrap(), key["script_pubkey"]);
     assert!(script_of(address, "bitcoin").is_err());
     assert!(script_of("nonsense", "regtest").is_err());
+    let tx = bitcoin::Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![],
+        output: vec![bitcoin::TxOut {
+            value: bitcoin::Amount::from_sat(1),
+            script_pubkey: ScriptBuf::new(),
+        }],
+    };
+    let hex = bitcoin::consensus::encode::serialize_hex(&tx);
+    assert_eq!(txid_of(&hex).unwrap(), tx.compute_txid().to_string());
+    assert!(txid_of("00").is_err());
 }
 
 /// The offer the driver's JavaScript tests take, as its seller signed it:

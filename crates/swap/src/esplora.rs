@@ -268,7 +268,13 @@ impl Bitcoin for Esplora {
         let Some(hex) = self.get(&format!("/tx/{txid}/hex"), true)? else {
             return Ok(None);
         };
-        let tx = deserialize_hex(hex.trim()).map_err(|e| Error(format!("/tx/{txid}/hex: {e}")))?;
+        let tx: Transaction =
+            deserialize_hex(hex.trim()).map_err(|e| Error(format!("/tx/{txid}/hex: {e}")))?;
+        // Trusted for where a transaction is, never for what it is: a
+        // forged refund would read as a punish.
+        if tx.compute_txid() != txid {
+            return Err(Error(format!("/tx/{txid}/hex is another transaction")));
+        }
         let confirmations = match (shown.status.confirmed, shown.status.block_height) {
             (true, Some(height)) => (self.tip_height()? + 1).saturating_sub(height),
             _ => 0,

@@ -1301,6 +1301,8 @@ fn the_native_buyer_closed_after_the_lock_resumes_at_launch() {
     );
     assert_eq!(world.state("native", &swap_id), "AwaitNexLock");
     buyer.close();
+    // The app closed: its wallet lets go of the directory.
+    drop(buyer);
     world.drive(
         false,
         || true,
@@ -1373,6 +1375,7 @@ fn the_browsers_recovery_file_restores_natively() {
         restored.running().unwrap().as_deref(),
         Some(swap_id.as_str())
     );
+    drop(restored);
     let mut buyer = world.native_resume("native");
     let (seller_out, outcome) = world.finish_both(&mut seller, &mut buyer, seller_out);
     assert_eq!(seller_out, "outcome: Swapped\n");
