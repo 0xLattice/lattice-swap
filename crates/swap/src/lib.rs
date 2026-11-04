@@ -61,6 +61,8 @@ pub mod driver;
 pub mod offer;
 mod seller;
 #[cfg(feature = "native")]
+pub mod session;
+#[cfg(feature = "native")]
 pub mod transport;
 pub mod view;
 

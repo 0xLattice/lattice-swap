@@ -2,6 +2,9 @@ use super::*;
 use bitcoin::hashes::Hash;
 use bitcoin::{OutPoint, WScriptHash};
 use clap::CommandFactory;
+use serde_json::Value;
+use swap::driver::Reconnect;
+use swap::session::request_terms;
 use swap::transport::PeerKey;
 use swap::{btc_amount_floor, btc_fee_at};
 use swap_bitcoin::{KeyPair, Params, Scalar, Spend, Swap};
@@ -1226,6 +1229,58 @@ fn an_amount_that_cannot_pay_redeem_is_refused() {
     };
     let refused = check_offer(&offer, &policy, network, MAINNET, FLOOR, NEX_FLOOR).unwrap_err();
     assert!(refused.contains("redeem pays two btc_fee"), "{refused}");
+}
+
+/// The library's `take` checks the offer and the NEX address itself,
+/// before it dials anyone: a caller that skips them is refused all the
+/// same.
+#[test]
+fn take_checks_the_offer_itself() {
+    let (policy, network) = policy(&[]);
+    let directory = tempfile::tempdir().unwrap();
+    let unreachable = "http://127.0.0.1:1";
+    let take = |offer: Offer, nex_address: &str| {
+        let policy = policy.policy(&agreed());
+        swap::session::take(
+            offer,
+            &policy,
+            network,
+            MAINNET,
+            FLOOR,
+            NEX_FLOOR,
+            ScriptBuf::new(),
+            nex_address.into(),
+            Bitcoind::new(unreachable, "u:p", network, TIMEOUT),
+            Client::new(unreachable, "c", TIMEOUT),
+            Store::new(directory.path(), [7; 32]),
+        )
+        .err()
+        .unwrap()
+        .to_string()
+    };
+    let nex = swap_nexus_tx::cid(b"buyer");
+    let refused = take(agreed(), "bc1qexample");
+    assert!(refused.contains("is not a Nexus address"), "{refused}");
+    type Change = (&'static str, fn(&mut Offer));
+    let changes: [Change; 5] = [
+        ("network", |o| o.btc_network = Network::Testnet),
+        ("nexus", |o| {
+            o.template.nexus_genesis = swap_nexus_tx::cid(b"dev")
+        }),
+        ("btc fee", |o| o.template.btc_fee += Amount::from_sat(1)),
+        ("nex fee floor", |o| o.template.nex_fee -= 1),
+        ("t1", |o| o.template.t1 += 1),
+    ];
+    for (what, change) in changes {
+        let mut offer = agreed();
+        change(&mut offer);
+        let refused = take(offer, &nex);
+        assert!(
+            refused.starts_with("refused: the offer"),
+            "{what}: {refused}"
+        );
+    }
+    assert!(!Store::new(directory.path(), [7; 32]).path().exists());
 }
 
 /// The bump settings default to the driver's, and a fraction the driver
