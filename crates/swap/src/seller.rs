@@ -69,6 +69,18 @@ pub enum Seller {
         claim: Claiming,
     },
     ClaimingNex(Claim),
+    /// Punish is `btc_confirmations` deep, and the NEX lock, signed, may
+    /// have landed at the lock address, which only `s` and `b` together
+    /// spend. As eigenwallet's ASB answers a cooperative redeem after
+    /// punish, the seller gives the buyer `s` when it asks, if the swap
+    /// cost it at most [`MAX_LOSS_PART`] of `btc_amount`: `lost`, in sat,
+    /// all but what punish, less the fee of the child that bumped it, paid
+    /// it. Ends `Punished` once a synced node shows the lock address has
+    /// signed: the buyer claimed.
+    Punished {
+        locked: SellerLocked,
+        lost: u64,
+    },
     Done(Outcome),
 }
 
@@ -137,7 +149,8 @@ impl Seller {
             | LockingNex { locked, .. }
             | AwaitRedeemSignature { locked, .. }
             | Redeeming { locked, .. }
-            | Cancelling { locked, .. } => Some(&locked.setup.terms),
+            | Cancelling { locked, .. }
+            | Punished { locked, .. } => Some(&locked.setup.terms),
             ClaimingNex(claim) => Some(&claim.setup.terms),
             Done(_) => None,
         }
@@ -156,7 +169,8 @@ impl Seller {
             | LockingNex { locked, .. }
             | AwaitRedeemSignature { locked, .. }
             | Redeeming { locked, .. }
-            | Cancelling { locked, .. } => Some(&locked.setup.nex_address),
+            | Cancelling { locked, .. }
+            | Punished { locked, .. } => Some(&locked.setup.nex_address),
             ClaimingNex(claim) => Some(&claim.setup.nex_address),
             Done(_) => None,
         }
@@ -193,6 +207,14 @@ fn abort(refusal: Refusal) -> (Seller, Vec<Action>) {
 impl Machine for Seller {
     fn step(self, event: Event) -> (Self, Vec<Action>) {
         use Seller::*;
+        // `s` only once punish is deep: before, the buyer may still refund,
+        // and with `s` it would hold the BTC and the NEX.
+        if matches!(event, Event::Message(Message::ShareRequest))
+            && !matches!(self, Punished { .. })
+        {
+            let refused = ShareAnswer::Refused(ShareRefusal::NotPunished);
+            return (self, vec![Action::Send(Message::ShareAnswer(refused))]);
+        }
         match (self, event) {
             (
                 AwaitBuyerHello(start),
@@ -499,6 +521,25 @@ impl Machine for Seller {
                     Claimed::Drained => (Done(Outcome::Drained), vec![]),
                 }
             }
+            // Punish is deep: the BTC is ours, and `s` can only give the
+            // buyer the NEX.
+            (Punished { locked, lost }, Event::Message(Message::ShareRequest)) => {
+                let terms = &locked.setup.terms;
+                let answer = if lost <= terms.btc_amount.to_sat() / MAX_LOSS_PART {
+                    ShareAnswer::Share(locked.setup.secrets.share)
+                } else {
+                    ShareAnswer::Refused(ShareRefusal::MaxLoss)
+                };
+                let answer = Action::Send(Message::ShareAnswer(answer));
+                (Punished { locked, lost }, vec![answer])
+            }
+            (Punished { locked, lost }, Event::Nexus(view)) => {
+                if synced(&view.health) && view.lock.nonce > 0 {
+                    (Done(Outcome::Punished), vec![])
+                } else {
+                    (Punished { locked, lost }, vec![])
+                }
+            }
             (
                 AwaitBuyerHello(_) | AwaitLockProposal(_) | AwaitBuyerSignatures { .. },
                 Event::Timeout,
@@ -527,14 +568,16 @@ impl Machine for Seller {
         &[Spend::Redeem, Spend::Punish]
     }
 
-    /// Until it holds the redeem signature.
+    /// Until it holds the redeem signature; again once punished, for the
+    /// buyer to ask for `s`.
     fn rejoin(&self) -> Option<Rejoin> {
         use Seller::*;
         match self {
             AwaitLockProposal(setup) | AwaitBuyerSignatures { setup, .. } => Some(setup.rejoin()),
             AwaitFunding { locked, .. }
             | LockingNex { locked, .. }
-            | AwaitRedeemSignature { locked, .. } => Some(locked.setup.rejoin()),
+            | AwaitRedeemSignature { locked, .. }
+            | Punished { locked, .. } => Some(locked.setup.rejoin()),
             AwaitBuyerHello(_)
             | Redeeming { .. }
             | Cancelling { .. }
@@ -590,6 +633,13 @@ impl Machine for Seller {
                 margin: locked.setup.terms.margin,
             },
             ClaimingNex(claim) => claim.watch(),
+            // Punish is final at `btc_confirmations`, as everywhere else:
+            // only the lock address is watched, for the buyer's claim.
+            Punished { locked, .. } => Watch {
+                bitcoin: None,
+                nexus: locked.setup.watch_nexus(None),
+                margin: locked.setup.terms.margin,
+            },
             AwaitBuyerHello(_) | AwaitLockProposal(_) | AwaitBuyerSignatures { .. } | Done(_) => {
                 Watch {
                     bitcoin: None,
@@ -639,6 +689,33 @@ impl SellerLocked {
             .terms
             .cancel_due(view)
             .then(|| Action::Broadcast(self.setup.cancel(self.lock, &self.buyer_cancel)))
+    }
+
+    /// What the swap cost us, in sat, once `view` shows a punish in a block:
+    /// `btc_amount` but for what the punish pays, less the fee of the child
+    /// that bumped it, which spends its payout alone, output 0. Cancel and
+    /// punish each pay `btc_fee`, and the child what it took to beat a
+    /// refund the buyer bumped after `t2`, up to all of the payout.
+    fn lost(&self, view: &BitcoinView) -> u64 {
+        let punish = &view.cancel_spend.as_ref().expect("a punish").tx;
+        let value = |outputs: &[bitcoin::TxOut]| -> u64 {
+            outputs.iter().map(|out| out.value.to_sat()).sum()
+        };
+        let payout = OutPoint::new(punish.compute_txid(), 0);
+        let child =
+            view.punish_child.as_ref().map(|spent| &spent.tx).filter(
+                |child| matches!(&child.input[..], [input] if input.previous_output == payout),
+            );
+        let child_fee = match (child, punish.output.first()) {
+            (Some(child), Some(out)) => out.value.to_sat().saturating_sub(value(&child.output)),
+            _ => 0,
+        };
+        let received = value(&punish.output).saturating_sub(child_fee);
+        self.setup
+            .terms
+            .btc_amount
+            .to_sat()
+            .saturating_sub(received)
     }
 
     /// Punish, signed by us alone: valid once cancel is `t2` deep.
@@ -741,11 +818,19 @@ impl SellerLocked {
                     .as_ref()
                     .is_some_and(|spent| spent.confirmations >= terms.btc_confirmations) =>
                 {
-                    if let Claiming::Pending(mut claim) = claim {
-                        claim.punished = true;
-                        return (Seller::ClaimingNex(*claim), vec![]);
-                    }
-                    return (Seller::Done(Outcome::Punished), vec![]);
+                    return match claim {
+                        Claiming::Pending(mut claim) => {
+                            claim.punished = true;
+                            (Seller::ClaimingNex(*claim), vec![])
+                        }
+                        // The NEX may wait at the lock address: the buyer may
+                        // ask for `s`.
+                        Claiming::None if nex_lock.is_some() => {
+                            let lost = self.lost(&view);
+                            (Seller::Punished { locked: self, lost }, vec![])
+                        }
+                        _ => (Seller::Done(Outcome::Punished), vec![]),
+                    };
                 }
                 // Whatever the claim: recovering the BTC must not wait on
                 // Nexus.

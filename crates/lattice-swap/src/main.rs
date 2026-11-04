@@ -71,7 +71,10 @@ enum Command {
     /// Carries on a swap from its swap file until it ends, from the chains
     /// and, while the swap still needs one, a new session to the other
     /// party. A swap still waiting on a message cancels and refunds once its
-    /// timelocks allow, so `refund` is this same command.
+    /// timelocks allow, so `refund` is this same command. A punished buyer
+    /// asks the seller for its key share once on each resume, and claims
+    /// the NEX with it; a punished seller, here or in `offer`, keeps
+    /// running to give it, until the buyer has claimed.
     #[command(visible_alias = "refund")]
     Resume(SwapFileArgs),
     /// Prints a swap's state and outcome from its swap file. Asks no node.
@@ -968,6 +971,8 @@ fn resume(args: SwapFileArgs) -> Result<Outcome> {
             )
         }
         Saved::Buyer(buyer) => {
+            // A punished buyer asks the seller for `s` again.
+            let buyer = buyer.resumed();
             let bitcoin = args.nodes.bitcoin()?;
             let nexus = args.nodes.nexus()?;
             if buyer.outcome().is_none() {

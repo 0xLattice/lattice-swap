@@ -54,14 +54,14 @@ async function world({ store = new MemoryStore(), policy = POLICY, chain = new C
   // The states each message must already be saved in when it goes out: the
   // cancel signature goes again on a session met again once the funding is
   // out.
-  const expect = { Request: ['AwaitSellerHello'], BuyerHello: ['AwaitSellerHello'], LockProposal: ['AwaitSellerSignatures'], BuyerSignatures: ['SendingSignatures', 'AwaitNexLock'] };
+  const expect = { Request: ['AwaitSellerHello'], BuyerHello: ['AwaitSellerHello'], LockProposal: ['AwaitSellerSignatures'], BuyerSignatures: ['SendingSignatures', 'AwaitNexLock'], ShareRequest: ['AskingShare'] };
   w.seller = seller(w.offer, answer);
   const open = w.seller.open;
   w.seller.open = async (...args) => {
     const session = await open(...args);
     const send = session.send;
     session.send = (message) => {
-      const name = Object.keys(JSON.parse(message))[0];
+      const name = kind(message);
       w.checked = saved().then((record) => {
         // The request goes out before the swap is taken: nothing of it
         // is at stake until the seller has answered.
@@ -312,6 +312,54 @@ test('a run stopped and started again meets the seller again', async () => {
   sellerLocksNex(w, funding);
   const again = running(w.buyer);
   await cidArrives(w);
+  await again.stop();
+  await w.checked;
+  assert.deepEqual(w.unsaved, []);
+});
+
+/** What the seller does on `event`, its broadcasts. */
+function sellerSees(w, event) {
+  const { actions } = call('stepSeller', w.seller.state(), JSON.stringify(event));
+  w.seller.step(event);
+  return actions.filter((action) => action.Broadcast).map((action) => action.Broadcast);
+}
+
+test('a punished page asks the seller for s once a resume, and claims the NEX with it', async () => {
+  const { w, run, funding } = await funded({ extra: { messageTimeout: 300 } });
+  // The page goes before the NEX lock lands: it never signs the redeem.
+  await run.stop();
+  sellerLocksNex(w, funding);
+  const lockHeight = w.chain.height;
+  const view = (lockSpend, cancelSpend) => ({
+    Bitcoin: { height: w.chain.height, funding: w.chain.height - lockHeight + 1, lock_spend: lockSpend, cancel_spend: cancelSpend, stale: null },
+  });
+  w.chain.mine(TERMS.t1 - 1);
+  const [cancel] = sellerSees(w, view(null, null));
+  confirm(w, cancel);
+  w.chain.mine(TERMS.t2 - 1);
+  const [punish] = sellerSees(w, view({ tx: cancel, confirmations: TERMS.t2 }, null));
+  assert.equal(parseTx(punish).inputs[0].txid, parseTx(cancel).txid);
+  confirm(w, punish);
+  assert.equal(kind(w.seller.state()), 'Cancelling', 'the seller has not seen its punish deep');
+
+  // The page comes back to a deep punish. The seller, not yet punished in
+  // its own eyes, is nowhere to be met: the run ends punished, the
+  // secrets kept.
+  w.buyer = await Buyer.resume(w.wallet, w.buyer.swapId);
+  assert.equal(await running(w.buyer).done, 'punished');
+  const record = await w.store.get(`swap:${w.buyer.swapId}`);
+  assert.equal(kind(record.state), 'Punished');
+  assert.equal(w.buyer.status().running, false, 'another swap may run');
+
+  // Its punish deep, the seller gives `s` to the next resume, which claims.
+  sellerSees(w, view({ tx: cancel, confirmations: TERMS.t2 + 1 }, { tx: punish, confirmations: 1 }));
+  assert.equal(kind(w.seller.state()), 'Punished');
+  w.buyer = await Buyer.resume(w.wallet, w.buyer.swapId);
+  const again = running(w.buyer);
+  const state = async () => kind((await w.store.get(`swap:${w.buyer.swapId}`)).state);
+  await until(async () => (await state()) === 'ClaimingNex').catch((e) => assert.fail(`${e.message}: ${JSON.stringify(w.buyer.status())}`));
+  assert.equal(w.buyer.status().step, 'finishing');
+  assert.equal(w.seller.log.filter((message) => message === 'ShareRequest').length, 1);
   await again.stop();
   await w.checked;
   assert.deepEqual(w.unsaved, []);

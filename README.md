@@ -220,6 +220,14 @@ node's mempool minimum, and not capped by `--max-fee-rate`; never at the
 wallet's own estimate, which a freshly synced node lacks, and without
 `-fallbackfee` funds nothing.
 
+A buyer punished for missing its refund can still have the NEX, as
+eigenwallet's cooperative redeem after punish: `resume` meets the seller
+again and asks for its key share once, and claims the NEX with it. The
+seller gives it once its punish is `--btc-confirmations` deep, unless the
+swap cost it more than a quarter of the BTC in fees, and its `offer` or
+`resume` keeps running after the punish to give it, until the buyer has
+claimed.
+
 `offer`, `take` and `resume` exit 0 only when the swap swapped: 3 when it
 refunded, 4 punished, 5 drained, 6 aborted. 1 means an error stopped the
 tool before the swap ended; if the swap file exists by then, it prints the

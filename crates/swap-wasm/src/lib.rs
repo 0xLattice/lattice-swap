@@ -79,6 +79,13 @@ pub fn step_seller(state: &str, event: &str) -> Result<String> {
     step::<Seller>(state, event)
 }
 
+/// A buyer's `state` as a resumed swap carries on from it
+/// ([`Machine::resumed`]): a punished buyer asks the seller for `s` again.
+#[wasm_bindgen(js_name = resumeBuyer)]
+pub fn resume_buyer(state: &str) -> Result<String> {
+    text(&parse::<Buyer>(state)?.resumed())
+}
+
 /// Feeds `event` to a buyer's `state`: a step.
 #[wasm_bindgen(js_name = stepBuyer)]
 pub fn step_buyer(state: &str, event: &str) -> Result<String> {
@@ -530,7 +537,8 @@ pub fn nexus_submit_body(transaction: &str) -> Result<String> {
 ///
 /// - `phase` is `swapping` until the redeem is signed, `finishing` from
 ///   then, `refunding` once it cancels, then the outcome: `swapped`,
-///   `refunded`, `punished`, `drained` or `aborted`.
+///   `refunded`, `punished`, `drained` or `aborted`. A punished buyer
+///   asking the seller for `s`, or claiming with it, is `finishing`.
 /// - `must_stay_open` is [`Buyer::must_stay_open`].
 /// - `confirmations`: `{"funding", "lock_spend", "cancel_spend"}` as the
 ///   view shows them, each null where it shows none.
@@ -550,9 +558,12 @@ pub fn buyer_status(state: &str, view: Option<String>) -> Result<String> {
     let buyer: Buyer = parse(state)?;
     let view: Option<BitcoinView> = view.as_deref().map(parse).transpose()?;
     let phase = match &buyer {
-        Buyer::AwaitRedeem { .. } | Buyer::ClaimingNex(_) => "finishing",
+        Buyer::AwaitRedeem { .. } | Buyer::ClaimingNex(_) | Buyer::AskingShare { .. } => {
+            "finishing"
+        }
         Buyer::Cancelling { .. } => "refunding",
         Buyer::Done(outcome) => self::outcome(outcome),
+        Buyer::Punished { .. } => "punished",
         _ => "swapping",
     };
     let (mut cancel, mut refund, mut punish) = (None, None, None);

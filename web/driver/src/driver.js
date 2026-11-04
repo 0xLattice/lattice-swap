@@ -138,11 +138,18 @@ export class Buyer extends EventTarget {
    * Nexus node is checked by `run`, the first round it is needed, and a
    * failed check is a round's warning, retried the next, as eigenwallet
    * resumes a swap and retries its backends. A refunding swap watches no
-   * Nexus, and never waits on one.
+   * Nexus, and never waits on one. A punished swap asks the seller for
+   * `s` once again (`Buyer::resumed`), as eigenwallet asks its ASB to
+   * redeem cooperatively on every resume, and claims the NEX with it.
    * @returns {Promise<Buyer>} */
   static async resume(wallet, swapId) {
     const record = await wallet.config.store.get(swapKey(swapId));
     if (!record) throw new Error(`no swap ${swapId} in the store`);
+    const resumed = JSON.stringify(call('resumeBuyer', record.state));
+    if (resumed !== record.state) {
+      record.state = resumed;
+      await wallet.config.store.put(swapKey(swapId), record);
+    }
     return new Buyer(wallet, record, false);
   }
 

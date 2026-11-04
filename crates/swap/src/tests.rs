@@ -146,6 +146,7 @@ fn btc(
         lock_spend: spent(lock_spend),
         cancel_spend: spent(cancel_spend),
         stale: None,
+        punish_child: None,
     })
 }
 
@@ -463,7 +464,219 @@ fn a_silent_buyer_is_punished_after_t2() {
         panic!("punish");
     };
     let (seller, _) = seller.step(btc(31, Some((cancel, 11)), Some((punish, 1))));
+    assert!(
+        matches!(seller, Seller::Punished { .. }),
+        "its NEX lock landed"
+    );
+    assert_eq!(seller.outcome(), None);
+}
+
+/// Both parties once the buyer went dark before its redeem signature and
+/// missed its refund: the seller's punish is `btc_confirmations` deep, the
+/// NEX waits at the lock address, the buyer asks for `s`. With the
+/// seller's view of that punish, its payout spent by a child paying
+/// `child_fee`, if one is given.
+struct Punished {
+    seller: Seller,
+    buyer: Buyer,
+    ask: Message,
+    lock_address: String,
+}
+
+fn punished(child_fee: Option<u64>) -> Punished {
+    let locked = locked();
+    let lock_address = locked.lock_address();
+    let (seller, buyer, _) = locked.nex_locked();
+    let (seller, actions) = seller.step(btc(20, None, None));
+    let [cancel] = &broadcasts(&actions)[..] else {
+        panic!("cancel");
+    };
+    let (seller, actions) = seller.step(btc(30, Some((cancel, 10)), None));
+    let [punish] = &broadcasts(&actions)[..] else {
+        panic!("punish");
+    };
+    let Event::Bitcoin(view) = btc(31, Some((cancel, 11)), Some((punish, 1))) else {
+        unreachable!()
+    };
+    let punish_child = child_fee.map(|fee| Spent {
+        tx: punish_child(punish, fee),
+        confirmations: 1,
+    });
+    let (seller, none) = seller.step(Event::Bitcoin(BitcoinView {
+        punish_child,
+        ..view.clone()
+    }));
+    assert!(none.is_empty());
+    assert!(matches!(seller, Seller::Punished { .. }));
+    // The buyer comes back only now: its cancel is in a block, the punish
+    // deep on it.
+    let (buyer, actions) = buyer.step(Event::Bitcoin(view));
+    assert!(
+        broadcasts(&actions).is_empty(),
+        "no refund against a deep punish"
+    );
+    assert!(matches!(buyer, Buyer::AskingShare { .. }));
+    let ask = sent(&actions);
+    assert!(matches!(ask, Message::ShareRequest));
+    Punished {
+        seller,
+        buyer,
+        ask,
+        lock_address,
+    }
+}
+
+/// A child spending the punish's payout alone, paying `fee`.
+fn punish_child(punish: &Transaction, fee: u64) -> Transaction {
+    let payout = &punish.output[0];
+    Transaction {
+        version: bitcoin::transaction::Version::non_standard(3),
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::new(punish.compute_txid(), 0),
+            script_sig: ScriptBuf::new(),
+            sequence: bitcoin::Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: payout.value - Amount::from_sat(fee),
+            script_pubkey: payout.script_pubkey.clone(),
+        }],
+    }
+}
+
+/// As eigenwallet's ASB answers a cooperative redeem after punish: the
+/// punished buyer asks, the seller gives `s`, and the buyer claims the NEX
+/// with it, to its own address. The seller ends `Punished` once the lock
+/// address has signed; the buyer `Swapped`.
+#[test]
+fn a_punished_buyer_is_given_s_and_claims_the_nex() {
+    let Punished {
+        seller,
+        buyer,
+        ask,
+        lock_address,
+        ..
+    } = punished(None);
+    let (seller, actions) = seller.step(message(ask));
+    let answer = sent(&actions);
+    assert!(matches!(
+        answer,
+        Message::ShareAnswer(ShareAnswer::Share(_))
+    ));
+    assert!(
+        matches!(seller, Seller::Punished { .. }),
+        "it answers again"
+    );
+    let (buyer, none) = buyer.step(message(answer));
+    assert!(none.is_empty());
+    assert!(matches!(buyer, Buyer::ClaimingNex(_)));
+    let (buyer, actions) = restart(&buyer).step(nexus(account(500_000, 0), None));
+    let claim = submitted(&actions);
+    assert_eq!(
+        claim.body,
+        TransactionBody::transfer(&lock_address, BUYER_NEX, 499_900, 100, 0).unwrap()
+    );
+    assert!(claim.verify(), "signed with the joint key");
+    let (buyer, _) = buyer.step(nexus(account(0, 1), mined(claim.body.clone(), 1)));
+    assert_eq!(buyer.outcome(), Some(Outcome::Swapped));
+
+    // Until a synced node shows the claim, the seller waits, answering.
+    let (seller, _) = seller.step(nexus(account(500_000, 0), None));
+    let (seller, _) = seller.step(nexus_at(syncing(), account(0, 3), account(0, 1), None));
+    assert_eq!(seller.outcome(), None);
+    let (seller, _) = seller.step(nexus(account(0, 1), None));
     assert_eq!(seller.outcome(), Some(Outcome::Punished));
+}
+
+/// Before its punish is `btc_confirmations` deep the buyer may still
+/// refund, and `s` would give it both: the seller refuses. Refused, the
+/// buyer's run ends `Punished`, its secrets kept; a resume asks again.
+#[test]
+fn s_is_refused_until_the_punish_is_deep_and_asked_again_on_resume() {
+    let locked = locked();
+    let (seller, buyer, _) = locked.nex_locked();
+    let (seller, actions) = seller.step(btc(20, None, None));
+    let [cancel] = &broadcasts(&actions)[..] else {
+        panic!("cancel");
+    };
+    let (seller, actions) = seller.step(btc(30, Some((cancel, 10)), None));
+    let [punish] = &broadcasts(&actions)[..] else {
+        panic!("punish");
+    };
+    let not_deep = [
+        seller.clone(),
+        seller
+            .clone()
+            .step(btc(30, Some((cancel, 10)), Some((punish, 0))))
+            .0,
+        // Every state before it, and one that ended otherwise.
+        locked_with(terms()).seller,
+        Seller::Done(Outcome::Refunded),
+    ];
+    for seller in not_deep {
+        let (seller, actions) = seller.step(message(Message::ShareRequest));
+        assert!(
+            matches!(
+                sent(&actions),
+                Message::ShareAnswer(ShareAnswer::Refused(ShareRefusal::NotPunished))
+            ),
+            "{actions:?}"
+        );
+        assert!(!matches!(seller, Seller::Punished { .. }));
+    }
+
+    let (buyer, _) = buyer.step(btc(31, Some((cancel, 11)), Some((punish, 1))));
+    let refused = Message::ShareAnswer(ShareAnswer::Refused(ShareRefusal::NotPunished));
+    for end in [message(refused), Event::Timeout] {
+        let (ended, none) = buyer.clone().step(end);
+        assert!(none.is_empty());
+        assert_eq!(ended.outcome(), Some(Outcome::Punished));
+        assert!(ended.rejoin().is_none() && !ended.awaits_message());
+        let again = restart(&ended).resumed();
+        assert!(matches!(again, Buyer::AskingShare { .. }));
+        assert!(matches!(again.resend(), Some(Message::ShareRequest)));
+        assert!(again.rejoin().is_some() && again.awaits_message());
+    }
+}
+
+/// The buyer takes only the share the seller proved at the start: any other
+/// would sign a claim the lock address refuses.
+#[test]
+fn a_share_that_is_not_s_is_not_claimed_with() {
+    let Punished { buyer, .. } = punished(None);
+    for wrong in [[0; 32], KeyShare::random().to_bytes()] {
+        let answer = Message::ShareAnswer(ShareAnswer::Share(wrong));
+        let (buyer, none) = buyer.clone().step(message(answer));
+        assert!(none.is_empty());
+        assert_eq!(buyer.outcome(), Some(Outcome::Punished));
+    }
+}
+
+/// As eigenwallet's ASB refuses once a swap lost it more than a quarter of
+/// its amount: the seller counts cancel's and punish's fees, and the fee of
+/// the child that bumped its punish, which a buyer racing a refund after
+/// `t2` drives up, against `btc_amount`.
+#[test]
+fn s_is_refused_once_the_swap_cost_the_seller_over_a_quarter() {
+    // 1,000,000 sat: cancel and punish pay 1,000 each, so a child may pay
+    // up to 248,000 more.
+    let answer = |child_fee: Option<u64>| {
+        let Punished { seller, ask, .. } = punished(child_fee);
+        let (seller, actions) = seller.step(message(ask));
+        assert!(matches!(seller, Seller::Punished { .. }));
+        sent(&actions)
+    };
+    for fee in [None, Some(0), Some(248_000)] {
+        assert!(
+            matches!(answer(fee), Message::ShareAnswer(ShareAnswer::Share(_))),
+            "{fee:?}"
+        );
+    }
+    assert!(matches!(
+        answer(Some(248_001)),
+        Message::ShareAnswer(ShareAnswer::Refused(ShareRefusal::MaxLoss))
+    ));
 }
 
 #[test]
@@ -1014,6 +1227,7 @@ fn the_seller_waits_blocks_not_seconds_for_the_funding() {
             lock_spend: None,
             cancel_spend: None,
             stale: None,
+            punish_child: None,
         })
     };
     let unseen = |height| view(height, None);
@@ -1331,6 +1545,7 @@ fn a_buyer_whose_funding_does_not_show_keeps_its_secrets() {
             lock_spend: None,
             cancel_spend: None,
             stale: None,
+            punish_child: None,
         })
     };
     let (buyer, actions) = buyer.step(view(100));
@@ -1369,8 +1584,12 @@ fn a_punish_of_the_sellers_own_making_ends_punished() {
     );
     assert_eq!(buyer.outcome(), None);
     let (buyer, actions) = buyer.step(btc(32, Some((cancel, 12)), Some((&punish, 1))));
-    assert!(actions.is_empty(), "no refund once it is in a block");
-    assert_eq!(buyer.outcome(), Some(Outcome::Punished));
+    assert!(
+        broadcasts(&actions).is_empty(),
+        "no refund once it is in a block"
+    );
+    assert!(matches!(sends(&actions)[..], [Message::ShareRequest]));
+    assert!(matches!(buyer, Buyer::AskingShare { .. }));
 }
 
 /// The same from the seller's side: a punish of its own making ends it
@@ -1392,7 +1611,7 @@ fn the_seller_ends_on_a_punish_of_its_own_making() {
     assert_eq!(seller.outcome(), None);
     let (seller, actions) = seller.step(btc(32, Some((cancel, 12)), Some((&punish, 1))));
     assert!(actions.is_empty());
-    assert_eq!(seller.outcome(), Some(Outcome::Punished));
+    assert!(matches!(seller, Seller::Punished { .. }));
 }
 
 /// A seller that first sees the buyer's refund already deep still reads it
@@ -1522,6 +1741,9 @@ struct Node {
     saved: Vec<String>,
     /// The feerate each lock funding was asked at.
     funded: Vec<FeeRate>,
+    /// What [`Bitcoin::spender`] finds: each outpoint's spender, and the
+    /// height of its block.
+    spenders: Vec<(OutPoint, Transaction, u32)>,
 }
 
 #[cfg(feature = "native")]
@@ -1569,8 +1791,14 @@ impl Bitcoin for Fake {
         let pooled = node.mempool.iter().find(|tx| tx.compute_txid() == txid);
         Ok(pooled.map(|tx| (tx.clone(), 0)))
     }
-    fn spender(&self, _: OutPoint, _: u32) -> crate::bitcoind::Result<Option<(Transaction, u32)>> {
-        Ok(None)
+    fn spender(
+        &self,
+        outpoint: OutPoint,
+        from: u32,
+    ) -> crate::bitcoind::Result<Option<(Transaction, u32)>> {
+        let node = self.0.borrow();
+        let found = (node.spenders.iter()).find(|(spent, _, at)| *spent == outpoint && *at >= from);
+        Ok(found.map(|(_, tx, at)| (tx.clone(), node.height + 1 - at)))
     }
     fn fund_lock(
         &self,
@@ -2851,7 +3079,8 @@ fn the_buyer_ends_only_on_a_deep_refund_or_punish() {
         assert!(actions.is_empty(), "a spend in a block is waited for");
         assert_eq!(buyer.outcome(), None);
         let (buyer, _) = buyer.step(btc(23, Some((cancel, 3)), Some((&spend, 3))));
-        assert!(buyer.outcome().is_some());
+        let punished = matches!(buyer, Buyer::AskingShare { .. });
+        assert!(buyer.outcome() == Some(Outcome::Refunded) || punished);
     }
 }
 
@@ -3986,5 +4215,147 @@ fn a_session_dropped_closes_its_connection() {
         e.kind(),
         std::io::ErrorKind::TimedOut,
         "closed, not gone quiet: {e}"
+    );
+}
+
+/// A punished seller's driver, with `session` open, run for a few polls:
+/// what it sent.
+#[cfg(feature = "native")]
+fn punished_seller_sends(seller: Seller, inbox: Vec<Vec<u8>>) -> Vec<Message> {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::new(directory.path(), terms().swap_id);
+    let client = Client::new("http://127.0.0.1:9", "", Duration::from_secs(1));
+    let sent = Arc::new(Mutex::new(vec![]));
+    let session = Recording {
+        inbox,
+        sent: sent.clone(),
+    };
+    let mut driver = Driver::start(
+        seller,
+        vec![],
+        Fake::default(),
+        client,
+        Some(session),
+        store,
+    )
+    .unwrap();
+    driver.poll = Duration::from_millis(1);
+    let polls = std::cell::Cell::new(0);
+    let stopped = driver.run_until(|_| {
+        polls.set(polls.get() + 1);
+        polls.get() > 5
+    });
+    assert!(stopped.unwrap().is_none());
+    let sent = sent.lock().unwrap();
+    sent.clone()
+}
+
+/// A request for another swap is dropped unanswered, as eigenwallet's ASB
+/// refuses one for a swap it does not know: a driver runs one swap, and
+/// takes only messages under its swap id.
+#[cfg(feature = "native")]
+#[test]
+fn a_share_request_for_another_swap_is_not_answered() {
+    let Punished { seller, ask, .. } = punished(None);
+    let other = punished_seller_sends(seller.clone(), vec![ask.encode([2; 32])]);
+    assert!(other.is_empty(), "{other:?}");
+    let own = punished_seller_sends(seller, vec![ask.encode(terms().swap_id)]);
+    assert!(
+        matches!(own[..], [Message::ShareAnswer(ShareAnswer::Share(_))]),
+        "{own:?}"
+    );
+}
+
+/// As eigenwallet's ASB answers only the swap's own peer: the punished
+/// seller takes a session only under the buyer's rejoin key, which only the
+/// two can work out, never the offer's `buyer_session`, which a relay's
+/// board shows anyone. A stranger gets no `s`; the buyer, rejoining, does.
+#[cfg(feature = "native")]
+#[test]
+fn only_the_buyer_is_given_s() {
+    use crate::transport::Ivy;
+    use ed25519_dalek::SigningKey;
+    let Punished { seller, buyer, .. } = punished(None);
+    let config = |seed: &[u8; 32]| ivy::Config::new(SigningKey::from_bytes(seed));
+    let seller_key = config(&[1; 32]).peer_key();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let wait = Duration::from_secs(10);
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::new(directory.path(), terms().swap_id);
+    let client = Client::new("http://127.0.0.1:9", "", Duration::from_secs(1));
+    let mut driver = Driver::start(seller, vec![], Fake::default(), client, None, store).unwrap();
+    driver.poll = Duration::from_millis(1);
+    driver.reconnect = Some(crate::transport::in_background(move |rejoin| {
+        let buyer = config(&rejoin.key).peer_key();
+        Ivy::accept(listener.try_clone()?, &config(&[1; 32]), buyer, wait, wait)
+    }));
+
+    let rejoin = buyer.rejoin().unwrap();
+    let request = Message::ShareRequest.encode(terms().swap_id);
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let finished = done.clone();
+    let peers = std::thread::spawn(move || {
+        let ask = |key: &[u8; 32]| -> Option<Message> {
+            let mut session = Ivy::connect(address, &config(key), seller_key, wait).ok()?;
+            session.send(&request).ok()?;
+            let answer = session.recv(Duration::from_secs(2)).ok()??;
+            Message::decode(&answer, terms().swap_id)
+        };
+        // A stranger, with the key an offer would show, then the buyer.
+        let stranger = ask(&[2; 32]);
+        let own = ask(&rejoin.key);
+        finished.store(true, std::sync::atomic::Ordering::SeqCst);
+        (stranger, own)
+    });
+    let stopped = driver.run_until(|_| done.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(stopped.unwrap().is_none());
+    let (stranger, own) = peers.join().unwrap();
+    assert!(stranger.is_none(), "{stranger:?}");
+    assert!(
+        matches!(own, Some(Message::ShareAnswer(ShareAnswer::Share(_)))),
+        "{own:?}"
+    );
+}
+
+/// The seller's driver reads the child that bumped its punish once the
+/// punish is in a block, and counts its fee among what the swap cost.
+#[cfg(feature = "native")]
+#[test]
+fn the_sellers_driver_counts_the_fee_of_its_punishs_child() {
+    let (seller, _, _) = locked().nex_locked();
+    let (seller, actions) = seller.step(btc(20, None, None));
+    let [cancel] = &broadcasts(&actions)[..] else {
+        panic!("cancel");
+    };
+    let (_, actions) = seller.clone().step(btc(30, Some((cancel, 10)), None));
+    let [punish] = &broadcasts(&actions)[..] else {
+        panic!("punish");
+    };
+    let (_, lock) = seller.watch().bitcoin.unwrap();
+    let node = funded_node(lock, 131);
+    let child = punish_child(punish, 40_000);
+    {
+        let mut node = node.0.borrow_mut();
+        node.mined.push((cancel.clone(), 121));
+        node.mined.push((punish.clone(), 131));
+        let payout = OutPoint::new(punish.compute_txid(), 0);
+        node.spenders.push((payout, child, 131));
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::new(directory.path(), terms().swap_id);
+    let client = Client::new("http://127.0.0.1:9", "", Duration::from_secs(1));
+    let mut driver =
+        Driver::<_, _, Offline>::start(seller, vec![], node, client, None, store).unwrap();
+    driver.poll = Duration::from_millis(1);
+    let stopped = driver.run_until(|seller| matches!(seller, Seller::Punished { .. }));
+    assert!(stopped.unwrap().is_none());
+    let Seller::Punished { lost, .. } = driver.state() else {
+        unreachable!()
+    };
+    assert_eq!(
+        *lost,
+        2_000 + 40_000,
+        "cancel's and punish's fees, and the child's"
     );
 }
