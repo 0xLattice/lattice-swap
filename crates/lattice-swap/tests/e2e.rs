@@ -726,8 +726,9 @@ fn a_punished_buyer_resumes_and_is_given_the_nex() {
 
     let mut buyer = world.resume("buyer", &swap_id);
     let (mut seller_done, mut buyer_done) = (None, None);
+    // Steady: the claim must reach two deep, past an empty pool.
     world.drive(
-        false,
+        true,
         || true,
         || {
             seller_done = seller_done.or(seller.0.try_wait().unwrap());
