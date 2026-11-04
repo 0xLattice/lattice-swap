@@ -5,15 +5,20 @@
 //!
 //! The operator port listens on loopback only and takes the node's cookie
 //! (`<data-directory>/.cookie`, `__cookie__:<token>`) as HTTP basic auth. It
-//! changes at every node restart. Every 64-bit integer on this API is a
-//! decimal string.
+//! changes at every node restart: a client made from the cookie file reads
+//! it again when the node refuses the one it holds. Every 64-bit integer on
+//! this API is a decimal string.
 
 #[cfg(feature = "native")]
 use std::io::Read;
 #[cfg(feature = "native")]
+use std::path::{Path, PathBuf};
+#[cfg(feature = "native")]
+use std::sync::Mutex;
+#[cfg(feature = "native")]
 use std::time::Duration;
 #[cfg(feature = "native")]
-use std::{fmt, fs, io, path::Path};
+use std::{fmt, fs, io};
 
 #[cfg(feature = "native")]
 use base64::Engine;
@@ -110,7 +115,9 @@ const MAX_RESPONSE_BYTES: u64 = 1 << 20;
 pub struct Client {
     agent: ureq::Agent,
     base: String,
-    authorization: String,
+    authorization: Mutex<String>,
+    /// The cookie file, for a client made from one: read again on a 401.
+    cookie: Option<PathBuf>,
 }
 
 #[cfg(feature = "native")]
@@ -119,20 +126,29 @@ impl Client {
     /// content. `timeout` bounds each request as a whole, so a stalled node
     /// fails the call instead of blocking it.
     pub fn new(base: &str, cookie: &str, timeout: Duration) -> Self {
-        let token = base64::engine::general_purpose::STANDARD.encode(cookie.trim());
         Self {
             agent: ureq::AgentBuilder::new().timeout(timeout).build(),
             base: base.trim_end_matches('/').into(),
-            authorization: format!("Basic {token}"),
+            authorization: Mutex::new(authorization(cookie)),
+            cookie: None,
         }
     }
 
+    /// A client with the cookie in the file at `path`, which it reads again
+    /// whenever the node answers 401, and then asks once more: the node
+    /// writes a new cookie at every start, so a client that outlives one
+    /// restart of its node goes on with the new cookie. Bitcoin Core's
+    /// `bitcoin-cli` reads its node's cookie file on every call, and btcd's
+    /// `rpcclient` reads it again whenever the file changes.
     pub fn from_cookie_file(
         base: &str,
         path: impl AsRef<Path>,
         timeout: Duration,
     ) -> io::Result<Self> {
-        Ok(Self::new(base, &fs::read_to_string(path)?, timeout))
+        let path = path.as_ref();
+        let mut client = Self::new(base, &fs::read_to_string(path)?, timeout);
+        client.cookie = Some(path.into());
+        Ok(client)
     }
 
     pub fn health(&self) -> Result<Health> {
@@ -198,12 +214,14 @@ impl Client {
     /// Submits to the node's pool and returns the transaction CID (of the
     /// signed transaction, not of its body: [`Transaction::cid`]).
     pub fn submit(&self, transaction: &Transaction) -> Result<String> {
-        let response = self
-            .agent
-            .post(&format!("{}/transactions", self.base))
-            .set("Authorization", &self.authorization)
-            .send_json(transaction.to_submit_json());
-        let json = read(response)?;
+        let json = self.authorized(|authorization| {
+            read(
+                self.agent
+                    .post(&format!("{}/transactions", self.base))
+                    .set("Authorization", authorization)
+                    .send_json(transaction.to_submit_json()),
+            )
+        })?;
         json["transactionCID"]
             .as_str()
             .map(String::from)
@@ -248,13 +266,38 @@ impl Client {
     }
 
     fn get(&self, path: &str) -> Result<Value> {
-        read(
-            self.agent
-                .get(&format!("{}{path}", self.base))
-                .set("Authorization", &self.authorization)
-                .call(),
-        )
+        self.authorized(|authorization| {
+            read(
+                self.agent
+                    .get(&format!("{}{path}", self.base))
+                    .set("Authorization", authorization)
+                    .call(),
+            )
+        })
     }
+
+    /// `request`'s answer under the cookie held; on a 401, under the cookie
+    /// file's, read again, if this client has one.
+    fn authorized(&self, request: impl Fn(&str) -> Result<Value>) -> Result<Value> {
+        let held = self.authorization.lock().expect("not poisoned").clone();
+        match (request(&held), &self.cookie) {
+            (Err(Error::Status { status: 401, .. }), Some(path)) => {
+                let cookie = fs::read_to_string(path)
+                    .map_err(|e| Error::Transport(format!("{}: {e}", path.display())))?;
+                let fresh = authorization(&cookie);
+                *self.authorization.lock().expect("not poisoned") = fresh.clone();
+                request(&fresh)
+            }
+            (answer, _) => answer,
+        }
+    }
+}
+
+/// The basic auth header for `cookie`, the cookie file's content.
+#[cfg(feature = "native")]
+fn authorization(cookie: &str) -> String {
+    let token = base64::engine::general_purpose::STANDARD.encode(cookie.trim());
+    format!("Basic {token}")
 }
 
 #[cfg(feature = "native")]
@@ -486,6 +529,8 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     /// A client whose node answers every request with `json`.
     fn answering(json: serde_json::Value) -> Client {
@@ -504,6 +549,79 @@ mod tests {
             stream.write_all(body.as_bytes()).unwrap();
         });
         Client::new(&url, "cookie", Duration::from_secs(5))
+    }
+
+    /// A node whose cookie is the content of `cookie` as each request
+    /// comes in: it answers a request under any other 401, as lattice-node
+    /// does, one for a block 404, and any other with a health. Counts the
+    /// requests and the 401s.
+    fn guarded(cookie: std::path::PathBuf) -> (String, Arc<[AtomicUsize; 2]>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let counts = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+        let counted = counts.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut request = [0u8; 4096];
+                let n = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..n]).to_string();
+                counted[0].fetch_add(1, Ordering::SeqCst);
+                let expected = authorization(&fs::read_to_string(&cookie).unwrap());
+                let (status, body) = if !request.contains(&format!("Authorization: {expected}\r\n"))
+                {
+                    counted[1].fetch_add(1, Ordering::SeqCst);
+                    ("401 Unauthorized", "")
+                } else if request.starts_with("GET /api/block/") {
+                    ("404 Not Found", "")
+                } else {
+                    ("200 OK", r#"{"phase":"active","height":"7"}"#)
+                };
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(head.as_bytes()).unwrap();
+                stream.write_all(body.as_bytes()).unwrap();
+            }
+        });
+        (url, counts)
+    }
+
+    /// The node writes a new cookie at every start: a client made from the
+    /// cookie file goes on under the new one, after one 401; a client given
+    /// the cookie itself has no file to read again, and stays refused. Any
+    /// other refusal is the node's answer, asked once.
+    #[test]
+    fn a_client_reads_a_rotated_cookie_again() {
+        let dir = std::env::temp_dir().join(format!("swap-cookie-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let cookie = dir.join(".cookie");
+        fs::write(&cookie, "__cookie__:first").unwrap();
+        let (url, counts) = guarded(cookie.clone());
+        let [asked, refused] = &*counts;
+        let timeout = Duration::from_secs(5);
+        let client = Client::from_cookie_file(&url, &cookie, timeout).unwrap();
+        let given = Client::new(&url, "__cookie__:first", timeout);
+        assert_eq!(client.health().unwrap().height, 7);
+        assert_eq!(given.health().unwrap().height, 7);
+        assert_eq!(refused.load(Ordering::SeqCst), 0);
+
+        fs::write(&cookie, "__cookie__:second\n").unwrap();
+        assert_eq!(client.health().unwrap().height, 7);
+        assert_eq!(refused.load(Ordering::SeqCst), 1);
+        // Held from then on: no 401 more.
+        assert_eq!(client.health().unwrap().height, 7);
+        assert_eq!(refused.load(Ordering::SeqCst), 1);
+        let before = asked.load(Ordering::SeqCst);
+        assert_eq!(client.block_hash(9).unwrap(), None);
+        assert_eq!(asked.load(Ordering::SeqCst), before + 1);
+        let stale = given.health();
+        assert!(
+            matches!(stale, Err(Error::Status { status: 401, .. })),
+            "{stale:?}"
+        );
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
