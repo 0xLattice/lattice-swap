@@ -204,12 +204,11 @@ impl NodeArgs {
         format!("{}/wallet/{wallet}", self.btc_url.trim_end_matches('/'))
     }
 
+    /// A client for the lattice-node, which reads its cookie file again
+    /// on a 401: the node writes a new cookie at every restart.
     fn nexus(&self) -> Result<Client> {
-        Ok(Client::new(
-            &self.nexus_url,
-            &read(&self.nexus_cookie)?,
-            TIMEOUT,
-        ))
+        Client::from_cookie_file(&self.nexus_url, &self.nexus_cookie, TIMEOUT)
+            .map_err(|e| format!("{}: {e}", self.nexus_cookie.display()).into())
     }
 
     /// Refuses a lattice-node on another Nexus than `--nexus-genesis`

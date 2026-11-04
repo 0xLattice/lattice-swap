@@ -2133,3 +2133,55 @@ fn a_resumed_seller_takes_the_buyer_back_over_tcp_and_no_one_else() {
         Some(&b"again"[..])
     );
 }
+
+/// The lattice-node writes a new cookie at every restart: the client
+/// offer, take and resume build reads the cookie file again on a 401
+/// instead of staying refused.
+#[test]
+fn the_nexus_client_reads_a_rotated_cookie_again() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let dir = tempfile::tempdir().unwrap();
+    let cookie = dir.path().join(".cookie");
+    fs::write(&cookie, "__cookie__:first").unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let path = cookie.clone();
+    std::thread::spawn(move || {
+        use base64::Engine;
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let mut request = [0u8; 4096];
+            let n = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..n]);
+            let token = base64::engine::general_purpose::STANDARD
+                .encode(fs::read_to_string(&path).unwrap().trim());
+            let (status, body) = if request.contains(&format!("Authorization: Basic {token}\r\n")) {
+                ("200 OK", r#"{"phase":"active","height":"7"}"#)
+            } else {
+                ("401 Unauthorized", "")
+            };
+            let head = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.write_all(body.as_bytes()).unwrap();
+        }
+    });
+    let cookie_arg = cookie.to_str().unwrap();
+    let cli = Cli::try_parse_from(
+        ["lattice-swap", "resume", "/s"]
+            .iter()
+            .chain(&NODES[..4])
+            .chain(&["--nexus-url", &url, "--nexus-cookie", cookie_arg]),
+    )
+    .unwrap();
+    let Command::Resume(args) = cli.command else {
+        panic!("not resume")
+    };
+    let nexus = args.nodes.nexus().unwrap();
+    assert_eq!(nexus.health().unwrap().height, 7);
+    fs::write(&cookie, "__cookie__:second\n").unwrap();
+    assert_eq!(nexus.health().unwrap().height, 7);
+}
