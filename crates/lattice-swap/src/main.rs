@@ -74,7 +74,8 @@ enum Command {
     /// timelocks allow, so `refund` is this same command. A punished buyer
     /// asks the seller for its key share once on each resume, and claims
     /// the NEX with it; a punished seller, here or in `offer`, keeps
-    /// running to give it, until the buyer has claimed.
+    /// running to give it until the buyer has claimed or the lock never
+    /// landed. Stopped before then, it answers again once resumed.
     #[command(visible_alias = "refund")]
     Resume(SwapFileArgs),
     /// Prints a swap's state and outcome from its swap file. Asks no node.

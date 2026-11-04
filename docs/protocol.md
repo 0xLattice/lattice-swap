@@ -155,21 +155,30 @@ in eigenwallet.
   with `s`, or `Refused` with why. S answers `Share` only in `Punished`,
   which it enters with a punish `btc_confirmations` deep and a NEX lock
   signed, and only if the swap cost it at most a quarter of `btc_amount`,
+  ending `Punished` at once otherwise,
   as eigenwallet's ASB refuses once a swap lost it more: `btc_amount` but
   for what punish paid it, less the fee of the child that bumped punish,
   which a B racing a refund after `t2` drives up, up to all of its payout.
   Without that check, a B could make S burn its BTC in fees, then take
-  the NEX all the same. Anywhere else S answers `Refused`. `s` cannot give
+  the NEX all the same. Anywhere else S answers `Refused`, as not
+  punished. `s` cannot give
   B the BTC too: B holds only `b` and its own Bitcoin key, and the BTC
   left the cancel output in a punish `btc_confirmations` deep, the depth
   every outcome here is final at; the refund spends that same output, so
-  it could only replace the punish in a reorg deeper than that. S keeps
-  running in `Punished`, answering, until a synced node shows the lock
-  address has signed, then ends `Punished`. B asks once on reaching a
-  deep punish and once on every resume: its run ends `Punished`, its
-  secrets kept, if S refuses, is not met, or sends a share other than the
-  one it proved; with `s`, B claims, ending `Swapped` once the claim lands,
-  and `Punished` if the lock turns out empty or drained.
+  it could only replace the punish in a reorg of that depth or more. S
+  keeps running in `Punished`, answering, as eigenwallet's ASB does,
+  until a synced node shows the lock address has signed, or that its
+  nonce has passed the lock, which never credited the lock address, over
+  `nex_confirmations` blocks, as a claim of a signed lock reads it; then
+  it ends `Punished`. There is no give-up timer: the operator may stop it,
+  and `resume` it later to answer again. B asks on reaching a deep punish
+  and on every resume. Refused as not punished, its view of the punish
+  perhaps ahead of S's, it asks once more at once. Its run ends
+  `Punished`, its secrets kept, if S refuses, is not met, or sends a share
+  other than the one it proved; with `s`, B claims, ending `Swapped` once
+  the claim lands. A lock it reads empty, never having seen it confirmed,
+  ends its run `Punished`, the secrets kept for a resume; a drained lock
+  ends the swap `Punished`.
 - Every deadline is read from the party's own Bitcoin node. A node that
   stalled, or that someone cut off from the network, shows fewer blocks
   than there are: every depth it reports is too low. That only delays
@@ -271,7 +280,8 @@ up where it stopped.
 - `Punished`: the seller took the BTC through punish. Its claim of the
   NEX, if it learned `b` from a refund that missed `t2`, may land too: a
   claim still pending is seen through before the swap ends. A seller that
-  locked NEX ends once the buyer, given `s`, has claimed it; a punished
+  locked NEX ends once the buyer, given `s`, has claimed it, or the lock
+  never landed, or at once if the swap cost it over a quarter; a punished
   buyer's run ends so when the seller does not give `s`, and a resume
   asks again. A buyer that claims with `s` ends `Swapped`.
 - `Drained`: this party learned the joint key, but the lock was already

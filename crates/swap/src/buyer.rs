@@ -39,10 +39,13 @@ pub enum Buyer {
     /// `s` and `b` together spend. Asks the seller for `s` and claims the
     /// NEX with it, as eigenwallet's CLI asks its ASB to redeem the XMR
     /// cooperatively after a punish. `seen`: the buyer saw the NEX lock
-    /// confirmed.
+    /// confirmed. `again`: refused as not yet punished, once, and asked
+    /// again: the seller's view of the punish may lag ours.
     AskingShare {
         setup: Setup,
         seen: bool,
+        #[serde(default)]
+        again: bool,
     },
     /// Punished, and the seller gave no `s` this time: the swap has ended
     /// for this run, but keeps the secrets, so that a resume asks again.
@@ -258,17 +261,21 @@ impl Machine for Buyer {
                 locked.cancelling(redeem, view)
             }
             (ClaimingNex(claim), event) => {
-                let punished = claim.punished;
-                match claim.step(event) {
-                    Claimed::Pending(claim, actions) => (ClaimingNex(claim), actions),
-                    Claimed::Done => (Done(Outcome::Swapped), vec![]),
-                    _ if punished => (Done(Outcome::Punished), vec![]),
-                    Claimed::Empty | Claimed::Drained => (Done(Outcome::Drained), vec![]),
+                // Claiming with `s` after a punish, the secrets are kept: a
+                // lock read empty, never seen, may yet show the NEX to a
+                // later resume.
+                let punished = claim.punished.then(|| claim.setup.clone());
+                match (claim.step(event), punished) {
+                    (Claimed::Pending(claim, actions), _) => (ClaimingNex(claim), actions),
+                    (Claimed::Done, _) => (Done(Outcome::Swapped), vec![]),
+                    (Claimed::Empty, Some(setup)) => (Punished { setup, seen: false }, vec![]),
+                    (Claimed::Drained, Some(_)) => (Done(Outcome::Punished), vec![]),
+                    (Claimed::Empty | Claimed::Drained, None) => (Done(Outcome::Drained), vec![]),
                 }
             }
             // Only `s` itself: the share the seller proved at the start.
             (
-                AskingShare { setup, seen },
+                AskingShare { setup, seen, .. },
                 Event::Message(Message::ShareAnswer(ShareAnswer::Share(share))),
             ) => match KeyShare::from_bytes(share) {
                 Some(key)
@@ -283,7 +290,21 @@ impl Machine for Buyer {
                 _ => (Punished { setup, seen }, vec![]),
             },
             (
-                AskingShare { setup, seen },
+                AskingShare {
+                    setup,
+                    seen,
+                    again: false,
+                },
+                Event::Message(Message::ShareAnswer(ShareAnswer::Refused(
+                    ShareRefusal::NotPunished,
+                ))),
+            ) => {
+                let again = true;
+                let ask = vec![Action::Send(Message::ShareRequest)];
+                (AskingShare { setup, seen, again }, ask)
+            }
+            (
+                AskingShare { setup, seen, .. },
                 Event::Message(Message::ShareAnswer(ShareAnswer::Refused(_))) | Event::Timeout,
             ) => (Punished { setup, seen }, vec![]),
             (
@@ -361,7 +382,11 @@ impl Machine for Buyer {
 
     fn resumed(self) -> Self {
         match self {
-            Buyer::Punished { setup, seen } => Buyer::AskingShare { setup, seen },
+            Buyer::Punished { setup, seen } => Buyer::AskingShare {
+                setup,
+                seen,
+                again: false,
+            },
             state => state,
         }
     }
@@ -512,7 +537,14 @@ impl BuyerLocked {
                             let seen = redeem.is_some();
                             let setup = self.setup;
                             let ask = vec![Action::Send(Message::ShareRequest)];
-                            (Buyer::AskingShare { setup, seen }, ask)
+                            (
+                                Buyer::AskingShare {
+                                    setup,
+                                    seen,
+                                    again: false,
+                                },
+                                ask,
+                            )
                         }
                     };
                 }

@@ -224,9 +224,10 @@ A buyer punished for missing its refund can still have the NEX, as
 eigenwallet's cooperative redeem after punish: `resume` meets the seller
 again and asks for its key share once, and claims the NEX with it. The
 seller gives it once its punish is `--btc-confirmations` deep, unless the
-swap cost it more than a quarter of the BTC in fees, and its `offer` or
-`resume` keeps running after the punish to give it, until the buyer has
-claimed.
+swap cost it more than a quarter of the BTC in fees, in which case it ends
+at once. Otherwise its `offer` or `resume` keeps running after the punish
+to give it, until the buyer has claimed, or its NEX lock never landed. The
+operator may stop it sooner; `resume` answers again.
 
 `offer`, `take` and `resume` exit 0 only when the swap swapped: 3 when it
 refunded, 4 punished, 5 drained, 6 aborted. 1 means an error stopped the

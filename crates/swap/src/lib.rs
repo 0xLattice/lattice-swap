@@ -311,15 +311,14 @@ pub enum ShareRefusal {
     /// It is not in [`Seller::Punished`]: its punish is not
     /// `btc_confirmations` deep, or the swap ended otherwise.
     NotPunished,
-    /// The swap cost it more than [`MAX_LOSS_PART`] of `btc_amount`.
-    MaxLoss,
 }
 
-/// The seller gives `s` after punish only if the swap cost it at most
-/// `btc_amount / MAX_LOSS_PART` of the BTC, as eigenwallet's ASB refuses a
-/// cooperative redeem once it lost more than a quarter of the swap amount
-/// (`check_max_loss_under_tolerance(4)`): one who drove its fees up, then
-/// had the NEX all the same, would grief it for free.
+/// The seller enters [`Seller::Punished`], to give `s`, only if the swap
+/// cost it at most `btc_amount / MAX_LOSS_PART` of the BTC, as eigenwallet's
+/// ASB refuses a cooperative redeem once it lost more than a quarter of the
+/// swap amount (`check_max_loss_under_tolerance(4)`): one who drove its fees
+/// up, then had the NEX all the same, would grief it for free. Past that it
+/// ends `Punished` at once, and no one answers.
 pub const MAX_LOSS_PART: u64 = 4;
 
 #[derive(Serialize, Deserialize)]
@@ -408,6 +407,10 @@ pub struct BitcoinView {
     /// out.
     #[serde(default)]
     pub punish_child: Option<Spent>,
+    /// The driver failed to read [`BitcoinView::punish_child`]: what the
+    /// swap cost is unknown, so the seller does not yet weigh giving `s`.
+    #[serde(default)]
+    pub punish_child_unread: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -719,6 +722,34 @@ fn lock_passed(terms: &Terms, nonce: u64, view: &NexusView) -> bool {
     view.lock.balance < terms.nex_amount && view.own.nonce > nonce
 }
 
+/// A lock signed at the seller's `nonce`, which its nonce moved past
+/// without crediting the lock address, can never land, unless a reorg takes
+/// back what moved the nonce. That must hold `nex_confirmations` blocks of
+/// the tip. A reorg below the tip it was first seen at, even one between
+/// two views, replaces that block: the count starts again. `passed_at`, the
+/// tip it was first seen at, is reported in [`NexusView::block_at`].
+fn never_lands(
+    passed_at: &mut Option<(u64, String)>,
+    terms: &Terms,
+    nonce: u64,
+    view: &NexusView,
+) -> bool {
+    if !lock_passed(terms, nonce, view) {
+        *passed_at = None;
+        return false;
+    }
+    let reorged = passed_at
+        .as_ref()
+        .is_some_and(|(_, tip)| view.block_at.as_ref() != Some(tip));
+    if reorged || passed_at.is_none() {
+        let tip = view.health.tip.clone();
+        *passed_at = tip.map(|tip| (view.health.height, tip));
+    }
+    passed_at.as_ref().is_some_and(|(since, _)| {
+        view.health.height >= since.saturating_add(terms.nex_confirmations)
+    })
+}
+
 /// The node is active and has executed the best chain it knows.
 fn synced(health: &Health) -> bool {
     health.phase == "active" && health.best_header_height == Some(health.height)
@@ -841,29 +872,7 @@ impl Claim {
         let short = view.lock.balance < terms.nex_amount;
         let empty = match self.lock {
             Lock::Unsigned => short,
-            // The seller's nonce moved past its lock, which did not credit
-            // the lock address: the lock can never land, unless a reorg takes
-            // back what moved the nonce. That must hold `nex_confirmations`
-            // blocks of the tip. A reorg below the tip it was first seen at,
-            // even one between two views, replaces that block: the count
-            // starts again.
-            Lock::Signed(nonce) if lock_passed(terms, nonce, &view) => {
-                let reorged = self
-                    .passed_at
-                    .as_ref()
-                    .is_some_and(|(_, tip)| view.block_at.as_ref() != Some(tip));
-                if reorged || self.passed_at.is_none() {
-                    let tip = view.health.tip.clone();
-                    self.passed_at = tip.map(|tip| (view.health.height, tip));
-                }
-                self.passed_at.as_ref().is_some_and(|(since, _)| {
-                    view.health.height >= since.saturating_add(terms.nex_confirmations)
-                })
-            }
-            Lock::Signed(_) => {
-                self.passed_at = None;
-                false
-            }
+            Lock::Signed(nonce) => never_lands(&mut self.passed_at, terms, nonce, &view),
             Lock::Seen => false,
         };
         if empty {

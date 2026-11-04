@@ -453,9 +453,11 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
                                 view.punish_child = child.clone();
                                 self.punish_child = tip.map(|tip| (tip, child));
                             }
+                            // The rest of the view still stands: the seller
+                            // weighs giving `s` once the child is read.
                             Err(e) => {
                                 warn_again(&mut self.view_failed, e.to_string(), now);
-                                return Ok(());
+                                view.punish_child_unread = true;
                             }
                         },
                     }
@@ -471,7 +473,11 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
                     }
                     None => {
                         self.stale_since = None;
-                        self.view_failed = None;
+                        // A failed read of the child is warned of again
+                        // only after a while.
+                        if !view.punish_child_unread {
+                            self.view_failed = None;
+                        }
                     }
                 }
                 let height = view.height;
@@ -835,6 +841,7 @@ pub fn bitcoin_view(
         cancel_spend,
         stale,
         punish_child: None,
+        punish_child_unread: false,
     })
 }
 
