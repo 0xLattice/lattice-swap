@@ -326,7 +326,8 @@ function sellerSees(w, event) {
 }
 
 test('a punished page asks the seller for s once a resume, and claims the NEX with it', async () => {
-  const { w, run, funding } = await funded({ extra: { messageTimeout: 300 } });
+  const clock = { offset: 0 };
+  const { w, run, funding } = await funded({ extra: { now: () => Date.now() + clock.offset } });
   // The page goes before the NEX lock lands: it never signs the redeem.
   await run.stop();
   sellerLocksNex(w, funding);
@@ -347,7 +348,10 @@ test('a punished page asks the seller for s once a resume, and claims the NEX wi
   // its own eyes, is nowhere to be met: the run ends punished, the
   // secrets kept.
   w.buyer = await Buyer.resume(w.wallet, w.buyer.swapId);
-  assert.equal(await running(w.buyer).done, 'punished');
+  const asking = running(w.buyer);
+  await until(async () => kind((await w.store.get(`swap:${w.buyer.swapId}`)).state) === 'AskingShare');
+  clock.offset += 61_000;
+  assert.equal(await asking.done, 'punished');
   const record = await w.store.get(`swap:${w.buyer.swapId}`);
   assert.equal(kind(record.state), 'Punished');
   assert.equal(w.buyer.status().running, false, 'another swap may run');
@@ -1083,7 +1087,7 @@ test('an Esplora that answers a txid with another transaction is refused', async
 });
 
 test('an outspend naming an unrelated transaction leaves the page on its refund path', async () => {
-  const { w, run, funding } = await funded({ extra: { messageTimeout: 300 } });
+  const { w, run, funding } = await funded();
   await run.stop();
   sellerLocksNex(w, funding);
   const lockHeight = w.chain.height;
