@@ -61,7 +61,7 @@ impl Store {
 
     /// Saves the state of a new swap; fails if the file exists, so a swap
     /// started twice keeps its first secrets.
-    fn create<M: Machine>(&self, state: &M) -> io::Result<()> {
+    pub fn create<M: Machine>(&self, state: &M) -> io::Result<()> {
         let temporary = self.write_temporary(state)?;
         // A hard link, unlike a rename, never replaces its target.
         let linked = fs::hard_link(&temporary, &self.path);
@@ -441,7 +441,9 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
             &mut self.first_seen,
         );
         match view {
-            Ok(mut view) => {
+            // The tip moved while the view was read: read again next round.
+            Ok(None) => Ok(()),
+            Ok(Some(mut view)) => {
                 // Read once a tip, and only for the seller, whose loss it
                 // counts: a search walks blocks.
                 if self.state.own_spends().contains(&Spend::Punish) {
@@ -800,7 +802,8 @@ thread_local! {
 }
 
 /// The view [`view::Lookups`] asks for, aged by [`view::stale`] with
-/// `max_tip_age` at `now`.
+/// `max_tip_age` at `now`; `None` if the tip moved while it was read, as
+/// web/driver's `bitcoinView` reads one.
 pub fn bitcoin_view(
     bitcoin: &impl Bitcoin,
     swap: &Swap,
@@ -808,12 +811,8 @@ pub fn bitcoin_view(
     max_tip_age: Duration,
     now: SystemTime,
     first_seen: &mut Option<(BlockHash, u64)>,
-) -> bitcoind::Result<BitcoinView> {
+) -> bitcoind::Result<Option<BitcoinView>> {
     let tip = bitcoin.tip()?;
-    let now = now
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |now| now.as_secs());
-    let stale = view::stale(&tip, max_tip_age.as_secs(), now, first_seen);
     let height = tip.height;
     let lookups = view::Lookups::new(swap, lock);
     let funding = bitcoin
@@ -834,7 +833,26 @@ pub fn bitcoin_view(
             .spender(lookups.cancel_output, from)?
             .map(|(tx, confirmations)| Spent { tx, confirmations });
     }
-    Ok(BitcoinView {
+    for (spent, outpoint) in [
+        (&lock_spend, lookups.lock),
+        (&cancel_spend, lookups.cancel_output),
+    ] {
+        if let Some(spent) = spent.as_ref().filter(|s| !view::spends(&s.tx, outpoint)) {
+            return Err(bitcoind::Error(format!(
+                "{} does not spend {outpoint}",
+                spent.tx.compute_txid()
+            )));
+        }
+    }
+    // Each depth was read against the tip of its read: one tip, or none.
+    if bitcoin.tip()?.hash != tip.hash {
+        return Ok(None);
+    }
+    let now = now
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |now| now.as_secs());
+    let stale = view::stale(&tip, max_tip_age.as_secs(), now, first_seen);
+    Ok(Some(BitcoinView {
         height,
         funding,
         lock_spend,
@@ -842,7 +860,7 @@ pub fn bitcoin_view(
         stale,
         punish_child: None,
         punish_child_unread: false,
-    })
+    }))
 }
 
 /// What spends the payout of the swap's punish, output 0, once that punish

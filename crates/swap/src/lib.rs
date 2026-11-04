@@ -54,15 +54,19 @@
 //! `t` blocks can be broadcast once the output it spends is `t` deep.
 
 #[cfg(feature = "native")]
+pub mod app;
+#[cfg(feature = "native")]
 pub mod bitcoind;
 mod buyer;
 #[cfg(feature = "native")]
 pub mod driver;
+#[cfg(feature = "native")]
+pub mod esplora;
 pub mod offer;
 mod seller;
-pub mod status;
 #[cfg(feature = "native")]
 pub mod session;
+pub mod status;
 #[cfg(feature = "native")]
 pub mod transport;
 pub mod view;

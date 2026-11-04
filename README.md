@@ -59,6 +59,17 @@ the page open until the refund confirms, which must come before the punish.
 with `web/driver/build.sh` (wasm-bindgen-cli 0.2.130) and test it with
 `npm test` there.
 
+`swap::app` is the same buyer for a native app: a wallet key of its own and
+each swap's record in one directory, Bitcoin from one Esplora
+(`swap::esplora`) and Nexus from the app's own node's RPC. It prepares,
+waits for the deposit, takes, cancels, shows the same status and withdraws
+as the browser does, runs the swap on the native driver, and carries on the
+one that runs at the next launch. Its recovery file is the browser's, so a
+wallet and its swaps move between the two either way. Unlike the browser,
+it bumps its refund by CPFP, submitting the pair to the Esplora's
+`POST /txs/package` (Bitcoin Core's `submitpackage`), which mempool.space
+serves.
+
 ## Install
 
 Download the archive for your platform from

@@ -6,7 +6,10 @@
 //!
 //! The browser's buyer, web/driver run in Node, takes offers here too,
 //! through an Esplora shim over the regtest bitcoind and the node's public
-//! read port; web/driver/build.sh builds what it loads first.
+//! read port; web/driver/build.sh builds what it loads first. So does the
+//! native one an app runs, `swap::app`, in this process, through the same
+//! shim and the node's RPC, and each carries on a swap from the other's
+//! recovery file.
 //!
 //! Ignored by a plain `cargo test`; run with `NEXUS_NODE_IMAGE` naming the
 //! node image and `-- --ignored`. The node's RPC listens on loopback only,
@@ -16,6 +19,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -25,8 +29,9 @@ use corepc_node::{Conf, Node};
 use ed25519_dalek::SigningKey;
 use rand_core::{OsRng, RngCore};
 use serde_json::{json, Value};
+use swap::app::{self, Wallet};
 use swap::bitcoind::Bitcoind;
-use swap::SecretBytes;
+use swap::{Outcome, SecretBytes};
 use swap_nexus_tx::address;
 use swap_nexus_tx::rpc::Client;
 use swap_relay::board::Board;
@@ -924,17 +929,23 @@ impl World {
             "nexus": self.nexus.public,
             "genesis": self.nexus_genesis,
             "offer": offer,
-            "policy": {
-                "btc_amount": BTC_AMOUNT.to_sat(), "price": PRICE,
-                "max_btc_fee": BTC_FEE.to_sat(), "max_nex_fee": self.nex_fee,
-                "max_t1": t1, "min_t2": 10, "min_refund_window": 9, "min_margin": 3,
-                "min_btc_fee_rate": 1, "min_btc_confirmations": 1, "min_nex_confirmations": 1,
-            },
+            "policy": self.buyer_policy(t1),
             "nex_address": self.buyer_nex,
         });
         let path = self.directory.path().join("browser.json");
         std::fs::write(&path, config.to_string()).unwrap();
         path
+    }
+
+    /// The CLI buyer's bounds, as the browser and the native buyer take
+    /// them.
+    fn buyer_policy(&self, t1: u16) -> Value {
+        json!({
+            "btc_amount": BTC_AMOUNT.to_sat(), "price": PRICE,
+            "max_btc_fee": BTC_FEE.to_sat(), "max_nex_fee": self.nex_fee,
+            "max_t1": t1, "min_t2": 10, "min_refund_window": 9, "min_margin": 3,
+            "min_btc_fee_rate": 1, "min_btc_confirmations": 1, "min_nex_confirmations": 1,
+        })
     }
 
     /// The browser prepares the offer in `config`, and the buyer's bitcoind
@@ -1125,6 +1136,288 @@ fn the_browser_killed_restores_from_its_recovery_file() {
     let status = world.finish(&mut buyer, false, true);
     assert!(status.success(), "{status}");
     assert_eq!(stdout(&mut buyer.0), "outcome: swapped\n");
+    assert_eq!(
+        world.nexus.balance(&world.buyer_nex),
+        NEX_AMOUNT - world.nex_fee
+    );
+}
+
+/// The native buyer, `swap::app`, running a swap on a thread of this
+/// process; stopped if the test ends first.
+struct Native {
+    wallet: Arc<Wallet>,
+    stop: Arc<AtomicBool>,
+    run: Option<JoinHandle<Result<Option<Outcome>, String>>>,
+}
+
+impl Native {
+    fn start(wallet: Arc<Wallet>, buy: app::Buy) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = stop.clone();
+        let run = thread::spawn(move || {
+            buy.run(|| stopping.load(Ordering::SeqCst))
+                .map_err(|e| e.to_string())
+        });
+        Native {
+            wallet,
+            stop,
+            run: Some(run),
+        }
+    }
+
+    fn done(&self) -> bool {
+        self.run.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
+    /// How the run ended.
+    fn outcome(&mut self) -> Result<Option<Outcome>, String> {
+        self.run.take().unwrap().join().unwrap()
+    }
+
+    /// Stops the run where it is, as an app closed, and waits for it.
+    fn close(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        assert_eq!(self.outcome(), Ok(None));
+    }
+}
+
+impl Drop for Native {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+}
+
+impl World {
+    /// The native buyer's wallet in `dir`, through an Esplora shim over the
+    /// regtest bitcoind and the node's RPC.
+    fn native_config(&self, dir: &str) -> app::Config {
+        let mut config = app::Config::new(
+            self.dir(dir),
+            Network::Regtest,
+            esplora::esplora(wallet_client(&self.bitcoind, "")),
+            self.nexus.url.clone(),
+            self.nexus_cookie.clone(),
+            self.nexus_genesis.clone(),
+        );
+        config.poll = Duration::from_millis(500);
+        config
+    }
+
+    /// The native buyer prepares `offer`, its wallet is funded with what
+    /// it needs, and it runs: the buyer and its wallet's address.
+    fn native_take(&self, offer: &str, t1: u16) -> (Native, String) {
+        let wallet = Wallet::open(self.native_config("native")).unwrap();
+        let buy = wallet
+            .prepare(offer, self.buyer_policy(t1), &self.buyer_nex)
+            .unwrap();
+        let status = buy.status().unwrap();
+        assert_eq!(status["step"], "fund-wallet");
+        let need = Amount::from_sat(status["need"].as_u64().unwrap());
+        assert_eq!(
+            need,
+            Amount::from_sat(wallet.need(BTC_AMOUNT.to_sat()).unwrap().1)
+        );
+        let address = wallet.address().to_string();
+        wallet_client(&self.bitcoind, "buyer")
+            .call("sendtoaddress", json!([address, need.to_btc()]))
+            .unwrap();
+        (Native::start(wallet, buy), address)
+    }
+
+    /// The native buyer in `dir` opened again, as an app at launch, and the
+    /// swap it runs resumed.
+    fn native_resume(&self, dir: &str) -> Native {
+        let wallet = Wallet::open(self.native_config(dir)).unwrap();
+        let id = wallet.running().unwrap().expect("a swap that runs");
+        let buy = wallet.resume(&id).unwrap();
+        Native::start(wallet, buy)
+    }
+
+    /// Drives until the seller and `buyer` both end: the seller's output
+    /// and the buyer's outcome.
+    fn finish_both(
+        &self,
+        seller: &mut Party,
+        buyer: &mut Native,
+        seller_out: JoinHandle<String>,
+    ) -> (String, Result<Option<Outcome>, String>) {
+        let mut seller_done = None;
+        self.drive(
+            false,
+            || true,
+            || {
+                seller_done = seller_done.or(seller.0.try_wait().unwrap());
+                seller_done.is_some() && buyer.done()
+            },
+        );
+        (seller_out.join().unwrap(), buyer.outcome())
+    }
+}
+
+/// The native buyer takes a CLI seller's offer from a relay, funded from
+/// its wallet, and swaps; the change stays in its wallet.
+#[test]
+#[ignore = "needs Docker and NEXUS_NODE_IMAGE"]
+fn the_native_buyer_swaps_through_a_relay() {
+    let world = World::new();
+    let (url, relay) = relay();
+    let (mut seller, offer, swap_id, seller_out) = world.offer_on(20, 1, Some(&url));
+    let (mut buyer, wallet) = world.native_take(&offer, 20);
+    let (seller_out, outcome) = world.finish_both(&mut seller, &mut buyer, seller_out);
+    assert_eq!(seller_out, "outcome: Swapped\n");
+    assert_eq!(outcome, Ok(Some(Outcome::Swapped)));
+    assert_eq!(
+        world.nexus.balance(&world.buyer_nex),
+        NEX_AMOUNT - world.nex_fee
+    );
+    let seller_wallet = wallet_client(&world.bitcoind, "seller");
+    assert_eq!(btc_balance(&seller_wallet), BTC_AMOUNT - BTC_FEE * 2);
+    // The deposit less the lock and the funding's fee: under 1000 sat.
+    let change = world.received(&wallet);
+    assert!(change < Amount::from_sat(1_000), "{change}");
+    assert!(relay.board.offers().is_empty());
+    // Ended: nothing runs, and its status says so.
+    let ended = buyer.wallet.resume(&swap_id).unwrap().status().unwrap();
+    assert_eq!(ended["step"], "done");
+    assert_eq!(ended["outcome"], "swapped");
+    assert_eq!(buyer.wallet.running().unwrap(), None);
+}
+
+/// The native buyer closed once its BTC lock is in a block, before the
+/// seller's NEX lock lands: opened again, as an app at launch, it finds the
+/// swap that runs, meets the seller again at the relay, gets the CID it
+/// missed, and swaps.
+#[test]
+#[ignore = "needs Docker and NEXUS_NODE_IMAGE"]
+fn the_native_buyer_closed_after_the_lock_resumes_at_launch() {
+    let world = World::new();
+    let (url, _relay) = relay();
+    let (mut seller, offer, swap_id, seller_out) = world.offer_on(20, 1, Some(&url));
+    let (mut buyer, _) = world.native_take(&offer, 20);
+    world.drive(
+        false,
+        || false,
+        || world.state("seller", &swap_id) == "LockingNex",
+    );
+    assert_eq!(world.state("native", &swap_id), "AwaitNexLock");
+    buyer.close();
+    // The app closed: its wallet lets go of the directory.
+    drop(buyer);
+    world.drive(
+        false,
+        || true,
+        || world.state("seller", &swap_id) == "AwaitRedeemSignature",
+    );
+
+    let mut buyer = world.native_resume("native");
+    let (seller_out, outcome) = world.finish_both(&mut seller, &mut buyer, seller_out);
+    assert_eq!(seller_out, "outcome: Swapped\n");
+    assert_eq!(outcome, Ok(Some(Outcome::Swapped)));
+    assert_eq!(
+        world.nexus.balance(&world.buyer_nex),
+        NEX_AMOUNT - world.nex_fee
+    );
+}
+
+/// The seller goes once the NEX is locked: the native buyer cancels at t1
+/// and refunds to its wallet.
+#[test]
+#[ignore = "needs Docker and NEXUS_NODE_IMAGE"]
+fn the_native_buyer_refunds_to_its_wallet_when_the_seller_goes() {
+    let world = World::new();
+    let (url, _relay) = relay();
+    let (mut seller, offer, swap_id, seller_out) = world.offer_on(24, 2, Some(&url));
+    let (mut buyer, wallet) = world.native_take(&offer, 24);
+    world.drive(
+        false,
+        || true,
+        || world.state("seller", &swap_id) == "AwaitRedeemSignature",
+    );
+    kill(&mut seller);
+    seller_out.join().unwrap();
+    // The deadlines show, as the browser's do.
+    let status = buyer.wallet.resume(&swap_id).unwrap().status().unwrap();
+    assert_eq!(status["step"], "swapping");
+    assert_eq!(status["backupCovers"], "lock");
+    assert!(status["deadlines"]["cancel"]["height"].is_u64(), "{status}");
+    world.drive(true, || false, || buyer.done());
+    assert_eq!(buyer.outcome(), Ok(Some(Outcome::Refunded)));
+    // The lock less cancel's and refund's fees, back in the wallet.
+    let held = world.received(&wallet);
+    assert!(held >= BTC_AMOUNT - BTC_FEE * 2, "{held}");
+    assert!(held < BTC_AMOUNT, "{held}");
+    assert_eq!(world.nexus.balance(&world.buyer_nex), 0);
+}
+
+/// The browser's page closed once its BTC lock is out: its recovery file,
+/// restored natively, carries the swap on to its end.
+#[test]
+#[ignore = "needs Docker, NEXUS_NODE_IMAGE and web/driver built"]
+fn the_browsers_recovery_file_restores_natively() {
+    let world = World::new();
+    let (url, _relay) = relay();
+    let (mut seller, offer, swap_id, seller_out) = world.offer_on(20, 1, Some(&url));
+    let config = world.browser_config(&offer, 20);
+    let (mut browser, wallet, _) = world.browser_take(&config);
+    world.drive(
+        false,
+        || false,
+        || world.state("seller", &swap_id) == "LockingNex",
+    );
+    let backup = world.dir("browser").join("backup");
+    wait_for("the recovery file", || backup.exists().then_some(()));
+    kill(&mut browser);
+
+    let file = std::fs::read_to_string(backup).unwrap();
+    let restored = Wallet::restore(world.native_config("native"), &file).unwrap();
+    assert_eq!(restored.address(), wallet);
+    assert_eq!(
+        restored.running().unwrap().as_deref(),
+        Some(swap_id.as_str())
+    );
+    drop(restored);
+    let mut buyer = world.native_resume("native");
+    let (seller_out, outcome) = world.finish_both(&mut seller, &mut buyer, seller_out);
+    assert_eq!(seller_out, "outcome: Swapped\n");
+    assert_eq!(outcome, Ok(Some(Outcome::Swapped)));
+    assert_eq!(
+        world.nexus.balance(&world.buyer_nex),
+        NEX_AMOUNT - world.nex_fee
+    );
+}
+
+/// The native buyer closed once its BTC lock is out: its recovery file,
+/// restored in the browser, carries the swap on to its end.
+#[test]
+#[ignore = "needs Docker, NEXUS_NODE_IMAGE and web/driver built"]
+fn the_native_recovery_file_restores_in_the_browser() {
+    let world = World::new();
+    let (url, _relay) = relay();
+    let (mut seller, offer, swap_id, seller_out) = world.offer_on(20, 1, Some(&url));
+    let (mut buyer, _) = world.native_take(&offer, 20);
+    world.drive(
+        false,
+        || false,
+        || world.state("seller", &swap_id) == "LockingNex",
+    );
+    buyer.close();
+    let (_, file) = buyer.wallet.backup().unwrap();
+    std::fs::create_dir_all(world.dir("browser")).unwrap();
+    std::fs::write(world.dir("browser").join("backup"), file).unwrap();
+
+    let config = world.browser_config(&offer, 20);
+    let mut browser = browser("restore", &config);
+    let mut seller_done = None;
+    world.drive(
+        false,
+        || true,
+        || {
+            seller_done = seller_done.or(seller.0.try_wait().unwrap());
+            seller_done.is_some() && browser.0.try_wait().unwrap().is_some()
+        },
+    );
+    assert_eq!(seller_out.join().unwrap(), "outcome: Swapped\n");
+    assert_eq!(stdout(&mut browser.0), "outcome: swapped\n");
     assert_eq!(
         world.nexus.balance(&world.buyer_nex),
         NEX_AMOUNT - world.nex_fee

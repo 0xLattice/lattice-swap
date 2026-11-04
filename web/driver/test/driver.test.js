@@ -4,6 +4,7 @@ import 'fake-indexeddb/auto';
 
 import { Buyer, IndexedDBStore, MemoryStore, Wallet } from '../src/index.js';
 import { call } from '../src/wasm.js';
+import { Esplora } from '../src/esplora.js';
 import { PINGS_MISSED, Session } from '../src/relay.js';
 import { Chain, esplora, kind, Locks, loadWasm, nexus, parseTx, POLICY, seller, testOffer, until } from './fakes.js';
 
@@ -1061,4 +1062,55 @@ test('Wallet.exists with no store given closes the one it opens', async () => {
   } finally {
     globalThis.indexedDB = indexedDB;
   }
+});
+
+test('an Esplora that answers a txid with another transaction is refused', async () => {
+  const chain = new Chain();
+  // One input, one output of 1 sat to an empty script.
+  const hex = `02000000 01 ${'11'.repeat(32)} 00000000 00 ffffffff 01 0100000000000000 00 00000000`.replaceAll(' ', '');
+  const { txid } = parseTx(hex);
+  const forged = 'ff'.repeat(32);
+  chain.txs.set(txid, { hex, height: null });
+  chain.txs.set(forged, { hex, height: null });
+  const server = await esplora(chain);
+  try {
+    const backend = new Esplora(server.url);
+    assert.deepEqual(await backend.transaction(txid), { hex, height: null });
+    await assert.rejects(backend.transaction(forged), /another transaction/);
+  } finally {
+    server.close();
+  }
+});
+
+test('an outspend naming an unrelated transaction leaves the page on its refund path', async () => {
+  const { w, run, funding } = await funded({ extra: { messageTimeout: 300 } });
+  await run.stop();
+  sellerLocksNex(w, funding);
+  const lockHeight = w.chain.height;
+  const view = (lockSpend, cancelSpend) => ({
+    Bitcoin: { height: w.chain.height, funding: w.chain.height - lockHeight + 1, lock_spend: lockSpend, cancel_spend: cancelSpend, stale: null },
+  });
+  w.chain.mine(TERMS.t1 - 1);
+  const [cancel] = sellerSees(w, view(null, null));
+  confirm(w, cancel);
+  w.chain.mine(TERMS.t2 - 1);
+  // Real and in a block, but spending nothing of the swap.
+  const unrelated = `02000000 01 ${'11'.repeat(32)} 00000000 00 ffffffff 01 0100000000000000 00 00000000`.replaceAll(' ', '');
+  confirm(w, unrelated);
+
+  // The page comes back to cancel in a block and is on its refund path.
+  w.buyer = await Buyer.resume(w.wallet, w.buyer.swapId);
+  const again = running(w.buyer);
+  const state = async () => kind((await w.store.get(`swap:${w.buyer.swapId}`)).state);
+  await until(async () => (await state()) === 'Cancelling').catch((e) => assert.fail(`${e.message}: ${JSON.stringify(w.buyer.status())}`));
+  // Then its Esplora names the unrelated transaction as cancel's spender.
+  w.chain.spends.set(`${parseTx(cancel).txid}:0`, parseTx(unrelated).txid);
+  await until(() => /does not spend/.test(w.buyer.status().warning ?? '')).catch((e) =>
+    assert.fail(`${e.message}: ${JSON.stringify(w.buyer.status())}`),
+  );
+  await again.stop();
+  const record = await w.store.get(`swap:${w.buyer.swapId}`);
+  // Never read as the seller's punish: it still waits to refund.
+  assert.ok(!['AskingShare', 'Punished', 'Done'].includes(kind(record.state)), kind(record.state));
+  assert.equal(kind(record.state), 'Cancelling');
 });

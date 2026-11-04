@@ -114,6 +114,7 @@ fn a_stale_tip_shows_a_stale_view() {
         SystemTime::now(),
         &mut first_seen,
     )
+    .unwrap()
     .unwrap();
     let stale = view.stale.unwrap();
     assert!(stale.contains("minutes old"), "{stale}");
@@ -127,6 +128,7 @@ fn a_stale_tip_shows_a_stale_view() {
         SystemTime::now(),
         &mut first_seen,
     )
+    .unwrap()
     .unwrap();
     assert_eq!(view.height, 1);
     assert_eq!(view.stale, None);
@@ -177,7 +179,9 @@ fn a_punish_of_the_sellers_own_making_shows_in_the_view() {
     let cancel = swap.finalize(lock, Spend::Cancel, &a, Some(&b)).unwrap();
     rpc.broadcast(&cancel).unwrap();
     mine(3);
-    let view = bitcoin_view(&rpc, &swap, lock, AGE, SystemTime::now(), &mut None).unwrap();
+    let view = bitcoin_view(&rpc, &swap, lock, AGE, SystemTime::now(), &mut None)
+        .unwrap()
+        .unwrap();
     assert_eq!(view.lock_spend.unwrap().confirmations, 3);
     assert!(view.cancel_spend.is_none(), "the cancel output is unspent");
 
@@ -192,6 +196,7 @@ fn a_punish_of_the_sellers_own_making_shows_in_the_view() {
     rpc.broadcast(&punish).unwrap();
     let spent = |depth| {
         let spent = bitcoin_view(&rpc, &swap, lock, AGE, SystemTime::now(), &mut None)
+            .unwrap()
             .unwrap()
             .cancel_spend
             .unwrap();
@@ -965,7 +970,9 @@ fn contest_a_refund(punish: impl FnOnce(&Bitcoind, &Transaction)) {
     // The seller ignores it and punishes, with a child paying 30 sat/vB.
     let view = BitcoinView {
         cancel_spend: None,
-        ..bitcoin_view(&seller_rpc, &swap, lock, AGE, SystemTime::now(), &mut None).unwrap()
+        ..bitcoin_view(&seller_rpc, &swap, lock, AGE, SystemTime::now(), &mut None)
+            .unwrap()
+            .unwrap()
     };
     let (_, actions) = seller.step(Event::Bitcoin(view));
     let [Action::Broadcast(tx)] = &actions[..] else {

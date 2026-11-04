@@ -1,6 +1,8 @@
 // Bitcoin through an Esplora API, as mempool.space and blockstream.info
 // serve one: the reads a buyer's view needs, and broadcasts.
 
+import { wasm } from './wasm.js';
+
 /** One Esplora API at `url`, e.g. `https://mempool.space/api`. */
 export class Esplora {
   constructor(url, fetchImpl = globalThis.fetch) {
@@ -26,13 +28,15 @@ export class Esplora {
 
   /** A transaction, if Esplora holds it: `{hex, height}`, `height` null in
    * the mempool. `/tx/{txid}` answers 404 for one it never saw; its
-   * `/status` would answer unconfirmed. */
+   * `/status` would answer unconfirmed. Trusted for where a transaction
+   * is, never for what it is: a forged refund would read as a punish. */
   async transaction(txid) {
     const tx = await this.#get(`/tx/${txid}`, true);
     if (tx === null) return null;
     const { status } = JSON.parse(tx);
     const hex = await this.#get(`/tx/${txid}/hex`, true);
     if (hex === null) return null;
+    if (wasm.txidOf(hex) !== txid) throw new Error(`${this.url}/tx/${txid}/hex is another transaction`);
     return { hex: hex.trim(), height: status.confirmed ? status.block_height : null };
   }
 
