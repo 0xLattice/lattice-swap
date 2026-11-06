@@ -1830,7 +1830,7 @@ fn a_seller_on_public_nodes_swaps_and_withdraws() {
     world.nodes.borrow_mut().insert("seller", seller);
     world.nodes.borrow_mut().insert("buyer", buyer);
 
-    let (mut seller, mut buyer, _, seller_out) = world.start(20, 1);
+    let (mut seller, mut buyer, swap_id, seller_out) = world.start(20, 1);
     let (mut seller_done, mut buyer_done) = (None, None);
     world.drive(
         false,
@@ -1841,8 +1841,15 @@ fn a_seller_on_public_nodes_swaps_and_withdraws() {
             seller_done.is_some() && buyer_done.is_some()
         },
     );
-    assert_eq!(seller_out.join().unwrap(), "outcome: Swapped\n");
-    assert_eq!(stdout(&mut buyer.0), "outcome: Swapped\n");
+    let swap_file = |side| std::fs::read_to_string(world.swap_file(side, &swap_id)).unwrap();
+    let (seller_out, buyer_out) = (seller_out.join().unwrap(), stdout(&mut buyer.0));
+    assert_eq!(
+        (seller_out.as_str(), buyer_out.as_str()),
+        ("outcome: Swapped\n", "outcome: Swapped\n"),
+        "DIAG seller {}\nDIAG buyer {}",
+        swap_file("seller"),
+        swap_file("buyer")
+    );
     assert!(seller_done.unwrap().success() && buyer_done.unwrap().success());
     assert_eq!(
         world.nexus.balance(&world.buyer_nex),
