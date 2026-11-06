@@ -313,18 +313,28 @@ impl Bitcoin for Esplora {
     }
 
     /// The relay floor, and if another unconfirmed transaction spends
-    /// `parent`'s input, enough to replace it, as [`Bitcoind`]'s floor
-    /// works it out: Esplora shows no descendants, so only the conflict's
-    /// own fee counts.
+    /// `parent`'s input, enough to replace it, above `parent`'s own feerate,
+    /// as [`Bitcoind`]'s floor works it out: Esplora shows no descendants,
+    /// so only the conflict's own fee counts.
     ///
     /// [`Bitcoind`]: crate::bitcoind::Bitcoind
     fn floor(&self, parent: &Transaction) -> Result<FeeRate> {
-        let other = match self.pooled_spender(parent.input[0].previous_output)? {
+        let input = parent.input[0].previous_output;
+        let other = match self.pooled_spender(input)? {
             Some((txid, shown)) if txid != parent.compute_txid() => shown,
             _ => return Ok(MIN_RELAY),
         };
         let ours = self.package_vsize(parent)?;
-        let beat = over(other.fee, other.vsize()).max(over(other.fee, ours));
+        let (spent, _) = self
+            .transaction(input.txid)?
+            .ok_or_else(|| Error(format!("input {input} unseen")))?;
+        let paid = spent.output[input.vout as usize].value.to_sat();
+        let fee = (parent.output.iter())
+            .try_fold(paid, |left, out| left.checked_sub(out.value.to_sat()))
+            .ok_or_else(|| Error("the parent pays out more than its input".into()))?;
+        let beat = over(other.fee, other.vsize())
+            .max(over(other.fee, ours))
+            .max(over(fee, parent.vsize() as u64));
         let above = beat.to_sat_per_kwu() + MIN_RELAY.to_sat_per_kwu();
         Ok(MIN_RELAY.max(FeeRate::from_sat_per_kwu(above)))
     }

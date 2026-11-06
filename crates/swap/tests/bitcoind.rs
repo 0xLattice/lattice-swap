@@ -595,6 +595,78 @@ fn a_cancel_cannot_displace_a_waiting_redeem() {
     assert!(pooled(&seller, redeem));
 }
 
+/// After `t2` a pending refund and the seller's punish pay the same fee,
+/// and the punish, the smaller, is already above the refund's feerate:
+/// Bitcoin Core takes a package replacing the refund only above the
+/// punish's own feerate too, which its floor reaches.
+#[test]
+fn a_punish_package_replaces_a_pending_refund() {
+    let node = start(&[]);
+    let rpc = rpc(&node, "default");
+    let (machine, cancel) =
+        Redeems::funded(&node, node.client.new_address().unwrap().script_pubkey());
+    let (swap, lock, seller) = (machine.swap(), machine.lock, machine.key(0));
+    // The lock is one deep; t1 = 3, then t2 = 2 from the cancel's block.
+    for _ in 0..2 {
+        mine_empty(&node);
+    }
+    rpc.broadcast(&cancel).unwrap();
+    let miner = node.client.new_address().unwrap();
+    node.client.generate_to_address(2, &miner).unwrap();
+    let refund = signed(&machine, Spend::Refund);
+    rpc.broadcast(&refund).unwrap();
+
+    let a = swap.sign(lock, Spend::Punish, &seller);
+    let punish = swap.finalize(lock, Spend::Punish, &a, None).unwrap();
+    assert!(punish.vsize() < refund.vsize());
+    outbid(&rpc, &swap, Spend::Punish, &punish, refund.compute_txid());
+}
+
+/// The same for a redeem against a pending cancel and refund, which pay
+/// its fee between them over about twice its size.
+#[test]
+fn a_redeem_package_replaces_a_pending_cancel_and_refund() {
+    let node = start(&[]);
+    let rpc = rpc(&node, "default");
+    let (machine, cancel) =
+        Redeems::funded(&node, node.client.new_address().unwrap().script_pubkey());
+    // The lock is one deep; t1 = 3, and a block more to be sure.
+    for _ in 0..3 {
+        mine_empty(&node);
+    }
+    rpc.broadcast(&cancel).unwrap();
+    rpc.broadcast(&signed(&machine, Spend::Refund)).unwrap();
+    let swap = machine.swap();
+    outbid(
+        &rpc,
+        &swap,
+        Spend::Redeem,
+        &machine.redeem,
+        cancel.compute_txid(),
+    );
+}
+
+/// `spend` of `machine`'s swap, signed by both parties.
+fn signed(machine: &Redeems, spend: Spend) -> Transaction {
+    let (swap, lock) = (machine.swap(), machine.lock);
+    let a = swap.sign(lock, spend, &machine.key(0));
+    let b = swap.sign(lock, spend, &machine.key(1));
+    swap.finalize(lock, spend, &a, Some(&b)).unwrap()
+}
+
+/// `parent`, `spend` of `swap`, refused for the pending `conflict`, then
+/// bumped at its floor into `conflict`'s place.
+fn outbid(rpc: &Bitcoind, swap: &Swap, spend: Spend, parent: &Transaction, conflict: Txid) {
+    let refused = rpc.broadcast(parent).unwrap_err().to_string();
+    assert!(refused.contains("insufficient fee"), "{refused}");
+    let floor = rpc.floor(parent).unwrap();
+    let fee = swap.fee(spend);
+    rpc.bump(parent, fee, floor, parent.output[0].value)
+        .unwrap();
+    assert!(pooled(rpc, parent.compute_txid()));
+    assert!(!pooled(rpc, conflict));
+}
+
 /// A payout the child cannot cover is spent to all but dust rather than
 /// not bumped, and the child pays no more than it may.
 #[test]

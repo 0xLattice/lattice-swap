@@ -50,7 +50,8 @@ pub trait Bitcoin {
     /// The lowest package feerate at which `parent`, which the mempool
     /// refused, would enter it with a child spending its payout: the
     /// mempool's minimum, and if another transaction spends `parent`'s input
-    /// there, enough to replace it and its descendants.
+    /// there, enough to replace it and its descendants, above `parent`'s own
+    /// feerate.
     fn floor(&self, parent: &Transaction) -> Result<FeeRate>;
     /// The feerate of `parent` and its descendants in the mempool, as a
     /// child that bumped it made it; `None` if `parent` is not there.
@@ -414,9 +415,20 @@ impl Bitcoin for Bitcoind {
             btc(&entry["fees"]["descendant"])?,
         );
         let (_, ours) = self.sized(parent)?;
+        // And it replaces with a package only above `parent`'s own feerate,
+        // a child that raises it: a punish, smaller than the refund it
+        // replaces at the same fee, is already above the refund's.
+        let (spent, _) = self
+            .transaction(input.txid)?
+            .ok_or_else(|| Error(format!("input {input} unseen")))?;
+        let paid = spent.output[input.vout as usize].value;
+        let fee = (parent.output.iter())
+            .try_fold(paid, |left, out| left.checked_sub(out.value))
+            .ok_or_else(|| Error("the parent pays out more than its input".into()))?;
         let beat = over(own, size("vsize")?)
             .max(over(all, size("descendantsize")?))
-            .max(over(all, ours));
+            .max(over(all, ours))
+            .max(over(fee, parent.vsize() as u64));
         let incremental = per_kvb(&mempool["incrementalrelayfee"])?;
         let above = beat.to_sat_per_kwu() + incremental.to_sat_per_kwu();
         Ok(minimum.max(FeeRate::from_sat_per_kwu(above)))
