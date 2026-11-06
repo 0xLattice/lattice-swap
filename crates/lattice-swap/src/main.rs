@@ -1139,18 +1139,14 @@ fn wallet(args: WalletArgs) -> Result<()> {
     Ok(())
 }
 
-/// A swap in `dir` whose swap file holds no outcome, if any.
+/// A swap in `dir` that has not ended, as the app judges it, if any.
 fn unended(dir: &Path) -> Result<Option<String>> {
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
         let Ok(store) = swap_store(&path) else {
             continue;
         };
-        let ended = match Saved::load(&store)? {
-            Saved::Seller(seller) => seller.outcome().is_some(),
-            Saved::Buyer(buyer) => buyer.outcome().is_some(),
-        };
-        if !ended {
+        if matches!(store.load_value()?, Some(state) if !app::ended(&state)) {
             let stem = path.file_stem().unwrap_or_default();
             return Ok(Some(stem.to_string_lossy().into()));
         }

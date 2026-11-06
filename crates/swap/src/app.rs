@@ -147,9 +147,10 @@ struct Recovery {
     swaps: Vec<Value>,
 }
 
-/// Whether a buyer's state has ended: `Punished` keeps its secrets, for a
-/// resume to ask the seller for `s` again.
-fn ended(state: &Value) -> bool {
+/// Whether a swap's state has ended: `Punished` keeps a buyer's secrets,
+/// for a resume to ask the seller for `s` again, and a seller's until the
+/// buyer claims, which may be never; neither spends from the wallet again.
+pub fn ended(state: &Value) -> bool {
     matches!(state, Value::String(name) if name == "Done")
         || state.get("Done").is_some()
         || state.get("Punished").is_some()

@@ -2307,7 +2307,7 @@ fn a_public_nexus_node_must_take_submits() {
 }
 
 /// `wallet --withdraw` is refused while a swap in the directory has not
-/// ended.
+/// ended; a punished one has.
 #[test]
 fn a_swap_not_ended_is_found() {
     let (directory, _) = swap_file(Seller::Done(Outcome::Swapped));
@@ -2319,8 +2319,17 @@ fn a_swap_not_ended_is_found() {
         ScriptBuf::new(),
     )
     .unwrap();
-    let (directory, _) = swap_file(seller);
+    let (directory, path) = swap_file(seller);
     assert_eq!(unended(directory.path()).unwrap(), Some("07".repeat(32)));
+
+    // A punished seller waits only for the buyer's claim, which may never
+    // come, and spends nothing more from the wallet: ended, as the app's.
+    let mut file: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let state = file["state"].as_object_mut().unwrap();
+    let (_, inner) = state.iter().next().unwrap();
+    file["state"] = json!({ "Punished": inner.clone() });
+    fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+    assert_eq!(unended(directory.path()).unwrap(), None);
 }
 
 /// An Esplora whose block 0 is `network`'s genesis, and that has nothing
