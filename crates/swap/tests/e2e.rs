@@ -24,7 +24,7 @@ use serde_json::{json, Value};
 use swap::bitcoind::{Bitcoin, Bitcoind};
 use swap::driver::{Driver, Store};
 use swap::transport::{Ivy, PeerKey};
-use swap::{Buyer, Outcome, SecretBytes, Seller, Terms};
+use swap::{Buyer, Machine, Outcome, SecretBytes, Seller, Terms};
 use swap_nexus_tx::rpc::Client;
 use swap_nexus_tx::{address, Transaction, TransactionBody};
 
@@ -70,8 +70,11 @@ fn wait_for<T>(what: &str, mut poll: impl FnMut() -> Option<T>) -> T {
 /// A lattice-node in Docker, as in swap-nexus-tx's node test. Its cookie
 /// is copied out to `cookie_file`, which the parties' clients read again
 /// when the node refuses theirs, as they would a mounted data directory.
+/// It dials no one but the peer named in `/tmp/peer`, if any, so a test
+/// can partition two nodes and join them again.
 struct Nexus {
     container: String,
+    p2p: u16,
     url: String,
     cookie: String,
     cookie_file: tempfile::NamedTempFile,
@@ -84,7 +87,8 @@ impl Nexus {
         let (rpc, p2p) = (free_port(), free_port());
         let script = format!(
             "exec lattice-node --data-directory /tmp/d --identity-key /tmp/p.key \
-             --listen-port {p2p} --rpc-port {rpc} --websocket-port 0 --no-default-peers"
+             --listen-port {p2p} --rpc-port {rpc} --websocket-port 0 --no-default-peers \
+             --peer-target 0 --peer-search-interval 0 $(cat /tmp/peer 2>/dev/null)"
         );
         let out = Command::new("docker")
             .args([
@@ -108,6 +112,7 @@ impl Nexus {
         // Built first, so the container goes even if the node never starts.
         let mut nexus = Nexus {
             container: String::from_utf8(out.stdout).unwrap().trim().to_string(),
+            p2p,
             url: format!("http://127.0.0.1:{rpc}"),
             cookie: String::new(),
             cookie_file: tempfile::NamedTempFile::new().unwrap(),
@@ -154,6 +159,56 @@ impl Nexus {
         assert_ne!(code.trim(), "137", "the node ended on SIGTERM, not SIGKILL");
         docker(&["start", &self.container]);
         self.copy_cookie();
+    }
+
+    /// Restarts the node peered with `with` alone, or, with `None`, with
+    /// no one: a partition.
+    fn peer(&mut self, with: Option<&Nexus>) {
+        let peer = with.map_or(String::new(), |other| {
+            format!("--peer {}@127.0.0.1:{}", other.peer_key(), other.p2p)
+        });
+        let write = format!("echo '{peer}' > /tmp/peer");
+        let out = Command::new("docker")
+            .args(["exec", &self.container, "sh", "-c", &write])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        self.restart();
+    }
+
+    /// The node's overlay key, from its identity key.
+    fn peer_key(&self) -> String {
+        let out = Command::new("docker")
+            .args(["exec", &self.container, "cat", "/tmp/p.key"])
+            .output()
+            .unwrap();
+        let secret: [u8; 32] = hex::decode(String::from_utf8(out.stdout).unwrap().trim())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        hex::encode(SigningKey::from_bytes(&secret).verifying_key().to_bytes())
+    }
+
+    /// The block the node acts on.
+    fn tip(&self) -> Option<String> {
+        self.client().health().unwrap().tip
+    }
+
+    /// Waits until the node acts on `other`'s tip.
+    fn follow(&self, other: &Nexus) {
+        wait_for("the nodes to agree", || {
+            let tip = other.tip();
+            (tip.is_some() && self.tip() == tip).then_some(())
+        });
+    }
+
+    /// Mines until the node is two blocks past `other`'s height: a
+    /// heavier branch, the blocks here all costing about the same work.
+    fn outmine(&self, other: &Nexus) {
+        let height = other.client().health().unwrap().height;
+        while self.client().health().unwrap().height < height + 2 {
+            self.mine(None);
+        }
     }
 
     fn client(&self) -> Client {
@@ -1152,6 +1207,173 @@ fn a_swap_completes_across_a_nexus_node_restart() {
         2 * REWARD - NEX_AMOUNT - fee
     );
     assert_eq!(n.balance(&lock_address(&lock)), 0);
+    assert_eq!(btc_balance(&world.seller_wallet), BTC_AMOUNT - BTC_FEE * 2);
+    assert_eq!(
+        btc_balance(&world.buyer_wallet),
+        BUYER_BTC - BTC_AMOUNT - world.funding_fee()
+    );
+}
+
+/// A second node, peered with `world`'s and at its tip.
+fn fork_node(world: &World) -> Nexus {
+    let mut fork = Nexus::start();
+    fork.peer(Some(&world.nexus));
+    world.nexus.follow(&fork);
+    fork
+}
+
+/// Mines a heavier branch on `fork`, cut off from `world`'s node, then
+/// joins the two: the swap's node reorgs onto it.
+fn reorg_onto(world: &World, fork: &mut Nexus) {
+    fork.outmine(&world.nexus);
+    fork.peer(Some(&world.nexus));
+    world.nexus.follow(fork);
+}
+
+/// Mines Bitcoin on demand and Nexus every round, so a claim gets deep with
+/// nothing else pending, until both parties end.
+fn mine_until_ended(world: &World, seller: &Party<Seller>, buyer: &Party<Buyer>) {
+    wait_for("the swap to end", || {
+        if finished(seller) && finished(buyer) {
+            return Some(());
+        }
+        if !world.mempool().is_empty() {
+            world.mine_btc(1);
+        }
+        world.nexus.mine(None);
+        None
+    });
+}
+
+#[test]
+#[ignore = "needs Docker and NEXUS_NODE_IMAGE"]
+fn a_claim_reorged_out_is_sent_again() {
+    let mut world = World::new(2);
+    // Two confirmations: a claim one block deep is received, not final.
+    // t1 leaves time for the deeper lock.
+    world.terms.nex_confirmations = 2;
+    world.terms.t1 = world.terms.t1_floor().try_into().unwrap();
+    let mut fork = fork_node(&world);
+    // The buyer's phases as `buyer_status` shows them, and its claims.
+    let phases = Arc::new(Mutex::new(Vec::<String>::new()));
+    let claims = Arc::new(Mutex::new(Vec::<String>::new()));
+    let (seen, cids) = (phases.clone(), claims.clone());
+    let (seller, buyer, lock) = start(&world, move |state| {
+        let status = swap::status::buyer_status(state, None);
+        let phase = status["phase"].as_str().unwrap().to_string();
+        let mut seen = seen.lock().unwrap();
+        if seen.last() != Some(&phase) {
+            seen.push(phase);
+        }
+        let cid = state.watch().nexus.and_then(|watch| watch.cid);
+        if let (Buyer::ClaimingNex(_), Some(cid)) = (state, cid) {
+            let mut cids = cids.lock().unwrap();
+            if !cids.contains(&cid) {
+                cids.push(cid);
+            }
+        }
+        false
+    });
+    let received = || phases.lock().unwrap().last().map(String::as_str) == Some("received");
+    // The lock lands one deep, and both nodes have it; then they part, and
+    // the swap's node takes the lock to two deep and the claim to one.
+    world.drive(Pace::OnDemand, true, || {
+        let address = lock.lock().unwrap().clone();
+        address.is_some_and(|address| world.nexus.balance(&address) == NEX_AMOUNT)
+    });
+    fork.follow(&world.nexus);
+    fork.peer(None);
+    world.nexus.mine(None);
+    world.drive(Pace::OnDemand, true, received);
+    assert_eq!(
+        world.nexus.balance(&world.buyer_nex),
+        NEX_AMOUNT - world.terms.nex_fee
+    );
+
+    // A heavier branch without the claim; the lock under it stays.
+    reorg_onto(&world, &mut fork);
+    assert_eq!(world.nexus.balance(&world.buyer_nex), 0);
+    assert_eq!(world.nexus.balance(&lock_address(&lock)), NEX_AMOUNT);
+    wait_for("the buyer to see the claim gone", || {
+        (!received()).then_some(())
+    });
+    // The claim lands again, and the swap ends once it is two deep.
+    mine_until_ended(&world, &seller, &buyer);
+    assert_eq!(outcome(seller).0, Some(Outcome::Swapped));
+    assert_eq!(outcome(buyer).0, Some(Outcome::Swapped));
+    let phases = phases.lock().unwrap();
+    let from = phases.iter().position(|phase| phase == "received").unwrap();
+    assert_eq!(
+        phases[from..],
+        ["received", "finishing", "received"],
+        "{phases:?}"
+    );
+    assert_eq!(claims.lock().unwrap().len(), 1, "one claim, sent again");
+
+    let fee = world.terms.nex_fee;
+    let n = &world.nexus;
+    assert_eq!(n.balance(&world.buyer_nex), NEX_AMOUNT - fee);
+    assert_eq!(
+        n.balance(&world.seller_nex.nex_address()),
+        2 * REWARD - NEX_AMOUNT - fee
+    );
+    assert_eq!(n.balance(&lock_address(&lock)), 0);
+    assert_eq!(btc_balance(&world.seller_wallet), BTC_AMOUNT - BTC_FEE * 2);
+    assert_eq!(
+        btc_balance(&world.buyer_wallet),
+        BUYER_BTC - BTC_AMOUNT - world.funding_fee()
+    );
+}
+
+#[test]
+#[ignore = "needs Docker and NEXUS_NODE_IMAGE"]
+fn a_nex_lock_reorged_out_is_signed_for_once_deep_again() {
+    let mut world = World::new(2);
+    // Two confirmations: a lock one block deep is not yet signed for. t1
+    // leaves time for the deeper lock.
+    world.terms.nex_confirmations = 2;
+    world.terms.t1 = world.terms.t1_floor().try_into().unwrap();
+    let mut fork = fork_node(&world);
+    // The two nodes part before the swap.
+    fork.peer(None);
+    let signed = Arc::new(AtomicBool::new(false));
+    let flag = signed.clone();
+    let (seller, buyer, lock) = start(&world, move |state| {
+        if matches!(state, Buyer::AwaitRedeem { .. }) {
+            flag.store(true, Ordering::SeqCst);
+        }
+        false
+    });
+    // The lock lands one deep on the swap's node alone.
+    world.drive(Pace::OnDemand, true, || {
+        let address = lock.lock().unwrap().clone();
+        address.is_some_and(|address| world.nexus.balance(&address) == NEX_AMOUNT)
+    });
+    // A heavier branch without it: the node takes the lock back to its
+    // pool.
+    reorg_onto(&world, &mut fork);
+    let address = lock_address(&lock);
+    assert_eq!(world.nexus.balance(&address), 0);
+    assert!(world.nexus.pending() > 0, "the lock back in the pool");
+    // It lands again, one deep: still not enough to sign for.
+    world.nexus.mine(None);
+    assert_eq!(world.nexus.balance(&address), NEX_AMOUNT);
+    thread::sleep(Duration::from_secs(5));
+    assert!(!signed.load(Ordering::SeqCst), "signed for a shallow lock");
+    // Two deep on the new branch, the buyer signs, and the swap ends once
+    // its claim is two deep.
+    mine_until_ended(&world, &seller, &buyer);
+    assert_eq!(outcome(seller).0, Some(Outcome::Swapped));
+    assert_eq!(outcome(buyer).0, Some(Outcome::Swapped));
+
+    let fee = world.terms.nex_fee;
+    let n = &world.nexus;
+    assert_eq!(n.balance(&world.buyer_nex), NEX_AMOUNT - fee);
+    assert_eq!(
+        n.balance(&world.seller_nex.nex_address()),
+        2 * REWARD - NEX_AMOUNT - fee
+    );
+    assert_eq!(n.balance(&address), 0);
     assert_eq!(btc_balance(&world.seller_wallet), BTC_AMOUNT - BTC_FEE * 2);
     assert_eq!(
         btc_balance(&world.buyer_wallet),
