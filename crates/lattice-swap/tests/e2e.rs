@@ -15,6 +15,7 @@
 //! node image and `-- --ignored`. The node's RPC listens on loopback only,
 //! so its container shares the host's network.
 
+use std::cell::{Cell, RefCell};
 use std::io::{BufRead, BufReader, Read};
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -87,6 +88,13 @@ fn wait_for<T>(what: &str, mut poll: impl FnMut() -> Option<T>) -> T {
 
 /// A relay on loopback: its URL and the relay.
 fn relay() -> (String, Arc<Relay>) {
+    let (url, relay, _) = stoppable_relay();
+    (url, relay)
+}
+
+/// [`relay`], and what stops it: its runtime dropped, every connection it
+/// holds closes, and its port takes no more.
+fn stoppable_relay() -> (String, Arc<Relay>, impl FnOnce()) {
     let relay = Arc::new(Relay {
         board: Board::new(10),
         rejoins: Board::new(10),
@@ -95,14 +103,25 @@ fn relay() -> (String, Arc<Relay>) {
     let url = format!("http://{}", listener.local_addr().unwrap());
     listener.set_nonblocking(true).unwrap();
     let serving = relay.clone();
-    thread::spawn(move || {
+    let stopped = Arc::new(AtomicBool::new(false));
+    let stopping = stopped.clone();
+    let server = thread::spawn(move || {
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        runtime.block_on(async {
-            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-            swap_relay::serve(listener, serving).await.unwrap();
-        });
+        let listener = {
+            let _entered = runtime.enter();
+            tokio::net::TcpListener::from_std(listener).unwrap()
+        };
+        runtime.spawn(async move { swap_relay::serve(listener, serving).await.unwrap() });
+        while !stopping.load(Ordering::SeqCst) {
+            thread::park();
+        }
     });
-    (url, relay)
+    let stop = move || {
+        stopped.store(true, Ordering::SeqCst);
+        server.thread().unpark();
+        server.join().unwrap();
+    };
+    (url, relay, stop)
 }
 
 /// A lattice-node in Docker, as in the swap crate's end-to-end tests.
@@ -469,7 +488,22 @@ impl World {
         nex_confirmations: u64,
         relay: Option<&str>,
     ) -> (Party, String, String, JoinHandle<String>) {
+        self.offer_deep(t1, 1, nex_confirmations, relay)
+    }
+
+    /// [`World::offer_on`], each lock to be `btc_confirmations` and
+    /// `nex_confirmations` deep, and `t2` as far over `btc_confirmations`
+    /// as at one: the buyer's refund window stays the 9 blocks it asks.
+    fn offer_deep(
+        &self,
+        t1: u16,
+        btc_confirmations: u32,
+        nex_confirmations: u64,
+        relay: Option<&str>,
+    ) -> (Party, String, String, JoinHandle<String>) {
         let (t1, nex_confirmations) = (t1.to_string(), nex_confirmations.to_string());
+        let t2 = (9 + btc_confirmations).to_string();
+        let btc_confirmations = btc_confirmations.to_string();
         let nex_fee = self.nex_fee.to_string();
         let place = match relay {
             Some(relay) => ["--relay", relay],
@@ -486,8 +520,8 @@ impl World {
                 // Regtest has no fee estimate.
                 .args(["--min-btc-fee-rate", "1"])
                 .args(["--nex-fee", &nex_fee])
-                .args(["--t1", &t1, "--t2", "10", "--margin", "3"])
-                .args(["--btc-confirmations", "1"])
+                .args(["--t1", &t1, "--t2", &t2, "--margin", "3"])
+                .args(["--btc-confirmations", &btc_confirmations])
                 .args(["--nex-confirmations", &nex_confirmations])
                 .args(NO_BUMP)
                 .arg("--dir")
@@ -580,6 +614,78 @@ impl World {
             },
         );
         status.unwrap()
+    }
+}
+
+impl World {
+    /// Time passes with the buyer gone, before it signed the redeem: the
+    /// seller cancels at t1, punishes at t2, and stays, blocks after, for
+    /// the buyer to come back.
+    fn punish(&self, seller: &mut Party, swap_id: &str) {
+        self.drive(
+            true,
+            || false,
+            || self.state("seller", swap_id) == "Punished",
+        );
+        let mut rounds = 0;
+        self.drive(
+            true,
+            || false,
+            || {
+                rounds += 1;
+                rounds > 5
+            },
+        );
+        assert!(
+            seller.0.try_wait().unwrap().is_none(),
+            "the punished seller stays"
+        );
+    }
+
+    /// Drives steadily until `done`, reading the buyer's `status` each
+    /// round. Once its redeem is signed, Nexus is mined only to take the
+    /// claim in, then one block for each claim depth the status has shown
+    /// `received`, so it shows every one: those depths, in order. Nothing
+    /// keeps the buyer open once it has received the NEX.
+    fn drive_through_received(
+        &self,
+        status: impl Fn() -> Value,
+        mut done: impl FnMut() -> bool,
+    ) -> Vec<u64> {
+        let last = RefCell::new(Value::Null);
+        let mined_over = Cell::new(None);
+        let mut depths = Vec::new();
+        self.drive(
+            true,
+            || {
+                let last = last.borrow();
+                match last["step"].as_str() {
+                    Some("finishing") => self.nexus.pending() > 0,
+                    Some("received") => {
+                        let depth = last["confirmations"]["nexLock"].as_u64();
+                        mined_over.replace(depth) != depth
+                    }
+                    _ => true,
+                }
+            },
+            || {
+                if done() {
+                    return true;
+                }
+                let now = status();
+                if now["step"] == "received" {
+                    assert_eq!(now["mustStayOpen"], false, "{now}");
+                    let depth = now["confirmations"]["nexLock"].as_u64();
+                    let depth = depth.expect("the claim's depth");
+                    if depths.last() != Some(&depth) {
+                        depths.push(depth);
+                    }
+                }
+                *last.borrow_mut() = now;
+                false
+            },
+        );
+        depths
     }
 }
 
@@ -902,21 +1008,37 @@ fn a_seller_killed_after_the_lock_resumes_and_the_buyer_rejoins_over_tcp() {
 }
 
 /// The browser's buyer: web/driver in Node, its wallet and swap kept in
-/// files.
+/// files. Each status it reports on stderr goes on to ours, the last also
+/// to `browser-status.json` beside `config`, for [`World::browser_status`].
 fn browser(mode: &str, config: &std::path::Path) -> Party {
     let script = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../web/driver/test/e2e-buyer.js"
     );
-    Party(
+    let mut buyer = Party(
         Command::new("node")
             .arg(script)
             .arg(mode)
             .arg(config)
             .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
             .expect("node, with web/driver built"),
-    )
+    );
+    let stderr = BufReader::new(buyer.0.stderr.take().unwrap());
+    let status = config.with_file_name("browser-status.json");
+    thread::spawn(move || {
+        for line in stderr.lines() {
+            let line = line.unwrap();
+            eprintln!("{line}");
+            if serde_json::from_str::<Value>(&line).is_ok_and(|status| status["step"].is_string()) {
+                let partial = status.with_extension("tmp");
+                std::fs::write(&partial, &line).unwrap();
+                std::fs::rename(&partial, &status).unwrap();
+            }
+        }
+    });
+    buyer
 }
 
 impl World {
@@ -981,6 +1103,13 @@ impl World {
             Value::Object(state) => state.keys().next().unwrap().clone(),
             state => panic!("a state: {state}"),
         }
+    }
+
+    /// The browser's last status; null before it reports one.
+    fn browser_status(&self) -> Value {
+        let path = self.directory.path().join("browser-status.json");
+        std::fs::read_to_string(path)
+            .map_or(Value::Null, |text| serde_json::from_str(&text).unwrap())
     }
 
     /// What the buyer's bitcoind holds at `address` in blocks.
@@ -1421,5 +1550,251 @@ fn the_native_recovery_file_restores_in_the_browser() {
     assert_eq!(
         world.nexus.balance(&world.buyer_nex),
         NEX_AMOUNT - world.nex_fee
+    );
+}
+
+/// As `a_punished_buyer_resumes_and_is_given_the_nex`, the browser's
+/// buyer: its page closed before it signed the redeem, and opened again
+/// from its recovery file past `t2`, it finds itself punished, meets the
+/// seller again at the relay, is given `s` and claims the NEX with it.
+#[test]
+#[ignore = "needs Docker, NEXUS_NODE_IMAGE and web/driver built"]
+fn a_punished_browser_restores_and_is_given_the_nex() {
+    let world = World::new();
+    let (url, _relay) = relay();
+    // The NEX lock stays one deep of two: the browser never signs the
+    // redeem.
+    let (mut seller, offer, swap_id, seller_out) = world.offer_on(24, 2, Some(&url));
+    let config = world.browser_config(&offer, 24);
+    let (mut buyer, _, _) = world.browser_take(&config);
+    world.drive(
+        false,
+        || true,
+        || world.state("seller", &swap_id) == "AwaitRedeemSignature",
+    );
+    assert_eq!(world.browser_state(&swap_id), "AwaitNexLock");
+    wait_for("the recovery file", || {
+        world.dir("browser").join("backup").exists().then_some(())
+    });
+    kill(&mut buyer);
+    world.punish(&mut seller, &swap_id);
+
+    let mut buyer = browser("restore", &config);
+    let (mut seller_done, mut buyer_done) = (None, None);
+    // Steady: the claim must reach two deep, past an empty pool.
+    world.drive(
+        true,
+        || true,
+        || {
+            seller_done = seller_done.or(seller.0.try_wait().unwrap());
+            buyer_done = buyer_done.or(buyer.0.try_wait().unwrap());
+            seller_done.is_some() && buyer_done.is_some()
+        },
+    );
+    assert!(buyer_done.unwrap().success(), "{buyer_done:?}");
+    assert_eq!(stdout(&mut buyer.0), "outcome: swapped\n");
+    assert_eq!(seller_done.unwrap().code(), Some(4));
+    assert_eq!(seller_out.join().unwrap(), "outcome: Punished\n");
+    assert_eq!(
+        world.nexus.balance(&world.buyer_nex),
+        NEX_AMOUNT - world.nex_fee
+    );
+    // Punish pays the BTC less cancel's fee and its own.
+    let seller_wallet = wallet_client(&world.bitcoind, "seller");
+    assert_eq!(btc_balance(&seller_wallet), BTC_AMOUNT - BTC_FEE * 2);
+}
+
+/// As `a_punished_buyer_resumes_and_is_given_the_nex`, the native buyer:
+/// closed before it signed the redeem, and opened again past `t2`, it finds
+/// itself punished, meets the seller again at the relay, is given `s` and
+/// claims the NEX with it.
+#[test]
+#[ignore = "needs Docker and NEXUS_NODE_IMAGE"]
+fn a_punished_native_buyer_resumes_and_is_given_the_nex() {
+    let world = World::new();
+    let (url, _relay) = relay();
+    // The NEX lock stays one deep of two: the buyer never signs the redeem.
+    let (mut seller, offer, swap_id, seller_out) = world.offer_on(24, 2, Some(&url));
+    let (mut buyer, _) = world.native_take(&offer, 24);
+    world.drive(
+        false,
+        || true,
+        || world.state("seller", &swap_id) == "AwaitRedeemSignature",
+    );
+    assert_eq!(world.state("native", &swap_id), "AwaitNexLock");
+    buyer.close();
+    drop(buyer);
+    world.punish(&mut seller, &swap_id);
+
+    let mut buyer = world.native_resume("native");
+    let mut seller_done = None;
+    // Steady: the claim must reach two deep, past an empty pool.
+    world.drive(
+        true,
+        || true,
+        || {
+            seller_done = seller_done.or(seller.0.try_wait().unwrap());
+            seller_done.is_some() && buyer.done()
+        },
+    );
+    assert_eq!(buyer.outcome(), Ok(Some(Outcome::Swapped)));
+    assert_eq!(seller_done.unwrap().code(), Some(4));
+    assert_eq!(seller_out.join().unwrap(), "outcome: Punished\n");
+    assert_eq!(
+        world.nexus.balance(&world.buyer_nex),
+        NEX_AMOUNT - world.nex_fee
+    );
+    let seller_wallet = wallet_client(&world.bitcoind, "seller");
+    assert_eq!(btc_balance(&seller_wallet), BTC_AMOUNT - BTC_FEE * 2);
+}
+
+/// A swap at three Nexus confirmations, the browser's buyer: once its claim
+/// is in a block over the lock it saw three deep, the NEX is its own, and
+/// its status says `received`, the claim one deep, then two, with nothing
+/// to keep the page open for; at three it is `done`.
+#[test]
+#[ignore = "needs Docker, NEXUS_NODE_IMAGE and web/driver built"]
+fn the_browser_has_received_the_nex_while_the_claim_deepens() {
+    let world = World::new();
+    let (url, _relay) = relay();
+    // t1 at the floor's 1 + 6 x 4 + 3, and two blocks over.
+    let (mut seller, offer, _, seller_out) = world.offer_on(30, 3, Some(&url));
+    let config = world.browser_config(&offer, 30);
+    let (mut buyer, _, buyer_out) = world.browser_take(&config);
+    let mut seller_done = None;
+    let depths = world.drive_through_received(
+        || world.browser_status(),
+        || {
+            seller_done = seller_done.or(seller.0.try_wait().unwrap());
+            seller_done.is_some() && buyer.0.try_wait().unwrap().is_some()
+        },
+    );
+    assert_eq!(depths, [1, 2]);
+    assert!(seller_done.unwrap().success());
+    assert_eq!(seller_out.join().unwrap(), "outcome: Swapped\n");
+    assert_eq!(buyer_out.join().unwrap(), "outcome: swapped\n");
+    let ended = wait_for("the last status", || {
+        let status = world.browser_status();
+        (status["step"] == "done").then_some(status)
+    });
+    assert_eq!(ended["outcome"], "swapped");
+    assert_eq!(
+        world.nexus.balance(&world.buyer_nex),
+        NEX_AMOUNT - world.nex_fee
+    );
+}
+
+/// As `the_browser_has_received_the_nex_while_the_claim_deepens`, the
+/// native buyer, its BTC lock two deep too.
+#[test]
+#[ignore = "needs Docker and NEXUS_NODE_IMAGE"]
+fn the_native_buyer_has_received_the_nex_while_the_claim_deepens() {
+    let world = World::new();
+    let (url, _relay) = relay();
+    // t1 at the floor's 2 + 6 x 4 + 3, and a block over.
+    let (mut seller, offer, swap_id, seller_out) = world.offer_deep(30, 2, 3, Some(&url));
+    let (mut buyer, _) = world.native_take(&offer, 30);
+    let mut seller_done = None;
+    let depths = world.drive_through_received(
+        || buyer.wallet.resume(&swap_id).unwrap().status().unwrap(),
+        || {
+            seller_done = seller_done.or(seller.0.try_wait().unwrap());
+            seller_done.is_some() && buyer.done()
+        },
+    );
+    assert_eq!(depths, [1, 2]);
+    assert!(seller_done.unwrap().success());
+    assert_eq!(seller_out.join().unwrap(), "outcome: Swapped\n");
+    assert_eq!(buyer.outcome(), Ok(Some(Outcome::Swapped)));
+    let ended = buyer.wallet.resume(&swap_id).unwrap().status().unwrap();
+    assert_eq!(ended["step"], "done");
+    assert_eq!(ended["outcome"], "swapped");
+    assert_eq!(
+        world.nexus.balance(&world.buyer_nex),
+        NEX_AMOUNT - world.nex_fee
+    );
+    let seller_wallet = wallet_client(&world.bitcoind, "seller");
+    assert_eq!(btc_balance(&seller_wallet), BTC_AMOUNT - BTC_FEE * 2);
+}
+
+/// The relay goes once the browser's BTC lock is in a block, before the
+/// seller's NEX lock lands, and their session with it. A relayed offer
+/// meets nowhere else, and each rejoin is at the relay, so the two never
+/// meet again: the browser cancels at t1 and refunds to its wallet, and
+/// the seller learns `b` from the refund and claims its NEX back.
+#[test]
+#[ignore = "needs Docker, NEXUS_NODE_IMAGE and web/driver built"]
+fn the_browser_refunds_when_the_relay_goes() {
+    let world = World::new();
+    let (url, _relay, stop) = stoppable_relay();
+    let (mut seller, offer, swap_id, seller_out) = world.offer_on(20, 1, Some(&url));
+    let config = world.browser_config(&offer, 20);
+    let (mut buyer, wallet, buyer_out) = world.browser_take(&config);
+    // No Nexus block until the relay is gone: the browser cannot sign the
+    // redeem before.
+    world.drive(
+        false,
+        || false,
+        || world.state("seller", &swap_id) == "LockingNex",
+    );
+    stop();
+    let (mut seller_done, mut buyer_done) = (None, None);
+    world.drive(
+        true,
+        || true,
+        || {
+            seller_done = seller_done.or(seller.0.try_wait().unwrap());
+            buyer_done = buyer_done.or(buyer.0.try_wait().unwrap());
+            seller_done.is_some() && buyer_done.is_some()
+        },
+    );
+    assert!(buyer_done.unwrap().success(), "{buyer_done:?}");
+    assert_eq!(buyer_out.join().unwrap(), "outcome: refunded\n");
+    assert_eq!(seller_done.unwrap().code(), Some(3));
+    assert_eq!(seller_out.join().unwrap(), "outcome: Refunded\n");
+    // The lock less cancel's and refund's fees, back in the wallet.
+    let held = world.received(&wallet);
+    assert!(held >= BTC_AMOUNT - BTC_FEE * 2, "{held}");
+    assert!(held < BTC_AMOUNT, "{held}");
+    assert_eq!(world.nexus.balance(&world.buyer_nex), 0);
+    assert_eq!(
+        world.nexus.balance(&world.seller_nex.nex_address()),
+        2 * REWARD - 2 * world.nex_fee
+    );
+}
+
+/// As `the_browser_refunds_when_the_relay_goes`, the native buyer.
+#[test]
+#[ignore = "needs Docker and NEXUS_NODE_IMAGE"]
+fn the_native_buyer_refunds_when_the_relay_goes() {
+    let world = World::new();
+    let (url, _relay, stop) = stoppable_relay();
+    let (mut seller, offer, swap_id, seller_out) = world.offer_on(20, 1, Some(&url));
+    let (mut buyer, wallet) = world.native_take(&offer, 20);
+    world.drive(
+        false,
+        || false,
+        || world.state("seller", &swap_id) == "LockingNex",
+    );
+    stop();
+    let mut seller_done = None;
+    world.drive(
+        true,
+        || true,
+        || {
+            seller_done = seller_done.or(seller.0.try_wait().unwrap());
+            seller_done.is_some() && buyer.done()
+        },
+    );
+    assert_eq!(buyer.outcome(), Ok(Some(Outcome::Refunded)));
+    assert_eq!(seller_done.unwrap().code(), Some(3));
+    assert_eq!(seller_out.join().unwrap(), "outcome: Refunded\n");
+    let held = world.received(&wallet);
+    assert!(held >= BTC_AMOUNT - BTC_FEE * 2, "{held}");
+    assert!(held < BTC_AMOUNT, "{held}");
+    assert_eq!(world.nexus.balance(&world.buyer_nex), 0);
+    assert_eq!(
+        world.nexus.balance(&world.seller_nex.nex_address()),
+        2 * REWARD - 2 * world.nex_fee
     );
 }
