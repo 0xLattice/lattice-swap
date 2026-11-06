@@ -802,6 +802,11 @@ pub struct Claim {
     /// `Swapped` if the claim lands and `Punished` otherwise.
     #[serde(default)]
     punished: bool,
+    /// A synced node last showed the claim in a block: the NEX is at this
+    /// party's address, still counting toward `nex_confirmations`. Cleared
+    /// if a reorg drops it, when it is submitted again.
+    #[serde(default)]
+    mined: bool,
 }
 
 #[allow(clippy::large_enum_variant)] // Short-lived: matched on as soon as made.
@@ -824,6 +829,7 @@ impl Claim {
             passed_at: None,
             claim: None,
             punished: false,
+            mined: false,
         }
     }
 
@@ -836,6 +842,7 @@ impl Claim {
         let terms = &self.setup.terms;
         let depth = view.watched.as_ref().and_then(|(_, depth)| *depth);
         if let Some(claim) = &self.claim {
+            self.mined = depth.is_some();
             return match depth {
                 Some(depth) if depth >= terms.nex_confirmations => Claimed::Done,
                 Some(_) => Claimed::Pending(self, vec![]),

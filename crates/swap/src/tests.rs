@@ -3190,8 +3190,20 @@ fn a_claim_is_done_only_nex_confirmations_deep() {
     };
     let (buyer, actions) = buyer_claiming_with(deep).step(nexus(account(500_000, 0), None));
     let claim = submitted(&actions);
+    let phase = |buyer: &Buyer| status::buyer_status(buyer, None)["phase"].clone();
+    assert_eq!(phase(&buyer), "finishing", "submitted, not yet in a block");
     let (buyer, _) = buyer.step(nexus(account(0, 1), mined(claim.body.clone(), 2)));
     assert_eq!(buyer.outcome(), None);
+    assert_eq!(
+        phase(&buyer),
+        "received",
+        "in a block: the NEX is at the address"
+    );
+    assert!(!buyer.must_stay_open());
+    // A reorg drops the claim: it is submitted again, and finishing again.
+    let (buyer, actions) = restart(&buyer).step(nexus(account(500_000, 0), None));
+    assert_eq!(submitted(&actions).cid(), claim.cid());
+    assert_eq!(phase(&buyer), "finishing");
     let (buyer, _) = buyer.step(nexus(account(0, 1), mined(claim.body, 3)));
     assert_eq!(buyer.outcome(), Some(Outcome::Swapped));
 }

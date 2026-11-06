@@ -13,6 +13,9 @@ use crate::{BitcoinView, Buyer, Machine, Outcome, Spent};
 ///   then, `refunding` once it cancels, then the outcome: `swapped`,
 ///   `refunded`, `punished`, `drained` or `aborted`. A punished buyer
 ///   asking the seller for `s` is `asking`; claiming with it, `finishing`.
+///   Either way, once the claim is in a block, `received`: the NEX is at
+///   the buyer's address while the claim counts toward
+///   `nex_confirmations`, and the swap ends `swapped` at that depth.
 /// - `must_stay_open` is [`Buyer::must_stay_open`].
 /// - `confirmations`: `{"funding", "lock_spend", "cancel_spend"}` as the
 ///   view shows them, each null where it shows none.
@@ -29,6 +32,7 @@ use crate::{BitcoinView, Buyer, Machine, Outcome, Spent};
 ///   ends; null once it has.
 pub fn buyer_status(buyer: &Buyer, view: Option<&BitcoinView>) -> Value {
     let phase = match buyer {
+        Buyer::ClaimingNex(claim) if claim.mined => "received",
         Buyer::AwaitRedeem { .. } | Buyer::ClaimingNex(_) => "finishing",
         Buyer::AskingShare { .. } => "asking",
         Buyer::Cancelling { .. } => "refunding",

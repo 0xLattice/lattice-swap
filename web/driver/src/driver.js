@@ -32,6 +32,7 @@ const STEPS = {
   swapping: 'swapping',
   finishing: 'finishing',
   asking: 'asking',
+  received: 'received',
   refunding: 'refunding',
   refunded: 'refunded',
   swapped: 'done',
@@ -162,9 +163,10 @@ export class Buyer extends EventTarget {
   /** Where the swap is, for a page to show:
    * - `step`: `fund-wallet` until the wallet can fund the lock and the
    *   offer is taken, then `swapping`, `finishing` once the redeem is
-   *   signed, and `done`; or `refunding` and `refunded`; or `asking`,
-   *   punished and resumed, while it asks the seller for `s`, then
-   *   `finishing` once given it; or `offer-gone`
+   *   signed, `received` once the claim is in a block, and `done` once
+   *   it is `nex_confirmations` deep; or `refunding` and `refunded`; or
+   *   `asking`, punished and resumed, while it asks the seller for `s`,
+   *   then `finishing` once given it; or `offer-gone`
    *   if the session to the seller would not open, or the seller refused
    *   the amount or answered other terms, as the CLI's `take` fails once:
    *   nothing of the swap was sent, and the buyer picks another offer; or
@@ -174,7 +176,9 @@ export class Buyer extends EventTarget {
    * - `wallet`: `{address, confirmed, unconfirmed}`, in sat, and `need`,
    *   in `fund-wallet`, the spendable balance the lock needs;
    * - `confirmations`: `{funding, lockSpend, cancelSpend, nexLock}`, as
-   *   last seen, null where unseen;
+   *   last seen, null where unseen; `nexLock` is the watched Nexus
+   *   transaction's depth: the NEX lock's, then, once claiming, the
+   *   claim's;
    * - `deadlines`: once the lock is in a block, `cancel`, the first block
    *   cancel can be in, and `punish`, the first the seller's punish can be
    *   in (the earliest it could be, until cancel is in a block), each
