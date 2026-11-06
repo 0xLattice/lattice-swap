@@ -116,8 +116,8 @@ and a public Nexus node for its claim of the NEX back on a refund, so keep
 time to refund, and a public Nexus node for how deep the NEX lock is, so
 keep `--btc-amount` small. Each prints the note for each chain it reads
 through a public node. With either chain on a public node, the swap reads
-the chains a round every 10 seconds, as the app does, within the node's
-rate limits.
+the chains at most once every 10 seconds, as the app does, however many
+messages the counterparty sends, within the node's rate limits.
 
 On an Esplora, the BTC a seller receives, and a buyer's refund, go to a
 single-key wallet in `wallet.json` in `--dir`, the native app's

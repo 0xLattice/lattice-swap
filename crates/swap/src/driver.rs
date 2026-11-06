@@ -192,7 +192,9 @@ pub struct Driver<M, B, T> {
     /// See [`crate::transport::in_background`].
     pub reconnect: Option<Reconnect<T>>,
     store: Store,
-    /// How long one round waits for a message; also the polling interval.
+    /// The least time between two reads of the chains. Messages are taken
+    /// as they come in between: however many the counterparty sends, the
+    /// nodes are read no more often, so it cannot spend their rate limits.
     pub poll: Duration,
     /// How long a counterparty may stay quiet before anything is at stake.
     pub message_timeout: Duration,
@@ -353,6 +355,7 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
         }
         let mut since = Instant::now();
         let mut kind = discriminant(&self.state);
+        let mut read_at = Instant::now();
         loop {
             if let Some(outcome) = self.state.outcome() {
                 return Ok(Some(outcome));
@@ -361,14 +364,17 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
                 return Ok(None);
             }
             self.rejoin()?;
-            if let Some(message) = self.receive() {
+            if let Some(message) = self.receive(read_at.saturating_duration_since(Instant::now())) {
                 self.apply(Event::Message(message))?;
             }
             if self.state.awaits_message() && since.elapsed() > self.message_timeout {
                 self.apply(Event::Timeout)?;
             }
-            self.observe_bitcoin()?;
-            self.observe_nexus()?;
+            if Instant::now() >= read_at {
+                read_at = Instant::now() + self.poll;
+                self.observe_bitcoin()?;
+                self.observe_nexus()?;
+            }
             if discriminant(&self.state) != kind {
                 kind = discriminant(&self.state);
                 since = Instant::now();
@@ -404,12 +410,13 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
         Ok(())
     }
 
-    fn receive(&mut self) -> Option<Message> {
+    /// A message, if one comes within `wait`.
+    fn receive(&mut self, wait: Duration) -> Option<Message> {
         let Some(transport) = &mut self.transport else {
-            std::thread::sleep(self.poll);
+            std::thread::sleep(wait);
             return None;
         };
-        match transport.recv(self.poll) {
+        match transport.recv(wait) {
             Ok(Some(bytes)) => {
                 let message = Message::decode(&bytes, self.store.swap_id);
                 if message.is_none() {

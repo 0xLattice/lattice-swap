@@ -281,7 +281,7 @@ impl NodeArgs {
     }
 
     /// The driver's poll: the app's on a public node, whose rate limits
-    /// a round each 250 ms would run into; else the driver's own.
+    /// reads every 250 ms would run into; else the driver's own.
     fn poll(&self) -> Option<Duration> {
         self.public().then_some(app::POLL)
     }
@@ -1171,8 +1171,8 @@ fn status(swap_file: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Runs the swap to its end, bumping as `bump` says, a round each `poll`
-/// if given, logging each state it reaches. On an error once the swap
+/// Runs the swap to its end, bumping as `bump` says, reading the chains
+/// at most once each `poll` if given, logging each state it reaches. On an error once the swap
 /// file exists, says how to carry on.
 fn run<M: Machine, B: Bitcoin, T: Transport>(
     swap_file: &Path,
