@@ -623,6 +623,44 @@ mod tests {
         (url, counts)
     }
 
+    /// A public read port's `/health` is a snapshot that may lag: a public
+    /// client reads its height and tip from `/api/chain/info`, sending no
+    /// cookie; a cookie client takes `/health`'s.
+    #[test]
+    fn a_public_client_reads_its_tip_live() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut request = [0u8; 4096];
+                let n = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..n]).to_string();
+                let body = if request.starts_with("GET /health ") {
+                    r#"{"phase":"active","height":"5","tipCID":"stale"}"#.to_string()
+                } else if request.starts_with("GET /api/chain/info ") {
+                    let authorized = request.contains("Authorization:");
+                    format!(r#"{{"height":"9","tipCID":"live","authorized":{authorized}}}"#)
+                } else {
+                    String::new()
+                };
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(head.as_bytes()).unwrap();
+                stream.write_all(body.as_bytes()).unwrap();
+            }
+        });
+        let timeout = Duration::from_secs(5);
+        let public = Client::public(&url, timeout);
+        let health = public.health().unwrap();
+        assert_eq!((health.height, health.tip.as_deref()), (9, Some("live")));
+        assert_eq!(public.chain_info().unwrap()["authorized"], false);
+        let own = Client::new(&url, "__cookie__:c", timeout);
+        assert_eq!(own.health().unwrap().height, 5);
+    }
+
     /// The node writes a new cookie at every start: a client made from the
     /// cookie file goes on under the new one, after one 401; a client given
     /// the cookie itself has no file to read again, and stays refused. Any

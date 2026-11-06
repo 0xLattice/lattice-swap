@@ -5174,3 +5174,44 @@ fn a_spend_that_spends_nothing_of_the_swap_is_refused() {
     assert_eq!(stopped.unwrap(), None);
     assert!(matches!(driver.state(), Buyer::Cancelling { .. }));
 }
+
+/// An Esplora whose block 0 is another chain's genesis is refused; one
+/// whose block 0 is the network's is taken.
+#[cfg(feature = "native")]
+#[test]
+fn an_esplora_on_another_network_is_refused() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Bitcoin)
+        .block_hash()
+        .to_string();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let mut request = [0u8; 4096];
+            let n = stream.read(&mut request).unwrap();
+            let (status, body) = if request[..n].starts_with(b"GET /block-height/0 ") {
+                ("200 OK", genesis.as_str())
+            } else {
+                ("404 Not Found", "")
+            };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    let esplora = crate::esplora::Esplora::new(
+        &url,
+        wallet::Key::new("regtest").unwrap(),
+        Duration::from_secs(5),
+    );
+    assert!(esplora.check_network(bitcoin::Network::Bitcoin).is_ok());
+    let refused = esplora
+        .check_network(bitcoin::Network::Signet)
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("not signet's"), "{refused}");
+}
