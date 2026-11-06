@@ -154,10 +154,11 @@ fn esplora_reads_funds_and_bumps() {
     let refused = esplora.bump(&low, Amount::from_sat(200), capped, Amount::from_sat(4_000));
     assert!(refused.is_err_and(|e| e.0.contains("/txs/package")));
 
-    // Another spend of its input, unconfirmed: the floor is its feerate
-    // and the incremental relay feerate over it.
+    // Another spend of its input, unconfirmed: the floor is the higher of
+    // its feerate and the rival's own, and the incremental relay feerate
+    // over it.
     let rival = parent(&key, change, value, key.script_pubkey.clone(), 5_000);
-    let beat = (200 * 250u64).div_ceil(low.vsize() as u64);
+    let beat = (5_000 * 250u64).div_ceil(rival.vsize() as u64);
     assert_eq!(
         esplora.floor(&rival).unwrap(),
         FeeRate::from_sat_per_kwu(beat + 250)
