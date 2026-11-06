@@ -85,8 +85,9 @@ enum Command {
     /// Prints the address and balance of the wallet a swap on an Esplora
     /// pays its BTC to, and funds a buyer's lock from: `wallet.json` in
     /// --dir, made there by the first such swap or by this. With
-    /// --withdraw, first sends all it can spend to that address; refused
-    /// while a swap in --dir runs or has not ended.
+    /// --withdraw, first sends all it can spend to that address. Refused
+    /// while a swap in --dir runs; with --withdraw, also while one has not
+    /// ended.
     Wallet(WalletArgs),
     /// Prints a swap's state and outcome from its swap file. Asks no node.
     Status {
@@ -194,8 +195,8 @@ struct NodeArgs {
     /// or with --nexus-cookie your own lattice-node's RPC.
     #[arg(long, default_value = PUBLIC_NEXUS)]
     nexus_url: String,
-    /// Your own lattice-node's RPC cookie file.
-    #[arg(long)]
+    /// Your own lattice-node's RPC cookie file, with its --nexus-url.
+    #[arg(long, requires = "nexus_url")]
     nexus_cookie: Option<PathBuf>,
     /// The CID of the genesis block of the Nexus to trade on: the
     /// lattice-node must follow that chain. Mainnet's by default.
@@ -264,9 +265,35 @@ impl NodeArgs {
         format!("{}/wallet/{wallet}", self.btc_url().trim_end_matches('/'))
     }
 
+    /// Whether Bitcoin is read through mempool.space's Esplora.
+    fn public_bitcoin(&self) -> bool {
+        self.btc_wallet.is_none() && self.esplora.is_none()
+    }
+
+    /// Whether Nexus is read through a public read port.
+    fn public_nexus(&self) -> bool {
+        self.nexus_cookie.is_none()
+    }
+
     /// Whether either chain is read through a public node.
     fn public(&self) -> bool {
-        (self.btc_wallet.is_none() && self.esplora.is_none()) || self.nexus_cookie.is_none()
+        self.public_bitcoin() || self.public_nexus()
+    }
+
+    /// The driver's poll: the app's on a public node, whose rate limits
+    /// a round each 250 ms would run into; else the driver's own.
+    fn poll(&self) -> Option<Duration> {
+        self.public().then_some(app::POLL)
+    }
+
+    /// Says what `trusts` says of each chain read through a public node.
+    fn trust(&self, trusts: [&str; 2]) {
+        if self.public_bitcoin() {
+            log(trusts[0]);
+        }
+        if self.public_nexus() {
+            log(trusts[1]);
+        }
     }
 
     /// A client for the Nexus node: your lattice-node's RPC, which reads
@@ -322,21 +349,28 @@ fn esplora_url(given: Option<&str>, network: Network) -> Result<String> {
     }
 }
 
-/// What each side trusts a public node for, said once it reads through
-/// one.
-const SELLER_TRUSTS: &str = "the seller trusts the public node for how deep the buyer's BTC \
-                             lock is: keep --max-btc-amount small";
-const BUYER_TRUSTS: &str = "the buyer trusts the public node for how deep the seller's NEX \
-                            lock is: keep --btc-amount small";
+/// What each side trusts a public node for, Bitcoin's then Nexus's, said
+/// of each chain it reads through one.
+const SELLER_TRUSTS: [&str; 2] = [
+    "the seller trusts mempool.space for how deep the buyer's BTC lock is: keep \
+     --max-btc-amount small",
+    "the seller trusts the public Nexus node for its claim of the NEX back on a refund: keep \
+     --max-btc-amount small",
+];
+const BUYER_TRUSTS: [&str; 2] = [
+    "the buyer trusts mempool.space to show Bitcoin in time to refund: keep --btc-amount small",
+    "the buyer trusts the public Nexus node for how deep the seller's NEX lock is: keep \
+     --btc-amount small",
+];
 
 /// The Bitcoin a party swaps on: its own bitcoind and wallet, or an
 /// Esplora over the wallet in its swap's directory, held open while it
 /// runs, as an app holds it.
 enum Btc {
     Node(Bitcoind),
-    /// The wallet only held, as its lock keeps other swaps and a
-    /// withdrawal out of the directory.
-    Esplora(Esplora, #[allow(dead_code)] Arc<Wallet>),
+    /// The wallet held, as its lock keeps other swaps and a withdrawal out
+    /// of the directory.
+    Esplora(Esplora, Arc<Wallet>),
 }
 
 /// `$body`, with `$bitcoin` the [`Btc`]'s own client.
@@ -767,9 +801,7 @@ fn offer(args: OfferArgs) -> Result<Outcome> {
         )
         .into());
     }
-    if args.nodes.public() {
-        log(SELLER_TRUSTS);
-    }
+    args.nodes.trust(SELLER_TRUSTS);
     let redeem = bitcoin.payout(args.nodes.btc_network)?;
     let punish = bitcoin.payout(args.nodes.btc_network)?;
     fs::create_dir_all(&args.dir)?;
@@ -802,6 +834,7 @@ fn offer(args: OfferArgs) -> Result<Outcome> {
         store,
         nex_key: Some(key.clone()),
         bump: &args.bump,
+        poll: args.nodes.poll(),
     };
     // The seller fixes the terms at the amount the buyer asks for, then
     // starts its machine on them.
@@ -875,6 +908,7 @@ struct Start<'a> {
     store: Store,
     nex_key: Option<SecretBytes>,
     bump: &'a BumpArgs,
+    poll: Option<Duration>,
 }
 
 impl Start<'_> {
@@ -902,7 +936,7 @@ impl Start<'_> {
         );
         let mut driver = driver.map_err(|e| resume_hint(&swap_file, e))?;
         driver.nex_key = self.nex_key;
-        run(&swap_file, Ok(driver), self.bump)
+        run(&swap_file, Ok(driver), self.bump, self.poll)
     }
 }
 
@@ -924,6 +958,15 @@ fn take(args: TakeArgs) -> Result<Outcome> {
         ));
     }
     let bitcoin = args.nodes.bitcoin(&args.dir)?;
+    if let (Btc::Esplora(..), Some(swap_id)) = (&bitcoin, unended(&args.dir)?) {
+        // As the app's: a swap not ended may yet broadcast a funding it
+        // signed from the wallet.
+        return Err(format!(
+            "refused: swap {swap_id} has not ended, and may yet spend from this wallet: \
+             resume it first; one swap at a time"
+        )
+        .into());
+    }
     let floor = btc_fee_floor(&bitcoin, args.policy.min_btc_fee_rate)?;
     let nexus = args.nodes.nexus()?;
     args.nodes.check_nexus(&nexus)?;
@@ -931,9 +974,20 @@ fn take(args: TakeArgs) -> Result<Outcome> {
     let (network, genesis) = (args.nodes.btc_network, &args.nodes.nexus_genesis);
     let policy = args.policy.policy(&offer);
     check_offer(&offer, &policy, network, genesis, floor, nex_floor)?;
-    if args.nodes.public() {
-        log(BUYER_TRUSTS);
+    if let Btc::Esplora(_, wallet) = &bitcoin {
+        // As the app's, before the offer is taken.
+        let (enough, needed) = wallet.need(policy.btc_amount)?;
+        if !enough {
+            let (confirmed, _) = wallet.balance()?;
+            return Err(format!(
+                "refused: the wallet's {confirmed} sat confirmed does not fund the lock: \
+                 deposit to {} until it holds {needed} sat",
+                wallet.address()
+            )
+            .into());
+        }
     }
+    args.nodes.trust(BUYER_TRUSTS);
     let refund = bitcoin.payout(network)?;
     fs::create_dir_all(&args.dir)?;
 
@@ -958,7 +1012,7 @@ fn take(args: TakeArgs) -> Result<Outcome> {
         store,
     )
     .map_err(|e| resume_hint(&swap_file, e))?;
-    run(&swap_file, Ok(driver), &args.bump)
+    run(&swap_file, Ok(driver), &args.bump, args.nodes.poll())
 }
 
 fn resume(args: SwapFileArgs) -> Result<Outcome> {
@@ -979,13 +1033,11 @@ fn resume(args: SwapFileArgs) -> Result<Outcome> {
         Saved::Seller(seller) => {
             let given = args.key.given()?;
             let key = seller_key(seller.nex_address(), seller.signs_nex(), given)?;
-            let bitcoin = args.nodes.bitcoin(dir)?;
+            let bitcoin = resume_bitcoin(&args.nodes, dir, seller.redeem_payout())?;
             let nexus = args.nodes.nexus()?;
             if seller.outcome().is_none() {
                 args.nodes.check_nexus(&nexus)?;
-                if args.nodes.public() {
-                    log(SELLER_TRUSTS);
-                }
+                args.nodes.trust(SELLER_TRUSTS);
             }
             let driver = swap::session::resume::<Seller, _>(bitcoin, nexus, store);
             run(
@@ -995,23 +1047,46 @@ fn resume(args: SwapFileArgs) -> Result<Outcome> {
                     driver
                 }),
                 &args.bump,
+                args.nodes.poll(),
             )
         }
         Saved::Buyer(buyer) => {
             // A punished buyer asks the seller for `s` again.
             let buyer = buyer.resumed();
-            let bitcoin = args.nodes.bitcoin(dir)?;
+            let bitcoin = resume_bitcoin(&args.nodes, dir, buyer.refund_payout())?;
             let nexus = args.nodes.nexus()?;
             if buyer.outcome().is_none() {
                 args.nodes.check_nexus(&nexus)?;
-                if args.nodes.public() {
-                    log(BUYER_TRUSTS);
-                }
+                args.nodes.trust(BUYER_TRUSTS);
             }
             let driver = swap::session::resume::<Buyer, _>(bitcoin, nexus, store);
-            run(&swap_file, driver, &args.bump)
+            run(&swap_file, driver, &args.bump, args.nodes.poll())
         }
     }
+}
+
+/// The Bitcoin to resume a swap in `dir` on whose BTC is paid to
+/// `payout`. A swap file does not say which Bitcoin it was made on: on an
+/// Esplora, one that does not pay the wallet in `dir`, as one made on a
+/// bitcoind does, is refused, and no wallet is made for it.
+fn resume_bitcoin(nodes: &NodeArgs, dir: &Path, payout: Option<&Script>) -> Result<Btc> {
+    let refused = || {
+        format!(
+            "refused: the swap does not pay the wallet in {}: resume it with the Bitcoin \
+             flags it was made with, --btc-wallet and its node's for a bitcoind",
+            dir.display()
+        )
+    };
+    if nodes.btc_wallet.is_none() && !dir.join("wallet.json").exists() {
+        return Err(refused().into());
+    }
+    let bitcoin = nodes.bitcoin(dir)?;
+    if let (Btc::Esplora(esplora, _), Some(payout)) = (&bitcoin, payout) {
+        if esplora.key().script_pubkey.as_script() != payout {
+            return Err(refused().into());
+        }
+    }
+    Ok(bitcoin)
 }
 
 #[derive(Args)]
@@ -1094,17 +1169,22 @@ fn status(swap_file: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Runs the swap to its end, bumping as `bump` says, logging each state it
-/// reaches. On an error once the swap file exists, says how to carry on.
+/// Runs the swap to its end, bumping as `bump` says, a round each `poll`
+/// if given, logging each state it reaches. On an error once the swap
+/// file exists, says how to carry on.
 fn run<M: Machine, B: Bitcoin, T: Transport>(
     swap_file: &Path,
     driver: io::Result<Driver<M, B, T>>,
     bump: &BumpArgs,
+    poll: Option<Duration>,
 ) -> Result<Outcome> {
     let last = RefCell::new(String::new());
     let outcome = driver
         .and_then(|mut driver| {
             bump.apply(&mut driver);
+            if let Some(poll) = poll {
+                driver.poll = poll;
+            }
             driver.run_until(|state| {
                 let name = state_name(state);
                 if *last.borrow() != name {

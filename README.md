@@ -109,18 +109,29 @@ or `--btc-wallet` with `--btc-cookie` or `--btc-user` (and `--btc-url`) for
 your bitcoind, not both; `--nexus-url` for another node, and with
 `--nexus-cookie` your own lattice-node's RPC. At startup each prints
 `bitcoin: public <url>` or `bitcoin: your node <url>`, and the same for
-nexus. A public node is trusted for what it shows: a seller reading one
-trusts it for how deep the buyer's BTC lock is before it locks its NEX, so
-keep `--max-btc-amount` small, and a buyer trusts it for how deep the NEX
-lock is.
+nexus. A public node is trusted for what it shows: a seller trusts
+mempool.space for how deep the buyer's BTC lock is before it locks its NEX,
+and a public Nexus node for its claim of the NEX back on a refund, so keep
+`--max-btc-amount` small; a buyer trusts mempool.space to show Bitcoin in
+time to refund, and a public Nexus node for how deep the NEX lock is, so
+keep `--btc-amount` small. Each prints the note for each chain it reads
+through a public node. With either chain on a public node, the swap reads
+the chains a round every 10 seconds, as the app does, within the node's
+rate limits.
 
 On an Esplora, the BTC a seller receives, and a buyer's refund, go to a
 single-key wallet in `wallet.json` in `--dir`, the native app's
 (`swap::app`), and a buyer's lock is funded from it: deposit to it first.
 `lattice-swap wallet --dir <dir> [--esplora <url>] [--btc-network <net>]`
-prints its address and balance, and with `--withdraw <address>` sends all
-it can spend there, refused while a swap in the directory runs or has not
-ended. One swap at a time runs in a directory on an Esplora.
+prints its address and balance, refused while a swap in the directory
+runs; with `--withdraw <address>` it first sends all it can spend there,
+refused also while a swap there has not ended. One swap at a time runs in a
+directory on an Esplora: `take` is refused while one there has not ended,
+or while the wallet's confirmed balance does not fund the lock. A swap file
+does not say which Bitcoin it was made on: `resume` with no Bitcoin flags,
+or `--esplora`, refuses a swap that does not pay the wallet in its
+directory, as one made on a bitcoind does not; resume that with the flags
+it was made with.
 
 ```sh
 lattice-swap offer --nex-key-file ~/.lattice-swap/nex.key \

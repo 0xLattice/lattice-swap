@@ -65,6 +65,9 @@ const WALLET: &str = "wallet.json";
 const LOCK: &str = "wallet.lock";
 /// The blocks the offer's fee floor reads an estimate for, as the CLI's.
 const FEE_TARGET: &str = "6";
+/// Between two rounds of reads: slow enough for a public node's rate
+/// limits, as the browser's.
+pub const POLL: Duration = Duration::from_secs(10);
 /// About ten minutes a Bitcoin block.
 const BLOCK: Duration = Duration::from_secs(600);
 
@@ -108,7 +111,7 @@ impl Config {
             nexus,
             nexus_cookie,
             nexus_genesis,
-            poll: Duration::from_secs(10),
+            poll: POLL,
             message_timeout: Duration::from_secs(60),
             max_tip_age: Duration::from_secs(90 * 60),
         }

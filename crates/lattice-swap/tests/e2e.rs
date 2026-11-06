@@ -128,21 +128,25 @@ fn stoppable_relay() -> (String, Arc<Relay>, impl FnOnce()) {
 struct Nexus {
     container: String,
     url: String,
-    /// The public read port, which also takes submits, unthrottled.
+    /// The public read port, which also takes submits.
     public: String,
     cookie: String,
 }
 
+/// The public read port's flags for no rate limits.
+const UNLIMITED: &str = "--public-read-rate 0 --public-read-expensive-rate 0 \
+                         --public-read-max-rate 0 --public-submit-rate 0";
+
 impl Nexus {
-    fn start() -> Self {
+    /// A node whose public read port takes `rates`, its rate limit flags.
+    fn start(rates: &str) -> Self {
         let image =
             std::env::var("NEXUS_NODE_IMAGE").expect("NEXUS_NODE_IMAGE names the node image");
         let (rpc, p2p, public) = (free_port(), free_port(), free_port());
         let script = format!(
             "lattice-node --data-directory /tmp/d --identity-key /tmp/p.key \
              --listen-port {p2p} --rpc-port {rpc} --websocket-port 0 --no-default-peers \
-             --public-read-port {public} --public-submit --public-read-rate 0 \
-             --public-read-expensive-rate 0 --public-read-max-rate 0 --public-submit-rate 0"
+             --public-read-port {public} --public-submit {rates}"
         );
         let out = Command::new("docker")
             .args([
@@ -329,6 +333,11 @@ struct World {
 
 impl World {
     fn new() -> Self {
+        Self::with_rates(UNLIMITED)
+    }
+
+    /// [`World::new`], the node's public read port at `rates`.
+    fn with_rates(rates: &str) -> Self {
         let mut conf = Conf::default();
         conf.args.push("-txindex");
         let bitcoind = Node::from_downloaded_with_conf(&conf).expect("start bitcoind");
@@ -349,7 +358,7 @@ impl World {
             wallet_client(&bitcoind, "buyer").check_node().ok()
         });
 
-        let nexus = Nexus::start();
+        let nexus = Nexus::start(rates);
         let seller_nex = SecretBytes(random32());
         for _ in 0..2 {
             nexus.mine(Some(&seller_nex.nex_address()));
@@ -1807,12 +1816,14 @@ fn the_native_buyer_refunds_when_the_relay_goes() {
 
 /// The node-free seller: Bitcoin through an Esplora, here the shim, its
 /// BTC paid to the wallet in its directory, and Nexus through the node's
-/// public read port with no cookie; the buyer on its own bitcoind and the
-/// same public Nexus. They swap, and the seller withdraws its BTC.
+/// public read port with no cookie, at the node's default rate limits,
+/// which both parties, on one address, share; the buyer on its own
+/// bitcoind and the same public Nexus. They swap, and the seller withdraws
+/// its BTC.
 #[test]
 #[ignore = "needs Docker and NEXUS_NODE_IMAGE"]
 fn a_seller_on_public_nodes_swaps_and_withdraws() {
-    let world = World::new();
+    let world = World::with_rates("");
     let shim = esplora::esplora(wallet_client(&world.bitcoind, ""));
     let public_nexus = [
         "--nexus-url",
