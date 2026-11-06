@@ -7,19 +7,21 @@
 //! node image and `-- --ignored`. The node's RPC listens on loopback only,
 //! so its container shares the host's network.
 
+use std::cell::Cell;
 use std::net::TcpListener;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bitcoin::address::NetworkUnchecked;
-use bitcoin::{Address, Amount, Denomination, FeeRate, Network, ScriptBuf};
+use bitcoin::{Address, Amount, Denomination, FeeRate, Network, ScriptBuf, Txid};
 use corepc_node::{Conf, Node};
 use ed25519_dalek::SigningKey;
 use rand_core::{OsRng, RngCore};
 use serde_json::{json, Value};
-use swap::bitcoind::Bitcoind;
+use swap::bitcoind::{Bitcoin, Bitcoind};
 use swap::driver::{Driver, Store};
 use swap::transport::{Ivy, PeerKey};
 use swap::{Buyer, Outcome, SecretBytes, Seller, Terms};
@@ -65,11 +67,14 @@ fn wait_for<T>(what: &str, mut poll: impl FnMut() -> Option<T>) -> T {
     }
 }
 
-/// A lattice-node in Docker, as in swap-nexus-tx's node test.
+/// A lattice-node in Docker, as in swap-nexus-tx's node test. Its cookie
+/// is copied out to `cookie_file`, which the parties' clients read again
+/// when the node refuses theirs, as they would a mounted data directory.
 struct Nexus {
     container: String,
     url: String,
     cookie: String,
+    cookie_file: tempfile::NamedTempFile,
 }
 
 impl Nexus {
@@ -78,13 +83,15 @@ impl Nexus {
             std::env::var("NEXUS_NODE_IMAGE").expect("NEXUS_NODE_IMAGE names the node image");
         let (rpc, p2p) = (free_port(), free_port());
         let script = format!(
-            "lattice-node --data-directory /tmp/d --identity-key /tmp/p.key \
+            "exec lattice-node --data-directory /tmp/d --identity-key /tmp/p.key \
              --listen-port {p2p} --rpc-port {rpc} --websocket-port 0 --no-default-peers"
         );
         let out = Command::new("docker")
             .args([
                 "run",
                 "-d",
+                // Forwards `docker stop`'s SIGTERM to the node.
+                "--init",
                 "--network",
                 "host",
                 "--platform",
@@ -103,22 +110,54 @@ impl Nexus {
             container: String::from_utf8(out.stdout).unwrap().trim().to_string(),
             url: format!("http://127.0.0.1:{rpc}"),
             cookie: String::new(),
+            cookie_file: tempfile::NamedTempFile::new().unwrap(),
         };
-        nexus.cookie = wait_for("node cookie", || {
-            let out = Command::new("docker")
-                .args(["exec", &nexus.container, "cat", "/tmp/d/.cookie"])
-                .output()
-                .unwrap();
-            out.status
-                .success()
-                .then(|| String::from_utf8(out.stdout).unwrap())
-        });
-        wait_for("node RPC", || nexus.client().min_relay_fee().ok());
+        nexus.copy_cookie();
         nexus
     }
 
+    /// Waits for a cookie other than the one held, copies it out, and waits
+    /// for the RPC to take it.
+    fn copy_cookie(&mut self) {
+        let old = std::mem::take(&mut self.cookie);
+        self.cookie = wait_for("node cookie", || {
+            let out = Command::new("docker")
+                .args(["exec", &self.container, "cat", "/tmp/d/.cookie"])
+                .output()
+                .unwrap();
+            let cookie = String::from_utf8(out.stdout).unwrap();
+            (out.status.success() && !cookie.is_empty() && cookie != old).then_some(cookie)
+        });
+        std::fs::write(self.cookie_file.path(), &self.cookie).unwrap();
+        wait_for("node RPC", || self.client().min_relay_fee().ok());
+    }
+
+    /// Stops the node with SIGTERM, as an operator's `docker stop` does,
+    /// and starts it again. It keeps its chain and writes a new cookie.
+    fn restart(&mut self) {
+        let docker = |args: &[&str]| {
+            let out = Command::new("docker").args(args).output().unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap()
+        };
+        docker(&["stop", "--time", "30", &self.container]);
+        let code = docker(&[
+            "inspect",
+            "--format",
+            "{{.State.ExitCode}}",
+            &self.container,
+        ]);
+        assert_ne!(code.trim(), "137", "the node ended on SIGTERM, not SIGKILL");
+        docker(&["start", &self.container]);
+        self.copy_cookie();
+    }
+
     fn client(&self) -> Client {
-        Client::new(&self.url, &self.cookie, TIMEOUT)
+        Client::from_cookie_file(&self.url, self.cookie_file.path(), TIMEOUT).unwrap()
     }
 
     fn balance(&self, address: &str) -> u64 {
@@ -204,6 +243,12 @@ struct World {
     buyer_nex: String,
     seller_wallet: Bitcoind,
     buyer_wallet: Bitcoind,
+    /// The most the seller's driver bumps to: `NO_BUMP` unless a test needs
+    /// a bump.
+    seller_max_fee_rate: FeeRate,
+    /// How much less NEX than `nex_amount` the seller locks: a seller that
+    /// agreed to less than the buyer, or cheats.
+    short_lock: u64,
 }
 
 /// How the test mines Bitcoin while a scenario runs.
@@ -219,8 +264,14 @@ enum Pace {
 impl World {
     /// `seller_blocks` Nexus blocks pay the seller.
     fn new(seller_blocks: usize) -> Self {
+        Self::with_args(seller_blocks, &[])
+    }
+
+    /// [`World::new`], bitcoind started with `args`.
+    fn with_args(seller_blocks: usize, args: &[&'static str]) -> Self {
         let mut conf = Conf::default();
         conf.args.push("-txindex");
+        conf.args.extend(args);
         let bitcoind = Node::from_downloaded_with_conf(&conf).expect("start bitcoind");
         let miner = bitcoind.client.new_address().unwrap();
         bitcoind.client.generate_to_address(101, &miner).unwrap();
@@ -258,6 +309,8 @@ impl World {
             },
             seller_nex,
             buyer_nex,
+            seller_max_fee_rate: NO_BUMP,
+            short_lock: 0,
         };
         world.terms.nex_fee = world.nexus.client().min_relay_fee().unwrap();
         let buyer = world.address(&world.buyer_wallet);
@@ -286,6 +339,58 @@ impl World {
             .client
             .generate_to_address(blocks, &self.miner)
             .unwrap();
+    }
+
+    /// A block with none of the mempool in it: a miner leaving it out.
+    fn mine_empty(&self) {
+        bitcoind_call(
+            &self.bitcoind,
+            "generateblock",
+            json!([self.miner.to_string(), []]),
+        );
+    }
+
+    /// Takes the tip block away, its transactions back to the mempool;
+    /// returns its hash and the one transaction in it but the coinbase.
+    fn reorg_out_tip(&self) -> (String, Txid) {
+        let tip = bitcoind_call(&self.bitcoind, "getbestblockhash", json!([]));
+        let block = bitcoind_call(&self.bitcoind, "getblock", json!([tip]));
+        let txs = block["tx"].as_array().unwrap();
+        assert_eq!(txs.len(), 2, "the coinbase and one spend: {block}");
+        let tx = txs[1].as_str().unwrap().parse().unwrap();
+        bitcoind_call(&self.bitcoind, "invalidateblock", json!([tip]));
+        (tip.as_str().unwrap().into(), tx)
+    }
+
+    fn pooled(&self, txid: Txid) -> bool {
+        wallet_client(&self.bitcoind, "")
+            .call("getmempoolentry", json!([txid.to_string()]))
+            .is_ok()
+    }
+
+    /// The transactions in the mempool.
+    fn mempool(&self) -> Vec<Txid> {
+        let pool = bitcoind_call(&self.bitcoind, "getrawmempool", json!([]));
+        let txids = pool.as_array().unwrap().iter();
+        txids
+            .map(|txid| txid.as_str().unwrap().parse().unwrap())
+            .collect()
+    }
+
+    /// Drops every transaction in the mempool, as a node started with
+    /// `-mempoolexpiry=1` drops those an hour old: its clock jumps two hours
+    /// ahead, and the next transaction it takes expires them.
+    fn expire_mempool(&self) {
+        let chain = bitcoind_call(&self.bitcoind, "getblockchaininfo", json!([]));
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        let time = now.as_secs().max(chain["time"].as_u64().unwrap()) + 2 * 3600;
+        bitcoind_call(&self.bitcoind, "setmocktime", json!([time]));
+        let pooled = self.mempool();
+        self.bitcoind
+            .client
+            .send_to_address(&self.miner, Amount::from_sat(10_000))
+            .unwrap();
+        assert!(pooled.iter().all(|txid| !self.pooled(*txid)), "expired");
     }
 
     fn bitcoin(&self, wallet: &str) -> Bitcoind {
@@ -389,8 +494,10 @@ fn spawn_seller(
     buyer: PeerKey,
     stop: impl Fn(&Seller) -> bool + Send + 'static,
 ) -> Party<Seller> {
+    let mut terms = world.terms.clone();
+    terms.nex_amount -= world.short_lock;
     let seller = Seller::new(
-        world.terms.clone(),
+        terms,
         world.seller_nex.nex_address(),
         world.script(&world.seller_wallet),
         world.script(&world.seller_wallet),
@@ -401,14 +508,14 @@ fn spawn_seller(
         world.nexus.client(),
         world.store("seller"),
     );
-    let key = world.seller_nex.clone();
+    let (key, max_fee_rate) = (world.seller_nex.clone(), world.seller_max_fee_rate);
     thread::spawn(move || {
         let transport = Ivy::accept(listener, &config, buyer, TIMEOUT * 6, TIMEOUT).unwrap();
         let mut driver =
             Driver::start(seller, vec![], bitcoin, nexus, Some(transport), store).unwrap();
         driver.nex_key = Some(key);
         driver.fallback_fee_rate = NO_BUMP;
-        driver.max_fee_rate = NO_BUMP;
+        driver.max_fee_rate = max_fee_rate;
         let outcome = driver.run_until(stop).unwrap();
         (outcome, driver.state().clone())
     })
@@ -454,6 +561,24 @@ fn resume_buyer(world: &World) -> Party<Buyer> {
         let mut driver = Driver::<Buyer, _, Ivy>::resume(bitcoin, nexus, None, store).unwrap();
         driver.fallback_fee_rate = NO_BUMP;
         driver.max_fee_rate = NO_BUMP;
+        let outcome = driver.run().unwrap();
+        (Some(outcome), driver.state().clone())
+    })
+}
+
+/// The seller brought back from its state file, with no session.
+fn resume_seller(world: &World) -> Party<Seller> {
+    let (bitcoin, nexus, store) = (
+        world.bitcoin("seller"),
+        world.nexus.client(),
+        world.store("seller"),
+    );
+    let (key, max_fee_rate) = (world.seller_nex.clone(), world.seller_max_fee_rate);
+    thread::spawn(move || {
+        let mut driver = Driver::<Seller, _, Ivy>::resume(bitcoin, nexus, None, store).unwrap();
+        driver.nex_key = Some(key);
+        driver.fallback_fee_rate = NO_BUMP;
+        driver.max_fee_rate = max_fee_rate;
         let outcome = driver.run().unwrap();
         (Some(outcome), driver.state().clone())
     })
@@ -663,6 +788,360 @@ fn buyer_restarts_from_its_state_file() {
     // Restored from disk, it finds the redeem on chain and claims.
     let buyer = resume_buyer(&world);
     world.drive(Pace::OnDemand, true, || finished(&buyer));
+    assert_eq!(outcome(buyer).0, Some(Outcome::Swapped));
+
+    let fee = world.terms.nex_fee;
+    let n = &world.nexus;
+    assert_eq!(n.balance(&world.buyer_nex), NEX_AMOUNT - fee);
+    assert_eq!(
+        n.balance(&world.seller_nex.nex_address()),
+        2 * REWARD - NEX_AMOUNT - fee
+    );
+    assert_eq!(n.balance(&lock_address(&lock)), 0);
+    assert_eq!(btc_balance(&world.seller_wallet), BTC_AMOUNT - BTC_FEE * 2);
+    assert_eq!(
+        btc_balance(&world.buyer_wallet),
+        BUYER_BTC - BTC_AMOUNT - world.funding_fee()
+    );
+}
+
+#[test]
+#[ignore = "needs Docker and NEXUS_NODE_IMAGE"]
+fn a_refund_reorged_out_past_t2_loses_to_the_punish() {
+    let mut world = World::new(2);
+    // Two confirmations, so the one-block reorg below is one the terms
+    // allow for: a refund one block deep is not yet final.
+    world.terms.btc_confirmations = 2;
+    // The seller's driver bumps its punish as far as it takes to replace a
+    // pending refund; the buyer's never above the refund's own feerate.
+    world.seller_max_fee_rate = FeeRate::from_sat_per_vb_u32(50);
+    // The seller goes offline as it gives up the redeem, so it never sees
+    // the refund before `t2`.
+    let (seller, buyer, lock) = start_with(
+        &world,
+        |state| matches!(state, Seller::Cancelling { .. }),
+        |_| false,
+    );
+    // Nexus stalls with the lock pending; the buyer cancels at t1 and
+    // refunds once cancel is two deep. Stopped as the refund is one deep.
+    world.drive(Pace::Steady, false, || {
+        finished(&seller) && btc_balance(&world.buyer_wallet) > BUYER_BTC - BTC_AMOUNT
+    });
+    assert!(matches!(outcome(seller).1, Seller::Cancelling { .. }));
+    assert!(!finished(&buyer), "a refund one deep is not yet final");
+
+    // The refund's block is reorged out, and a miner leaves the refund out
+    // of every block until cancel is past `t2`.
+    let (_, refund) = world.reorg_out_tip();
+    for _ in 0..world.terms.t2 {
+        world.mine_empty();
+    }
+    assert!(world.pooled(refund));
+    // Back online, the seller learns `b` from the pending refund and
+    // punishes, bumping its punish as a package that replaces the refund.
+    let seller = resume_seller(&world);
+    wait_for("the punish to replace the refund", || {
+        (!world.pooled(refund)).then_some(())
+    });
+    // The buyer's refund cannot take the output back, and with no seller to
+    // ask for `s`, it ends punished; the seller claims the NEX back with
+    // `b` beside the punish.
+    world.drive(Pace::Steady, true, || finished(&seller) && finished(&buyer));
+    assert_eq!(outcome(seller).0, Some(Outcome::Punished));
+    assert_eq!(outcome(buyer).0, Some(Outcome::Punished));
+
+    let fee = world.terms.nex_fee;
+    let n = &world.nexus;
+    assert_eq!(n.balance(&world.buyer_nex), 0);
+    assert_eq!(
+        n.balance(&world.seller_nex.nex_address()),
+        2 * REWARD - 2 * fee
+    );
+    assert_eq!(n.balance(&lock_address(&lock)), 0);
+    // The punish's payout, less the child that bumped it.
+    let punished = BTC_AMOUNT - BTC_FEE * 2;
+    let seller_btc = btc_balance(&world.seller_wallet);
+    assert!(
+        seller_btc < punished && seller_btc > punished - Amount::from_sat(20_000),
+        "{seller_btc}"
+    );
+    assert_eq!(
+        btc_balance(&world.buyer_wallet),
+        BUYER_BTC - BTC_AMOUNT - world.funding_fee()
+    );
+}
+
+#[test]
+#[ignore = "needs Docker and NEXUS_NODE_IMAGE"]
+fn a_redeem_reorged_out_after_the_buyer_has_s_is_sent_again() {
+    let mut world = World::with_args(2, &["-mempoolexpiry=1"]);
+    // Two confirmations: a redeem one block deep is not yet final.
+    world.terms.btc_confirmations = 2;
+    // The seller goes offline once its redeem is out; the buyer learns `s`
+    // from it and claims.
+    let claiming = Arc::new(AtomicBool::new(false));
+    let flag = claiming.clone();
+    let (seller, buyer, lock) = start_with(
+        &world,
+        |state| matches!(state, Seller::Redeeming { seen: true, .. }),
+        move |state| {
+            if matches!(state, Buyer::ClaimingNex(_) | Buyer::Done(Outcome::Swapped)) {
+                flag.store(true, Ordering::SeqCst);
+            }
+            false
+        },
+    );
+    world.drive(Pace::Steady, true, || finished(&seller));
+    assert!(matches!(
+        outcome(seller).1,
+        Seller::Redeeming { seen: true, .. }
+    ));
+    if !world.mempool().is_empty() {
+        world.mine_btc(1);
+    }
+    // The buyer has `s` from the first redeem, before any reorg.
+    wait_for("the buyer to claim", || {
+        claiming.load(Ordering::SeqCst).then_some(())
+    });
+
+    // The redeem's block is reorged out, and the redeem dropped from the
+    // mempool: only the seller can send it again.
+    let (block, redeem) = world.reorg_out_tip();
+    world.expire_mempool();
+    let seller = resume_seller(&world);
+    world.drive(Pace::Steady, true, || finished(&seller) && finished(&buyer));
+    assert_eq!(outcome(seller).0, Some(Outcome::Swapped));
+    assert_eq!(outcome(buyer).0, Some(Outcome::Swapped));
+    let mined = bitcoind_call(
+        &world.bitcoind,
+        "getrawtransaction",
+        json!([redeem.to_string(), 1]),
+    );
+    assert_ne!(mined["blockhash"].as_str(), Some(block.as_str()));
+    assert!(mined["confirmations"].as_u64() >= Some(2), "{mined}");
+
+    let fee = world.terms.nex_fee;
+    let n = &world.nexus;
+    assert_eq!(n.balance(&world.buyer_nex), NEX_AMOUNT - fee);
+    assert_eq!(
+        n.balance(&world.seller_nex.nex_address()),
+        2 * REWARD - NEX_AMOUNT - fee
+    );
+    assert_eq!(n.balance(&lock_address(&lock)), 0);
+    assert_eq!(btc_balance(&world.seller_wallet), BTC_AMOUNT - BTC_FEE * 2);
+    assert_eq!(
+        btc_balance(&world.buyer_wallet),
+        BUYER_BTC - BTC_AMOUNT - world.funding_fee()
+    );
+}
+
+/// Runs both parties until the redeem signature has passed and both go
+/// offline: the buyer has sent it, the seller has broadcast its redeem.
+/// The redeem is then dropped from the mempool, seen by no one, and at t1
+/// the buyer, back, cancels. Returns the buyer, the lock address slot and
+/// the redeem, with the cancel pending.
+fn cancel_pending_after_the_redeem_dropped(
+    world: &World,
+) -> (Party<Buyer>, Arc<Mutex<Option<String>>>, Txid) {
+    let (seller, buyer, lock) = start_with(
+        world,
+        |state| matches!(state, Seller::Redeeming { seen: true, .. }),
+        |state| matches!(state, Buyer::AwaitRedeem { .. }),
+    );
+    // Bitcoin stands still once the NEX lock is submitted, so no block
+    // takes the redeem; only Nexus moves.
+    world.drive(Pace::OnDemand, false, || world.nexus.pending() > 0);
+    wait_for("the redeem", || {
+        if finished(&seller) && finished(&buyer) {
+            return Some(());
+        }
+        if world.nexus.pending() > 0 {
+            world.nexus.mine(None);
+        }
+        None
+    });
+    assert!(matches!(
+        outcome(seller).1,
+        Seller::Redeeming { seen: true, .. }
+    ));
+    assert!(matches!(outcome(buyer).1, Buyer::AwaitRedeem { .. }));
+    let [redeem] = world.mempool()[..] else {
+        panic!("the redeem alone is pending");
+    };
+
+    world.expire_mempool();
+    world.mine_btc(world.terms.t1.into());
+    let buyer = resume_buyer(world);
+    wait_for("the cancel", || (!world.mempool().is_empty()).then_some(()));
+    assert!(!world.pooled(redeem));
+    (buyer, lock, redeem)
+}
+
+#[test]
+#[ignore = "needs Docker and NEXUS_NODE_IMAGE"]
+fn a_redeem_replaces_the_pending_cancel() {
+    let world = World::with_args(2, &["-mempoolexpiry=1"]);
+    let (buyer, lock, redeem) = cancel_pending_after_the_redeem_dropped(&world);
+    // The seller, back with the cancel still pending, sends its redeem
+    // against it, which pays twice cancel's fee and replaces it; the buyer
+    // finds `s` in it and claims.
+    let seller = resume_seller(&world);
+    wait_for("the redeem against the cancel", || {
+        world.pooled(redeem).then_some(())
+    });
+    world.drive(Pace::OnDemand, true, || {
+        finished(&seller) && finished(&buyer)
+    });
+    assert_eq!(outcome(seller).0, Some(Outcome::Swapped));
+    assert_eq!(outcome(buyer).0, Some(Outcome::Swapped));
+
+    let fee = world.terms.nex_fee;
+    let n = &world.nexus;
+    assert_eq!(n.balance(&world.buyer_nex), NEX_AMOUNT - fee);
+    assert_eq!(
+        n.balance(&world.seller_nex.nex_address()),
+        2 * REWARD - NEX_AMOUNT - fee
+    );
+    assert_eq!(n.balance(&lock_address(&lock)), 0);
+    assert_eq!(btc_balance(&world.seller_wallet), BTC_AMOUNT - BTC_FEE * 2);
+    assert_eq!(
+        btc_balance(&world.buyer_wallet),
+        BUYER_BTC - BTC_AMOUNT - world.funding_fee()
+    );
+}
+
+#[test]
+#[ignore = "needs Docker and NEXUS_NODE_IMAGE"]
+fn a_cancel_mined_before_the_redeem_returns_refunds_both() {
+    let world = World::with_args(2, &["-mempoolexpiry=1"]);
+    let (buyer, lock, redeem) = cancel_pending_after_the_redeem_dropped(&world);
+    // The cancel is mined before the seller is back: its redeem can no
+    // longer land, the buyer refunds, and the seller, which learns `b`
+    // from the refund, claims its NEX back.
+    world.mine_btc(1);
+    let seller = resume_seller(&world);
+    world.drive(Pace::OnDemand, true, || {
+        finished(&seller) && finished(&buyer)
+    });
+    assert_eq!(outcome(seller).0, Some(Outcome::Refunded));
+    assert_eq!(outcome(buyer).0, Some(Outcome::Refunded));
+    assert!(world.bitcoin("").transaction(redeem).unwrap().is_none());
+
+    let fee = world.terms.nex_fee;
+    let n = &world.nexus;
+    assert_eq!(n.balance(&world.buyer_nex), 0);
+    assert_eq!(
+        n.balance(&world.seller_nex.nex_address()),
+        2 * REWARD - 2 * fee
+    );
+    assert_eq!(n.balance(&lock_address(&lock)), 0);
+    assert_eq!(btc_balance(&world.seller_wallet), Amount::ZERO);
+    assert_eq!(
+        btc_balance(&world.buyer_wallet),
+        BUYER_BTC - world.funding_fee() - BTC_FEE * 2
+    );
+}
+
+#[test]
+#[ignore = "needs Docker and NEXUS_NODE_IMAGE"]
+fn a_short_nex_lock_is_never_redeemed() {
+    let mut world = World::new(2);
+    world.short_lock = 1;
+    let signed = Arc::new(AtomicBool::new(false));
+    let flag = signed.clone();
+    let (seller, buyer, lock) = start(&world, move |state| {
+        if matches!(state, Buyer::AwaitRedeem { .. }) {
+            flag.store(true, Ordering::SeqCst);
+        }
+        false
+    });
+    // The short lock lands and is named, but the buyer never signs the
+    // redeem: it cancels and refunds at t1.
+    let locked = Cell::new(0);
+    world.drive(Pace::Steady, true, || {
+        if let Some(address) = lock.lock().unwrap().clone() {
+            locked.set(locked.get().max(world.nexus.balance(&address)));
+        }
+        finished(&buyer)
+    });
+    assert_eq!(outcome(buyer).0, Some(Outcome::Refunded));
+    assert_eq!(locked.get(), NEX_AMOUNT - 1, "the short lock landed");
+    assert!(
+        !signed.load(Ordering::SeqCst),
+        "the redeem was never signed"
+    );
+    // The seller, which learned `b` from the refund, claims its NEX back.
+    world.drive(Pace::OnDemand, true, || finished(&seller));
+    assert_eq!(outcome(seller).0, Some(Outcome::Refunded));
+
+    let fee = world.terms.nex_fee;
+    let n = &world.nexus;
+    assert_eq!(n.balance(&world.buyer_nex), 0);
+    assert_eq!(
+        n.balance(&world.seller_nex.nex_address()),
+        2 * REWARD - 2 * fee
+    );
+    assert_eq!(n.balance(&lock_address(&lock)), 0);
+    assert_eq!(btc_balance(&world.seller_wallet), Amount::ZERO);
+    assert_eq!(
+        btc_balance(&world.buyer_wallet),
+        BUYER_BTC - world.funding_fee() - BTC_FEE * 2
+    );
+}
+
+#[test]
+#[ignore = "needs Docker and NEXUS_NODE_IMAGE"]
+fn a_redeem_below_the_mempool_minimum_is_bumped_into_a_block() {
+    // The mempool takes nothing below 20 sat/vB alone, which redeem's two
+    // fees are; the buyer's driver funds the lock at that minimum, and the
+    // miner's wallet pays 50 sat/vB.
+    let mut world = World::with_args(2, &["-minrelaytxfee=0.0002", "-fallbackfee=0.0005"]);
+    world.seller_max_fee_rate = FeeRate::from_sat_per_vb_u32(25);
+    let (seller, buyer, lock) = start(&world, |_| false);
+    world.drive(Pace::OnDemand, true, || {
+        finished(&seller) && finished(&buyer)
+    });
+    assert_eq!(outcome(seller).0, Some(Outcome::Swapped));
+    assert_eq!(outcome(buyer).0, Some(Outcome::Swapped));
+
+    let fee = world.terms.nex_fee;
+    let n = &world.nexus;
+    assert_eq!(n.balance(&world.buyer_nex), NEX_AMOUNT - fee);
+    assert_eq!(
+        n.balance(&world.seller_nex.nex_address()),
+        2 * REWARD - NEX_AMOUNT - fee
+    );
+    assert_eq!(n.balance(&lock_address(&lock)), 0);
+    // The redeem's payout, less the child that bumped it.
+    let redeemed = BTC_AMOUNT - BTC_FEE * 2;
+    let seller_btc = btc_balance(&world.seller_wallet);
+    assert!(
+        seller_btc < redeemed && seller_btc > redeemed - Amount::from_sat(20_000),
+        "{seller_btc}"
+    );
+    assert_eq!(
+        btc_balance(&world.buyer_wallet),
+        BUYER_BTC - BTC_AMOUNT - world.funding_fee()
+    );
+}
+
+#[test]
+#[ignore = "needs Docker and NEXUS_NODE_IMAGE"]
+fn a_swap_completes_across_a_nexus_node_restart() {
+    let mut world = World::new(2);
+    let (seller, buyer, lock) = start(&world, |_| false);
+    // Restarted once the NEX lock is in, before the buyer claims it.
+    world.drive(Pace::OnDemand, true, || {
+        let address = lock.lock().unwrap().clone();
+        address.is_some_and(|address| world.nexus.balance(&address) == NEX_AMOUNT)
+    });
+    let height = world.nexus.client().health().unwrap().height;
+    world.nexus.restart();
+    assert!(world.nexus.client().health().unwrap().height >= height);
+    world.drive(Pace::OnDemand, true, || {
+        finished(&seller) && finished(&buyer)
+    });
+    assert_eq!(outcome(seller).0, Some(Outcome::Swapped));
     assert_eq!(outcome(buyer).0, Some(Outcome::Swapped));
 
     let fee = world.terms.nex_fee;
