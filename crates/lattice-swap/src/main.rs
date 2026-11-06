@@ -958,14 +958,16 @@ fn take(args: TakeArgs) -> Result<Outcome> {
         ));
     }
     let bitcoin = args.nodes.bitcoin(&args.dir)?;
-    if let (Btc::Esplora(..), Some(swap_id)) = (&bitcoin, unended(&args.dir)?) {
-        // As the app's: a swap not ended may yet broadcast a funding it
-        // signed from the wallet.
-        return Err(format!(
-            "refused: swap {swap_id} has not ended, and may yet spend from this wallet: \
-             resume it first; one swap at a time"
-        )
-        .into());
+    // As the app's: a swap not ended may yet broadcast a funding it signed
+    // from the wallet. Only on an Esplora, whose wallet made --dir.
+    if let Btc::Esplora(..) = &bitcoin {
+        if let Some(swap_id) = unended(&args.dir)? {
+            return Err(format!(
+                "refused: swap {swap_id} has not ended, and may yet spend from this wallet: \
+                 resume it first; one swap at a time"
+            )
+            .into());
+        }
     }
     let floor = btc_fee_floor(&bitcoin, args.policy.min_btc_fee_rate)?;
     let nexus = args.nodes.nexus()?;
