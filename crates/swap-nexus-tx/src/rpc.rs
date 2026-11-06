@@ -6,8 +6,10 @@
 //! The operator port listens on loopback only and takes the node's cookie
 //! (`<data-directory>/.cookie`, `__cookie__:<token>`) as HTTP basic auth. It
 //! changes at every node restart: a client made from the cookie file reads
-//! it again when the node refuses the one it holds. Every 64-bit integer on
-//! this API is a decimal string.
+//! it again when the node refuses the one it holds. A node's public read
+//! port serves the same routes, and `POST /transactions` too when it says
+//! `acceptsSubmit`, with no cookie: [`Client::public`]. Every 64-bit integer
+//! on this API is a decimal string.
 
 #[cfg(feature = "native")]
 use std::io::Read;
@@ -151,6 +153,16 @@ impl Client {
         Ok(client)
     }
 
+    /// A client for a node's public read port, which takes no cookie.
+    pub fn public(base: &str, timeout: Duration) -> Self {
+        Self {
+            agent: ureq::AgentBuilder::new().timeout(timeout).build(),
+            base: base.trim_end_matches('/').into(),
+            authorization: Mutex::new(String::new()),
+            cookie: None,
+        }
+    }
+
     pub fn health(&self) -> Result<Health> {
         parse::health(&self.get("/health")?).map_err(Error::Malformed)
     }
@@ -215,12 +227,8 @@ impl Client {
     /// signed transaction, not of its body: [`Transaction::cid`]).
     pub fn submit(&self, transaction: &Transaction) -> Result<String> {
         let json = self.authorized(|authorization| {
-            read(
-                self.agent
-                    .post(&format!("{}/transactions", self.base))
-                    .set("Authorization", authorization)
-                    .send_json(transaction.to_submit_json()),
-            )
+            let request = self.agent.post(&format!("{}/transactions", self.base));
+            read(authorize(request, authorization).send_json(transaction.to_submit_json()))
         })?;
         json["transactionCID"]
             .as_str()
@@ -267,12 +275,8 @@ impl Client {
 
     fn get(&self, path: &str) -> Result<Value> {
         self.authorized(|authorization| {
-            read(
-                self.agent
-                    .get(&format!("{}{path}", self.base))
-                    .set("Authorization", authorization)
-                    .call(),
-            )
+            let request = self.agent.get(&format!("{}{path}", self.base));
+            read(authorize(request, authorization).call())
         })
     }
 
@@ -298,6 +302,16 @@ impl Client {
 fn authorization(cookie: &str) -> String {
     let token = base64::engine::general_purpose::STANDARD.encode(cookie.trim());
     format!("Basic {token}")
+}
+
+/// `request` with the `authorization` header, unless it is a public
+/// client's, which has none.
+#[cfg(feature = "native")]
+fn authorize(request: ureq::Request, authorization: &str) -> ureq::Request {
+    match authorization {
+        "" => request,
+        authorization => request.set("Authorization", authorization),
+    }
 }
 
 #[cfg(feature = "native")]

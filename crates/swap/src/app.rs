@@ -295,7 +295,8 @@ impl Wallet {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn esplora(&self) -> Esplora {
+    /// The wallet's Bitcoin, through the config's Esplora.
+    pub fn esplora(&self) -> Esplora {
         Esplora::new(&self.config.esplora, self.key.clone(), TIMEOUT)
     }
 
@@ -611,6 +612,7 @@ impl Wallet {
         if let Some(running) = self.running()? {
             return Err(format!("refused: swap {running} is running; one swap at a time").into());
         }
+        self.esplora().check_network(self.config.network)?;
         let nexus = self.nexus()?;
         self.check_nexus(&nexus)?;
         self.check(&decoded, &parsed, &nexus)?;
@@ -744,6 +746,7 @@ impl Buy {
                 }
                 let nexus = wallet.nexus()?;
                 if buyer.resumed().outcome().is_none() {
+                    wallet.esplora().check_network(wallet.config.network)?;
                     wallet.check_nexus(&nexus)?;
                 }
                 let store = wallet.store(&record.swap_id)?;

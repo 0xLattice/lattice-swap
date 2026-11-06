@@ -1,5 +1,7 @@
-//! `lattice-swap`: one side of a NEX<->BTC swap, run against the operator's
-//! own bitcoind and lattice-node.
+//! `lattice-swap`: one side of a NEX<->BTC swap, run against public nodes
+//! by default, mempool.space's Esplora and a public Nexus read node, or the
+//! operator's own bitcoind or Esplora and lattice-node, each chain on its
+//! own.
 //!
 //! The seller runs `offer`: it listens, or lists the offer on a relay, and
 //! prints an offer for the buyer. The buyer runs `take` on that offer, which
@@ -15,16 +17,19 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bitcoin::address::NetworkUnchecked;
-use bitcoin::{Address, Amount, FeeRate, Network, ScriptBuf};
+use bitcoin::{Address, Amount, FeeRate, Network, OutPoint, Script, ScriptBuf, Transaction, Txid};
 use clap::{Args, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use rand_core::{OsRng, RngCore};
 use serde_json::json;
-use swap::bitcoind::{Bitcoin, Bitcoind};
+use swap::app::{self, Wallet};
+use swap::bitcoind::{Bitcoin, Bitcoind, Tip};
 use swap::driver::{Driver, Store};
+use swap::esplora::Esplora;
 use swap::offer::{self, check_offer, Answer, Bounds, Offer, Place, Policy, Quote, Template};
 use swap::session::{
     check_nex_address, state_name, swap_store, Result, Saved, Session, SessionFile, TIMEOUT,
@@ -38,6 +43,8 @@ const NEX_KEY_ENV: &str = "LATTICE_SWAP_NEX_KEY";
 const BTC_PASSWORD_ENV: &str = "LATTICE_SWAP_BTC_PASSWORD";
 /// The blocks the buyer's fee estimate aims to confirm in.
 const FEE_TARGET: u16 = 6;
+/// The public Nexus node read by default: a read port that takes submits.
+const PUBLIC_NEXUS: &str = "https://lattice-mainnet-read.fly.dev";
 /// What a seller is told without its Nexus key.
 const NO_KEY: &str = "the seller needs its Nexus key: --nex-key-file or LATTICE_SWAP_NEX_KEY";
 
@@ -75,6 +82,12 @@ enum Command {
     /// landed. Stopped before then, it answers again once resumed.
     #[command(visible_alias = "refund")]
     Resume(SwapFileArgs),
+    /// Prints the address and balance of the wallet a swap on an Esplora
+    /// pays its BTC to, and funds a buyer's lock from: `wallet.json` in
+    /// --dir, made there by the first such swap or by this. With
+    /// --withdraw, first sends all it can spend to that address; refused
+    /// while a swap in --dir runs or has not ended.
+    Wallet(WalletArgs),
     /// Prints a swap's state and outcome from its swap file. Asks no node.
     Status {
         /// The swap file, `<swap id>.json`.
@@ -142,30 +155,48 @@ impl TermsArgs {
     }
 }
 
+/// Each chain is read through a public node unless its flags name your own:
+/// Bitcoin through mempool.space's Esplora for --btc-network, or --esplora,
+/// or your bitcoind with --btc-wallet; Nexus through the public read node,
+/// or --nexus-url, your own node's RPC with --nexus-cookie.
 #[derive(Args)]
 struct NodeArgs {
-    /// bitcoind's RPC URL, without the wallet path.
-    #[arg(long, default_value = "http://127.0.0.1:8332")]
-    btc_url: String,
-    /// The bitcoind wallet that funds the lock or receives the BTC.
-    #[arg(long)]
-    btc_wallet: String,
+    /// Your own Esplora API, as a mempool instance serves one, e.g.
+    /// `http://127.0.0.1:3006/api`, instead of mempool.space's. On an
+    /// Esplora, the BTC is paid to, and a buyer's lock funded from, the
+    /// wallet in the swap's directory: see `lattice-swap wallet`.
+    #[arg(long, conflicts_with_all = ["btc_url", "btc_wallet", "btc_cookie", "btc_user"])]
+    esplora: Option<String>,
+    /// bitcoind's RPC URL, without the wallet path; http://127.0.0.1:8332
+    /// if left out.
+    #[arg(long, requires = "btc_wallet")]
+    btc_url: Option<String>,
+    /// The bitcoind wallet that funds the lock or receives the BTC: your
+    /// own bitcoind, instead of an Esplora.
+    #[arg(long, requires = "btc_auth")]
+    btc_wallet: Option<String>,
     /// bitcoind's cookie file, or any file holding `user:password`.
-    #[arg(long, required_unless_present = "btc_user")]
+    #[arg(long, group = "btc_auth", requires = "btc_wallet")]
     btc_cookie: Option<PathBuf>,
     /// A bitcoind RPC user, whose password is read from
     /// LATTICE_SWAP_BTC_PASSWORD.
-    #[arg(long, conflicts_with = "btc_cookie")]
+    #[arg(
+        long,
+        group = "btc_auth",
+        conflicts_with = "btc_cookie",
+        requires = "btc_wallet"
+    )]
     btc_user: Option<String>,
     /// bitcoin, testnet, testnet4, signet or regtest.
     #[arg(long, default_value_t = Network::Bitcoin)]
     btc_network: Network,
-    /// The lattice-node's RPC base URL.
-    #[arg(long)]
+    /// The Nexus node's URL: a public read port, which must take submits,
+    /// or with --nexus-cookie your own lattice-node's RPC.
+    #[arg(long, default_value = PUBLIC_NEXUS)]
     nexus_url: String,
-    /// The lattice-node's RPC cookie file.
+    /// Your own lattice-node's RPC cookie file.
     #[arg(long)]
-    nexus_cookie: PathBuf,
+    nexus_cookie: Option<PathBuf>,
     /// The CID of the genesis block of the Nexus to trade on: the
     /// lattice-node must follow that chain. Mainnet's by default.
     #[arg(long, default_value = swap_nexus_tx::MAINNET_GENESIS)]
@@ -173,8 +204,33 @@ struct NodeArgs {
 }
 
 impl NodeArgs {
-    /// A client for bitcoind, which must be one a swap can rely on.
-    fn bitcoin(&self) -> Result<Bitcoind> {
+    /// The Bitcoin to swap on, which must be one a swap can rely on: the
+    /// bitcoind, or the Esplora over the wallet in `dir`, held open while
+    /// the swap runs. Says which.
+    fn bitcoin(&self, dir: &Path) -> Result<Btc> {
+        let Some(wallet) = &self.btc_wallet else {
+            let url = esplora_url(self.esplora.as_deref(), self.btc_network)?;
+            let whose = if self.esplora.is_some() {
+                "your node"
+            } else {
+                "public"
+            };
+            log(&format!("bitcoin: {whose} {url}"));
+            // Only the Esplora and the directory are read: Nexus is this
+            // tool's own.
+            let config = app::Config::new(
+                dir.into(),
+                self.btc_network,
+                url,
+                String::new(),
+                PathBuf::new(),
+                String::new(),
+            );
+            let wallet = Wallet::open(config)?;
+            let esplora = wallet.esplora();
+            esplora.check_network(self.btc_network)?;
+            return Ok(Btc::Esplora(esplora, wallet));
+        };
         let auth = match (&self.btc_cookie, &self.btc_user) {
             (Some(path), _) => read(path)?,
             (None, Some(user)) => {
@@ -184,15 +240,19 @@ impl NodeArgs {
             }
             (None, None) => return Err("--btc-cookie or --btc-user is required".into()),
         };
-        let bitcoin = Bitcoind::new(&self.wallet_url(), &auth, self.btc_network, TIMEOUT);
+        log(&format!("bitcoin: your node {}", self.btc_url()));
+        let bitcoin = Bitcoind::new(&self.wallet_url(wallet), &auth, self.btc_network, TIMEOUT);
         bitcoin.check_node()?;
-        Ok(bitcoin)
+        Ok(Btc::Node(bitcoin))
+    }
+
+    fn btc_url(&self) -> &str {
+        self.btc_url.as_deref().unwrap_or("http://127.0.0.1:8332")
     }
 
     /// The wallet's RPC URL, its name percent-escaped.
-    fn wallet_url(&self) -> String {
-        let wallet: String = self
-            .btc_wallet
+    fn wallet_url(&self, wallet: &str) -> String {
+        let wallet: String = wallet
             .bytes()
             .map(|b| match b {
                 b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
@@ -201,21 +261,41 @@ impl NodeArgs {
                 _ => format!("%{b:02X}"),
             })
             .collect();
-        format!("{}/wallet/{wallet}", self.btc_url.trim_end_matches('/'))
+        format!("{}/wallet/{wallet}", self.btc_url().trim_end_matches('/'))
     }
 
-    /// A client for the lattice-node, which reads its cookie file again
-    /// on a 401: the node writes a new cookie at every restart.
+    /// Whether either chain is read through a public node.
+    fn public(&self) -> bool {
+        (self.btc_wallet.is_none() && self.esplora.is_none()) || self.nexus_cookie.is_none()
+    }
+
+    /// A client for the Nexus node: your lattice-node's RPC, which reads
+    /// its cookie file again on a 401, as the node writes a new cookie at
+    /// every restart; else a public read port, with no cookie. Says which.
     fn nexus(&self) -> Result<Client> {
-        Client::from_cookie_file(&self.nexus_url, &self.nexus_cookie, TIMEOUT)
-            .map_err(|e| format!("{}: {e}", self.nexus_cookie.display()).into())
+        let Some(cookie) = &self.nexus_cookie else {
+            log(&format!("nexus: public {}", self.nexus_url));
+            return Ok(Client::public(&self.nexus_url, TIMEOUT));
+        };
+        log(&format!("nexus: your node {}", self.nexus_url));
+        Client::from_cookie_file(&self.nexus_url, cookie, TIMEOUT)
+            .map_err(|e| format!("{}: {e}", cookie.display()).into())
     }
 
-    /// Refuses a lattice-node on another Nexus than `--nexus-genesis`
-    /// names, or one that cannot say how deep a transaction is: see
+    /// Refuses a public node that takes no transactions, then a Nexus
+    /// node on another Nexus than `--nexus-genesis` names, or one that
+    /// cannot say how deep a transaction is: see
     /// [`swap::session::check_nexus`].
     fn check_nexus(&self, client: &Client) -> Result<()> {
         use swap_nexus_tx::rpc::parse::NodeRefusal;
+        if self.nexus_cookie.is_none() && client.chain_info()?["acceptsSubmit"] != true {
+            return Err(format!(
+                "refused: {} takes no transactions: give a public node that does, or your \
+                 own with --nexus-cookie",
+                self.nexus_url
+            )
+            .into());
+        }
         swap::session::check_nexus(client, &self.nexus_genesis)?.map_err(|refusal| {
             match refusal {
                 NodeRefusal::OtherNexus { .. } => {
@@ -229,15 +309,124 @@ impl NodeArgs {
             .into()
         })
     }
+}
 
-    /// A fresh address from the wallet, as the script that pays it.
-    fn payout(&self, bitcoin: &Bitcoind) -> Result<ScriptBuf> {
+/// The Esplora at `given`, else mempool.space's for `network`.
+fn esplora_url(given: Option<&str>, network: Network) -> Result<String> {
+    match given.or(app::default_esplora(network)) {
+        Some(url) => Ok(url.into()),
+        None => Err(format!(
+            "{network} has no public Esplora: give --esplora, or --btc-wallet for your bitcoind"
+        )
+        .into()),
+    }
+}
+
+/// What each side trusts a public node for, said once it reads through
+/// one.
+const SELLER_TRUSTS: &str = "the seller trusts the public node for how deep the buyer's BTC \
+                             lock is: keep --max-btc-amount small";
+const BUYER_TRUSTS: &str = "the buyer trusts the public node for how deep the seller's NEX \
+                            lock is: keep --btc-amount small";
+
+/// The Bitcoin a party swaps on: its own bitcoind and wallet, or an
+/// Esplora over the wallet in its swap's directory, held open while it
+/// runs, as an app holds it.
+enum Btc {
+    Node(Bitcoind),
+    /// The wallet only held, as its lock keeps other swaps and a
+    /// withdrawal out of the directory.
+    Esplora(Esplora, #[allow(dead_code)] Arc<Wallet>),
+}
+
+/// `$body`, with `$bitcoin` the [`Btc`]'s own client.
+macro_rules! either {
+    ($btc:expr, $bitcoin:ident => $body:expr) => {
+        match $btc {
+            Btc::Node($bitcoin) => $body,
+            Btc::Esplora($bitcoin, _) => $body,
+        }
+    };
+}
+
+impl Bitcoin for Btc {
+    fn broadcast(&self, tx: &Transaction) -> swap::bitcoind::Result<()> {
+        either!(self, b => b.broadcast(tx))
+    }
+    fn tip(&self) -> swap::bitcoind::Result<Tip> {
+        either!(self, b => b.tip())
+    }
+    fn transaction(&self, txid: Txid) -> swap::bitcoind::Result<Option<(Transaction, u32)>> {
+        either!(self, b => b.transaction(txid))
+    }
+    fn spender(
+        &self,
+        outpoint: OutPoint,
+        from: u32,
+    ) -> swap::bitcoind::Result<Option<(Transaction, u32)>> {
+        either!(self, b => b.spender(outpoint, from))
+    }
+    fn fund_lock(
+        &self,
+        script: &Script,
+        amount: Amount,
+        fee_rate: FeeRate,
+    ) -> swap::bitcoind::Result<Transaction> {
+        either!(self, b => b.fund_lock(script, amount, fee_rate))
+    }
+    fn fee_rate(&self, urgent: bool) -> swap::bitcoind::Result<Option<FeeRate>> {
+        either!(self, b => b.fee_rate(urgent))
+    }
+    fn floor(&self, parent: &Transaction) -> swap::bitcoind::Result<FeeRate> {
+        either!(self, b => b.floor(parent))
+    }
+    fn package_rate(&self, parent: &Transaction) -> swap::bitcoind::Result<Option<FeeRate>> {
+        either!(self, b => b.package_rate(parent))
+    }
+    fn bump(
+        &self,
+        parent: &Transaction,
+        fee: Amount,
+        rate: FeeRate,
+        max: Amount,
+    ) -> swap::bitcoind::Result<Txid> {
+        either!(self, b => b.bump(parent, fee, rate, max))
+    }
+}
+
+impl Btc {
+    /// Where the BTC is paid, as its script: a fresh address from the
+    /// bitcoind wallet, or the Esplora wallet's own.
+    fn payout(&self, network: Network) -> Result<ScriptBuf> {
+        let bitcoin = match self {
+            Btc::Node(bitcoin) => bitcoin,
+            Btc::Esplora(esplora, _) => return Ok(esplora.key().script_pubkey.clone()),
+        };
         let address = bitcoin.call("getnewaddress", json!([]))?;
         let address: Address<NetworkUnchecked> = address
             .as_str()
             .ok_or("getnewaddress returned no address")?
             .parse()?;
-        Ok(address.require_network(self.btc_network)?.script_pubkey())
+        Ok(address.require_network(network)?.script_pubkey())
+    }
+
+    /// The conservative fee estimate for `FEE_TARGET` blocks, in sat/kvB,
+    /// if there is one.
+    fn fee_estimate(&self) -> Result<Option<u64>> {
+        match self {
+            Btc::Node(bitcoin) => {
+                let estimate =
+                    bitcoin.call("estimatesmartfee", json!([FEE_TARGET, "CONSERVATIVE"]))?;
+                match estimate["feerate"].as_f64() {
+                    Some(btc) => Ok(Some(Amount::from_btc(btc)?.to_sat())),
+                    None => Ok(None),
+                }
+            }
+            // As the app reads its floor.
+            Btc::Esplora(esplora, _) => Ok(esplora
+                .estimate(&FEE_TARGET.to_string())?
+                .map(|rate| (rate * 1000.0).ceil() as u64)),
+        }
     }
 }
 
@@ -496,17 +685,16 @@ struct SwapFileArgs {
     bump: BumpArgs,
 }
 
-/// The least `btc_fee` the buyer takes, in satoshis: what bitcoind's
+/// The least `btc_fee` the buyer takes, in satoshis: what the node's
 /// conservative estimate, or else `fallback` sat/vB, asks of every swap
 /// spend.
-fn btc_fee_floor(bitcoin: &Bitcoind, fallback: Option<u64>) -> Result<u64> {
-    let estimate = bitcoin.call("estimatesmartfee", json!([FEE_TARGET, "CONSERVATIVE"]))?;
-    let per_kvb = match estimate["feerate"].as_f64() {
-        Some(btc) => Some(Amount::from_btc(btc)?.to_sat()),
-        None => None,
+fn btc_fee_floor(bitcoin: &Btc, fallback: Option<u64>) -> Result<u64> {
+    let node = match bitcoin {
+        Btc::Node(_) => "bitcoind",
+        Btc::Esplora(..) => "the Esplora",
     };
-    Ok(offer::btc_fee_floor(per_kvb, fallback)
-        .map_err(|_| "bitcoind has no fee estimate: give --min-btc-fee-rate")?)
+    Ok(offer::btc_fee_floor(bitcoin.fee_estimate()?, fallback)
+        .map_err(|_| format!("{node} has no fee estimate: give --min-btc-fee-rate"))?)
 }
 
 /// [`offer::nex_fee_floor`] at its Nexus node's relay floor.
@@ -558,7 +746,7 @@ fn offer(args: OfferArgs) -> Result<Outcome> {
     let quote = args.terms.quote();
     template.check(&quote)?;
     let key = args.key.load()?;
-    let bitcoin = args.nodes.bitcoin()?;
+    let bitcoin = args.nodes.bitcoin(&args.dir)?;
     let floor = btc_fee_floor(&bitcoin, args.min_btc_fee_rate)?;
     if template.btc_fee.to_sat() < floor {
         return Err(format!(
@@ -579,8 +767,11 @@ fn offer(args: OfferArgs) -> Result<Outcome> {
         )
         .into());
     }
-    let redeem = args.nodes.payout(&bitcoin)?;
-    let punish = args.nodes.payout(&bitcoin)?;
+    if args.nodes.public() {
+        log(SELLER_TRUSTS);
+    }
+    let redeem = bitcoin.payout(args.nodes.btc_network)?;
+    let punish = bitcoin.payout(args.nodes.btc_network)?;
     fs::create_dir_all(&args.dir)?;
     let store = Store::new(&args.dir, swap_id);
 
@@ -679,7 +870,7 @@ fn answer_request<T: Transport>(transport: &mut T, offer: &Offer) -> Result<Term
 
 /// What a swap starts on, once the session is up.
 struct Start<'a> {
-    bitcoin: Bitcoind,
+    bitcoin: Btc,
     nexus: Client,
     store: Store,
     nex_key: Option<SecretBytes>,
@@ -732,7 +923,7 @@ fn take(args: TakeArgs) -> Result<Outcome> {
             "this offer was taken already: its swap file exists".into(),
         ));
     }
-    let bitcoin = args.nodes.bitcoin()?;
+    let bitcoin = args.nodes.bitcoin(&args.dir)?;
     let floor = btc_fee_floor(&bitcoin, args.policy.min_btc_fee_rate)?;
     let nexus = args.nodes.nexus()?;
     args.nodes.check_nexus(&nexus)?;
@@ -740,7 +931,10 @@ fn take(args: TakeArgs) -> Result<Outcome> {
     let (network, genesis) = (args.nodes.btc_network, &args.nodes.nexus_genesis);
     let policy = args.policy.policy(&offer);
     check_offer(&offer, &policy, network, genesis, floor, nex_floor)?;
-    let refund = args.nodes.payout(&bitcoin)?;
+    if args.nodes.public() {
+        log(BUYER_TRUSTS);
+    }
+    let refund = bitcoin.payout(network)?;
     fs::create_dir_all(&args.dir)?;
 
     log(&offer.describe());
@@ -770,6 +964,7 @@ fn take(args: TakeArgs) -> Result<Outcome> {
 fn resume(args: SwapFileArgs) -> Result<Outcome> {
     let store = swap_store(&args.swap_file)?;
     let swap_file = store.path().to_path_buf();
+    let dir = swap_file.parent().expect("a swap file is in a directory");
     let saved = Saved::load(&store)?;
     let flag = &args.nodes.nexus_genesis;
     if let Some(genesis) = saved.nexus_genesis().filter(|genesis| genesis != flag) {
@@ -784,10 +979,13 @@ fn resume(args: SwapFileArgs) -> Result<Outcome> {
         Saved::Seller(seller) => {
             let given = args.key.given()?;
             let key = seller_key(seller.nex_address(), seller.signs_nex(), given)?;
-            let bitcoin = args.nodes.bitcoin()?;
+            let bitcoin = args.nodes.bitcoin(dir)?;
             let nexus = args.nodes.nexus()?;
             if seller.outcome().is_none() {
                 args.nodes.check_nexus(&nexus)?;
+                if args.nodes.public() {
+                    log(SELLER_TRUSTS);
+                }
             }
             let driver = swap::session::resume::<Seller, _>(bitcoin, nexus, store);
             run(
@@ -802,15 +1000,85 @@ fn resume(args: SwapFileArgs) -> Result<Outcome> {
         Saved::Buyer(buyer) => {
             // A punished buyer asks the seller for `s` again.
             let buyer = buyer.resumed();
-            let bitcoin = args.nodes.bitcoin()?;
+            let bitcoin = args.nodes.bitcoin(dir)?;
             let nexus = args.nodes.nexus()?;
             if buyer.outcome().is_none() {
                 args.nodes.check_nexus(&nexus)?;
+                if args.nodes.public() {
+                    log(BUYER_TRUSTS);
+                }
             }
             let driver = swap::session::resume::<Buyer, _>(bitcoin, nexus, store);
             run(&swap_file, driver, &args.bump)
         }
     }
+}
+
+#[derive(Args)]
+struct WalletArgs {
+    /// The directory the wallet and its swaps are in.
+    #[arg(long, default_value = ".")]
+    dir: PathBuf,
+    /// Sends all the wallet can spend, less the fee, to this address.
+    #[arg(long)]
+    withdraw: Option<String>,
+    /// Your own Esplora API, instead of mempool.space's.
+    #[arg(long)]
+    esplora: Option<String>,
+    /// bitcoin, testnet, testnet4, signet or regtest.
+    #[arg(long, default_value_t = Network::Bitcoin)]
+    btc_network: Network,
+}
+
+/// The wallet's address and balance, after its withdrawal if asked for:
+/// what the app's wallet shows and does.
+fn wallet(args: WalletArgs) -> Result<()> {
+    let network = args.btc_network;
+    let url = esplora_url(args.esplora.as_deref(), network)?;
+    let config = app::Config::new(
+        args.dir.clone(),
+        network,
+        url,
+        String::new(),
+        PathBuf::new(),
+        String::new(),
+    );
+    // Refused while a swap runs in the directory, which holds it open.
+    let wallet = Wallet::open(config)?;
+    wallet.esplora().check_network(network)?;
+    if let Some(to) = &args.withdraw {
+        if let Some(swap_id) = unended(&args.dir)? {
+            return Err(format!(
+                "refused: swap {swap_id} has not ended, and may yet spend from this wallet: \
+                 resume it first"
+            )
+            .into());
+        }
+        println!("withdrawn: {}", wallet.withdraw(to)?);
+    }
+    let (confirmed, unconfirmed) = wallet.balance()?;
+    println!("address: {}", wallet.address());
+    println!("balance: {confirmed} sat, {unconfirmed} sat unconfirmed");
+    Ok(())
+}
+
+/// A swap in `dir` whose swap file holds no outcome, if any.
+fn unended(dir: &Path) -> Result<Option<String>> {
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        let Ok(store) = swap_store(&path) else {
+            continue;
+        };
+        let ended = match Saved::load(&store)? {
+            Saved::Seller(seller) => seller.outcome().is_some(),
+            Saved::Buyer(buyer) => buyer.outcome().is_some(),
+        };
+        if !ended {
+            let stem = path.file_stem().unwrap_or_default();
+            return Ok(Some(stem.to_string_lossy().into()));
+        }
+    }
+    Ok(None)
 }
 
 fn status(swap_file: &Path) -> Result<()> {
@@ -897,6 +1165,7 @@ fn exit_status(command: Command) -> Result<u8> {
         Command::Offer(args) => offer(args).map(exit_code),
         Command::Take(args) => take(args).map(exit_code),
         Command::Resume(args) => resume(args).map(exit_code),
+        Command::Wallet(args) => wallet(args).map(|()| 0),
         Command::Status { swap_file } => status(&swap_file).map(|()| 0),
     }
 }

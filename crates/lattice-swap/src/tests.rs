@@ -805,10 +805,9 @@ fn a_failure_after_the_swap_file_exists_says_how_to_resume() {
 
 #[test]
 fn the_wallet_name_is_escaped() {
-    let mut args = offer_args(&[]);
-    args.nodes.btc_wallet = "my wallet/../x".into();
+    let args = offer_args(&[]);
     assert_eq!(
-        args.nodes.wallet_url(),
+        args.nodes.wallet_url("my wallet/../x"),
         "http://127.0.0.1:8332/wallet/my%20wallet%2F..%2Fx"
     );
 }
@@ -1551,7 +1550,7 @@ fn every_run_checks_its_node() {
 
     let key = key_file(7);
     let mut args = offer_args(&["--nex-key-file", key.path().to_str().unwrap()]);
-    args.nodes.btc_url = unindexed();
+    args.nodes.btc_url = Some(unindexed());
     let cookie = tempfile::NamedTempFile::new().unwrap();
     args.nodes.btc_cookie = Some(cookie.path().to_path_buf());
     let refused = offer(args).unwrap_err().to_string();
@@ -1647,9 +1646,9 @@ fn offer_refuses_a_fee_below_its_nodes_estimate() {
         let mut args = offer_args(&["--nex-key-file", key.path().to_str().unwrap()]);
         args.terms.btc_fee = fee;
         args.min_btc_fee_rate = rate;
-        args.nodes.btc_url = bitcoind(result);
+        args.nodes.btc_url = Some(bitcoind(result));
         args.nodes.btc_cookie = Some(cookie.path().to_path_buf());
-        args.nodes.nexus_cookie = cookie.path().to_path_buf();
+        args.nodes.nexus_cookie = Some(cookie.path().to_path_buf());
         args.nodes.nexus_url = nexus_node(10, true);
         offer(args).unwrap_err().to_string()
     };
@@ -1683,6 +1682,18 @@ fn nexus_node_relaying(min_relay_fee: u64) -> String {
 }
 
 fn nexus_node_with(genesis: &str, height: u64, keeps_state: bool, min_relay_fee: u64) -> String {
+    nexus_node_submitting(genesis, height, keeps_state, min_relay_fee, true)
+}
+
+/// [`nexus_node_with`], its `/api/chain/info` saying `acceptsSubmit` as
+/// `accepts_submit`.
+fn nexus_node_submitting(
+    genesis: &str,
+    height: u64,
+    keeps_state: bool,
+    min_relay_fee: u64,
+    accepts_submit: bool,
+) -> String {
     use std::io::BufRead;
     let genesis = genesis.to_string();
     let min_relay_fee = min_relay_fee.to_string();
@@ -1709,6 +1720,7 @@ fn nexus_node_with(genesis: &str, height: u64, keeps_state: bool, min_relay_fee:
                     "chain": ["Nexus"],
                     "genesisHash": genesis,
                     "minRelayFee": min_relay_fee,
+                    "acceptsSubmit": accepts_submit,
                 }))
             } else if path == "/health" {
                 let height = height.to_string();
@@ -1743,7 +1755,7 @@ fn a_nexus_node_that_keeps_no_past_state_is_refused() {
     let check = |height, keeps_state| {
         let mut nodes = offer_args(&[]).nodes;
         nodes.nexus_url = nexus_node(height, keeps_state);
-        nodes.nexus_cookie = cookie.path().to_path_buf();
+        nodes.nexus_cookie = Some(cookie.path().to_path_buf());
         let client = nodes.nexus().unwrap();
         nodes.check_nexus(&client).map_err(|e| e.to_string())
     };
@@ -1844,7 +1856,7 @@ fn the_nexus_genesis_defaults_to_mainnets() {
             Command::Offer(args) => args.nodes,
             Command::Take(args) => args.nodes,
             Command::Resume(args) => args.nodes,
-            Command::Status { .. } => unreachable!(),
+            Command::Wallet(_) | Command::Status { .. } => unreachable!(),
         };
         assert_eq!(nodes.nexus_genesis, MAINNET, "{args:?}");
     }
@@ -1985,9 +1997,9 @@ fn offer_and_take_refuse_a_nex_fee_below_the_floor() {
         if let Some(least) = least {
             args.min_nex_fee = least;
         }
-        args.nodes.btc_url = bitcoind(estimate());
+        args.nodes.btc_url = Some(bitcoind(estimate()));
         args.nodes.btc_cookie = Some(cookie.path().to_path_buf());
-        args.nodes.nexus_cookie = cookie.path().to_path_buf();
+        args.nodes.nexus_cookie = Some(cookie.path().to_path_buf());
         args.nodes.nexus_url = nexus_node_relaying(relay);
         offer(args).unwrap_err().to_string()
     };
@@ -2184,4 +2196,119 @@ fn the_nexus_client_reads_a_rotated_cookie_again() {
     assert_eq!(nexus.health().unwrap().height, 7);
     fs::write(&cookie, "__cookie__:second\n").unwrap();
     assert_eq!(nexus.health().unwrap().height, 7);
+}
+
+/// With no node flags, both chains are read through public nodes: the
+/// Esplora for `--btc-network` and the public Nexus read node.
+#[test]
+fn with_no_node_flags_both_chains_are_public() {
+    let args = ["offer", "--price", "1", "--min-btc-amount", "1"];
+    let args = [
+        &args[..],
+        &["--max-btc-amount", "2", "--btc-fee", "1", "--nex-fee", "1"],
+    ];
+    let args = [
+        &["lattice-swap"][..],
+        &args.concat(),
+        &["--relay", "http://r"],
+    ]
+    .concat();
+    let Command::Offer(offer) = Cli::try_parse_from(&args).unwrap().command else {
+        panic!("an offer");
+    };
+    let nodes = offer.nodes;
+    assert_eq!((nodes.btc_wallet, nodes.esplora), (None, None));
+    assert_eq!(nodes.nexus_url, PUBLIC_NEXUS);
+    assert_eq!(nodes.nexus_cookie, None);
+    let url = |network| esplora_url(None, network).map_err(|e| e.to_string());
+    assert_eq!(url(Network::Bitcoin).unwrap(), "https://mempool.space/api");
+    assert_eq!(
+        url(Network::Signet).unwrap(),
+        "https://mempool.space/signet/api"
+    );
+    assert_eq!(
+        url(Network::Testnet).unwrap(),
+        "https://mempool.space/testnet/api"
+    );
+    assert!(url(Network::Regtest).unwrap_err().contains("--esplora"));
+    assert_eq!(
+        esplora_url(Some("http://e"), Network::Regtest).unwrap(),
+        "http://e"
+    );
+}
+
+/// Each chain's own-node flags stand alone: any mix parses, an Esplora
+/// and a bitcoind together do not, and a bitcoind needs its wallet and
+/// credentials.
+#[test]
+fn each_chain_is_public_or_your_own_independently() {
+    let nodes = |flags: &[&str]| {
+        let args = [&["lattice-swap", "resume", "f.json"][..], flags].concat();
+        Cli::try_parse_from(&args).map(|cli| match cli.command {
+            Command::Resume(args) => args.nodes,
+            _ => unreachable!(),
+        })
+    };
+    let bitcoind = ["--btc-wallet", "w", "--btc-cookie", "/c"];
+    let own_nexus = ["--nexus-url", "http://n", "--nexus-cookie", "/n"];
+    let esplora = ["--esplora", "http://e"];
+    assert!(nodes(&[]).unwrap().public());
+    // Own bitcoind, public Nexus; an own Esplora, own Nexus; both own.
+    assert!(nodes(&bitcoind).unwrap().public());
+    assert!(nodes(&own_nexus).unwrap().public());
+    assert!(!nodes(&[&esplora[..], &own_nexus].concat())
+        .unwrap()
+        .public());
+    assert!(!nodes(&[&bitcoind[..], &own_nexus].concat())
+        .unwrap()
+        .public());
+    // A public Nexus at another URL is still public.
+    let other = nodes(&["--nexus-url", "http://n"]).unwrap();
+    assert!(other.public() && other.nexus_cookie.is_none());
+
+    assert!(nodes(&[&esplora[..], &bitcoind].concat()).is_err());
+    assert!(nodes(&[&esplora[..], &["--btc-url", "http://b"]].concat()).is_err());
+    assert!(nodes(&["--btc-wallet", "w"]).is_err(), "no credentials");
+    assert!(nodes(&["--btc-cookie", "/c"]).is_err(), "no wallet");
+    assert!(nodes(&["--btc-user", "u"]).is_err(), "no wallet");
+    assert!(nodes(&["--btc-url", "http://b"]).is_err(), "no wallet");
+    let both = ["--btc-wallet", "w", "--btc-cookie", "/c", "--btc-user", "u"];
+    assert!(nodes(&both).is_err());
+    let user = nodes(&["--btc-wallet", "w", "--btc-user", "u"]).unwrap();
+    assert_eq!(user.btc_user.as_deref(), Some("u"));
+}
+
+/// A public Nexus node is refused unless it takes submits; your own node's
+/// RPC is not asked.
+#[test]
+fn a_public_nexus_node_must_take_submits() {
+    let check = |accepts: bool, cookie: Option<PathBuf>| {
+        let mut nodes = offer_args(&[]).nodes;
+        nodes.nexus_url = nexus_node_submitting(MAINNET, 10, true, 1, accepts);
+        nodes.nexus_cookie = cookie;
+        let client = nodes.nexus().unwrap();
+        nodes.check_nexus(&client).map_err(|e| e.to_string())
+    };
+    assert_eq!(check(true, None), Ok(()));
+    let refused = check(false, None).unwrap_err();
+    assert!(refused.contains("takes no transactions"), "{refused}");
+    let cookie = tempfile::NamedTempFile::new().unwrap();
+    assert_eq!(check(false, Some(cookie.path().into())), Ok(()));
+}
+
+/// `wallet --withdraw` is refused while a swap in the directory has not
+/// ended.
+#[test]
+fn a_swap_not_ended_is_found() {
+    let (directory, _) = swap_file(Seller::Done(Outcome::Swapped));
+    assert_eq!(unended(directory.path()).unwrap(), None);
+    let seller = Seller::new(
+        small(16),
+        SecretBytes([7; 32]).nex_address(),
+        ScriptBuf::new(),
+        ScriptBuf::new(),
+    )
+    .unwrap();
+    let (directory, _) = swap_file(seller);
+    assert_eq!(unended(directory.path()).unwrap(), Some("07".repeat(32)));
 }

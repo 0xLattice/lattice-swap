@@ -17,7 +17,7 @@ use std::io::Read;
 use std::time::Duration;
 
 use bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
-use bitcoin::{Amount, FeeRate, OutPoint, Script, Transaction, Txid};
+use bitcoin::{Amount, BlockHash, FeeRate, Network, OutPoint, Script, Transaction, Txid};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -87,6 +87,25 @@ impl Esplora {
             url: url.trim_end_matches('/').into(),
             key,
         }
+    }
+
+    /// Refuses an Esplora on another chain than `network`, whose blocks
+    /// would never show the swap's transactions: its block 0 must be
+    /// `network`'s genesis, as bitcoind's `getblockchaininfo` names its
+    /// chain.
+    pub fn check_network(&self, network: Network) -> Result<()> {
+        let expected = bitcoin::constants::genesis_block(network).block_hash();
+        let text = self.get("/block-height/0", false)?.unwrap_or_default();
+        let genesis: BlockHash = text
+            .trim()
+            .parse()
+            .map_err(|e| Error(format!("/block-height/0 {text:?}: {e}")))?;
+        if genesis != expected {
+            return Err(Error(format!(
+                "refused: the Esplora's genesis is {genesis}, not {network}'s {expected}"
+            )));
+        }
+        Ok(())
     }
 
     pub fn key(&self) -> &Key {
