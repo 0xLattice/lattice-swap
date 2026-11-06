@@ -371,9 +371,9 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
                 self.apply(Event::Timeout)?;
             }
             if Instant::now() >= read_at {
-                read_at = Instant::now() + self.poll;
                 self.observe_bitcoin()?;
                 self.observe_nexus()?;
+                read_at = Instant::now() + self.poll;
             }
             if discriminant(&self.state) != kind {
                 kind = discriminant(&self.state);
