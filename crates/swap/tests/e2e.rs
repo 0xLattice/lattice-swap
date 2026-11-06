@@ -953,8 +953,11 @@ fn a_redeem_dropped_before_t1_races_the_cancel_to_one_outcome() {
     wait_for("the cancel", || (!world.mempool().is_empty()).then_some(()));
     assert!(!world.pooled(redeem));
     // The seller, back with the cancel still pending, sends its redeem
-    // against it.
+    // against it; no block is mined until the mempool shows which won.
     let seller = resume_seller(&world);
+    wait_for("the redeem against the cancel", || {
+        world.pooled(redeem).then_some(())
+    });
     world.drive(Pace::OnDemand, true, || {
         finished(&seller) && finished(&buyer)
     });
