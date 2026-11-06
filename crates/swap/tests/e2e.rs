@@ -21,7 +21,7 @@ use corepc_node::{Conf, Node};
 use ed25519_dalek::SigningKey;
 use rand_core::{OsRng, RngCore};
 use serde_json::{json, Value};
-use swap::bitcoind::Bitcoind;
+use swap::bitcoind::{Bitcoin, Bitcoind};
 use swap::driver::{Driver, Store};
 use swap::transport::{Ivy, PeerKey};
 use swap::{Buyer, Outcome, SecretBytes, Seller, Terms};
@@ -83,13 +83,15 @@ impl Nexus {
             std::env::var("NEXUS_NODE_IMAGE").expect("NEXUS_NODE_IMAGE names the node image");
         let (rpc, p2p) = (free_port(), free_port());
         let script = format!(
-            "lattice-node --data-directory /tmp/d --identity-key /tmp/p.key \
+            "exec lattice-node --data-directory /tmp/d --identity-key /tmp/p.key \
              --listen-port {p2p} --rpc-port {rpc} --websocket-port 0 --no-default-peers"
         );
         let out = Command::new("docker")
             .args([
                 "run",
                 "-d",
+                // Forwards `docker stop`'s SIGTERM to the node.
+                "--init",
                 "--network",
                 "host",
                 "--platform",
@@ -130,18 +132,27 @@ impl Nexus {
         wait_for("node RPC", || self.client().min_relay_fee().ok());
     }
 
-    /// Restarts the node's container. The node keeps its chain and writes a
-    /// new cookie.
+    /// Stops the node with SIGTERM, as an operator's `docker stop` does,
+    /// and starts it again. It keeps its chain and writes a new cookie.
     fn restart(&mut self) {
-        let out = Command::new("docker")
-            .args(["restart", "--time", "1", &self.container])
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        let docker = |args: &[&str]| {
+            let out = Command::new("docker").args(args).output().unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap()
+        };
+        docker(&["stop", "--time", "30", &self.container]);
+        let code = docker(&[
+            "inspect",
+            "--format",
+            "{{.State.ExitCode}}",
+            &self.container,
+        ]);
+        assert_ne!(code.trim(), "137", "the node ended on SIGTERM, not SIGKILL");
+        docker(&["start", &self.container]);
         self.copy_cookie();
     }
 
@@ -868,10 +879,17 @@ fn a_redeem_reorged_out_after_the_buyer_has_s_is_sent_again() {
     world.terms.btc_confirmations = 2;
     // The seller goes offline once its redeem is out; the buyer learns `s`
     // from it and claims.
+    let claiming = Arc::new(AtomicBool::new(false));
+    let flag = claiming.clone();
     let (seller, buyer, lock) = start_with(
         &world,
         |state| matches!(state, Seller::Redeeming { seen: true, .. }),
-        |_| false,
+        move |state| {
+            if matches!(state, Buyer::ClaimingNex(_) | Buyer::Done(Outcome::Swapped)) {
+                flag.store(true, Ordering::SeqCst);
+            }
+            false
+        },
     );
     world.drive(Pace::Steady, true, || finished(&seller));
     assert!(matches!(
@@ -881,6 +899,10 @@ fn a_redeem_reorged_out_after_the_buyer_has_s_is_sent_again() {
     if !world.mempool().is_empty() {
         world.mine_btc(1);
     }
+    // The buyer has `s` from the first redeem, before any reorg.
+    wait_for("the buyer to claim", || {
+        claiming.load(Ordering::SeqCst).then_some(())
+    });
 
     // The redeem's block is reorged out, and the redeem dropped from the
     // mempool: only the seller can send it again.
@@ -913,14 +935,16 @@ fn a_redeem_reorged_out_after_the_buyer_has_s_is_sent_again() {
     );
 }
 
-#[test]
-#[ignore = "needs Docker and NEXUS_NODE_IMAGE"]
-fn a_redeem_dropped_before_t1_races_the_cancel_to_one_outcome() {
-    let world = World::with_args(2, &["-mempoolexpiry=1"]);
-    // Both go offline once the redeem signature has passed: the buyer has
-    // sent it, the seller has broadcast its redeem.
+/// Runs both parties until the redeem signature has passed and both go
+/// offline: the buyer has sent it, the seller has broadcast its redeem.
+/// The redeem is then dropped from the mempool, seen by no one, and at t1
+/// the buyer, back, cancels. Returns the buyer, the lock address slot and
+/// the redeem, with the cancel pending.
+fn cancel_pending_after_the_redeem_dropped(
+    world: &World,
+) -> (Party<Buyer>, Arc<Mutex<Option<String>>>, Txid) {
     let (seller, buyer, lock) = start_with(
-        &world,
+        world,
         |state| matches!(state, Seller::Redeeming { seen: true, .. }),
         |state| matches!(state, Buyer::AwaitRedeem { .. }),
     );
@@ -945,15 +969,22 @@ fn a_redeem_dropped_before_t1_races_the_cancel_to_one_outcome() {
         panic!("the redeem alone is pending");
     };
 
-    // Dropped from the mempool, the redeem is seen by no one; at t1 the
-    // buyer, back, cancels.
     world.expire_mempool();
     world.mine_btc(world.terms.t1.into());
-    let buyer = resume_buyer(&world);
+    let buyer = resume_buyer(world);
     wait_for("the cancel", || (!world.mempool().is_empty()).then_some(()));
     assert!(!world.pooled(redeem));
+    (buyer, lock, redeem)
+}
+
+#[test]
+#[ignore = "needs Docker and NEXUS_NODE_IMAGE"]
+fn a_redeem_replaces_the_pending_cancel() {
+    let world = World::with_args(2, &["-mempoolexpiry=1"]);
+    let (buyer, lock, redeem) = cancel_pending_after_the_redeem_dropped(&world);
     // The seller, back with the cancel still pending, sends its redeem
-    // against it; no block is mined until the mempool shows which won.
+    // against it, which pays twice cancel's fee and replaces it; the buyer
+    // finds `s` in it and claims.
     let seller = resume_seller(&world);
     wait_for("the redeem against the cancel", || {
         world.pooled(redeem).then_some(())
@@ -961,35 +992,54 @@ fn a_redeem_dropped_before_t1_races_the_cancel_to_one_outcome() {
     world.drive(Pace::OnDemand, true, || {
         finished(&seller) && finished(&buyer)
     });
-    let (seller, buyer) = (outcome(seller).0, outcome(buyer).0);
-    assert_eq!(seller, buyer, "one outcome for both");
-    eprintln!("the race ended {seller:?}");
+    assert_eq!(outcome(seller).0, Some(Outcome::Swapped));
+    assert_eq!(outcome(buyer).0, Some(Outcome::Swapped));
 
     let fee = world.terms.nex_fee;
     let n = &world.nexus;
-    let seller_nex = world.seller_nex.nex_address();
+    assert_eq!(n.balance(&world.buyer_nex), NEX_AMOUNT - fee);
+    assert_eq!(
+        n.balance(&world.seller_nex.nex_address()),
+        2 * REWARD - NEX_AMOUNT - fee
+    );
     assert_eq!(n.balance(&lock_address(&lock)), 0);
-    match seller {
-        Some(Outcome::Swapped) => {
-            assert_eq!(n.balance(&world.buyer_nex), NEX_AMOUNT - fee);
-            assert_eq!(n.balance(&seller_nex), 2 * REWARD - NEX_AMOUNT - fee);
-            assert_eq!(btc_balance(&world.seller_wallet), BTC_AMOUNT - BTC_FEE * 2);
-            assert_eq!(
-                btc_balance(&world.buyer_wallet),
-                BUYER_BTC - BTC_AMOUNT - world.funding_fee()
-            );
-        }
-        Some(Outcome::Refunded) => {
-            assert_eq!(n.balance(&world.buyer_nex), 0);
-            assert_eq!(n.balance(&seller_nex), 2 * REWARD - 2 * fee);
-            assert_eq!(btc_balance(&world.seller_wallet), Amount::ZERO);
-            assert_eq!(
-                btc_balance(&world.buyer_wallet),
-                BUYER_BTC - world.funding_fee() - BTC_FEE * 2
-            );
-        }
-        other => panic!("swapped or refunded, not {other:?}"),
-    }
+    assert_eq!(btc_balance(&world.seller_wallet), BTC_AMOUNT - BTC_FEE * 2);
+    assert_eq!(
+        btc_balance(&world.buyer_wallet),
+        BUYER_BTC - BTC_AMOUNT - world.funding_fee()
+    );
+}
+
+#[test]
+#[ignore = "needs Docker and NEXUS_NODE_IMAGE"]
+fn a_cancel_mined_before_the_redeem_returns_refunds_both() {
+    let world = World::with_args(2, &["-mempoolexpiry=1"]);
+    let (buyer, lock, redeem) = cancel_pending_after_the_redeem_dropped(&world);
+    // The cancel is mined before the seller is back: its redeem can no
+    // longer land, the buyer refunds, and the seller, which learns `b`
+    // from the refund, claims its NEX back.
+    world.mine_btc(1);
+    let seller = resume_seller(&world);
+    world.drive(Pace::OnDemand, true, || {
+        finished(&seller) && finished(&buyer)
+    });
+    assert_eq!(outcome(seller).0, Some(Outcome::Refunded));
+    assert_eq!(outcome(buyer).0, Some(Outcome::Refunded));
+    assert!(world.bitcoin("").transaction(redeem).unwrap().is_none());
+
+    let fee = world.terms.nex_fee;
+    let n = &world.nexus;
+    assert_eq!(n.balance(&world.buyer_nex), 0);
+    assert_eq!(
+        n.balance(&world.seller_nex.nex_address()),
+        2 * REWARD - 2 * fee
+    );
+    assert_eq!(n.balance(&lock_address(&lock)), 0);
+    assert_eq!(btc_balance(&world.seller_wallet), Amount::ZERO);
+    assert_eq!(
+        btc_balance(&world.buyer_wallet),
+        BUYER_BTC - world.funding_fee() - BTC_FEE * 2
+    );
 }
 
 #[test]
