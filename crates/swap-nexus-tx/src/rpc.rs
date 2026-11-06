@@ -659,6 +659,7 @@ mod tests {
         assert_eq!(public.chain_info().unwrap()["authorized"], false);
         let own = Client::new(&url, "__cookie__:c", timeout);
         assert_eq!(own.health().unwrap().height, 5);
+        assert_eq!(own.chain_info().unwrap()["authorized"], true);
     }
 
     /// The node writes a new cookie at every start: a client made from the
