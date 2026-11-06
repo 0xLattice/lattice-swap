@@ -13,9 +13,16 @@ use crate::{BitcoinView, Buyer, Machine, Outcome, Spent};
 ///   then, `refunding` once it cancels, then the outcome: `swapped`,
 ///   `refunded`, `punished`, `drained` or `aborted`. A punished buyer
 ///   asking the seller for `s` is `asking`; claiming with it, `finishing`.
+///   Either way, `received` once the claim is in a block over a lock the
+///   buyer saw `nex_confirmations` deep: the NEX is at the buyer's
+///   address while the claim counts toward `nex_confirmations`, and the
+///   swap ends `swapped` at that depth. A punished buyer that never saw
+///   the lock stays `finishing` until then: a shallow reorg could take
+///   the lock and the claim together.
 /// - `must_stay_open` is [`Buyer::must_stay_open`].
 /// - `confirmations`: `{"funding", "lock_spend", "cancel_spend"}` as the
-///   view shows them, each null where it shows none.
+///   view shows them, each null where it shows none, and `"claim"`, the
+///   claim's depth while `received`, as the last synced Nexus view showed it.
 /// - `deadlines`: `{"cancel", "refund", "punish"}`, each the first Bitcoin
 ///   block that can hold it, once the lock is in a block. Cancel is valid
 ///   `t1` blocks after the lock, punish `t2` after cancel; the refund goes
@@ -29,6 +36,7 @@ use crate::{BitcoinView, Buyer, Machine, Outcome, Spent};
 ///   ends; null once it has.
 pub fn buyer_status(buyer: &Buyer, view: Option<&BitcoinView>) -> Value {
     let phase = match buyer {
+        Buyer::ClaimingNex(claim) if claim.received().is_some() => "received",
         Buyer::AwaitRedeem { .. } | Buyer::ClaimingNex(_) => "finishing",
         Buyer::AskingShare { .. } => "asking",
         Buyer::Cancelling { .. } => "refunding",
@@ -76,6 +84,10 @@ pub fn buyer_status(buyer: &Buyer, view: Option<&BitcoinView>) -> Value {
             "funding": view.and_then(|view| view.funding),
             "lock_spend": view.and_then(|view| depth(&view.lock_spend)),
             "cancel_spend": view.and_then(|view| depth(&view.cancel_spend)),
+            "claim": match buyer {
+                Buyer::ClaimingNex(claim) => claim.received(),
+                _ => None,
+            },
         },
         "deadlines": {"cancel": cancel, "refund": refund, "punish": punish},
         "backup_covers": backup_covers,

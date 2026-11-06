@@ -802,6 +802,11 @@ pub struct Claim {
     /// `Swapped` if the claim lands and `Punished` otherwise.
     #[serde(default)]
     punished: bool,
+    /// The claim's depth as a synced node last showed it, None while it is
+    /// in no block: cleared if a reorg drops it, when it is submitted
+    /// again. See [`Claim::received`].
+    #[serde(default)]
+    depth: Option<u64>,
 }
 
 #[allow(clippy::large_enum_variant)] // Short-lived: matched on as soon as made.
@@ -824,6 +829,7 @@ impl Claim {
             passed_at: None,
             claim: None,
             punished: false,
+            depth: None,
         }
     }
 
@@ -836,6 +842,9 @@ impl Claim {
         let terms = &self.setup.terms;
         let depth = view.watched.as_ref().and_then(|(_, depth)| *depth);
         if let Some(claim) = &self.claim {
+            if synced(&view.health) {
+                self.depth = depth;
+            }
             return match depth {
                 Some(depth) if depth >= terms.nex_confirmations => Claimed::Done,
                 Some(_) => Claimed::Pending(self, vec![]),
@@ -888,6 +897,18 @@ impl Claim {
         } else {
             Claimed::Pending(self, vec![])
         }
+    }
+
+    /// The claim's depth once the NEX is this party's: the claim is in a
+    /// block, and the lock under it was `nex_confirmations` deep before
+    /// (`Lock::Seen`), so no shallow reorg takes the lock away with it.
+    /// Only the two shares together spend the lock, so a reorg that drops
+    /// the claim only delays it: it is submitted again, byte for byte. The
+    /// one exception is a buyer whose cancel beat the redeem after all: a
+    /// copy of it that refunds hands the seller `b`, and a reorg may let the
+    /// seller's claim in instead; that buyer has its BTC back.
+    fn received(&self) -> Option<u64> {
+        self.depth.filter(|_| matches!(self.lock, Lock::Seen))
     }
 
     fn transaction(&self, amount: u64, fee: u64) -> swap_nexus_tx::Transaction {

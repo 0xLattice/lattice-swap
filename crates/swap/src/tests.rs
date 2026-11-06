@@ -3190,8 +3190,45 @@ fn a_claim_is_done_only_nex_confirmations_deep() {
     };
     let (buyer, actions) = buyer_claiming_with(deep).step(nexus(account(500_000, 0), None));
     let claim = submitted(&actions);
+    let phase = |buyer: &Buyer| status::buyer_status(buyer, None)["phase"].clone();
+    assert_eq!(phase(&buyer), "finishing", "submitted, not yet in a block");
     let (buyer, _) = buyer.step(nexus(account(0, 1), mined(claim.body.clone(), 2)));
     assert_eq!(buyer.outcome(), None);
+    let shown = status::buyer_status(&buyer, None);
+    assert_eq!(
+        shown["phase"], "received",
+        "in a block over a deep lock: the NEX is at the address"
+    );
+    assert_eq!(shown["confirmations"]["claim"], 2);
+    assert!(!buyer.must_stay_open());
+    // A punished buyer that never saw the lock deep: a shallow reorg could
+    // take the lock and the claim together, so it is not yet received.
+    let Buyer::ClaimingNex(mut unseen) = buyer.clone() else {
+        unreachable!()
+    };
+    unseen.lock = Lock::Unsigned;
+    let unseen = Buyer::ClaimingNex(unseen);
+    assert_eq!(phase(&unseen), "finishing");
+    assert_eq!(
+        status::buyer_status(&unseen, None)["confirmations"]["claim"],
+        serde_json::Value::Null
+    );
+    // A node still syncing changes nothing shown.
+    let lagging = nexus_at(
+        syncing(),
+        account(0, 1),
+        account(0, 1),
+        mined(claim.body.clone(), 1),
+    );
+    let (buyer, _) = buyer.step(lagging);
+    assert_eq!(
+        status::buyer_status(&buyer, None)["confirmations"]["claim"],
+        2
+    );
+    // A reorg drops the claim: it is submitted again, and finishing again.
+    let (buyer, actions) = restart(&buyer).step(nexus(account(500_000, 0), None));
+    assert_eq!(submitted(&actions).cid(), claim.cid());
+    assert_eq!(phase(&buyer), "finishing");
     let (buyer, _) = buyer.step(nexus(account(0, 1), mined(claim.body, 3)));
     assert_eq!(buyer.outcome(), Some(Outcome::Swapped));
 }

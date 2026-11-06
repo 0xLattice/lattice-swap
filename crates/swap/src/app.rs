@@ -856,7 +856,8 @@ impl Buy {
     /// `need`, `confirmations`, `deadlines`, `mustStayOpen`,
     /// `backupCovers`, `running`, the amounts, `nexAddress`, `tip` and
     /// `warning`. Reads the wallet's balance and, once the lock is agreed,
-    /// a Bitcoin view; Nexus confirmations are not read (`nexLock` null).
+    /// a Bitcoin view. Nexus is not read: `nexLock` is the claim's depth
+    /// as the state last saw it while `received`, else null.
     pub fn status(&self) -> Result<Value> {
         let wallet = &self.wallet;
         let record = self.record().clone();
@@ -933,7 +934,7 @@ impl Buy {
                 "funding": confirmations["funding"],
                 "lockSpend": confirmations["lock_spend"],
                 "cancelSpend": confirmations["cancel_spend"],
-                "nexLock": null,
+                "nexLock": confirmations["claim"],
             },
             "deadlines": deadlines,
             "mustStayOpen": machine["must_stay_open"] == true || phase == "refunding",
