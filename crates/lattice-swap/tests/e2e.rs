@@ -492,7 +492,8 @@ impl World {
     }
 
     /// [`World::offer_on`], each lock to be `btc_confirmations` and
-    /// `nex_confirmations` deep.
+    /// `nex_confirmations` deep, and `t2` as far over `btc_confirmations`
+    /// as at one: the buyer's refund window stays the 9 blocks it asks.
     fn offer_deep(
         &self,
         t1: u16,
@@ -501,6 +502,7 @@ impl World {
         relay: Option<&str>,
     ) -> (Party, String, String, JoinHandle<String>) {
         let (t1, nex_confirmations) = (t1.to_string(), nex_confirmations.to_string());
+        let t2 = (9 + btc_confirmations).to_string();
         let btc_confirmations = btc_confirmations.to_string();
         let nex_fee = self.nex_fee.to_string();
         let place = match relay {
@@ -518,7 +520,7 @@ impl World {
                 // Regtest has no fee estimate.
                 .args(["--min-btc-fee-rate", "1"])
                 .args(["--nex-fee", &nex_fee])
-                .args(["--t1", &t1, "--t2", "10", "--margin", "3"])
+                .args(["--t1", &t1, "--t2", &t2, "--margin", "3"])
                 .args(["--btc-confirmations", &btc_confirmations])
                 .args(["--nex-confirmations", &nex_confirmations])
                 .args(NO_BUMP)
