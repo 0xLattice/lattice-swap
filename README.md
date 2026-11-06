@@ -109,7 +109,8 @@ or `--btc-wallet` with `--btc-cookie` or `--btc-user` (and `--btc-url`) for
 your bitcoind, not both; `--nexus-url` for another node, and with
 `--nexus-cookie` your own lattice-node's RPC. At startup each prints
 `bitcoin: public <url>` or `bitcoin: your node <url>`, and the same for
-nexus. A public node is trusted for what it shows: a seller trusts
+nexus; `--esplora` naming the mempool.space URL for `--btc-network` is
+public too. A public node is trusted for what it shows: a seller trusts
 mempool.space for how deep the buyer's BTC lock is before it locks its NEX,
 and a public Nexus node for its claim of the NEX back on a refund, so keep
 `--max-btc-amount` small; a buyer trusts mempool.space to show Bitcoin in
@@ -130,8 +131,9 @@ directory on an Esplora: `take` is refused while one there has not ended,
 or while the wallet's confirmed balance does not fund the lock. A swap file
 does not say which Bitcoin it was made on: `resume` with no Bitcoin flags,
 or `--esplora`, refuses a swap that does not pay the wallet in its
-directory, as one made on a bitcoind does not; resume that with the flags
-it was made with.
+directory, as one made on a bitcoind does not, and `resume` with the
+bitcoind flags refuses one that does not pay that bitcoind wallet, as one
+made on an Esplora does not; resume each with the flags it was made with.
 
 ```sh
 lattice-swap offer --nex-key-file ~/.lattice-swap/nex.key \

@@ -984,9 +984,9 @@ fn bitcoind(result: Value) -> String {
     node(json!({}), result)
 }
 
-/// A bitcoind on mainnet that passes the node check, but where `replies`
-/// names a method and the reply to it, and that answers every other call
-/// with `result`.
+/// A bitcoind on mainnet that passes the node check, whose wallet owns
+/// every address, but where `replies` names a method and the reply to it,
+/// and that answers every other call with `result`.
 fn node(replies: Value, result: Value) -> String {
     use std::io::BufRead;
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1016,6 +1016,7 @@ fn node(replies: Value, result: Value) -> String {
                 "getnetworkinfo" => json!({"version": 300_200}),
                 "getblockchaininfo" => json!({"chain": "main", "initialblockdownload": false}),
                 "getwalletinfo" => json!({"private_keys_enabled": true}),
+                "getaddressinfo" => json!({"ismine": true}),
                 _ => result.clone(),
             };
             let reply = match &replies[method] {
@@ -1032,6 +1033,11 @@ fn node(replies: Value, result: Value) -> String {
         }
     });
     url
+}
+
+/// A payout to an address, which [`node`]'s wallet owns.
+fn paid() -> ScriptBuf {
+    ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([1; 20]))
 }
 
 /// 10 sat/vB.
@@ -1813,14 +1819,14 @@ fn offer_take_and_resume_check_the_nexus_node() {
         &forgetful(),
     ));
     let home = SecretBytes([7; 32]).nex_address();
-    let seller = Seller::new(small(16), home, ScriptBuf::new(), ScriptBuf::new()).unwrap();
+    let seller = Seller::new(small(16), home, paid(), paid()).unwrap();
     let (_directory, path) = swap_file(seller);
     refused(refusal_on(
         &["resume", &path, "--nex-key-file", key],
         &url,
         &forgetful(),
     ));
-    let (buyer, _) = Buyer::start(small(16), ScriptBuf::new(), "b".into()).unwrap();
+    let (buyer, _) = Buyer::start(small(16), paid(), "b".into()).unwrap();
     let (_directory, path) = swap_file(buyer);
     refused(refusal_on(&["resume", &path], &url, &forgetful()));
 }
@@ -1945,14 +1951,9 @@ fn offer_take_and_resume_refuse_another_nexus() {
     };
     let mut files = vec![];
     for genesis in [MAINNET, dev.as_str()] {
-        let seller = Seller::new(
-            on(genesis),
-            home.clone(),
-            ScriptBuf::new(),
-            ScriptBuf::new(),
-        );
+        let seller = Seller::new(on(genesis), home.clone(), paid(), paid());
         files.push((genesis, swap_file(seller.unwrap())));
-        let (buyer, _) = Buyer::start(on(genesis), ScriptBuf::new(), "b".into()).unwrap();
+        let (buyer, _) = Buyer::start(on(genesis), paid(), "b".into()).unwrap();
         files.push((genesis, swap_file(buyer)));
     }
     for (genesis, (_directory, path)) in &files {
@@ -2282,6 +2283,21 @@ fn each_chain_is_public_or_your_own_independently() {
     assert!(nodes(&["--btc-cookie", "/c"]).is_err(), "no wallet");
     assert!(nodes(&["--btc-user", "u"]).is_err(), "no wallet");
     assert!(nodes(&["--btc-url", "http://b"]).is_err(), "no wallet");
+    // mempool.space named by --esplora is still public, with its trust
+    // note and the poll its rate limits ask for.
+    for url in ["https://mempool.space/api", "https://mempool.space/api/"] {
+        let named = nodes(&["--esplora", url]).unwrap();
+        assert!(named.public_bitcoin() && named.public(), "{url}");
+    }
+    let named = nodes(&[
+        "--esplora",
+        "https://mempool.space/signet/api",
+        "--btc-network",
+        "signet",
+    ]);
+    assert!(named.unwrap().public_bitcoin());
+    let own = nodes(&[&esplora[..], &own_nexus].concat()).unwrap();
+    assert!(!own.public_bitcoin());
     let both = ["--btc-wallet", "w", "--btc-cookie", "/c", "--btc-user", "u"];
     assert!(nodes(&both).is_err());
     let user = nodes(&["--btc-wallet", "w", "--btc-user", "u"]).unwrap();
@@ -2410,6 +2426,52 @@ fn resume_on_an_esplora_takes_only_a_swap_paying_its_wallet() {
     };
     assert!(refused.contains("does not pay the wallet"), "{refused}");
     assert!(resume_bitcoin(&args.nodes, dir, Some(&paid)).is_ok());
+}
+
+/// Resumed on a bitcoind, a swap that does not pay its wallet, as one
+/// made on an Esplora does not, is refused, and says how to resume it.
+#[test]
+fn resume_on_a_bitcoind_takes_only_a_swap_paying_its_wallet() {
+    let directory = tempfile::tempdir().unwrap();
+    let dir = directory.path();
+    let cookie = tempfile::NamedTempFile::new().unwrap();
+    fs::write(cookie.path(), "user:password").unwrap();
+    let resume_on = |ismine: bool| {
+        let url = node(
+            json!({"getaddressinfo": {"result": {"ismine": ismine}}}),
+            Value::Null,
+        );
+        let cli = Cli::try_parse_from([
+            "lattice-swap",
+            "resume",
+            "f.json",
+            "--btc-url",
+            &url,
+            "--btc-wallet",
+            "w",
+            "--btc-cookie",
+            cookie.path().to_str().unwrap(),
+        ])
+        .unwrap();
+        let Command::Resume(args) = cli.command else {
+            panic!("not resume")
+        };
+        args.nodes
+    };
+    assert!(resume_bitcoin(&resume_on(true), dir, Some(&paid())).is_ok());
+    for (ismine, payout) in [(false, paid()), (true, ScriptBuf::new())] {
+        let refused = match resume_bitcoin(&resume_on(ismine), dir, Some(&payout)) {
+            Ok(_) => panic!("a swap not paying the wallet was resumed"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            refused.contains("does not pay the bitcoind wallet w")
+                && refused.contains("flags it was made with"),
+            "{refused}"
+        );
+    }
+    // A swap that has ended pays no one.
+    assert!(resume_bitcoin(&resume_on(false), dir, None).is_ok());
 }
 
 /// On an Esplora, `take` is refused while a swap in the directory has not

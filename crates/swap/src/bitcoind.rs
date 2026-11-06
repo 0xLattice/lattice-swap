@@ -157,6 +157,16 @@ impl Bitcoind {
         Ok(())
     }
 
+    /// Whether `script` pays an address of this wallet, as `getaddressinfo`
+    /// says; a script no address spells is no wallet's.
+    pub fn owns(&self, script: &Script) -> Result<bool> {
+        let Ok(address) = Address::from_script(script, self.network) else {
+            return Ok(false);
+        };
+        let info = self.call("getaddressinfo", json!([address.to_string()]))?;
+        Ok(info["ismine"] == true)
+    }
+
     pub fn call(&self, method: &str, params: Value) -> Result<Value> {
         let request = json!({"jsonrpc": "1.0", "id": 0, "method": method, "params": params});
         let response = self
@@ -203,10 +213,8 @@ impl Bitcoind {
     fn change_for(&self, parent: &Transaction) -> Result<ScriptBuf> {
         // An operator's external payout script is not this wallet's to bump
         // with.
-        let payout = Address::from_script(&parent.output[0].script_pubkey, self.network)
-            .map_err(|e| Error(format!("payout: {e}")))?;
-        let info = self.call("getaddressinfo", json!([payout.to_string()]))?;
-        if info["ismine"] != true {
+        let payout = &parent.output[0].script_pubkey;
+        if !self.owns(payout)? {
             return Err(Error(format!("payout {payout} is not this wallet's")));
         }
         let change = self.call("getrawchangeaddress", json!([]))?;

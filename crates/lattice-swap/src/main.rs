@@ -211,10 +211,10 @@ impl NodeArgs {
     fn bitcoin(&self, dir: &Path) -> Result<Btc> {
         let Some(wallet) = &self.btc_wallet else {
             let url = esplora_url(self.esplora.as_deref(), self.btc_network)?;
-            let whose = if self.esplora.is_some() {
-                "your node"
-            } else {
+            let whose = if self.public_bitcoin() {
                 "public"
+            } else {
+                "your node"
             };
             log(&format!("bitcoin: {whose} {url}"));
             // Only the Esplora and the directory are read: Nexus is this
@@ -265,9 +265,13 @@ impl NodeArgs {
         format!("{}/wallet/{wallet}", self.btc_url().trim_end_matches('/'))
     }
 
-    /// Whether Bitcoin is read through mempool.space's Esplora.
+    /// Whether Bitcoin is read through mempool.space's Esplora: by
+    /// default, or named by --esplora.
     fn public_bitcoin(&self) -> bool {
-        self.btc_wallet.is_none() && self.esplora.is_none()
+        self.btc_wallet.is_none()
+            && self.esplora.as_deref().is_none_or(|url| {
+                Some(url.trim_end_matches('/')) == app::default_esplora(self.btc_network)
+            })
     }
 
     /// Whether Nexus is read through a public read port.
@@ -1077,7 +1081,9 @@ fn resume(args: SwapFileArgs) -> Result<Outcome> {
 /// The Bitcoin to resume a swap in `dir` on whose BTC is paid to
 /// `payout`. A swap file does not say which Bitcoin it was made on: on an
 /// Esplora, one that does not pay the wallet in `dir`, as one made on a
-/// bitcoind does, is refused, and no wallet is made for it.
+/// bitcoind does, is refused, and no wallet is made for it; on a bitcoind,
+/// one that does not pay its wallet, as one made on an Esplora does, is
+/// refused too.
 fn resume_bitcoin(nodes: &NodeArgs, dir: &Path, payout: Option<&Script>) -> Result<Btc> {
     let refused = || {
         format!(
@@ -1090,10 +1096,24 @@ fn resume_bitcoin(nodes: &NodeArgs, dir: &Path, payout: Option<&Script>) -> Resu
         return Err(refused().into());
     }
     let bitcoin = nodes.bitcoin(dir)?;
-    if let (Btc::Esplora(esplora, _), Some(payout)) = (&bitcoin, payout) {
-        if esplora.key().script_pubkey.as_script() != payout {
-            return Err(refused().into());
+    match (&bitcoin, payout) {
+        (Btc::Esplora(esplora, _), Some(payout)) => {
+            if esplora.key().script_pubkey.as_script() != payout {
+                return Err(refused().into());
+            }
         }
+        (Btc::Node(bitcoind), Some(payout)) => {
+            if !bitcoind.owns(payout)? {
+                return Err(format!(
+                    "refused: the swap does not pay the bitcoind wallet {}: resume it with \
+                     the Bitcoin flags it was made with, none or --esplora for the wallet in {}",
+                    nodes.btc_wallet.as_deref().unwrap_or_default(),
+                    dir.display()
+                )
+                .into());
+            }
+        }
+        (_, None) => {}
     }
     Ok(bitcoin)
 }
