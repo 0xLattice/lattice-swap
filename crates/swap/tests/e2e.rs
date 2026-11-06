@@ -10,7 +10,7 @@
 use std::cell::Cell;
 use std::net::TcpListener;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -618,6 +618,27 @@ fn resume_buyer(world: &World) -> Party<Buyer> {
         driver.max_fee_rate = NO_BUMP;
         let outcome = driver.run().unwrap();
         (Some(outcome), driver.state().clone())
+    })
+}
+
+/// [`resume_buyer`], `watch` shown every state it steps to.
+fn resume_buyer_watched(world: &World, watch: impl Fn(&Buyer) + Send + 'static) -> Party<Buyer> {
+    let (bitcoin, nexus, store) = (
+        world.bitcoin("buyer"),
+        world.nexus.client(),
+        world.store("buyer"),
+    );
+    thread::spawn(move || {
+        let mut driver = Driver::<Buyer, _, Ivy>::resume(bitcoin, nexus, None, store).unwrap();
+        driver.fallback_fee_rate = NO_BUMP;
+        driver.max_fee_rate = NO_BUMP;
+        let outcome = driver
+            .run_until(|state| {
+                watch(state);
+                false
+            })
+            .unwrap();
+        (outcome, driver.state().clone())
     })
 }
 
@@ -1245,6 +1266,34 @@ fn mine_until_ended(world: &World, seller: &Party<Seller>, buyer: &Party<Buyer>)
     });
 }
 
+/// The buyer's phases as `buyer_status` shows them, each once in a row,
+/// and the claims it watches.
+#[derive(Clone, Default)]
+struct Trail {
+    phases: Arc<Mutex<Vec<String>>>,
+    claims: Arc<Mutex<Vec<String>>>,
+}
+
+impl Trail {
+    /// Records `state`; returns its phase.
+    fn record(&self, state: &Buyer) -> String {
+        let status = swap::status::buyer_status(state, None);
+        let phase = status["phase"].as_str().unwrap().to_string();
+        let mut phases = self.phases.lock().unwrap();
+        if phases.last() != Some(&phase) {
+            phases.push(phase.clone());
+        }
+        let cid = state.watch().nexus.and_then(|watch| watch.cid);
+        if let (Buyer::ClaimingNex(_), Some(cid)) = (state, cid) {
+            let mut claims = self.claims.lock().unwrap();
+            if !claims.contains(&cid) {
+                claims.push(cid);
+            }
+        }
+        phase
+    }
+}
+
 #[test]
 #[ignore = "needs Docker and NEXUS_NODE_IMAGE"]
 fn a_claim_reorged_out_is_sent_again() {
@@ -1254,27 +1303,11 @@ fn a_claim_reorged_out_is_sent_again() {
     world.terms.nex_confirmations = 2;
     world.terms.t1 = world.terms.t1_floor().try_into().unwrap();
     let mut fork = fork_node(&world);
-    // The buyer's phases as `buyer_status` shows them, and its claims.
-    let phases = Arc::new(Mutex::new(Vec::<String>::new()));
-    let claims = Arc::new(Mutex::new(Vec::<String>::new()));
-    let (seen, cids) = (phases.clone(), claims.clone());
-    let (seller, buyer, lock) = start(&world, move |state| {
-        let status = swap::status::buyer_status(state, None);
-        let phase = status["phase"].as_str().unwrap().to_string();
-        let mut seen = seen.lock().unwrap();
-        if seen.last() != Some(&phase) {
-            seen.push(phase);
-        }
-        let cid = state.watch().nexus.and_then(|watch| watch.cid);
-        if let (Buyer::ClaimingNex(_), Some(cid)) = (state, cid) {
-            let mut cids = cids.lock().unwrap();
-            if !cids.contains(&cid) {
-                cids.push(cid);
-            }
-        }
-        false
-    });
-    let received = || phases.lock().unwrap().last().map(String::as_str) == Some("received");
+    // The buyer stops once received, so nothing sends the claim while the
+    // reorg below takes it out.
+    let trail = Trail::default();
+    let first = trail.clone();
+    let (seller, buyer, lock) = start(&world, move |state| first.record(state) == "received");
     // The lock lands one deep, and both nodes have it; then they part, and
     // the swap's node takes the lock to two deep and the claim to one.
     world.drive(Pace::OnDemand, true, || {
@@ -1284,7 +1317,10 @@ fn a_claim_reorged_out_is_sent_again() {
     fork.follow(&world.nexus);
     fork.peer(None);
     world.nexus.mine(None);
-    world.drive(Pace::OnDemand, true, received);
+    world.drive(Pace::OnDemand, true, || finished(&buyer));
+    let (stopped, state) = outcome(buyer);
+    assert_eq!(stopped, None);
+    assert!(matches!(state, Buyer::ClaimingNex(_)));
     assert_eq!(
         world.nexus.balance(&world.buyer_nex),
         NEX_AMOUNT - world.terms.nex_fee
@@ -1292,23 +1328,34 @@ fn a_claim_reorged_out_is_sent_again() {
 
     // A heavier branch without the claim; the lock under it stays.
     reorg_onto(&world, &mut fork);
+    // The node returns the claim to its pool, which does not outlive a
+    // restart; the fork, which may hold it too, is cut off again first.
+    fork.peer(None);
+    world.nexus.restart();
+    assert_eq!(world.nexus.pending(), 0, "only the buyer can send it again");
     assert_eq!(world.nexus.balance(&world.buyer_nex), 0);
     assert_eq!(world.nexus.balance(&lock_address(&lock)), NEX_AMOUNT);
-    wait_for("the buyer to see the claim gone", || {
-        (!received()).then_some(())
+    // Back, the buyer finds the claim gone, sends it again, and the swap
+    // ends once it is two deep.
+    let again = trail.clone();
+    let buyer = resume_buyer_watched(&world, move |state| {
+        again.record(state);
     });
-    // The claim lands again, and the swap ends once it is two deep.
     mine_until_ended(&world, &seller, &buyer);
     assert_eq!(outcome(seller).0, Some(Outcome::Swapped));
     assert_eq!(outcome(buyer).0, Some(Outcome::Swapped));
-    let phases = phases.lock().unwrap();
+    let phases = trail.phases.lock().unwrap();
     let from = phases.iter().position(|phase| phase == "received").unwrap();
     assert_eq!(
         phases[from..],
         ["received", "finishing", "received"],
         "{phases:?}"
     );
-    assert_eq!(claims.lock().unwrap().len(), 1, "one claim, sent again");
+    assert_eq!(
+        trail.claims.lock().unwrap().len(),
+        1,
+        "one claim, sent again"
+    );
 
     let fee = world.terms.nex_fee;
     let n = &world.nexus;
@@ -1336,11 +1383,20 @@ fn a_nex_lock_reorged_out_is_signed_for_once_deep_again() {
     let mut fork = fork_node(&world);
     // The two nodes part before the swap.
     fork.peer(None);
+    // Whether the buyer signed, how many states it stepped to, and the
+    // lock the seller named.
     let signed = Arc::new(AtomicBool::new(false));
-    let flag = signed.clone();
+    let steps = Arc::new(AtomicUsize::new(0));
+    let named = Arc::new(Mutex::new(None));
+    let (flag, count, slot) = (signed.clone(), steps.clone(), named.clone());
     let (seller, buyer, lock) = start(&world, move |state| {
-        if matches!(state, Buyer::AwaitRedeem { .. }) {
-            flag.store(true, Ordering::SeqCst);
+        count.fetch_add(1, Ordering::SeqCst);
+        match state {
+            Buyer::AwaitNexLock { .. } => {
+                *slot.lock().unwrap() = state.watch().nexus.and_then(|watch| watch.cid);
+            }
+            Buyer::AwaitRedeem { .. } => flag.store(true, Ordering::SeqCst),
+            _ => {}
         }
         false
     });
@@ -1355,11 +1411,35 @@ fn a_nex_lock_reorged_out_is_signed_for_once_deep_again() {
     let address = lock_address(&lock);
     assert_eq!(world.nexus.balance(&address), 0);
     assert!(world.nexus.pending() > 0, "the lock back in the pool");
-    // It lands again, one deep: still not enough to sign for.
+    // It lands again, one deep: still not enough to sign for. For five
+    // seconds the node is synced and shows it one deep, and the buyer,
+    // stepping on its views all along, does not sign.
     world.nexus.mine(None);
     assert_eq!(world.nexus.balance(&address), NEX_AMOUNT);
-    thread::sleep(Duration::from_secs(5));
-    assert!(!signed.load(Ordering::SeqCst), "signed for a shallow lock");
+    let cid = named
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the seller named the lock");
+    let client = world.nexus.client();
+    let (before, until) = (
+        steps.load(Ordering::SeqCst),
+        Instant::now() + Duration::from_secs(5),
+    );
+    while Instant::now() < until {
+        let health = client.health().unwrap();
+        assert!(
+            health.phase == "active" && health.best_header_height == Some(health.height),
+            "{health:?}"
+        );
+        assert_eq!(client.confirmations(&cid).unwrap(), Some(1));
+        assert!(!signed.load(Ordering::SeqCst), "signed for a shallow lock");
+        thread::sleep(Duration::from_millis(250));
+    }
+    assert!(
+        steps.load(Ordering::SeqCst) >= before + 10,
+        "the buyer stepped"
+    );
     // Two deep on the new branch, the buyer signs, and the swap ends once
     // its claim is two deep.
     mine_until_ended(&world, &seller, &buyer);
