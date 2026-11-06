@@ -60,10 +60,14 @@ export class Buyer extends EventTarget {
   #gone = null;
   #status = '';
   #wake = null;
-  /** Whether the Nexus node is known to follow the swap's Nexus:
-   * `prepare` checks it first; a resumed swap checks it the first round
-   * it reads Nexus. */
+  /** Whether the Nexus node is known to follow the swap's Nexus, and the
+   * Esplora the page's network: `prepare` checks both first; a resumed
+   * swap checks each the first round it reads it. */
   #nexusChecked;
+  #bitcoinChecked;
+  /** When the chains may next be read: a poll after the last round of
+   * reads ended, however many messages come in between. */
+  #readAt = -Infinity;
   /** A swap that ended: its terms, which its state no longer holds. */
   #doneTerms = null;
   /** Whether {@link Buyer#cancel} dropped the swap before it was taken. */
@@ -79,14 +83,15 @@ export class Buyer extends EventTarget {
   #running = false;
   #halt = new AbortController();
 
-  constructor(wallet, record, nexusChecked) {
+  constructor(wallet, record, checked) {
     super();
     this.#wallet = wallet;
     this.#c = wallet.config;
     this.#r = record;
     this.#kind = kind(record.state);
     this.#since = this.#c.now();
-    this.#nexusChecked = nexusChecked;
+    this.#nexusChecked = checked;
+    this.#bitcoinChecked = checked;
   }
 
   /** A swap of `offer`, an offer's text from a relay's board, that the
@@ -108,7 +113,7 @@ export class Buyer extends EventTarget {
     return wallet.exclusive(async () => {
       const running = await wallet.running();
       if (running !== null) throw new Error(`refused: swap ${running} is running; one swap at a time`);
-      await checkNexus(wallet.nexus, wallet.config.nexusGenesis);
+      await wallet.check();
       const refused = await refusal(wallet, decoded, policy);
       if (refused !== null) throw new Error(refused);
       const { store } = wallet.config;
@@ -296,7 +301,7 @@ export class Buyer extends EventTarget {
         this.#announce();
         if (done) break;
         await new Promise((resolve) => {
-          const timer = setTimeout(resolve, this.#c.poll);
+          const timer = setTimeout(resolve, Math.max(0, this.#readAt - this.#c.now()));
           this.#wake = () => {
             clearTimeout(timer);
             resolve();
@@ -314,22 +319,33 @@ export class Buyer extends EventTarget {
   }
 
   /** One round: whether the swap is over, its offer gone, or it is
-   * cancelled. */
+   * cancelled. The messages are taken as they come, and the chains read
+   * only once a poll has passed since the last reads ended, as the native
+   * driver's `run_until`: however many messages the seller sends, the
+   * backends are read no more often, so it cannot spend their rate
+   * limits. */
   async #round() {
     if (this.#cancelled) return true;
-    if (!this.#r.taken) {
-      this.#balance = await this.#wallet.balance();
-      await this.#take();
-      return this.#gone !== null || this.#cancelled;
+    if (this.#r.taken) {
+      await this.#rejoin();
+      for (const message of this.#inbox.splice(0)) await this.#apply({ Message: JSON.parse(message) });
+      if (this.#awaits() && this.#c.now() - this.#since > this.#c.messageTimeout) await this.#apply('Timeout');
     }
-    await this.#rejoin();
-    for (const message of this.#inbox.splice(0)) await this.#apply({ Message: JSON.parse(message) });
-    if (this.#awaits() && this.#c.now() - this.#since > this.#c.messageTimeout) await this.#apply('Timeout');
-    await this.#observeBitcoin();
-    await this.#observeNexus();
-    // Last: the balance is shown, and a failed read of it skips nothing.
-    this.#balance = await this.#wallet.balance();
-    return ended(this.#r.state);
+    if (this.#c.now() < this.#readAt) return ended(this.#r.state);
+    try {
+      if (!this.#r.taken) {
+        this.#balance = await this.#wallet.balance();
+        await this.#take();
+        return this.#gone !== null || this.#cancelled;
+      }
+      await this.#observeBitcoin();
+      await this.#observeNexus();
+      // Last: the balance is shown, and a failed read of it skips nothing.
+      this.#balance = await this.#wallet.balance();
+      return ended(this.#r.state);
+    } finally {
+      this.#readAt = this.#c.now() + this.#c.poll;
+    }
   }
 
   /** While the swap needs its session and has none, meets the seller
@@ -391,6 +407,7 @@ export class Buyer extends EventTarget {
       const { enough, need } = await this.#wallet.need(r.policy.btc_amount);
       this.#need = need;
       if (!enough) return false;
+      await this.#checkBitcoin();
       await this.#checkNexus();
       const refused = await refusal(this.#wallet, r.offer, r.policy);
       if (refused !== null) throw new Error(refused);
@@ -515,6 +532,7 @@ export class Buyer extends EventTarget {
   async #observeBitcoin() {
     const watch = call('watchBuyer', this.#r.state).bitcoin;
     if (!watch) return;
+    await this.#checkBitcoin();
     const seen = await bitcoinView(this.#wallet.esplora, watch);
     // The tip moved while the view was read: read again next round.
     if (seen === null) return;
@@ -555,6 +573,15 @@ export class Buyer extends EventTarget {
     }
     await checkNexus(this.#wallet.nexus, page);
     this.#nexusChecked = true;
+  }
+
+  /** Refuses an Esplora on another network than the page's, once per
+   * Buyer: a resumed swap's first use of it, as `prepare` checks it before
+   * anything else. Throws into the round, as any failed read does. */
+  async #checkBitcoin() {
+    if (this.#bitcoinChecked) return;
+    await this.#wallet.esplora.checkNetwork(this.#c.network);
+    this.#bitcoinChecked = true;
   }
 
   async #save() {

@@ -5,7 +5,7 @@
 import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
 import { readFileSync } from 'node:fs';
-import { call, load } from '../src/wasm.js';
+import { call, load, wasm } from '../src/wasm.js';
 
 export async function loadWasm() {
   await load(readFileSync(new URL('../pkg/swap_wasm_bg.wasm', import.meta.url)));
@@ -32,7 +32,8 @@ export async function serve(route) {
   };
 }
 
-/** A chain as an Esplora shows it: its tip, transactions and outputs. */
+/** A chain as an Esplora shows it: its block 0, by default regtest's, its
+ * tip, transactions and outputs. */
 export class Chain {
   constructor(height = 100) {
     this.height = height;
@@ -44,6 +45,7 @@ export class Chain {
     /** "txid:vout" -> spending txid */
     this.spends = new Map();
     this.fees = {};
+    this.genesis = wasm.bitcoinGenesis('regtest');
   }
 
   get hash() {
@@ -115,10 +117,11 @@ function unspendable(chain, posted, hex) {
 
 /** An Esplora over `chain`: what it takes is logged in `posted`, and
  * `onPost(hex)` runs first; it refuses a transaction that spends what it
- * cannot. */
+ * cannot. It logs each path asked in `chain.paths`, if given. */
 export async function esplora(chain, onPost = () => {}) {
   const posted = [];
   const server = await serve(async (method, path, body) => {
+    chain.paths?.push(path);
     if (method === 'POST' && path === '/tx') {
       await onPost(body);
       const refused = unspendable(chain, posted, body);
@@ -130,6 +133,7 @@ export async function esplora(chain, onPost = () => {}) {
     if (path === '/blocks/tip/hash') return [200, hash];
     if (path === `/block/${hash}`) return [200, { height, timestamp: chain.time }];
     if (path === '/fee-estimates') return [200, chain.fees];
+    if (path === '/block-height/0') return [200, chain.genesis];
     let m = path.match(/^\/tx\/(\w+)(\/hex)?$/);
     if (m) {
       const tx = chain.txs.get(m[1]);
@@ -155,15 +159,22 @@ export async function esplora(chain, onPost = () => {}) {
   return { ...server, posted };
 }
 
-/** A Nexus node at height 1 on the test offer's genesis, or on `genesis`;
- * it answers 503 to everything while `down` holds, and logs each path
- * asked in `paths`, if given. */
+/** A Nexus node's public read port at height 1 on the test offer's
+ * genesis, or on `genesis`, that takes submits unless `acceptsSubmit` is
+ * false; its `/api/chain/info` is at `height` and `tip`, if given, while
+ * its `/health`, a snapshot, stays at height 1. It answers 503 to
+ * everything while `down` holds, and logs each path asked in `paths`, if
+ * given. */
 export function nexus(node = {}) {
   return serve((method, path) => {
     node.paths?.push(path);
     if (node.down) return [503, 'down'];
-    if (path === '/api/chain/info' && node.genesis) return [200, { chain: ['Nexus'], genesisHash: node.genesis, minRelayFee: '1', height: '1' }];
-    if (path === '/api/chain/info') return [200, { chain: ['Nexus'], genesisHash: 'genesis', minRelayFee: '1', height: '1' }];
+    if (path === '/api/chain/info') {
+      return [200, {
+        chain: ['Nexus'], genesisHash: node.genesis ?? 'genesis', minRelayFee: '1',
+        height: node.height ?? '1', tipCID: node.tip ?? 'tip', acceptsSubmit: node.acceptsSubmit ?? true,
+      }];
+    }
     if (path === '/health') return [200, { phase: 'active', height: '1', tipCID: 'tip' }];
   });
 }

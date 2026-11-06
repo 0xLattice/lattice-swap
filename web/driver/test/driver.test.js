@@ -3,8 +3,9 @@ import assert from 'node:assert/strict';
 import 'fake-indexeddb/auto';
 
 import { Buyer, IndexedDBStore, MemoryStore, Wallet } from '../src/index.js';
-import { call } from '../src/wasm.js';
 import { Esplora } from '../src/esplora.js';
+import { Nexus, nexusView } from '../src/views.js';
+import { call, wasm } from '../src/wasm.js';
 import { PINGS_MISSED, Session } from '../src/relay.js';
 import { Chain, esplora, kind, Locks, loadWasm, nexus, parseTx, POLICY, seller, testOffer, until } from './fakes.js';
 
@@ -58,8 +59,11 @@ async function world({ store = new MemoryStore(), policy = POLICY, chain = new C
   const expect = { Request: ['AwaitSellerHello'], BuyerHello: ['AwaitSellerHello'], LockProposal: ['AwaitSellerSignatures'], BuyerSignatures: ['SendingSignatures', 'AwaitNexLock'], ShareRequest: ['AskingShare'] };
   w.seller = seller(w.offer, answer);
   const open = w.seller.open;
-  w.seller.open = async (...args) => {
-    const session = await open(...args);
+  // What the seller sent, in order.
+  w.received = [];
+  w.seller.open = async (offer, onMessage, ...rest) => {
+    const session = await open(offer, (message) => (w.received.push(message), onMessage(message)), ...rest);
+    w.onMessage = onMessage;
     const send = session.send;
     session.send = (message) => {
       const name = kind(message);
@@ -1132,4 +1136,88 @@ test('an outspend naming an unrelated transaction leaves the page on its refund 
   // Never read as the seller's punish: it still waits to refund.
   assert.ok(!['AskingShare', 'Punished', 'Done'].includes(kind(record.state)), kind(record.state));
   assert.equal(kind(record.state), 'Cancelling');
+});
+
+test('a Nexus view counts a depth against the live tip, not the /health snapshot', async () => {
+  // A public read port: /health a snapshot at 5, every other read live at
+  // 9, where the watched claim is mined.
+  const routes = {
+    '/health': { phase: 'active', height: '5', bestHeaderHeight: '5', tipCID: 'tip5' },
+    '/api/chain/info': { minRelayFee: '1', height: '9', tipCID: 'tip9' },
+    '/api/state/account/own': { balance: '0', nonce: '0' },
+    '/api/state/account/lock': { balance: '500000', nonce: '0' },
+    '/api/transaction/claim': {
+      accountActions: [{ owner: 'lock', delta: '500000' }],
+      depositActions: [], receiptActions: [], withdrawalActions: [],
+      signers: ['seller'], nonce: '0', chainPath: ['Nexus'], blockHeight: '9', blockHash: 'tip9',
+    },
+  };
+  const fetchImpl = async (url) => {
+    const body = routes[new URL(url).pathname];
+    return { ok: body !== undefined, status: body === undefined ? 404 : 200, json: async () => body, text: async () => '' };
+  };
+  const nexus = new Nexus('http://node.invalid', fetchImpl);
+  const view = await nexusView(nexus, { own_address: 'own', lock_address: 'lock', cid: 'claim', block_at: null });
+  assert.deepEqual([view.health.height, view.health.tip], [9, 'tip9']);
+  assert.equal(view.watched[1], 1, 'mined in the live tip: one deep');
+});
+
+test('the Nexus check probes past state below the live tip, not the /health snapshot', async () => {
+  const w = await world();
+  w.node.height = '9';
+  w.node.paths = [];
+  await assert.rejects(Buyer.prepare(w.wallet, { offer: w.offer, policy: POLICY, nexAddress: w.nexAddress }), /no state of past blocks/);
+  assert.ok(w.node.paths.includes('/api/block/5'), JSON.stringify(w.node.paths));
+});
+
+test('an Esplora on another network is refused, before a swap and on a resumed one', async () => {
+  const w = await world();
+  await w.wallet.check();
+  w.chain.genesis = wasm.bitcoinGenesis('signet');
+  const refused = new RegExp(`refused: the Esplora's genesis is ${w.chain.genesis}, not regtest's`);
+  await assert.rejects(w.wallet.check(), refused);
+  await assert.rejects(Buyer.prepare(w.wallet, { offer: w.offer, policy: POLICY, nexAddress: w.nexAddress }), refused);
+
+  w.chain.genesis = wasm.bitcoinGenesis('regtest');
+  const { w: v, run, funding } = await funded();
+  await run.stop();
+  v.chain.genesis = wasm.bitcoinGenesis('signet');
+  const buyer = await Buyer.resume(v.wallet, v.buyer.swapId);
+  const again = running(buyer);
+  confirm(v, funding);
+  await until(() => refused.test(buyer.status().warning ?? ''));
+  await pause(20);
+  await again.stop();
+  assert.equal(buyer.status().confirmations.funding, null, 'nothing read from it');
+});
+
+test('a Nexus node that takes no transactions is refused', async () => {
+  const w = await world();
+  w.node.acceptsSubmit = false;
+  const refused = new RegExp(`refused: ${w.config.nexus} takes no transactions`);
+  await assert.rejects(w.wallet.check(), refused);
+  await assert.rejects(Buyer.prepare(w.wallet, { offer: w.offer, policy: POLICY, nexAddress: w.nexAddress }), refused);
+});
+
+test('the chains are read once a poll, however many messages the seller sends', async () => {
+  const poll = 300;
+  const { w, run } = await funded({ extra: { poll } });
+  w.chain.paths = [];
+  w.node.paths = [];
+  const start = Date.now();
+  // The seller's first message again, which the machine ignores, as fast
+  // as it can.
+  while (Date.now() - start < 3 * poll) {
+    w.onMessage(w.received[0]);
+    await pause(1);
+  }
+  const rounds = Math.ceil((Date.now() - start) / poll) + 1;
+  await run.stop();
+  const tips = w.chain.paths.filter((path) => path === '/blocks/tip/hash').length;
+  // Two tip reads a Bitcoin view.
+  assert.ok(tips <= 2 * rounds, `${tips} tip reads in ${rounds} polls`);
+  const infos = w.node.paths.filter((path) => path === '/api/chain/info').length;
+  // A Nexus view reads it three times; the balance and the views need it no more.
+  assert.ok(infos <= 3 * rounds, `${infos} chain info reads in ${rounds} polls`);
+  assert.equal(w.buyer.status().warning, null);
 });
