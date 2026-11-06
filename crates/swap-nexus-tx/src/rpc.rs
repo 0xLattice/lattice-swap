@@ -120,6 +120,8 @@ pub struct Client {
     authorization: Mutex<String>,
     /// The cookie file, for a client made from one: read again on a 401.
     cookie: Option<PathBuf>,
+    /// A public read port's, see [`Client::public`].
+    public: bool,
 }
 
 #[cfg(feature = "native")]
@@ -133,6 +135,7 @@ impl Client {
             base: base.trim_end_matches('/').into(),
             authorization: Mutex::new(authorization(cookie)),
             cookie: None,
+            public: false,
         }
     }
 
@@ -160,11 +163,21 @@ impl Client {
             base: base.trim_end_matches('/').into(),
             authorization: Mutex::new(String::new()),
             cookie: None,
+            public: true,
         }
     }
 
+    /// A public read port answers `/health` from a snapshot up to a few
+    /// seconds old and every other read live, so its height and tip are
+    /// read live from `/api/chain/info`: a depth worked out against the
+    /// snapshot's height would miss a block the other reads show.
     pub fn health(&self) -> Result<Health> {
-        parse::health(&self.get("/health")?).map_err(Error::Malformed)
+        let mut health = parse::health(&self.get("/health")?).map_err(Error::Malformed)?;
+        if self.public {
+            (health.height, health.tip) =
+                parse::tip(&self.chain_info()?).map_err(Error::Malformed)?;
+        }
+        Ok(health)
     }
 
     /// The CID of the canonical block at `height`, or `None` if the node has
@@ -442,6 +455,14 @@ pub mod parse {
             (None, _) | (Some(_), Some(true)) => Ok(()),
             (Some(_), _) => Err(NodeRefusal::NoPastState),
         }
+    }
+
+    /// `GET /api/chain/info`: the height and CID of the executed tip.
+    pub fn tip(json: &Value) -> Result<(u64, Option<String>), String> {
+        Ok((
+            decimal(json, "height")?,
+            json["tipCID"].as_str().map(String::from),
+        ))
     }
 
     /// `GET /api/block/:height`: the block's CID.

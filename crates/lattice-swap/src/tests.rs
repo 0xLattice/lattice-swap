@@ -1721,6 +1721,7 @@ fn nexus_node_submitting(
                     "genesisHash": genesis,
                     "minRelayFee": min_relay_fee,
                     "acceptsSubmit": accepts_submit,
+                    "height": height.to_string(),
                 }))
             } else if path == "/health" {
                 let height = height.to_string();
