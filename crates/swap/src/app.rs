@@ -606,14 +606,25 @@ impl Wallet {
     /// `check_nexus`, then a Nexus node on another Nexus than the config's,
     /// or one that cannot say how deep a transaction is.
     pub(crate) fn check_nexus(&self, nexus: &Client) -> Result<()> {
-        if self.config.nexus_cookie.is_none() && nexus.chain_info()?["acceptsSubmit"] != true {
+        if let Some(why) = self.takes_no_transactions(nexus)? {
             return Err(format!(
-                "refused: {} takes no transactions: give a public node that does, or your own \
-                 with its cookie",
-                self.config.nexus
+                "refused: {why}: give a public node that does, or your own with its cookie"
             )
             .into());
         }
+        self.check_nexus_chain(nexus)
+    }
+
+    /// Why a public node takes no transactions, if it takes none.
+    fn takes_no_transactions(&self, nexus: &Client) -> Result<Option<String>> {
+        let none =
+            self.config.nexus_cookie.is_none() && nexus.chain_info()?["acceptsSubmit"] != true;
+        Ok(none.then(|| format!("{} takes no transactions", self.config.nexus)))
+    }
+
+    /// Refuses a Nexus node on another Nexus than the config's, or one that
+    /// cannot say how deep a transaction is.
+    fn check_nexus_chain(&self, nexus: &Client) -> Result<()> {
         Ok(session::check_nexus(nexus, &self.config.nexus_genesis)?
             .map_err(|refusal| refusal.to_string())?)
     }
@@ -767,7 +778,15 @@ impl Buy {
                 let nexus = wallet.nexus()?;
                 if buyer.resumed().outcome().is_none() {
                     wallet.esplora().check_network(wallet.config.network)?;
-                    wallet.check_nexus(&nexus)?;
+                    // A taken swap's cancel, refund and the rest are
+                    // Bitcoin's, and go on through a node that takes no
+                    // transactions: its Nexus submits fail, and say so.
+                    if let Some(why) = wallet.takes_no_transactions(&nexus)? {
+                        *self.warning.lock().unwrap() = Some(format!(
+                            "{why}: the swap's Bitcoin side goes on, its Nexus submits fail"
+                        ));
+                    }
+                    wallet.check_nexus_chain(&nexus)?;
                 }
                 let store = wallet.store(&record.swap_id)?;
                 break session::resume::<Buyer, _>(wallet.esplora(), nexus, store)?;

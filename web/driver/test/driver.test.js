@@ -258,6 +258,50 @@ test('the refund lands in the wallet, and the deadlines show where it is', async
   assert.deepEqual(w.unsaved, []);
 });
 
+test('a failed cancel broadcast is the status’s warning until a round reads again', async () => {
+  const poll = 300;
+  const { w, run, funding } = await funded({ extra: { poll } });
+  const lookups = call('watchBuyer', (await w.store.get(`swap:${w.buyer.swapId}`)).state).bitcoin;
+  confirm(w, funding);
+  await until(() => w.buyer.status().confirmations.funding === 1);
+  w.chain.postDown = true;
+  w.chain.mine(TERMS.t1 - 1);
+  const failed = /^broadcast: .*503 down$/;
+  await until(() => failed.test(w.buyer.status().warning ?? '')).catch((e) =>
+    assert.fail(`${e.message}: ${JSON.stringify(w.buyer.status())}`),
+  );
+  // Between rounds too, not only while the failing round runs.
+  const start = Date.now();
+  while (Date.now() - start < 2 * poll) {
+    await pause(5);
+    assert.match(w.buyer.status().warning ?? '', failed);
+  }
+  w.chain.postDown = false;
+  await broadcast(w, lookups.lock_spends[1]);
+  await until(() => w.buyer.status().warning === null);
+  await run.stop();
+});
+
+test('a backend’s refusal stands through rounds that only take messages', async () => {
+  const poll = 300;
+  const { w, run } = await funded({ extra: { poll } });
+  await run.stop();
+  w.chain.genesis = wasm.bitcoinGenesis('signet');
+  const buyer = await Buyer.resume(w.wallet, w.buyer.swapId);
+  const again = running(buyer);
+  await until(() => /refused: the Esplora's genesis/.test(buyer.status().warning ?? ''));
+  await until(() => w.onMessage !== undefined && w.received.length > 0);
+  const start = Date.now();
+  while (Date.now() - start < poll / 2) {
+    w.onMessage(w.received[0]);
+    await pause(1);
+    assert.match(buyer.status().warning ?? '', /refused: the Esplora's genesis/);
+  }
+  w.chain.genesis = wasm.bitcoinGenesis('regtest');
+  await until(() => buyer.status().warning === null);
+  await again.stop();
+});
+
 /** The seller, its lock `funding` confirmed, locks its NEX and sends the
  * CID into whatever session is open, at once. */
 function sellerLocksNex(w, funding) {
@@ -1160,6 +1204,22 @@ test('a Nexus view counts a depth against the live tip, not the /health snapshot
   const view = await nexusView(nexus, { own_address: 'own', lock_address: 'lock', cid: 'claim', block_at: null });
   assert.deepEqual([view.health.height, view.health.tip], [9, 'tip9']);
   assert.equal(view.watched[1], 1, 'mined in the live tip: one deep');
+});
+
+test('a public Nexus counts as synced only from a synced /health snapshot', async () => {
+  // /api/chain/info names no best header: a snapshot taken while catching
+  // up stays unsynced even once the live tip reaches the header it knew.
+  const synced = async (health, height) => {
+    const routes = { '/health': health, '/api/chain/info': { height, tipCID: 'live' } };
+    const fetchImpl = async (url) => ({ ok: true, status: 200, json: async () => routes[new URL(url).pathname], text: async () => '' });
+    const read = await new Nexus('http://node.invalid', fetchImpl).health();
+    // What the wasm's synced check reads: a best header at the height.
+    return read.bestHeaderHeight !== undefined && read.bestHeaderHeight === read.height;
+  };
+  assert.equal(await synced({ phase: 'active', height: '100', bestHeaderHeight: '100', tipCID: 't' }, '105'), true, 'synced, live past it');
+  assert.equal(await synced({ phase: 'active', height: '100', bestHeaderHeight: '105', tipCID: 't' }, '105'), false, 'catching up');
+  assert.equal(await synced({ phase: 'active', height: '110', bestHeaderHeight: '110', tipCID: 't' }, '105'), false, 'live trails the snapshot');
+  assert.equal(await synced({ phase: 'active', height: '100', tipCID: 't' }, '105'), false, 'no header');
 });
 
 test('the Nexus check probes past state below the live tip, not the /health snapshot', async () => {

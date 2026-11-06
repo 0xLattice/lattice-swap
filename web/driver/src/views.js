@@ -71,11 +71,16 @@ export class Nexus {
    * the native `Client::public` reads them: a public read port answers
    * `/health` from a snapshot up to a few seconds old and every other read
    * live, so a depth worked out against the snapshot's height would miss a
-   * block the other reads show. */
+   * block the other reads show. `/api/chain/info` names no best header,
+   * so, as there, the node counts as synced only if the snapshot was (its
+   * best header at its height) and the live tip has reached that header;
+   * otherwise no best header is given. */
   async health() {
-    const health = await this.get('/health');
+    const { bestHeaderHeight, ...health } = await this.get('/health');
     const { height, tipCID } = await this.get('/api/chain/info');
-    return { ...health, height, tipCID };
+    const synced = bestHeaderHeight != null && health.height != null && height != null
+      && BigInt(bestHeaderHeight) === BigInt(health.height) && BigInt(height) >= BigInt(bestHeaderHeight);
+    return { ...health, height, tipCID, ...(synced ? { bestHeaderHeight: height } : {}) };
   }
 
   /** Submits `body`, from `nexusSubmitBody`. As plain text: a JSON body

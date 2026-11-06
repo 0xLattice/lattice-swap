@@ -171,11 +171,20 @@ impl Client {
     /// seconds old and every other read live, so its height and tip are
     /// read live from `/api/chain/info`: a depth worked out against the
     /// snapshot's height would miss a block the other reads show.
+    /// `/api/chain/info` names no best header, so the node counts as synced
+    /// only if the snapshot was (its best header at its height) and the
+    /// live tip has reached that header; otherwise `best_header_height` is
+    /// `None`. A snapshot taken while catching up never reads as synced,
+    /// even once the live tip reaches the header the snapshot knew.
     pub fn health(&self) -> Result<Health> {
         let mut health = parse::health(&self.get("/health")?).map_err(Error::Malformed)?;
         if self.public {
+            let snapshot = (health.height, health.best_header_height);
             (health.height, health.tip) =
                 parse::tip(&self.chain_info()?).map_err(Error::Malformed)?;
+            health.best_header_height = (snapshot.1 == Some(snapshot.0)
+                && health.height >= snapshot.0)
+                .then_some(health.height);
         }
         Ok(health)
     }
@@ -660,6 +669,58 @@ mod tests {
         let own = Client::new(&url, "__cookie__:c", timeout);
         assert_eq!(own.health().unwrap().height, 5);
         assert_eq!(own.chain_info().unwrap()["authorized"], true);
+    }
+
+    /// A public node whose `/health` snapshot is `health` and whose live
+    /// `/api/chain/info` is `info`.
+    fn public_node(health: &'static str, info: &'static str) -> Client {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut request = [0u8; 4096];
+                let n = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..n]).to_string();
+                let body = if request.starts_with("GET /health ") {
+                    health
+                } else {
+                    info
+                };
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(head.as_bytes()).unwrap();
+                stream.write_all(body.as_bytes()).unwrap();
+            }
+        });
+        Client::public(&url, Duration::from_secs(5))
+    }
+
+    /// `/api/chain/info` names no best header: a public node is synced only
+    /// if its `/health` snapshot was and the live tip has reached the
+    /// snapshot's best header. A snapshot taken while catching up stays
+    /// unsynced even when the live tip reaches the header it knew.
+    #[test]
+    fn a_public_client_trusts_only_a_synced_snapshot() {
+        let synced = |health, info| {
+            let health = public_node(health, info).health().unwrap();
+            health.best_header_height == Some(health.height)
+        };
+        let live = r#"{"height":"105","tipCID":"live"}"#;
+        // Synced at 100, live past it: synced at the live tip.
+        let at_100 = r#"{"phase":"active","height":"100","bestHeaderHeight":"100","tipCID":"t"}"#;
+        assert!(synced(at_100, live));
+        // Catching up, 100 of 105: still behind, though live reached 105.
+        let behind = r#"{"phase":"active","height":"100","bestHeaderHeight":"105","tipCID":"t"}"#;
+        assert!(!synced(behind, live));
+        // Synced at 110 but the live read trails it.
+        let at_110 = r#"{"phase":"active","height":"110","bestHeaderHeight":"110","tipCID":"t"}"#;
+        assert!(!synced(at_110, live));
+        // No header known.
+        let none = r#"{"phase":"active","height":"100","tipCID":"t"}"#;
+        assert!(!synced(none, live));
     }
 
     /// The node writes a new cookie at every start: a client made from the

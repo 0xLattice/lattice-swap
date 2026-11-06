@@ -56,6 +56,8 @@ export class Buyer extends EventTarget {
   #need = null;
   #nexusDepth = null;
   #warning = null;
+  /** What failed of this round's own steps, a send, broadcast or submit. */
+  #raised = null;
   /** Why the offer could not be taken, once it cannot. */
   #gone = null;
   #status = '';
@@ -292,11 +294,16 @@ export class Buyer extends EventTarget {
     try {
       while (!signal?.aborted) {
         let done = null;
+        // A round's failed step is the warning; else a round that reads
+        // the backends clears it, and one that only takes messages leaves
+        // a backend's refusal standing until they are read again.
+        const reads = this.#c.now() >= this.#readAt;
+        this.#raised = null;
         try {
-          done = await this.#round();
-          this.#warning = null;
+          done = await this.#round(reads);
+          if (this.#raised !== null || reads) this.#warning = this.#raised;
         } catch (e) {
-          this.#warning = e.message;
+          this.#warning = this.#raised === null ? e.message : `${this.#raised}; ${e.message}`;
         }
         this.#announce();
         if (done) break;
@@ -324,14 +331,14 @@ export class Buyer extends EventTarget {
    * driver's `run_until`: however many messages the seller sends, the
    * backends are read no more often, so it cannot spend their rate
    * limits. */
-  async #round() {
+  async #round(reads) {
     if (this.#cancelled) return true;
     if (this.#r.taken) {
       await this.#rejoin();
       for (const message of this.#inbox.splice(0)) await this.#apply({ Message: JSON.parse(message) });
       if (this.#awaits() && this.#c.now() - this.#since > this.#c.messageTimeout) await this.#apply('Timeout');
     }
-    if (this.#c.now() < this.#readAt) return ended(this.#r.state);
+    if (!reads) return ended(this.#r.state);
     try {
       if (!this.#r.taken) {
         this.#balance = await this.#wallet.balance();
@@ -496,7 +503,7 @@ export class Buyer extends EventTarget {
       try {
         this.#session.send(JSON.stringify(action.Send));
       } catch (e) {
-        this.#warning = `session ended: ${e.message}`;
+        this.#raised = `session ended: ${e.message}`;
         this.#session = null;
         return;
       }
@@ -517,14 +524,14 @@ export class Buyer extends EventTarget {
         await this.#wallet.esplora.broadcast(action.Broadcast);
       } catch (e) {
         // The machine asks again while it is needed.
-        this.#warning = `broadcast: ${e.message}`;
+        this.#raised = `broadcast: ${e.message}`;
       }
     } else if (action.Submit) {
       try {
         await this.#checkNexus();
         await this.#wallet.nexus.submit(wasm.nexusSubmitBody(JSON.stringify(action.Submit)));
       } catch (e) {
-        this.#warning = `nexus submit: ${e.message}`;
+        this.#raised = `nexus submit: ${e.message}`;
       }
     }
   }

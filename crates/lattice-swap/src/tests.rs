@@ -2304,8 +2304,10 @@ fn each_chain_is_public_or_your_own_independently() {
     assert_eq!(user.btc_user.as_deref(), Some("u"));
 }
 
-/// A public Nexus node is refused unless it takes submits; your own node's
-/// RPC is not asked.
+/// A public Nexus node is refused for a new swap unless it takes submits;
+/// your own node's RPC is not asked. A resumed swap goes on through one
+/// that takes none, as its Bitcoin side needs no Nexus submit, and is still
+/// refused a node on another Nexus or one keeping no past state.
 #[test]
 fn a_public_nexus_node_must_take_submits() {
     let check = |accepts: bool, cookie: Option<PathBuf>| {
@@ -2320,6 +2322,21 @@ fn a_public_nexus_node_must_take_submits() {
     assert!(refused.contains("takes no transactions"), "{refused}");
     let cookie = tempfile::NamedTempFile::new().unwrap();
     assert_eq!(check(false, Some(cookie.path().into())), Ok(()));
+
+    let resumed = |genesis: &str, keeps_state: bool| {
+        let mut nodes = offer_args(&[]).nodes;
+        nodes.nexus_url = nexus_node_submitting(genesis, 10, keeps_state, 1, false);
+        nodes.nexus_cookie = None;
+        let client = nodes.nexus().unwrap();
+        nodes
+            .check_resumed_nexus(&client)
+            .map_err(|e| e.to_string())
+    };
+    assert_eq!(resumed(MAINNET, true), Ok(()));
+    let other = swap_nexus_tx::cid(b"other");
+    assert!(resumed(&other, true).is_err(), "another Nexus");
+    let refused = resumed(MAINNET, false).unwrap_err();
+    assert!(refused.contains("--state all"), "{refused}");
 }
 
 /// `wallet --withdraw` is refused while a swap in the directory has not

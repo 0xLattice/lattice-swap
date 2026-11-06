@@ -5321,3 +5321,142 @@ fn the_app_reads_a_public_nexus_only_where_it_takes_submits() {
     assert_eq!(nexus.chain_info().unwrap()["authorized"], true);
     own.check_nexus(&nexus).unwrap();
 }
+
+/// A resumed swap on its refund path, through a public Nexus node that
+/// takes no transactions, is not refused: refunding is Bitcoin's, and it
+/// refunds, its status warning of the node.
+#[cfg(feature = "native")]
+#[test]
+fn a_resumed_refund_goes_on_through_a_public_nexus_that_takes_no_transactions() {
+    use bitcoin::consensus::encode::serialize_hex;
+    use std::io::{BufRead, Read, Write};
+    let (_, buyer, _) = locked().nex_locked();
+    let (cancelling, actions) = buyer.step(btc(20, None, None));
+    assert!(matches!(cancelling, Buyer::Cancelling { .. }));
+    let [cancel] = &broadcasts(&actions)[..] else {
+        panic!("cancel");
+    };
+    let state = serde_json::to_value(&cancelling).unwrap();
+    let funding = state["Cancelling"]["locked"]["funding"].as_str().unwrap();
+    let funding: Transaction = bitcoin::consensus::encode::deserialize_hex(funding).unwrap();
+    // The funding in block 101, cancel in 129, the tip at 131.
+    let mined: std::collections::HashMap<String, (String, u32)> = [(&funding, 101), (cancel, 129)]
+        .into_iter()
+        .map(|(tx, height)| (tx.compute_txid().to_string(), (serialize_hex(tx), height)))
+        .collect();
+    fn serve(route: impl Fn(&str, &str, &str) -> (u16, String) + Send + 'static) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut request = String::new();
+                reader.read_line(&mut request).unwrap();
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    let lower = line.to_ascii_lowercase();
+                    if let Some(n) = lower.strip_prefix("content-length:") {
+                        length = n.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                let mut line = request.split(' ');
+                let (method, path) = (line.next().unwrap_or(""), line.next().unwrap_or(""));
+                let (status, answer) = route(method, path, &String::from_utf8_lossy(&body));
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}",
+                    answer.len()
+                );
+            }
+        });
+        url
+    }
+    let posted = Arc::new(Mutex::new(Vec::<String>::new()));
+    let posts = posted.clone();
+    let tip = format!("{:064x}", 131);
+    let esplora = serve(move |method, path, body| {
+        let ok = |answer: String| (200, answer);
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let tx = path
+            .strip_prefix("/tx/")
+            .map(|rest| rest.split('/').collect::<Vec<_>>());
+        match (method, path, tx.as_deref()) {
+            ("POST", "/tx", _) => {
+                posts.lock().unwrap().push(body.to_string());
+                ok(String::new())
+            }
+            (_, "/block-height/0", _) => ok(bitcoin::constants::genesis_block(bitcoin::Network::Regtest)
+                .block_hash()
+                .to_string()),
+            (_, "/blocks/tip/hash", _) => ok(tip.clone()),
+            (_, "/blocks/tip/height", _) => ok("131".into()),
+            (_, "/fee-estimates", _) => ok("{}".into()),
+            _ if path == format!("/block/{tip}") => ok(json!({"height": 131, "timestamp": now}).to_string()),
+            _ if path.ends_with("/utxo") => ok("[]".into()),
+            (_, _, Some([_, "outspend", _])) => ok(json!({"spent": false}).to_string()),
+            (_, _, Some([txid, rest @ ..])) => match (mined.get(*txid), rest) {
+                (Some((hex, _)), ["hex"]) => ok(hex.clone()),
+                (Some((_, height)), []) => {
+                    ok(json!({"status": {"confirmed": true, "block_height": height}, "fee": 1000, "weight": 800})
+                        .to_string())
+                }
+                _ => (404, String::new()),
+            },
+            _ => (404, String::new()),
+        }
+    });
+    let nexus = serve(|_, path, _| {
+        let answer = if path == "/api/chain/info" {
+            json!({"chain": ["Nexus"], "genesisHash": swap_nexus_tx::MAINNET_GENESIS,
+                   "height": "1", "tipCID": "tip", "acceptsSubmit": false})
+        } else {
+            json!({"phase": "active", "height": "1", "bestHeaderHeight": "1", "tipCID": "tip"})
+        };
+        (200, answer.to_string())
+    });
+    let key = wallet::Key::new("regtest").unwrap();
+    let file = recovery(&key.wif, vec![recorded(1, &cancelling, &[], true)]);
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = app_config(dir.path());
+    config.esplora = esplora;
+    config.nexus = nexus;
+    config.nexus_cookie = None;
+    config.poll = Duration::from_millis(20);
+    let wallet = app::Wallet::restore(config, &file).unwrap();
+    let buy = wallet.resume(&hex::encode([1; 32])).unwrap();
+    let cancel_output = OutPoint::new(cancel.compute_txid(), 0);
+    let refunded = || {
+        posted.lock().unwrap().iter().any(|hex| {
+            let tx: Transaction = bitcoin::consensus::encode::deserialize_hex(hex).unwrap();
+            tx.input
+                .iter()
+                .any(|input| input.previous_output == cancel_output)
+        })
+    };
+    let start = std::time::Instant::now();
+    let stopped = buy.run(|| refunded() || start.elapsed() > Duration::from_secs(20));
+    assert_eq!(stopped.map_err(|e| e.to_string()), Ok(None));
+    assert!(
+        refunded(),
+        "no refund broadcast: {:?}",
+        posted.lock().unwrap()
+    );
+    let warning = buy.status().unwrap()["warning"].clone();
+    assert!(
+        warning
+            .as_str()
+            .is_some_and(|w| w.contains("takes no transactions")),
+        "{warning}"
+    );
+}

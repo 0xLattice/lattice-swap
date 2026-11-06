@@ -123,6 +123,7 @@ export async function esplora(chain, onPost = () => {}) {
   const server = await serve(async (method, path, body) => {
     chain.paths?.push(path);
     if (method === 'POST' && path === '/tx') {
+      if (chain.postDown) return [503, 'down'];
       await onPost(body);
       const refused = unspendable(chain, posted, body);
       if (refused) return [400, `sendrawtransaction RPC error: ${refused}`];

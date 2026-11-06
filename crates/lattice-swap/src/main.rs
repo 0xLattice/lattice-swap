@@ -318,15 +318,38 @@ impl NodeArgs {
     /// cannot say how deep a transaction is: see
     /// [`swap::session::check_nexus`].
     fn check_nexus(&self, client: &Client) -> Result<()> {
-        use swap_nexus_tx::rpc::parse::NodeRefusal;
-        if self.nexus_cookie.is_none() && client.chain_info()?["acceptsSubmit"] != true {
+        if let Some(why) = self.takes_no_transactions(client)? {
             return Err(format!(
-                "refused: {} takes no transactions: give a public node that does, or your \
-                 own with --nexus-cookie",
-                self.nexus_url
+                "refused: {why}: give a public node that does, or your own with --nexus-cookie"
             )
             .into());
         }
+        self.check_nexus_chain(client)
+    }
+
+    /// As [`NodeArgs::check_nexus`], for a swap resumed: a public node that
+    /// takes no transactions is warned of, not refused. A taken swap's
+    /// cancel, refund, redeem and punish are Bitcoin's, and go on; its
+    /// Nexus submits fail, and the driver warns of each.
+    fn check_resumed_nexus(&self, client: &Client) -> Result<()> {
+        if let Some(why) = self.takes_no_transactions(client)? {
+            log(&format!(
+                "{why}: the swap's Bitcoin side goes on, its Nexus submits fail"
+            ));
+        }
+        self.check_nexus_chain(client)
+    }
+
+    /// Why a public node takes no transactions, if it takes none.
+    fn takes_no_transactions(&self, client: &Client) -> Result<Option<String>> {
+        let none = self.nexus_cookie.is_none() && client.chain_info()?["acceptsSubmit"] != true;
+        Ok(none.then(|| format!("{} takes no transactions", self.nexus_url)))
+    }
+
+    /// Refuses a Nexus node on another Nexus than `--nexus-genesis` names,
+    /// or one that cannot say how deep a transaction is.
+    fn check_nexus_chain(&self, client: &Client) -> Result<()> {
+        use swap_nexus_tx::rpc::parse::NodeRefusal;
         swap::session::check_nexus(client, &self.nexus_genesis)?.map_err(|refusal| {
             match refusal {
                 NodeRefusal::OtherNexus { .. } => {
@@ -1049,7 +1072,7 @@ fn resume(args: SwapFileArgs) -> Result<Outcome> {
             let bitcoin = resume_bitcoin(&args.nodes, dir, seller.redeem_payout())?;
             let nexus = args.nodes.nexus()?;
             if seller.outcome().is_none() {
-                args.nodes.check_nexus(&nexus)?;
+                args.nodes.check_resumed_nexus(&nexus)?;
                 args.nodes.trust(SELLER_TRUSTS);
             }
             let driver = swap::session::resume::<Seller, _>(bitcoin, nexus, store);
@@ -1069,7 +1092,7 @@ fn resume(args: SwapFileArgs) -> Result<Outcome> {
             let bitcoin = resume_bitcoin(&args.nodes, dir, buyer.refund_payout())?;
             let nexus = args.nodes.nexus()?;
             if buyer.outcome().is_none() {
-                args.nodes.check_nexus(&nexus)?;
+                args.nodes.check_resumed_nexus(&nexus)?;
                 args.nodes.trust(BUYER_TRUSTS);
             }
             let driver = swap::session::resume::<Buyer, _>(bitcoin, nexus, store);
