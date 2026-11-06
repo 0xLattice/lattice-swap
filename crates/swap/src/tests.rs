@@ -5256,3 +5256,68 @@ fn an_esplora_on_another_network_is_refused() {
         .to_string();
     assert!(refused.contains("not signet's"), "{refused}");
 }
+
+/// With no cookie the app reads a public read port, sending none, and
+/// refuses one that takes no submits, as the CLI's public Nexus; your own
+/// node's RPC, with its cookie, is not asked.
+#[cfg(feature = "native")]
+#[test]
+fn the_app_reads_a_public_nexus_only_where_it_takes_submits() {
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let accepts = Arc::new(AtomicBool::new(true));
+    let accepting = accepts.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let mut request = [0u8; 4096];
+            let n = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..n]).to_string();
+            let body = if request.starts_with("GET /api/chain/info ") {
+                json!({
+                    "chain": ["Nexus"], "genesisHash": swap_nexus_tx::MAINNET_GENESIS,
+                    "height": "1", "tipCID": "tip",
+                    "acceptsSubmit": accepting.load(Ordering::SeqCst),
+                    "authorized": request.contains("Authorization:"),
+                })
+            } else {
+                json!({"phase": "active", "height": "1", "tipCID": "tip"})
+            }
+            .to_string();
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let cookie = directory.path().join("cookie");
+    std::fs::write(&cookie, "__cookie__:c").unwrap();
+    let wallet = |cookie: Option<std::path::PathBuf>| {
+        let mut config =
+            app_config(
+                &directory
+                    .path()
+                    .join(if cookie.is_some() { "own" } else { "public" }),
+            );
+        config.nexus = url.clone();
+        config.nexus_cookie = cookie;
+        app::Wallet::open(config).unwrap()
+    };
+    let public = wallet(None);
+    let nexus = public.nexus().unwrap();
+    assert_eq!(nexus.chain_info().unwrap()["authorized"], false);
+    public.check_nexus(&nexus).unwrap();
+    accepts.store(false, Ordering::SeqCst);
+    let refused = public.check_nexus(&nexus).unwrap_err().to_string();
+    assert!(refused.contains("takes no transactions"), "{refused}");
+    drop(public);
+
+    let own = wallet(Some(cookie));
+    let nexus = own.nexus().unwrap();
+    assert_eq!(nexus.chain_info().unwrap()["authorized"], true);
+    own.check_nexus(&nexus).unwrap();
+}

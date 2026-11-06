@@ -2411,7 +2411,7 @@ fn resume_on_an_esplora_takes_only_a_swap_paying_its_wallet() {
         Network::Regtest,
         esplora,
         String::new(),
-        PathBuf::new(),
+        None,
         String::new(),
     );
     let paid = Wallet::open(config)

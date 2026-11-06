@@ -224,7 +224,7 @@ impl NodeArgs {
                 self.btc_network,
                 url,
                 String::new(),
-                PathBuf::new(),
+                None,
                 String::new(),
             );
             let wallet = Wallet::open(config)?;
@@ -1144,7 +1144,7 @@ fn wallet(args: WalletArgs) -> Result<()> {
         network,
         url,
         String::new(),
-        PathBuf::new(),
+        None,
         String::new(),
     );
     // Refused while a swap runs in the directory, which holds it open.

@@ -81,9 +81,10 @@ pub struct Config {
     /// shows.
     pub esplora: String,
     /// The Nexus node's RPC, and its cookie file, read again whenever the
-    /// node restarts.
+    /// node restarts; with no cookie, a node's public read port, which must
+    /// take submits, as the CLI's public Nexus.
     pub nexus: String,
-    pub nexus_cookie: PathBuf,
+    pub nexus_cookie: Option<PathBuf>,
     /// The CID of the genesis of the Nexus to trade on.
     pub nexus_genesis: String,
     /// Between two rounds of reads: the driver's poll.
@@ -95,13 +96,14 @@ pub struct Config {
 }
 
 impl Config {
-    /// The browser's settings, but where to read from.
+    /// The browser's settings, but where to read from: `nexus_cookie` a
+    /// cookie file, or `None` for a public read port.
     pub fn new(
         dir: PathBuf,
         network: Network,
         esplora: String,
         nexus: String,
-        nexus_cookie: PathBuf,
+        nexus_cookie: impl Into<Option<PathBuf>>,
         nexus_genesis: String,
     ) -> Self {
         Self {
@@ -109,7 +111,7 @@ impl Config {
             network,
             esplora,
             nexus,
-            nexus_cookie,
+            nexus_cookie: nexus_cookie.into(),
             nexus_genesis,
             poll: POLL,
             message_timeout: Duration::from_secs(60),
@@ -304,10 +306,15 @@ impl Wallet {
         Esplora::new(&self.config.esplora, self.key.clone(), TIMEOUT)
     }
 
-    fn nexus(&self) -> Result<Client> {
+    /// The Nexus node's RPC, which reads its cookie file again on a 401;
+    /// with no cookie, a public read port, its tip read live.
+    pub(crate) fn nexus(&self) -> Result<Client> {
+        let Some(cookie) = &self.config.nexus_cookie else {
+            return Ok(Client::public(&self.config.nexus, TIMEOUT));
+        };
         Ok(
-            Client::from_cookie_file(&self.config.nexus, &self.config.nexus_cookie, TIMEOUT)
-                .map_err(|e| format!("{}: {e}", self.config.nexus_cookie.display()))?,
+            Client::from_cookie_file(&self.config.nexus, cookie, TIMEOUT)
+                .map_err(|e| format!("{}: {e}", cookie.display()))?,
         )
     }
 
@@ -595,9 +602,18 @@ impl Wallet {
         )?)
     }
 
-    /// Refuses a Nexus node on another Nexus than the config's, or one that
-    /// cannot say how deep a transaction is.
-    fn check_nexus(&self, nexus: &Client) -> Result<()> {
+    /// Refuses a public node that takes no transactions, as the CLI's
+    /// `check_nexus`, then a Nexus node on another Nexus than the config's,
+    /// or one that cannot say how deep a transaction is.
+    pub(crate) fn check_nexus(&self, nexus: &Client) -> Result<()> {
+        if self.config.nexus_cookie.is_none() && nexus.chain_info()?["acceptsSubmit"] != true {
+            return Err(format!(
+                "refused: {} takes no transactions: give a public node that does, or your own \
+                 with its cookie",
+                self.config.nexus
+            )
+            .into());
+        }
         Ok(session::check_nexus(nexus, &self.config.nexus_genesis)?
             .map_err(|refusal| refusal.to_string())?)
     }
