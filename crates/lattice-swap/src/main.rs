@@ -977,8 +977,15 @@ fn take(args: TakeArgs) -> Result<Outcome> {
     let policy = args.policy.policy(&offer);
     check_offer(&offer, &policy, network, genesis, floor, nex_floor)?;
     if let Btc::Esplora(_, wallet) = &bitcoin {
-        // As the app's, before the offer is taken.
-        let (enough, needed) = wallet.need(policy.btc_amount)?;
+        // As the app's, before the offer is taken, at the rate the driver
+        // funds the lock at: the estimate, else --fallback-fee-rate, never
+        // below 1 sat/vB.
+        let rate = (bitcoin.fee_rate(false)?)
+            .unwrap_or(args.bump.fallback_fee_rate)
+            .to_sat_per_vb_ceil()
+            .max(1);
+        let spendable = wallet.esplora().spendable()?;
+        let (enough, needed) = swap::wallet::need(spendable, policy.btc_amount, rate);
         if !enough {
             let (confirmed, _) = wallet.balance()?;
             return Err(format!(
