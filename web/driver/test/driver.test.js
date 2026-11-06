@@ -1024,6 +1024,20 @@ test('a resumed swap whose terms name another Nexus than the page’s is refused
   }
 });
 
+test('a page reopened on a received swap shows the claim’s depth from the state', async () => {
+  const { w, run, record } = await funded();
+  await run.stop();
+  const [, claiming] = watchingNexus(record);
+  const state = JSON.parse(claiming.state);
+  state.ClaimingNex.depth = 3;
+  await w.store.put(`swap:${record.swap_id}`, { ...claiming, state: JSON.stringify(state) });
+  const status = (await Buyer.resume(w.wallet, record.swap_id)).status();
+  assert.equal(status.step, 'received');
+  assert.equal(status.confirmations.nexLock, 3);
+  assert.equal(status.outcome, null);
+  assert.equal(status.running, true, 'still watched until nex_confirmations deep');
+});
+
 test('a taken swap’s terms come from its state, its offer not read', async () => {
   const { w, run, record } = await funded();
   await run.stop();

@@ -22,7 +22,7 @@ use crate::{BitcoinView, Buyer, Machine, Outcome, Spent};
 /// - `must_stay_open` is [`Buyer::must_stay_open`].
 /// - `confirmations`: `{"funding", "lock_spend", "cancel_spend"}` as the
 ///   view shows them, each null where it shows none, and `"claim"`, the
-///   claim's depth while `received`, as the last Nexus view showed it.
+///   claim's depth while `received`, as the last synced Nexus view showed it.
 /// - `deadlines`: `{"cancel", "refund", "punish"}`, each the first Bitcoin
 ///   block that can hold it, once the lock is in a block. Cancel is valid
 ///   `t1` blocks after the lock, punish `t2` after cancel; the refund goes

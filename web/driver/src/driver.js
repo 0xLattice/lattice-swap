@@ -178,7 +178,8 @@ export class Buyer extends EventTarget {
    * - `confirmations`: `{funding, lockSpend, cancelSpend, nexLock}`, as
    *   last seen, null where unseen; `nexLock` is the watched Nexus
    *   transaction's depth: the NEX lock's, then, once claiming, the
-   *   claim's;
+   *   claim's, from the state while `received`, so a resumed page shows
+   *   it before its first Nexus round;
    * - `deadlines`: once the lock is in a block, `cancel`, the first block
    *   cancel can be in, and `punish`, the first the seller's punish can be
    *   in (the earliest it could be, until cancel is in a block), each
@@ -222,7 +223,7 @@ export class Buyer extends EventTarget {
         funding: machine.confirmations.funding,
         lockSpend: machine.confirmations.lock_spend,
         cancelSpend: machine.confirmations.cancel_spend,
-        nexLock: this.#nexusDepth,
+        nexLock: machine.confirmations.claim ?? this.#nexusDepth,
       },
       deadlines: { cancel: null, refund: null, punish: null },
       mustStayOpen: machine.must_stay_open || machine.phase === 'refunding',

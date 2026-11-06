@@ -903,7 +903,10 @@ impl Claim {
     /// block, and the lock under it was `nex_confirmations` deep before
     /// (`Lock::Seen`), so no shallow reorg takes the lock away with it.
     /// Only the two shares together spend the lock, so a reorg that drops
-    /// the claim only delays it: it is submitted again, byte for byte.
+    /// the claim only delays it: it is submitted again, byte for byte. The
+    /// one exception is a buyer whose cancel beat the redeem after all: a
+    /// copy of it that refunds hands the seller `b`, and a reorg may let the
+    /// seller's claim in instead; that buyer has its BTC back.
     fn received(&self) -> Option<u64> {
         self.depth.filter(|_| matches!(self.lock, Lock::Seen))
     }
