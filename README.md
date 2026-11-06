@@ -97,9 +97,52 @@ The binary is `target/release/lattice-swap`.
 
 ## Usage
 
-Each party runs its own bitcoind with `-txindex` and a wallet, and its own
-lattice-node. Before anything else, `offer`, `take` and `resume` check the
-bitcoind: Bitcoin Core 28 or later, its txindex synced, not in initial block
+By default a party needs no node of its own. Bitcoin is read through
+mempool.space's Esplora for `--btc-network` (`https://mempool.space/api`,
+`/signet/api`, `/testnet/api`, `/testnet4/api`; regtest has none), and Nexus
+through the public read node `https://lattice-mainnet-read.fly.dev`, with no
+cookie; `offer`, `take` and `resume` refuse a public Nexus node whose
+`GET /api/chain/info` does not say `acceptsSubmit`, and an Esplora whose
+block 0 is not `--btc-network`'s genesis. Each chain can be your own
+instead, on its own: `--esplora <url>` for your Esplora or mempool instance,
+or `--btc-wallet` with `--btc-cookie` or `--btc-user` (and `--btc-url`) for
+your bitcoind, not both; `--nexus-url` for another node, and with
+`--nexus-cookie` your own lattice-node's RPC. At startup each prints
+`bitcoin: public <url>` or `bitcoin: your node <url>`, and the same for
+nexus. A public node is trusted for what it shows: a seller trusts
+mempool.space for how deep the buyer's BTC lock is before it locks its NEX,
+and a public Nexus node for its claim of the NEX back on a refund, so keep
+`--max-btc-amount` small; a buyer trusts mempool.space to show Bitcoin in
+time to refund, and a public Nexus node for how deep the NEX lock is, so
+keep `--btc-amount` small. Each prints the note for each chain it reads
+through a public node. With either chain on a public node, the swap reads
+the chains at most once every 10 seconds, as the app does, however many
+messages the counterparty sends, within the node's rate limits.
+
+On an Esplora, the BTC a seller receives, and a buyer's refund, go to a
+single-key wallet in `wallet.json` in `--dir`, the native app's
+(`swap::app`), and a buyer's lock is funded from it: deposit to it first.
+`lattice-swap wallet --dir <dir> [--esplora <url>] [--btc-network <net>]`
+prints its address and balance, refused while a swap in the directory
+runs; with `--withdraw <address>` it first sends all it can spend there,
+refused also while a swap there has not ended. One swap at a time runs in a
+directory on an Esplora: `take` is refused while one there has not ended,
+or while the wallet's confirmed balance does not fund the lock. A swap file
+does not say which Bitcoin it was made on: `resume` with no Bitcoin flags,
+or `--esplora`, refuses a swap that does not pay the wallet in its
+directory, as one made on a bitcoind does not; resume that with the flags
+it was made with.
+
+```sh
+lattice-swap offer --nex-key-file ~/.lattice-swap/nex.key \
+  --price 50000000 --min-btc-amount 100000 --max-btc-amount 1000000 \
+  --btc-fee 2000 --nex-fee 10 --relay https://relay.example > offer
+lattice-swap wallet --withdraw bc1q...
+```
+
+With its own nodes, a party runs a bitcoind with `-txindex` and a wallet,
+and a lattice-node. Before anything else, `offer`, `take` and `resume` check
+the bitcoind: Bitcoin Core 28 or later, its txindex synced, not in initial block
 download, on the chain `--btc-network` names, and `--btc-wallet` loaded with
 private keys and, if encrypted, unlocked; an unlock that times out mid-swap
 stops its bumps. They also check that the lattice-node keeps past blocks and

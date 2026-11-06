@@ -1812,6 +1812,8 @@ struct Node {
     tip_age: u64,
     /// Fail every read of the tip.
     down: bool,
+    /// How many times the tip was read.
+    tips: u32,
     /// A block lands after each read of the tip.
     mining: bool,
     /// A swap file, whose state's name is read into `saved` at every
@@ -1850,6 +1852,7 @@ impl Bitcoin for Fake {
     }
     fn tip(&self) -> crate::bitcoind::Result<crate::bitcoind::Tip> {
         let mut node = self.0.borrow_mut();
+        node.tips += 1;
         if node.down {
             return Err(crate::bitcoind::Error("connection refused".into()));
         }
@@ -3814,6 +3817,44 @@ impl Transport for Inbox {
     }
 }
 
+/// A counterparty that floods the session, with junk or not, gets the
+/// chains read no more often than once a poll: it cannot spend a public
+/// node's rate limits.
+#[cfg(feature = "native")]
+#[test]
+fn a_flooded_session_reads_the_chains_once_a_poll() {
+    struct Flood;
+    impl Transport for Flood {
+        fn send(&mut self, _: &[u8]) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn recv(&mut self, _: Duration) -> std::io::Result<Option<Vec<u8>>> {
+            Ok(Some(vec![0; 8]))
+        }
+    }
+    let locked = locked();
+    let node = pooled(&locked, &[], 50);
+    node.0.borrow_mut().height = 105;
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::new(directory.path(), terms().swap_id);
+    let client = Client::new("http://127.0.0.1:9", "", Duration::from_secs(1));
+    let watching = seller_watching(&locked, None);
+    let mut driver =
+        Driver::start(watching, vec![], node.clone(), client, Some(Flood), store).unwrap();
+    driver.poll = Duration::from_secs(3600);
+    let rounds = std::cell::Cell::new(0);
+    let stopped = driver.run_until(|_| {
+        rounds.set(rounds.get() + 1);
+        rounds.get() > 1_000
+    });
+    assert!(stopped.unwrap().is_none());
+    assert_eq!(
+        node.0.borrow().tips,
+        2,
+        "one view, of two tip reads, for 1,000 messages"
+    );
+}
+
 /// The buyer's driver funds the lock at bitcoind's estimate while it has
 /// one, and at `fallback_fee_rate`, whatever it is set to, while it has
 /// none: never at the wallet's own estimate, which a fresh node lacks.
@@ -5173,4 +5214,45 @@ fn a_spend_that_spends_nothing_of_the_swap_is_refused() {
     });
     assert_eq!(stopped.unwrap(), None);
     assert!(matches!(driver.state(), Buyer::Cancelling { .. }));
+}
+
+/// An Esplora whose block 0 is another chain's genesis is refused; one
+/// whose block 0 is the network's is taken.
+#[cfg(feature = "native")]
+#[test]
+fn an_esplora_on_another_network_is_refused() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Bitcoin)
+        .block_hash()
+        .to_string();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let mut request = [0u8; 4096];
+            let n = stream.read(&mut request).unwrap();
+            let (status, body) = if request[..n].starts_with(b"GET /block-height/0 ") {
+                ("200 OK", genesis.as_str())
+            } else {
+                ("404 Not Found", "")
+            };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    let esplora = crate::esplora::Esplora::new(
+        &url,
+        wallet::Key::new("regtest").unwrap(),
+        Duration::from_secs(5),
+    );
+    assert!(esplora.check_network(bitcoin::Network::Bitcoin).is_ok());
+    let refused = esplora
+        .check_network(bitcoin::Network::Signet)
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("not signet's"), "{refused}");
 }

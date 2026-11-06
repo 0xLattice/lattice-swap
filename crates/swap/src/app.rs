@@ -65,6 +65,9 @@ const WALLET: &str = "wallet.json";
 const LOCK: &str = "wallet.lock";
 /// The blocks the offer's fee floor reads an estimate for, as the CLI's.
 const FEE_TARGET: &str = "6";
+/// Between two rounds of reads: slow enough for a public node's rate
+/// limits, as the browser's.
+pub const POLL: Duration = Duration::from_secs(10);
 /// About ten minutes a Bitcoin block.
 const BLOCK: Duration = Duration::from_secs(600);
 
@@ -108,7 +111,7 @@ impl Config {
             nexus,
             nexus_cookie,
             nexus_genesis,
-            poll: Duration::from_secs(10),
+            poll: POLL,
             message_timeout: Duration::from_secs(60),
             max_tip_age: Duration::from_secs(90 * 60),
         }
@@ -144,9 +147,10 @@ struct Recovery {
     swaps: Vec<Value>,
 }
 
-/// Whether a buyer's state has ended: `Punished` keeps its secrets, for a
-/// resume to ask the seller for `s` again.
-fn ended(state: &Value) -> bool {
+/// Whether a swap's state has ended: `Punished` keeps a buyer's secrets,
+/// for a resume to ask the seller for `s` again, and a seller's until the
+/// buyer claims, which may be never; neither spends from the wallet again.
+pub fn ended(state: &Value) -> bool {
     matches!(state, Value::String(name) if name == "Done")
         || state.get("Done").is_some()
         || state.get("Punished").is_some()
@@ -295,7 +299,8 @@ impl Wallet {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn esplora(&self) -> Esplora {
+    /// The wallet's Bitcoin, through the config's Esplora.
+    pub fn esplora(&self) -> Esplora {
         Esplora::new(&self.config.esplora, self.key.clone(), TIMEOUT)
     }
 
@@ -611,6 +616,7 @@ impl Wallet {
         if let Some(running) = self.running()? {
             return Err(format!("refused: swap {running} is running; one swap at a time").into());
         }
+        self.esplora().check_network(self.config.network)?;
         let nexus = self.nexus()?;
         self.check_nexus(&nexus)?;
         self.check(&decoded, &parsed, &nexus)?;
@@ -744,6 +750,7 @@ impl Buy {
                 }
                 let nexus = wallet.nexus()?;
                 if buyer.resumed().outcome().is_none() {
+                    wallet.esplora().check_network(wallet.config.network)?;
                     wallet.check_nexus(&nexus)?;
                 }
                 let store = wallet.store(&record.swap_id)?;

@@ -128,21 +128,25 @@ fn stoppable_relay() -> (String, Arc<Relay>, impl FnOnce()) {
 struct Nexus {
     container: String,
     url: String,
-    /// The public read port, which also takes submits, unthrottled.
+    /// The public read port, which also takes submits.
     public: String,
     cookie: String,
 }
 
+/// The public read port's flags for no rate limits.
+const UNLIMITED: &str = "--public-read-rate 0 --public-read-expensive-rate 0 \
+                         --public-read-max-rate 0 --public-submit-rate 0";
+
 impl Nexus {
-    fn start() -> Self {
+    /// A node whose public read port takes `rates`, its rate limit flags.
+    fn start(rates: &str) -> Self {
         let image =
             std::env::var("NEXUS_NODE_IMAGE").expect("NEXUS_NODE_IMAGE names the node image");
         let (rpc, p2p, public) = (free_port(), free_port(), free_port());
         let script = format!(
             "lattice-node --data-directory /tmp/d --identity-key /tmp/p.key \
              --listen-port {p2p} --rpc-port {rpc} --websocket-port 0 --no-default-peers \
-             --public-read-port {public} --public-submit --public-read-rate 0 \
-             --public-read-expensive-rate 0 --public-read-max-rate 0 --public-submit-rate 0"
+             --public-read-port {public} --public-submit {rates}"
         );
         let out = Command::new("docker")
             .args([
@@ -323,10 +327,17 @@ struct World {
     directory: tempfile::TempDir,
     nexus_cookie: PathBuf,
     key_file: PathBuf,
+    /// A side's node flags, if not [`World::node_args`]'s own nodes.
+    nodes: RefCell<std::collections::HashMap<&'static str, Vec<String>>>,
 }
 
 impl World {
     fn new() -> Self {
+        Self::with_rates(UNLIMITED)
+    }
+
+    /// [`World::new`], the node's public read port at `rates`.
+    fn with_rates(rates: &str) -> Self {
         let mut conf = Conf::default();
         conf.args.push("-txindex");
         let bitcoind = Node::from_downloaded_with_conf(&conf).expect("start bitcoind");
@@ -347,7 +358,7 @@ impl World {
             wallet_client(&bitcoind, "buyer").check_node().ok()
         });
 
-        let nexus = Nexus::start();
+        let nexus = Nexus::start(rates);
         let seller_nex = SecretBytes(random32());
         for _ in 0..2 {
             nexus.mine(Some(&seller_nex.nex_address()));
@@ -382,12 +393,16 @@ impl World {
             directory,
             nexus_cookie,
             key_file,
+            nodes: Default::default(),
         }
     }
 
     /// What `side`, which names its wallet and its directory, passes to
     /// reach its nodes.
     fn node_args(&self, side: &str) -> Vec<String> {
+        if let Some(nodes) = self.nodes.borrow().get(side) {
+            return nodes.clone();
+        }
         let args = [
             "--btc-url",
             &self.bitcoind.rpc_url(),
@@ -1796,5 +1811,125 @@ fn the_native_buyer_refunds_when_the_relay_goes() {
     assert_eq!(
         world.nexus.balance(&world.seller_nex.nex_address()),
         2 * REWARD - 2 * world.nex_fee
+    );
+}
+
+/// The node-free seller: Bitcoin through an Esplora, here the shim, its
+/// BTC paid to the wallet in its directory, and Nexus through the node's
+/// public read port with no cookie, at the node's default rate limits,
+/// which both parties, on one address, share; the buyer on its own
+/// bitcoind and the same public Nexus. They swap, and the seller withdraws
+/// its BTC.
+#[test]
+#[ignore = "needs Docker and NEXUS_NODE_IMAGE"]
+fn a_seller_on_public_nodes_swaps_and_withdraws() {
+    let world = World::with_rates("");
+    let shim = esplora::esplora(wallet_client(&world.bitcoind, ""));
+    let public_nexus = [
+        "--nexus-url",
+        &world.nexus.public,
+        "--nexus-genesis",
+        &world.nexus_genesis,
+    ];
+    let public_nexus = public_nexus.map(String::from);
+    let seller = ["--esplora", &shim, "--btc-network", "regtest"].map(String::from);
+    let seller = [&seller[..], &public_nexus].concat();
+    // The buyer's own bitcoind, up to and with its --btc-network.
+    let own_bitcoind = world.node_args("buyer")[..8].to_vec();
+    assert_eq!(own_bitcoind[6], "--btc-network");
+    let buyer = [&own_bitcoind[..], &public_nexus].concat();
+    world.nodes.borrow_mut().insert("seller", seller);
+    world.nodes.borrow_mut().insert("buyer", buyer);
+
+    let (mut seller, mut buyer, _, seller_out) = world.start(20, 1);
+    let (mut seller_done, mut buyer_done) = (None, None);
+    world.drive(
+        false,
+        || true,
+        || {
+            seller_done = seller_done.or(seller.0.try_wait().unwrap());
+            buyer_done = buyer_done.or(buyer.0.try_wait().unwrap());
+            seller_done.is_some() && buyer_done.is_some()
+        },
+    );
+    assert_eq!(seller_out.join().unwrap(), "outcome: Swapped\n");
+    assert_eq!(stdout(&mut buyer.0), "outcome: Swapped\n");
+    assert!(seller_done.unwrap().success() && buyer_done.unwrap().success());
+    assert_eq!(
+        world.nexus.balance(&world.buyer_nex),
+        NEX_AMOUNT - world.nex_fee
+    );
+
+    // Redeem pays two fees, into the seller's wallet file.
+    let wallet = |extra: &[&str]| {
+        let out = lattice_swap()
+            .arg("wallet")
+            .arg("--dir")
+            .arg(world.dir("seller"))
+            .args(["--esplora", &shim, "--btc-network", "regtest"])
+            .args(extra)
+            .output()
+            .unwrap();
+        let text = String::from_utf8(out.stdout).unwrap();
+        assert!(
+            out.status.success(),
+            "{text}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        text
+    };
+    let held = BTC_AMOUNT - BTC_FEE * 2;
+    let shown = wallet(&[]);
+    assert!(
+        shown.contains(&format!(
+            "balance: {} sat, 0 sat unconfirmed",
+            held.to_sat()
+        )),
+        "{shown}"
+    );
+    let seller_btc = wallet_client(&world.bitcoind, "seller");
+    let to = seller_btc.call("getnewaddress", json!([])).unwrap();
+    let withdrawn = wallet(&["--withdraw", to.as_str().unwrap()]);
+    assert!(withdrawn.starts_with("withdrawn: "), "{withdrawn}");
+    world
+        .bitcoind
+        .client
+        .generate_to_address(1, &world.miner)
+        .unwrap();
+    assert!(wallet(&[]).contains("balance: 0 sat, 0 sat unconfirmed"));
+    let received = btc_balance(&seller_btc);
+    assert!(received > held - Amount::from_sat(1_000), "{received}");
+}
+
+/// An Esplora on another chain than `--btc-network` is refused before
+/// anything else is asked of it, as is a network with no public Esplora
+/// when none is given.
+#[test]
+fn an_esplora_on_another_network_is_refused() {
+    let mut conf = Conf::default();
+    conf.args.push("-txindex");
+    let bitcoind = Node::from_downloaded_with_conf(&conf).expect("start bitcoind");
+    let shim = esplora::esplora(wallet_client(&bitcoind, ""));
+    let directory = tempfile::tempdir().unwrap();
+    let offer = |nodes: &[&str]| {
+        let out = lattice_swap()
+            .args(["offer", "--relay", "http://127.0.0.1:1", "--price", "1"])
+            .args(["--min-btc-amount", "100000", "--max-btc-amount", "200000"])
+            .args(["--btc-fee", "1", "--nex-fee", "1", "--dir"])
+            .arg(directory.path())
+            .args(nodes)
+            .env("LATTICE_SWAP_NEX_KEY", hex::encode([7; 32]))
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1));
+        String::from_utf8(out.stderr).unwrap()
+    };
+    let refused = offer(&["--esplora", &shim, "--btc-network", "signet"]);
+    assert!(refused.contains("the Esplora's genesis is"), "{refused}");
+    assert!(refused.contains("not signet's"), "{refused}");
+    let refused = offer(&["--btc-network", "regtest"]);
+    assert!(
+        refused.contains("regtest has no public Esplora"),
+        "{refused}"
     );
 }

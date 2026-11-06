@@ -6,8 +6,10 @@
 //! The operator port listens on loopback only and takes the node's cookie
 //! (`<data-directory>/.cookie`, `__cookie__:<token>`) as HTTP basic auth. It
 //! changes at every node restart: a client made from the cookie file reads
-//! it again when the node refuses the one it holds. Every 64-bit integer on
-//! this API is a decimal string.
+//! it again when the node refuses the one it holds. A node's public read
+//! port serves the same routes, and `POST /transactions` too when it says
+//! `acceptsSubmit`, with no cookie: [`Client::public`]. Every 64-bit integer
+//! on this API is a decimal string.
 
 #[cfg(feature = "native")]
 use std::io::Read;
@@ -118,6 +120,8 @@ pub struct Client {
     authorization: Mutex<String>,
     /// The cookie file, for a client made from one: read again on a 401.
     cookie: Option<PathBuf>,
+    /// A public read port's, see [`Client::public`].
+    public: bool,
 }
 
 #[cfg(feature = "native")]
@@ -131,6 +135,7 @@ impl Client {
             base: base.trim_end_matches('/').into(),
             authorization: Mutex::new(authorization(cookie)),
             cookie: None,
+            public: false,
         }
     }
 
@@ -151,8 +156,28 @@ impl Client {
         Ok(client)
     }
 
+    /// A client for a node's public read port, which takes no cookie.
+    pub fn public(base: &str, timeout: Duration) -> Self {
+        Self {
+            agent: ureq::AgentBuilder::new().timeout(timeout).build(),
+            base: base.trim_end_matches('/').into(),
+            authorization: Mutex::new(String::new()),
+            cookie: None,
+            public: true,
+        }
+    }
+
+    /// A public read port answers `/health` from a snapshot up to a few
+    /// seconds old and every other read live, so its height and tip are
+    /// read live from `/api/chain/info`: a depth worked out against the
+    /// snapshot's height would miss a block the other reads show.
     pub fn health(&self) -> Result<Health> {
-        parse::health(&self.get("/health")?).map_err(Error::Malformed)
+        let mut health = parse::health(&self.get("/health")?).map_err(Error::Malformed)?;
+        if self.public {
+            (health.height, health.tip) =
+                parse::tip(&self.chain_info()?).map_err(Error::Malformed)?;
+        }
+        Ok(health)
     }
 
     /// The CID of the canonical block at `height`, or `None` if the node has
@@ -215,12 +240,8 @@ impl Client {
     /// signed transaction, not of its body: [`Transaction::cid`]).
     pub fn submit(&self, transaction: &Transaction) -> Result<String> {
         let json = self.authorized(|authorization| {
-            read(
-                self.agent
-                    .post(&format!("{}/transactions", self.base))
-                    .set("Authorization", authorization)
-                    .send_json(transaction.to_submit_json()),
-            )
+            let request = self.agent.post(&format!("{}/transactions", self.base));
+            read(authorize(request, authorization).send_json(transaction.to_submit_json()))
         })?;
         json["transactionCID"]
             .as_str()
@@ -267,12 +288,8 @@ impl Client {
 
     fn get(&self, path: &str) -> Result<Value> {
         self.authorized(|authorization| {
-            read(
-                self.agent
-                    .get(&format!("{}{path}", self.base))
-                    .set("Authorization", authorization)
-                    .call(),
-            )
+            let request = self.agent.get(&format!("{}{path}", self.base));
+            read(authorize(request, authorization).call())
         })
     }
 
@@ -298,6 +315,16 @@ impl Client {
 fn authorization(cookie: &str) -> String {
     let token = base64::engine::general_purpose::STANDARD.encode(cookie.trim());
     format!("Basic {token}")
+}
+
+/// `request` with the `authorization` header, unless it is a public
+/// client's, which has none.
+#[cfg(feature = "native")]
+fn authorize(request: ureq::Request, authorization: &str) -> ureq::Request {
+    match authorization {
+        "" => request,
+        authorization => request.set("Authorization", authorization),
+    }
 }
 
 #[cfg(feature = "native")]
@@ -428,6 +455,14 @@ pub mod parse {
             (None, _) | (Some(_), Some(true)) => Ok(()),
             (Some(_), _) => Err(NodeRefusal::NoPastState),
         }
+    }
+
+    /// `GET /api/chain/info`: the height and CID of the executed tip.
+    pub fn tip(json: &Value) -> Result<(u64, Option<String>), String> {
+        Ok((
+            decimal(json, "height")?,
+            json["tipCID"].as_str().map(String::from),
+        ))
     }
 
     /// `GET /api/block/:height`: the block's CID.
@@ -586,6 +621,45 @@ mod tests {
             }
         });
         (url, counts)
+    }
+
+    /// A public read port's `/health` is a snapshot that may lag: a public
+    /// client reads its height and tip from `/api/chain/info`, sending no
+    /// cookie; a cookie client takes `/health`'s.
+    #[test]
+    fn a_public_client_reads_its_tip_live() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut request = [0u8; 4096];
+                let n = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..n]).to_string();
+                let body = if request.starts_with("GET /health ") {
+                    r#"{"phase":"active","height":"5","tipCID":"stale"}"#.to_string()
+                } else if request.starts_with("GET /api/chain/info ") {
+                    let authorized = request.contains("Authorization:");
+                    format!(r#"{{"height":"9","tipCID":"live","authorized":{authorized}}}"#)
+                } else {
+                    String::new()
+                };
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(head.as_bytes()).unwrap();
+                stream.write_all(body.as_bytes()).unwrap();
+            }
+        });
+        let timeout = Duration::from_secs(5);
+        let public = Client::public(&url, timeout);
+        let health = public.health().unwrap();
+        assert_eq!((health.height, health.tip.as_deref()), (9, Some("live")));
+        assert_eq!(public.chain_info().unwrap()["authorized"], false);
+        let own = Client::new(&url, "__cookie__:c", timeout);
+        assert_eq!(own.health().unwrap().height, 5);
+        assert_eq!(own.chain_info().unwrap()["authorized"], true);
     }
 
     /// The node writes a new cookie at every start: a client made from the

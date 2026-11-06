@@ -180,6 +180,25 @@ impl Seller {
         }
     }
 
+    /// Where the BTC is paid to this side, until the swap ends.
+    pub fn redeem_payout(&self) -> Option<&bitcoin::Script> {
+        use Seller::*;
+        match self {
+            AwaitBuyerHello(start) => Some(&start.redeem_payout),
+            AwaitLockProposal(setup) | AwaitBuyerSignatures { setup, .. } => {
+                Some(&setup.redeem_payout)
+            }
+            AwaitFunding { locked, .. }
+            | LockingNex { locked, .. }
+            | AwaitRedeemSignature { locked, .. }
+            | Redeeming { locked, .. }
+            | Cancelling { locked, .. }
+            | Punished { locked, .. } => Some(&locked.setup.redeem_payout),
+            ClaimingNex(claim) => Some(&claim.setup.redeem_payout),
+            Done(_) => None,
+        }
+    }
+
     /// Whether the swap may still ask the driver to sign the NEX lock:
     /// only until it is signed.
     pub fn signs_nex(&self) -> bool {

@@ -163,6 +163,18 @@ pub fn esplora(node: Bitcoind) -> String {
             ),
         )
         .route(
+            "/block-height/{height}",
+            get(
+                |State(node): State<Shared>, Path(height): Path<u64>| async move {
+                    let hash = ask(&node, move |n| n.call("getblockhash", json!([height])).ok());
+                    match hash.await {
+                        Some(hash) => hash.as_str().unwrap().to_string().into_response(),
+                        None => (StatusCode::NOT_FOUND, "Block not found").into_response(),
+                    }
+                },
+            ),
+        )
+        .route(
             "/blocks/tip/hash",
             get(|State(node): State<Shared>| async move {
                 let hash = ask(&node, |n| n.call("getbestblockhash", json!([])).unwrap()).await;

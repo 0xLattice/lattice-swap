@@ -440,6 +440,22 @@ impl Buyer {
         }
     }
 
+    /// Where a refund pays this side, until the swap ends.
+    pub fn refund_payout(&self) -> Option<&bitcoin::Script> {
+        use Buyer::*;
+        match self {
+            AwaitSellerHello(start) => Some(&start.refund_payout),
+            AwaitFunded(setup) | AwaitSellerSignatures { setup, .. } => Some(&setup.refund_payout),
+            SendingSignatures(locked)
+            | AwaitNexLock { locked, .. }
+            | AwaitRedeem { locked, .. }
+            | Cancelling { locked, .. } => Some(&locked.setup.refund_payout),
+            ClaimingNex(claim) => Some(&claim.setup.refund_payout),
+            AskingShare { setup, .. } | Punished { setup, .. } => Some(&setup.refund_payout),
+            Done(_) => None,
+        }
+    }
+
     /// Whether the buyer has signed the redeem and the swap is not yet
     /// settled: from then on the seller may redeem at any moment, and the
     /// buyer's refund, if it comes to that, must beat the punish.
