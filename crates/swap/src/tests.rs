@@ -5333,40 +5333,45 @@ fn the_app_reads_a_public_nexus_only_where_it_takes_submits() {
 }
 
 /// Serves HTTP on a port of its own, answering each request, its body read
-/// by its Content-Length, with `route(method, path, body)`.
+/// by its Content-Length, with `route(method, path, body)`, each on a
+/// thread of its own: one that hangs holds up no other.
 #[cfg(feature = "native")]
-fn serve(route: impl Fn(&str, &str, &str) -> (u16, String) + Send + 'static) -> String {
+fn serve(route: impl Fn(&str, &str, &str) -> (u16, String) + Send + Sync + 'static) -> String {
     use std::io::{BufRead, Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
+    let route = Arc::new(route);
     std::thread::spawn(move || {
         for stream in listener.incoming() {
+            let route = route.clone();
             let mut stream = stream.unwrap();
-            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
-            let mut request = String::new();
-            reader.read_line(&mut request).unwrap();
-            let mut length = 0;
-            loop {
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                if line == "\r\n" || line.is_empty() {
-                    break;
+            std::thread::spawn(move || {
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut request = String::new();
+                reader.read_line(&mut request).unwrap();
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    let lower = line.to_ascii_lowercase();
+                    if let Some(n) = lower.strip_prefix("content-length:") {
+                        length = n.trim().parse().unwrap();
+                    }
                 }
-                let lower = line.to_ascii_lowercase();
-                if let Some(n) = lower.strip_prefix("content-length:") {
-                    length = n.trim().parse().unwrap();
-                }
-            }
-            let mut body = vec![0; length];
-            reader.read_exact(&mut body).unwrap();
-            let mut line = request.split(' ');
-            let (method, path) = (line.next().unwrap_or(""), line.next().unwrap_or(""));
-            let (status, answer) = route(method, path, &String::from_utf8_lossy(&body));
-            let _ = write!(
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                let mut line = request.split(' ');
+                let (method, path) = (line.next().unwrap_or(""), line.next().unwrap_or(""));
+                let (status, answer) = route(method, path, &String::from_utf8_lossy(&body));
+                let _ = write!(
                 stream,
                 "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}",
                 answer.len()
             );
+            });
         }
     });
     url
@@ -5386,6 +5391,8 @@ enum NexusNode {
     Forgetful,
     /// Follows another Nexus.
     Elsewhere,
+    /// Answers reads, and never a submit.
+    HangsOnSubmit,
 }
 
 /// A Nexus node doing what `node` says, as it changes.
@@ -5399,6 +5406,10 @@ fn nexus_node(node: Arc<Mutex<NexusNode>>) -> String {
         };
         let answer = match path {
             _ if node == NexusNode::Down => return (503, "down".into()),
+            "/transactions" if node == NexusNode::HangsOnSubmit => {
+                std::thread::sleep(Duration::from_secs(60));
+                return (503, "late".into());
+            }
             "/api/chain/info" => json!({
                 "chain": ["Nexus"], "genesisHash": genesis, "height": "10", "tipCID": "tip",
                 "minRelayFee": "1", "acceptsSubmit": node != NexusNode::NoSubmits,
@@ -5477,21 +5488,25 @@ fn watching_nex_lock(locked: &Locked) -> Buyer {
     buyer
 }
 
-/// Counts the Nexus views it is given, watching what `watcher` watches.
+/// Counts the Nexus views it is given, watching what `watcher` watches,
+/// and submits `submit`, if any, at each.
 #[cfg(feature = "native")]
 #[derive(Clone, Serialize, Deserialize)]
 struct NexusCounting {
     watcher: Buyer,
     views: u32,
+    submit: Option<swap_nexus_tx::Transaction>,
 }
 
 #[cfg(feature = "native")]
 impl Machine for NexusCounting {
     fn step(mut self, event: Event) -> (Self, Vec<Action>) {
-        if let Event::Nexus(_) = event {
-            self.views += 1;
-        }
-        (self, vec![])
+        let Event::Nexus(_) = event else {
+            return (self, vec![]);
+        };
+        self.views += 1;
+        let submit = self.submit.clone().map(Action::Submit);
+        (self, submit.into_iter().collect())
     }
     fn outcome(&self) -> Option<Outcome> {
         None
@@ -5534,6 +5549,7 @@ fn a_resumed_swap_reads_nexus_only_once_its_node_passes() {
     let machine = NexusCounting {
         watcher: watching_nex_lock(&locked),
         views: 0,
+        submit: None,
     };
     let client = Client::new(&url, "", Duration::from_secs(5));
     let mut driver =
@@ -5609,6 +5625,7 @@ fn a_new_swap_reads_no_nexus_node_on_another_nexus() {
     let machine = NexusCounting {
         watcher: watching_nex_lock(&locked),
         views: 0,
+        submit: None,
     };
     let offer = recorded(1, &(), &[], false)["offer"].clone();
     let rejoin = session::SessionFile {
@@ -5665,6 +5682,7 @@ fn a_silent_nexus_node_delays_a_round_by_the_budget_at_most() {
     let machine = NexusCounting {
         watcher: watching_nex_lock(&locked),
         views: 0,
+        submit: None,
     };
     let client = Client::new(&url, "", Duration::from_secs(30));
     let mut driver =
@@ -5681,6 +5699,44 @@ fn a_silent_nexus_node_delays_a_round_by_the_budget_at_most() {
     let took = start.elapsed();
     assert!(took < Duration::from_secs(3), "3 rounds took {took:?}");
     assert_eq!(driver.state().views, 0);
+}
+
+/// A Nexus node that answers reads and hangs on submits delays a round by
+/// the driver's Nexus budget, its submits included, not by its client's
+/// timeout: the round's view and the submit it leads to share the budget.
+#[cfg(feature = "native")]
+#[test]
+fn a_node_that_hangs_on_submits_delays_a_round_by_the_budget_at_most() {
+    let locked = locked();
+    let url = nexus_node(Arc::new(Mutex::new(NexusNode::HangsOnSubmit)));
+    let node = pooled(&locked, &[], 50);
+    node.0.borrow_mut().height = 105;
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::new(directory.path(), terms().swap_id);
+    let watcher = watching_nex_lock(&locked);
+    let (_, _, transaction) = locked.nex_signed();
+    let machine = NexusCounting {
+        watcher,
+        views: 0,
+        submit: Some(transaction),
+    };
+    let client = Client::new(&url, "", Duration::from_secs(30));
+    let mut driver =
+        Driver::<_, _, Offline>::start(machine, vec![], node, client, None, store).unwrap();
+    driver.poll = Duration::from_millis(1);
+    driver.nexus_budget = Duration::from_millis(500);
+    clear_warnings();
+    let rounds = std::cell::Cell::new(0);
+    let start = std::time::Instant::now();
+    let stopped = driver.run_until(|_| {
+        rounds.set(rounds.get() + 1);
+        rounds.get() > 3
+    });
+    assert!(stopped.unwrap().is_none());
+    let took = start.elapsed();
+    assert!(took < Duration::from_secs(4), "3 rounds took {took:?}");
+    assert_eq!(driver.state().views, 3, "read at every round");
+    assert_eq!(warnings("nexus submit"), 1, "a failing submit, logged once");
 }
 
 /// A resumed swap on its refund path is never refused for its Nexus node:

@@ -207,10 +207,14 @@ pub struct Driver<M, B, T> {
     /// a failed [`Driver::nexus_check`] is. Read from the `/api/chain/info`
     /// the view reads anyway.
     pub nexus_genesis: Option<String>,
-    /// How long a round's Nexus check and view may take: every request
-    /// ends by then, and one past it is not asked, so a slow or silent
-    /// Nexus node delays the next Bitcoin round by this at most.
+    /// How long a round's Nexus check, view and the submits it leads to
+    /// may take: every request ends by then, and one past it is not asked,
+    /// so a slow or silent Nexus node delays the next Bitcoin round by this
+    /// at most. A submit cut short is asked again at the next view.
     pub nexus_budget: Duration,
+    /// When the round under way must be done with Nexus by, while it reads
+    /// it.
+    nexus_round: Option<Instant>,
     store: Store,
     /// The least time between two reads of the chains. Messages are taken
     /// as they come in between: however many the counterparty sends, the
@@ -335,6 +339,7 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
             nexus_check: None,
             nexus_genesis: None,
             nexus_budget: NEXUS_BUDGET,
+            nexus_round: None,
             store,
             poll: Duration::from_millis(250),
             message_timeout: Duration::from_secs(60),
@@ -669,15 +674,22 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
         let Some(watch) = self.state.watch().nexus else {
             return Ok(());
         };
-        self.nexus
-            .set_deadline(Some(Instant::now() + self.nexus_budget));
+        self.nexus_round = Some(Instant::now() + self.nexus_budget);
+        self.nexus.set_deadline(self.nexus_round);
+        let observed = self.read_nexus(watch);
+        self.nexus_round = None;
+        self.nexus.set_deadline(None);
+        observed
+    }
+
+    /// The round's Nexus check and view of `watch`, and what they lead to,
+    /// under [`Driver::nexus_budget`].
+    fn read_nexus(&mut self, watch: NexusWatch) -> io::Result<()> {
         let genesis = self.nexus_genesis.as_deref();
         let read = match &mut self.nexus_check {
             Some(check) => check(&self.nexus).map(|()| nexus_view(&self.nexus, &watch, genesis)),
             None => Ok(nexus_view(&self.nexus, &watch, genesis)),
         };
-        // Submits, which the view may lead to, are not the round's reads.
-        self.nexus.set_deadline(None);
         match read {
             Err(e) | Ok(Ok(Err(e))) => {
                 let e = format!("nexus: {e}: Nexus is not read until it passes; Bitcoin goes on");
@@ -764,14 +776,22 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
                 None => warn("no Nexus key to sign with"),
             },
             // The machine watches the transaction by its CID: the answer
-            // adds nothing.
-            Action::Submit(transaction) => match self.nexus.submit(&transaction) {
-                Ok(_) => self.submit_failed = None,
-                Err(e) => {
-                    let e = format!("nexus submit {}: {e}", transaction.cid());
-                    warn_again(&mut self.submit_failed, e, (self.clock)());
+            // adds nothing. Bounded by what is left of the round's Nexus
+            // budget, as its view led to it; else by a budget of its own.
+            Action::Submit(transaction) => {
+                let round = self.nexus_round;
+                let deadline = round.unwrap_or_else(|| Instant::now() + self.nexus_budget);
+                self.nexus.set_deadline(Some(deadline));
+                let submitted = self.nexus.submit(&transaction);
+                self.nexus.set_deadline(round);
+                match submitted {
+                    Ok(_) => self.submit_failed = None,
+                    Err(e) => {
+                        let e = format!("nexus submit {}: {e}", transaction.cid());
+                        warn_again(&mut self.submit_failed, e, (self.clock)());
+                    }
                 }
-            },
+            }
         }
         Ok(())
     }
