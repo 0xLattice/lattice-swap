@@ -18,9 +18,9 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "native")]
 use std::sync::Mutex;
 #[cfg(feature = "native")]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 #[cfg(feature = "native")]
-use std::{fmt, fs, io};
+use std::{fmt, fs};
 
 #[cfg(feature = "native")]
 use base64::Engine;
@@ -117,8 +117,14 @@ const MAX_RESPONSE_BYTES: u64 = 1 << 20;
 pub struct Client {
     agent: ureq::Agent,
     base: String,
+    /// What bounds each request, see [`Client::new`].
+    timeout: Duration,
+    /// When every request must have ended by, if anything bounds them so:
+    /// see [`Client::set_deadline`].
+    deadline: Mutex<Option<Instant>>,
     authorization: Mutex<String>,
-    /// The cookie file, for a client made from one: read again on a 401.
+    /// The cookie file, for a client made from one: read again on a 401,
+    /// and before a request while it holds none.
     cookie: Option<PathBuf>,
     /// A public read port's, see [`Client::public`].
     public: bool,
@@ -133,6 +139,8 @@ impl Client {
         Self {
             agent: ureq::AgentBuilder::new().timeout(timeout).build(),
             base: base.trim_end_matches('/').into(),
+            timeout,
+            deadline: Mutex::new(None),
             authorization: Mutex::new(authorization(cookie)),
             cookie: None,
             public: false,
@@ -144,16 +152,36 @@ impl Client {
     /// writes a new cookie at every start, so a client that outlives one
     /// restart of its node goes on with the new cookie. Bitcoin Core's
     /// `bitcoin-cli` reads its node's cookie file on every call, and btcd's
-    /// `rpcclient` reads it again whenever the file changes.
-    pub fn from_cookie_file(
-        base: &str,
-        path: impl AsRef<Path>,
-        timeout: Duration,
-    ) -> io::Result<Self> {
+    /// `rpcclient` reads it again whenever the file changes. The node
+    /// removes the file when it stops: a client made while there is none
+    /// holds no cookie, and reads the file before each request until it
+    /// has one, each request failing, unasked, while the file is missing.
+    pub fn from_cookie_file(base: &str, path: impl AsRef<Path>, timeout: Duration) -> Self {
         let path = path.as_ref();
-        let mut client = Self::new(base, &fs::read_to_string(path)?, timeout);
+        let held = fs::read_to_string(path).map(|cookie| authorization(&cookie));
+        let mut client = Self::new(base, "", timeout);
+        client.authorization = Mutex::new(held.unwrap_or_default());
         client.cookie = Some(path.into());
-        Ok(client)
+        client
+    }
+
+    /// Bounds every request from now on to end by `deadline`, as well as
+    /// by the client's timeout; one asked after it fails at once, unsent.
+    /// `None` lifts the bound.
+    pub fn set_deadline(&self, deadline: Option<Instant>) {
+        *self.deadline.lock().expect("not poisoned") = deadline;
+    }
+
+    /// `request` bounded by the client's deadline, if it has one; an error
+    /// once that has passed.
+    fn bounded(&self, request: ureq::Request) -> Result<ureq::Request> {
+        let Some(deadline) = *self.deadline.lock().expect("not poisoned") else {
+            return Ok(request);
+        };
+        match deadline.checked_duration_since(Instant::now()) {
+            Some(left) if !left.is_zero() => Ok(request.timeout(left.min(self.timeout))),
+            _ => Err(Error::Transport("out of time for this round".into())),
+        }
     }
 
     /// A client for a node's public read port, which takes no cookie.
@@ -161,6 +189,8 @@ impl Client {
         Self {
             agent: ureq::AgentBuilder::new().timeout(timeout).build(),
             base: base.trim_end_matches('/').into(),
+            timeout,
+            deadline: Mutex::new(None),
             authorization: Mutex::new(String::new()),
             cookie: None,
             public: true,
@@ -171,11 +201,20 @@ impl Client {
     /// seconds old and every other read live, so its height and tip are
     /// read live from `/api/chain/info`: a depth worked out against the
     /// snapshot's height would miss a block the other reads show.
+    /// `/api/chain/info` names no best header, so the node counts as synced
+    /// only if the snapshot was (its best header at its height) and the
+    /// live tip has reached that header; otherwise `best_header_height` is
+    /// `None`. A snapshot taken while catching up never reads as synced,
+    /// even once the live tip reaches the header the snapshot knew.
     pub fn health(&self) -> Result<Health> {
         let mut health = parse::health(&self.get("/health")?).map_err(Error::Malformed)?;
         if self.public {
+            let snapshot = (health.height, health.best_header_height);
             (health.height, health.tip) =
                 parse::tip(&self.chain_info()?).map_err(Error::Malformed)?;
+            health.best_header_height = (snapshot.1 == Some(snapshot.0)
+                && health.height >= snapshot.0)
+                .then_some(health.height);
         }
         Ok(health)
     }
@@ -240,7 +279,7 @@ impl Client {
     /// signed transaction, not of its body: [`Transaction::cid`]).
     pub fn submit(&self, transaction: &Transaction) -> Result<String> {
         let json = self.authorized(|authorization| {
-            let request = self.agent.post(&format!("{}/transactions", self.base));
+            let request = self.bounded(self.agent.post(&format!("{}/transactions", self.base)))?;
             read(authorize(request, authorization).send_json(transaction.to_submit_json()))
         })?;
         json["transactionCID"]
@@ -288,25 +327,33 @@ impl Client {
 
     fn get(&self, path: &str) -> Result<Value> {
         self.authorized(|authorization| {
-            let request = self.agent.get(&format!("{}{path}", self.base));
+            let request = self.bounded(self.agent.get(&format!("{}{path}", self.base)))?;
             read(authorize(request, authorization).call())
         })
     }
 
-    /// `request`'s answer under the cookie held; on a 401, under the cookie
-    /// file's, read again, if this client has one.
+    /// `request`'s answer under the cookie held, the cookie file's read
+    /// first if it holds none; on a 401, under the cookie file's, read
+    /// again, if this client has one.
     fn authorized(&self, request: impl Fn(&str) -> Result<Value>) -> Result<Value> {
-        let held = self.authorization.lock().expect("not poisoned").clone();
+        let mut held = self.authorization.lock().expect("not poisoned").clone();
+        if held.is_empty() && self.cookie.is_some() {
+            held = self.read_cookie()?;
+        }
         match (request(&held), &self.cookie) {
-            (Err(Error::Status { status: 401, .. }), Some(path)) => {
-                let cookie = fs::read_to_string(path)
-                    .map_err(|e| Error::Transport(format!("{}: {e}", path.display())))?;
-                let fresh = authorization(&cookie);
-                *self.authorization.lock().expect("not poisoned") = fresh.clone();
-                request(&fresh)
-            }
+            (Err(Error::Status { status: 401, .. }), Some(_)) => request(&self.read_cookie()?),
             (answer, _) => answer,
         }
+    }
+
+    /// The authorization of the cookie file's cookie, now held.
+    fn read_cookie(&self) -> Result<String> {
+        let path = self.cookie.as_ref().expect("a cookie client");
+        let cookie = fs::read_to_string(path)
+            .map_err(|e| Error::Transport(format!("{}: {e}", path.display())))?;
+        let fresh = authorization(&cookie);
+        *self.authorization.lock().expect("not poisoned") = fresh.clone();
+        Ok(fresh)
     }
 }
 
@@ -662,6 +709,58 @@ mod tests {
         assert_eq!(own.chain_info().unwrap()["authorized"], true);
     }
 
+    /// A public node whose `/health` snapshot is `health` and whose live
+    /// `/api/chain/info` is `info`.
+    fn public_node(health: &'static str, info: &'static str) -> Client {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut request = [0u8; 4096];
+                let n = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..n]).to_string();
+                let body = if request.starts_with("GET /health ") {
+                    health
+                } else {
+                    info
+                };
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(head.as_bytes()).unwrap();
+                stream.write_all(body.as_bytes()).unwrap();
+            }
+        });
+        Client::public(&url, Duration::from_secs(5))
+    }
+
+    /// `/api/chain/info` names no best header: a public node is synced only
+    /// if its `/health` snapshot was and the live tip has reached the
+    /// snapshot's best header. A snapshot taken while catching up stays
+    /// unsynced even when the live tip reaches the header it knew.
+    #[test]
+    fn a_public_client_trusts_only_a_synced_snapshot() {
+        let synced = |health, info| {
+            let health = public_node(health, info).health().unwrap();
+            health.best_header_height == Some(health.height)
+        };
+        let live = r#"{"height":"105","tipCID":"live"}"#;
+        // Synced at 100, live past it: synced at the live tip.
+        let at_100 = r#"{"phase":"active","height":"100","bestHeaderHeight":"100","tipCID":"t"}"#;
+        assert!(synced(at_100, live));
+        // Catching up, 100 of 105: still behind, though live reached 105.
+        let behind = r#"{"phase":"active","height":"100","bestHeaderHeight":"105","tipCID":"t"}"#;
+        assert!(!synced(behind, live));
+        // Synced at 110 but the live read trails it.
+        let at_110 = r#"{"phase":"active","height":"110","bestHeaderHeight":"110","tipCID":"t"}"#;
+        assert!(!synced(at_110, live));
+        // No header known.
+        let none = r#"{"phase":"active","height":"100","tipCID":"t"}"#;
+        assert!(!synced(none, live));
+    }
+
     /// The node writes a new cookie at every start: a client made from the
     /// cookie file goes on under the new one, after one 401; a client given
     /// the cookie itself has no file to read again, and stays refused. Any
@@ -675,7 +774,7 @@ mod tests {
         let (url, counts) = guarded(cookie.clone());
         let [asked, refused] = &*counts;
         let timeout = Duration::from_secs(5);
-        let client = Client::from_cookie_file(&url, &cookie, timeout).unwrap();
+        let client = Client::from_cookie_file(&url, &cookie, timeout);
         let given = Client::new(&url, "__cookie__:first", timeout);
         assert_eq!(client.health().unwrap().height, 7);
         assert_eq!(given.health().unwrap().height, 7);
@@ -696,6 +795,56 @@ mod tests {
             "{stale:?}"
         );
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The node removes its cookie file when it stops: a client made while
+    /// there is none fails each request, unasked, and goes on under the
+    /// cookie the node writes once it is back, with no 401 first.
+    #[test]
+    fn a_client_made_without_its_cookie_file_reads_it_once_there() {
+        let dir = std::env::temp_dir().join(format!("swap-no-cookie-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let cookie = dir.join(".cookie");
+        let (url, counts) = guarded(cookie.clone());
+        let [asked, refused] = &*counts;
+        let client = Client::from_cookie_file(&url, &cookie, Duration::from_secs(5));
+        let missing = client.health();
+        assert!(
+            matches!(&missing, Err(Error::Transport(e)) if e.contains(".cookie")),
+            "{missing:?}"
+        );
+        assert_eq!(asked.load(Ordering::SeqCst), 0);
+
+        fs::write(&cookie, "__cookie__:back").unwrap();
+        assert_eq!(client.health().unwrap().height, 7);
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+        assert_eq!(refused.load(Ordering::SeqCst), 0);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A request asked once the deadline has passed fails, unsent; one
+    /// asked before it ends by it, whatever the client's own timeout.
+    #[test]
+    fn a_deadline_bounds_every_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        // Takes every connection and never answers.
+        std::thread::spawn(move || {
+            let held: Vec<_> = listener.incoming().collect();
+            drop(held);
+        });
+        let client = Client::new(&url, "c", Duration::from_secs(30));
+        let start = Instant::now();
+        client.set_deadline(Some(start + Duration::from_millis(300)));
+        assert!(client.health().is_err());
+        let took = start.elapsed();
+        assert!(took < Duration::from_secs(5), "{took:?}");
+        let late = client.health();
+        assert!(
+            matches!(&late, Err(Error::Transport(e)) if e.contains("out of time")),
+            "{late:?}"
+        );
+        client.set_deadline(None);
     }
 
     #[test]

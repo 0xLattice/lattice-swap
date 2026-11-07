@@ -16,7 +16,7 @@ use swap_nexus_tx::rpc::parse::NodeRefusal;
 use swap_nexus_tx::rpc::{self, Client};
 
 use crate::bitcoind::Bitcoin;
-use crate::driver::{Driver, Reconnect, Store};
+use crate::driver::{Driver, NexusCheck, Reconnect, Store};
 use crate::offer::{check_offer, Offer, Place, Policy};
 use crate::transport::{Ivy, Relayed, Transport};
 use crate::{Action, Buyer, Machine, Message, Seller, Terms};
@@ -155,12 +155,15 @@ pub fn request_terms<T: Transport>(
 /// A driver for `machine`, which asks for `actions` first, over `transport`,
 /// meeting the counterparty again by `rejoin`, saved beside the swap file,
 /// whenever the session is lost: the seller on `listener`, if it listens.
+/// Its Nexus node is checked to follow the Nexus of `nexus_genesis` at
+/// every view, as a resumed swap's is: see [`Driver::nexus_genesis`].
 #[allow(clippy::too_many_arguments)]
 pub fn start<M: Machine, B: Bitcoin>(
     machine: M,
     actions: Vec<Action>,
     bitcoin: B,
     nexus: Client,
+    nexus_genesis: &str,
     transport: Session,
     store: Store,
     rejoin: SessionFile,
@@ -171,6 +174,7 @@ pub fn start<M: Machine, B: Bitcoin>(
     rejoin.save(&store)?;
     let mut driver = Driver::start(machine, actions, bitcoin, nexus, Some(transport), store)?;
     driver.reconnect = Some(reconnect);
+    driver.nexus_genesis = Some(nexus_genesis.into());
     Ok(driver)
 }
 
@@ -223,7 +227,15 @@ pub fn take<B: Bitcoin>(
         listen: None,
     };
     start(
-        buyer, actions, bitcoin, nexus, transport, store, rejoin, None,
+        buyer,
+        actions,
+        bitcoin,
+        nexus,
+        nexus_genesis,
+        transport,
+        store,
+        rejoin,
+        None,
     )
 }
 
@@ -291,6 +303,19 @@ pub fn check_nexus(
         }),
     };
     Ok(check_node(genesis, &chain_info, height, past_state))
+}
+
+/// A [`Driver::nexus_check`] for a swap resumed: asks `check`, such as
+/// [`check_nexus`] made an error, until it passes once, and nothing after.
+pub fn check_once(mut check: impl FnMut(&Client) -> Result<()> + Send + 'static) -> NexusCheck {
+    let mut passed = false;
+    Box::new(move |client| {
+        if !passed {
+            check(client).map_err(|e| e.to_string())?;
+            passed = true;
+        }
+        Ok(())
+    })
 }
 
 /// A Nexus address as Lattice prints one: a CIDv1, dag-cbor, sha2-256, in

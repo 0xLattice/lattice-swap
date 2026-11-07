@@ -89,11 +89,12 @@ impl Esplora {
         }
     }
 
-    /// Refuses an Esplora on another chain than `network`, whose blocks
-    /// would never show the swap's transactions: its block 0 must be
-    /// `network`'s genesis, as bitcoind's `getblockchaininfo` names its
-    /// chain.
-    pub fn check_network(&self, network: Network) -> Result<()> {
+    /// Refuses (`Ok(Err)`) an Esplora on another chain than `network`,
+    /// whose blocks would never show the swap's transactions: its block 0
+    /// must be `network`'s genesis, as bitcoind's `getblockchaininfo` names
+    /// its chain. Only a genesis it names tells; any other failure to read
+    /// one (`Err`) may pass when asked again.
+    pub fn check_network(&self, network: Network) -> Result<Result<()>> {
         let expected = bitcoin::constants::genesis_block(network).block_hash();
         let text = self.get("/block-height/0", false)?.unwrap_or_default();
         let genesis: BlockHash = text
@@ -101,11 +102,11 @@ impl Esplora {
             .parse()
             .map_err(|e| Error(format!("/block-height/0 {text:?}: {e}")))?;
         if genesis != expected {
-            return Err(Error(format!(
+            return Ok(Err(Error(format!(
                 "refused: the Esplora's genesis is {genesis}, not {network}'s {expected}"
-            )));
+            ))));
         }
-        Ok(())
+        Ok(Ok(()))
     }
 
     pub fn key(&self) -> &Key {

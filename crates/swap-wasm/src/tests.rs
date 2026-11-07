@@ -887,6 +887,20 @@ fn a_nexus_node_is_checked_as_the_cli_checks_one() {
     }
 }
 
+/// An Esplora's block 0 is checked against its network's genesis.
+#[test]
+fn each_network_names_its_own_genesis() {
+    assert_eq!(
+        bitcoin_genesis("bitcoin").unwrap(),
+        "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
+    );
+    assert_ne!(
+        bitcoin_genesis("signet").unwrap(),
+        bitcoin_genesis("regtest").unwrap()
+    );
+    assert!(bitcoin_genesis("nonsense").is_err());
+}
+
 #[test]
 fn an_address_pays_its_script_on_its_network_only() {
     let key = json(&new_bitcoin_key("regtest").unwrap());

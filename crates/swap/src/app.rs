@@ -37,7 +37,7 @@ use serde_json::{json, Value};
 use swap_nexus_tx::rpc::Client;
 
 use crate::bitcoind::Bitcoin;
-use crate::driver::{bitcoin_view, Driver, Store};
+use crate::driver::{bitcoin_view, Driver, NexusCheck, Store};
 use crate::esplora::Esplora;
 use crate::offer::{self, check_offer, Offer, Place, Policy};
 use crate::session::{self, check_nex_address, Result, Session, SessionFile, TIMEOUT};
@@ -81,9 +81,10 @@ pub struct Config {
     /// shows.
     pub esplora: String,
     /// The Nexus node's RPC, and its cookie file, read again whenever the
-    /// node restarts.
+    /// node restarts; with no cookie, a node's public read port, which must
+    /// take submits, as the CLI's public Nexus.
     pub nexus: String,
-    pub nexus_cookie: PathBuf,
+    pub nexus_cookie: Option<PathBuf>,
     /// The CID of the genesis of the Nexus to trade on.
     pub nexus_genesis: String,
     /// Between two rounds of reads: the driver's poll.
@@ -92,16 +93,20 @@ pub struct Config {
     pub message_timeout: Duration,
     /// The oldest a Bitcoin tip may be for a view not to be stale.
     pub max_tip_age: Duration,
+    /// The most a round's Nexus requests may take: the driver's
+    /// [`nexus_budget`](crate::driver::Driver::nexus_budget).
+    pub nexus_budget: Duration,
 }
 
 impl Config {
-    /// The browser's settings, but where to read from.
+    /// The browser's settings, but where to read from: `nexus_cookie` a
+    /// cookie file, or `None` for a public read port.
     pub fn new(
         dir: PathBuf,
         network: Network,
         esplora: String,
         nexus: String,
-        nexus_cookie: PathBuf,
+        nexus_cookie: impl Into<Option<PathBuf>>,
         nexus_genesis: String,
     ) -> Self {
         Self {
@@ -109,11 +114,12 @@ impl Config {
             network,
             esplora,
             nexus,
-            nexus_cookie,
+            nexus_cookie: nexus_cookie.into(),
             nexus_genesis,
             poll: POLL,
             message_timeout: Duration::from_secs(60),
             max_tip_age: Duration::from_secs(90 * 60),
+            nexus_budget: crate::driver::NEXUS_BUDGET,
         }
     }
 }
@@ -304,11 +310,14 @@ impl Wallet {
         Esplora::new(&self.config.esplora, self.key.clone(), TIMEOUT)
     }
 
-    fn nexus(&self) -> Result<Client> {
-        Ok(
-            Client::from_cookie_file(&self.config.nexus, &self.config.nexus_cookie, TIMEOUT)
-                .map_err(|e| format!("{}: {e}", self.config.nexus_cookie.display()))?,
-        )
+    /// The Nexus node's RPC, which reads its cookie file again on a 401,
+    /// and fails each request while there is none; with no cookie, a
+    /// public read port, its tip read live.
+    pub(crate) fn nexus(&self) -> Client {
+        let Some(cookie) = &self.config.nexus_cookie else {
+            return Client::public(&self.config.nexus, TIMEOUT);
+        };
+        Client::from_cookie_file(&self.config.nexus, cookie, TIMEOUT)
     }
 
     /// `(confirmed, unconfirmed)`, in sat: what the wallet can spend, and
@@ -595,9 +604,29 @@ impl Wallet {
         )?)
     }
 
+    /// Refuses a public node that takes no transactions, as the CLI's
+    /// `check_nexus`, then a Nexus node on another Nexus than the config's,
+    /// or one that cannot say how deep a transaction is.
+    pub(crate) fn check_nexus(&self, nexus: &Client) -> Result<()> {
+        if let Some(why) = self.takes_no_transactions(nexus)? {
+            return Err(format!(
+                "refused: {why}: give a public node that does, or your own with its cookie"
+            )
+            .into());
+        }
+        self.check_nexus_chain(nexus)
+    }
+
+    /// Why a public node takes no transactions, if it takes none.
+    fn takes_no_transactions(&self, nexus: &Client) -> Result<Option<String>> {
+        let none =
+            self.config.nexus_cookie.is_none() && nexus.chain_info()?["acceptsSubmit"] != true;
+        Ok(none.then(|| format!("{} takes no transactions", self.config.nexus)))
+    }
+
     /// Refuses a Nexus node on another Nexus than the config's, or one that
     /// cannot say how deep a transaction is.
-    fn check_nexus(&self, nexus: &Client) -> Result<()> {
+    fn check_nexus_chain(&self, nexus: &Client) -> Result<()> {
         Ok(session::check_nexus(nexus, &self.config.nexus_genesis)?
             .map_err(|refusal| refusal.to_string())?)
     }
@@ -616,8 +645,8 @@ impl Wallet {
         if let Some(running) = self.running()? {
             return Err(format!("refused: swap {running} is running; one swap at a time").into());
         }
-        self.esplora().check_network(self.config.network)?;
-        let nexus = self.nexus()?;
+        self.esplora().check_network(self.config.network)??;
+        let nexus = self.nexus();
         self.check_nexus(&nexus)?;
         self.check(&decoded, &parsed, &nexus)?;
         for id in self.swaps()? {
@@ -663,8 +692,9 @@ pub struct Buy {
     cancelled: AtomicBool,
     /// Why the offer could not be taken, once it cannot.
     gone: Mutex<Option<String>>,
-    /// The last failure, if any.
-    warning: Mutex<Option<String>>,
+    /// The last failure, if any; once the driver runs a resumed swap, why
+    /// its Nexus node will not do, as its `nexus_check` last found.
+    warning: Arc<Mutex<Option<String>>>,
 }
 
 impl Buy {
@@ -674,7 +704,7 @@ impl Buy {
             record: Mutex::new(record),
             cancelled: AtomicBool::new(false),
             gone: Mutex::new(None),
-            warning: Mutex::new(None),
+            warning: Arc::default(),
         }
     }
 
@@ -723,9 +753,10 @@ impl Buy {
     /// Runs the swap until it ends, its offer is gone, it is cancelled, or
     /// `stop` holds: the outcome, once it ends. Until it has taken its
     /// offer, it waits for the wallet to fund the lock, a round each
-    /// `poll`, a failed round its [`Buy::status`]'s warning. Then the
-    /// driver runs it, and an error that stops the driver is returned: run
-    /// it again, as the CLI's `resume`.
+    /// `poll`, a failed round its [`Buy::status`]'s warning. A taken swap
+    /// waits so for an Esplora that cannot answer yet, and is refused on
+    /// one on another chain. Then the driver runs it, and an error that
+    /// stops the driver is returned: run it again, as the CLI's `resume`.
     pub fn run(&self, stop: impl Fn() -> bool) -> Result<Option<Outcome>> {
         let wallet = &self.wallet;
         let mut driver = loop {
@@ -748,18 +779,37 @@ impl Buy {
                     )
                     .into());
                 }
-                let nexus = wallet.nexus()?;
-                if buyer.resumed().outcome().is_none() {
-                    wallet.esplora().check_network(wallet.config.network)?;
-                    wallet.check_nexus(&nexus)?;
+                let ended = buyer.resumed().outcome().is_some();
+                let checked = if ended {
+                    Ok(Ok(()))
+                } else {
+                    wallet.esplora().check_network(wallet.config.network)
+                };
+                match checked {
+                    // As the CLI's `resume`: an Esplora that cannot answer
+                    // yet is asked again, a poll apart; one on another
+                    // chain is refused.
+                    Err(e) => {
+                        *self.warning.lock().unwrap() = Some(format!("bitcoin: {e}: asked again"))
+                    }
+                    Ok(checked) => {
+                        checked?;
+                        *self.warning.lock().unwrap() = None;
+                        let check = (!ended).then(|| self.resumed_check());
+                        let store = wallet.store(&record.swap_id)?;
+                        let mut driver =
+                            session::resume::<Buyer, _>(wallet.esplora(), wallet.nexus(), store)?;
+                        driver.nexus_check = check;
+                        driver.nexus_genesis = Some(genesis.clone());
+                        break driver;
+                    }
                 }
-                let store = wallet.store(&record.swap_id)?;
-                break session::resume::<Buyer, _>(wallet.esplora(), nexus, store)?;
-            }
-            match self.take() {
-                Ok(Some(driver)) => break driver,
-                Ok(None) => {}
-                Err(e) => *self.warning.lock().unwrap() = Some(e.to_string()),
+            } else {
+                match self.take() {
+                    Ok(Some(driver)) => break driver,
+                    Ok(None) => {}
+                    Err(e) => *self.warning.lock().unwrap() = Some(e.to_string()),
+                }
             }
             let start = Instant::now();
             while start.elapsed() < wallet.config.poll && !stop() {
@@ -769,10 +819,46 @@ impl Buy {
         driver.poll = wallet.config.poll;
         driver.message_timeout = wallet.config.message_timeout;
         driver.max_tip_age = wallet.config.max_tip_age;
+        driver.nexus_budget = wallet.config.nexus_budget;
         // As the browser funds and prices its own spends: the Esplora's
         // estimate, else the relay floor.
         driver.fallback_fee_rate = FeeRate::from_sat_per_vb_u32(1);
-        Ok(driver.run_until(|_| stop())?)
+        let outcome = driver.run_until(|_| stop())?;
+        if outcome.is_some() {
+            *self.warning.lock().unwrap() = None;
+        }
+        Ok(outcome)
+    }
+
+    /// The driver's `nexus_check` for a taken swap resumed, as the CLI's
+    /// `resume` and the browser's `#checkNexus` check its node, but never
+    /// refusing it: the swap's cancel, refund and the rest are Bitcoin's,
+    /// and go on whatever the node does. Nexus is read only once the node
+    /// passes; until then the status's warning says why, and if a public
+    /// node takes no transactions, asked until it answers once, that the
+    /// swap's Nexus submits fail.
+    fn resumed_check(&self) -> NexusCheck {
+        let wallet = self.wallet.clone();
+        let warning = self.warning.clone();
+        let checked = wallet.clone();
+        let mut chain = session::check_once(move |nexus| checked.check_nexus_chain(nexus));
+        let mut takes_none = None;
+        Box::new(move |nexus| {
+            let gated = chain(nexus);
+            let unread = gated
+                .as_ref()
+                .err()
+                .map(|e| format!("nexus: {e}: Nexus is not read until it passes; Bitcoin goes on"));
+            if takes_none.is_none() {
+                takes_none = wallet.takes_no_transactions(nexus).ok();
+            }
+            let no_submits = takes_none.clone().flatten().map(|why| {
+                format!("{why}: the swap's Bitcoin side goes on, its Nexus submits fail")
+            });
+            let why: Vec<String> = unread.into_iter().chain(no_submits).collect();
+            *warning.lock().unwrap() = (!why.is_empty()).then(|| why.join("; "));
+            gated
+        })
     }
 
     /// Takes the offer once the wallet's spendable balance pays for the
@@ -803,7 +889,7 @@ impl Buy {
             return Ok(None);
         }
         let offer: Offer = serde_json::from_value(record.offer.clone())?;
-        let nexus = wallet.nexus()?;
+        let nexus = wallet.nexus();
         wallet.check_nexus(&nexus)?;
         wallet.check(&offer, &policy, &nexus)?;
         let config = ivy::Config::new(SigningKey::from_bytes(&offer.buyer_session));
@@ -847,6 +933,7 @@ impl Buy {
             pending,
             wallet.esplora(),
             nexus,
+            &wallet.config.nexus_genesis,
             transport,
             store,
             rejoin,
