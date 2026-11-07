@@ -56,7 +56,8 @@ export class Buyer extends EventTarget {
   #need = null;
   #nexusDepth = null;
   #warning = null;
-  /** What failed of this round's own steps, a send, broadcast or submit. */
+  /** What failed of this round's own steps, sends, broadcasts or submits,
+   * joined by "; ". */
   #raised = null;
   /** Why the offer could not be taken, once it cannot. */
   #gone = null;
@@ -503,7 +504,7 @@ export class Buyer extends EventTarget {
       try {
         this.#session.send(JSON.stringify(action.Send));
       } catch (e) {
-        this.#raised = `session ended: ${e.message}`;
+        this.#raise(`session ended: ${e.message}`);
         this.#session = null;
         return;
       }
@@ -524,16 +525,20 @@ export class Buyer extends EventTarget {
         await this.#wallet.esplora.broadcast(action.Broadcast);
       } catch (e) {
         // The machine asks again while it is needed.
-        this.#raised = `broadcast: ${e.message}`;
+        this.#raise(`broadcast: ${e.message}`);
       }
     } else if (action.Submit) {
       try {
         await this.#checkNexus();
         await this.#wallet.nexus.submit(wasm.nexusSubmitBody(JSON.stringify(action.Submit)));
       } catch (e) {
-        this.#raised = `nexus submit: ${e.message}`;
+        this.#raise(`nexus submit: ${e.message}`);
       }
     }
+  }
+
+  #raise(why) {
+    this.#raised = this.#raised === null ? why : `${this.#raised}; ${why}`;
   }
 
   async #observeBitcoin() {

@@ -1054,6 +1054,48 @@ test('a resumed swap that watches Nexus reads nothing of a node on another Nexus
   }
 });
 
+test('a resumed swap that watches Nexus cancels and refunds while its node fails the check, reading no view of it', async () => {
+  const failing = [
+    ['down', (node) => (node.down = true), /503 down/],
+    ['keeping no past state', (node) => (node.height = '10'), /keeps no state of past blocks/],
+    ['on another Nexus', (node) => (node.genesis = 'another'), /another/],
+  ];
+  for (const [what, fail, why] of failing) {
+    const { w, run, record, funding } = await funded();
+    await run.stop();
+    const [watching] = watchingNexus(record);
+    await w.store.put(`swap:${record.swap_id}`, watching);
+    const lookups = call('watchBuyer', watching.state).bitcoin;
+    fail(w.node);
+    w.node.paths = [];
+    const buyer = await Buyer.resume(w.wallet, record.swap_id);
+    const again = running(buyer);
+    confirm(w, funding);
+    await until(() => why.test(buyer.status().warning ?? '')).catch((e) => assert.fail(`${what}: ${e.message}: ${JSON.stringify(buyer.status())}`));
+    w.chain.mine(TERMS.t1 - 1);
+    confirm(w, await broadcast(w, lookups.lock_spends[1]));
+    await broadcast(w, lookups.cancel_spends[0]);
+    await again.stop();
+    const checked = (path) => ['/api/chain/info', '/health'].includes(path) || path.startsWith('/api/block/');
+    assert.deepEqual(w.node.paths.filter((path) => !checked(path)), [], `${what}: only the check’s reads`);
+  }
+});
+
+test('a resumed swap reads Nexus once its node passes the check', async () => {
+  const { w, run, record } = await funded();
+  await run.stop();
+  const [watching] = watchingNexus(record);
+  await w.store.put(`swap:${record.swap_id}`, watching);
+  w.node.height = '10';
+  w.node.paths = [];
+  const buyer = await Buyer.resume(w.wallet, record.swap_id);
+  const again = running(buyer);
+  await until(() => /keeps no state of past blocks/.test(buyer.status().warning ?? ''));
+  w.node.keepsState = true;
+  await until(() => w.node.paths.some((path) => path.startsWith('/api/state/account/')));
+  await again.stop();
+});
+
 test('a resumed swap whose terms name another Nexus than the page’s is refused', async () => {
   const { w, run, record } = await funded();
   await run.stop();

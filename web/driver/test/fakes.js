@@ -177,6 +177,9 @@ export function nexus(node = {}) {
       }];
     }
     if (path === '/health') return [200, { phase: 'active', height: '1', tipCID: 'tip' }];
+    // The block halfway up, and the state after it, if it keeps them.
+    if (path.startsWith('/api/block/') && node.keepsState) return [200, { hash: 'half' }];
+    if (path.startsWith('/accounts/') && node.keepsState) return [200, { balance: '0', nonce: '0' }];
   });
 }
 
