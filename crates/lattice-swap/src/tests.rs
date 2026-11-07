@@ -1775,12 +1775,12 @@ fn a_nexus_node_that_keeps_no_past_state_is_refused() {
     assert_eq!(check(1, false), Ok(()), "too short to tell");
 }
 
-/// `offer`, `take` and `resume` of a swap still running each check the
-/// lattice-node, and `offer` and `take` before they take an address from
-/// the wallet.
+/// `offer` and `take` each check the lattice-node before they take an
+/// address from the wallet; `resume` checks it only to read Nexus (see
+/// [`a_resumed_swap_reads_nexus_only_once_its_node_passes`]).
 #[cfg(unix)]
 #[test]
-fn offer_take_and_resume_check_the_nexus_node() {
+fn offer_and_take_check_the_nexus_node() {
     let refused = |refusal: String| {
         assert!(refusal.contains("--state all"), "{refusal}");
     };
@@ -1818,17 +1818,6 @@ fn offer_take_and_resume_check_the_nexus_node() {
         &url,
         &forgetful(),
     ));
-    let home = SecretBytes([7; 32]).nex_address();
-    let seller = Seller::new(small(16), home, paid(), paid()).unwrap();
-    let (_directory, path) = swap_file(seller);
-    refused(refusal_on(
-        &["resume", &path, "--nex-key-file", key],
-        &url,
-        &forgetful(),
-    ));
-    let (buyer, _) = Buyer::start(small(16), paid(), "b".into()).unwrap();
-    let (_directory, path) = swap_file(buyer);
-    refused(refusal_on(&["resume", &path], &url, &forgetful()));
 }
 
 /// The Nexus genesis defaults to mainnet's, as anchored in Bitcoin, for
@@ -1869,9 +1858,9 @@ fn the_nexus_genesis_defaults_to_mainnets() {
     }
 }
 
-/// `offer`, `take` and `resume` refuse a lattice-node on another Nexus than
+/// `offer` and `take` refuse a lattice-node on another Nexus than
 /// `--nexus-genesis` names, before they ask it anything else, and run on
-/// the one it names.
+/// the one it names; `resume`, a flag naming another Nexus than the swap's.
 #[cfg(unix)]
 #[test]
 fn offer_take_and_resume_refuse_another_nexus() {
@@ -1943,7 +1932,7 @@ fn offer_take_and_resume_refuse_another_nexus() {
     );
 
     // A swap file keeps its Nexus: `resume` refuses a flag naming another
-    // before it asks any node, then a node on another than the flag's.
+    // before it asks any node.
     let home = SecretBytes([7; 32]).nex_address();
     let on = |genesis: &str| Terms {
         nexus_genesis: genesis.into(),
@@ -1962,9 +1951,9 @@ fn offer_take_and_resume_refuse_another_nexus() {
             args.extend(extra);
             refusal_on(&args, &url, nexus_url)
         };
-        let (flag, other) = match *genesis == MAINNET {
-            true => (vec![], dev.as_str()),
-            false => (on_dev.to_vec(), MAINNET),
+        let other = match *genesis == MAINNET {
+            true => dev.as_str(),
+            false => MAINNET,
         };
         let kept = resume(&["--nexus-genesis", other], &nexus_node_on(other, 10, true));
         assert!(
@@ -1973,14 +1962,6 @@ fn offer_take_and_resume_refuse_another_nexus() {
             )),
             "{kept}"
         );
-        refused(
-            resume(&flag, &nexus_node_on(other, 10, true)),
-            other,
-            genesis,
-        );
-        // Past the genesis, the next check is the node's past state.
-        let next = resume(&flag, &nexus_node_on(genesis, 10, false));
-        assert!(next.contains("--state all"), "{next}");
     }
 }
 
@@ -2305,9 +2286,7 @@ fn each_chain_is_public_or_your_own_independently() {
 }
 
 /// A public Nexus node is refused for a new swap unless it takes submits;
-/// your own node's RPC is not asked. A resumed swap goes on through one
-/// that takes none, as its Bitcoin side needs no Nexus submit, and is still
-/// refused a node on another Nexus or one keeping no past state.
+/// your own node's RPC is not asked.
 #[test]
 fn a_public_nexus_node_must_take_submits() {
     let check = |accepts: bool, cookie: Option<PathBuf>| {
@@ -2322,21 +2301,41 @@ fn a_public_nexus_node_must_take_submits() {
     assert!(refused.contains("takes no transactions"), "{refused}");
     let cookie = tempfile::NamedTempFile::new().unwrap();
     assert_eq!(check(false, Some(cookie.path().into())), Ok(()));
+}
 
-    let resumed = |genesis: &str, keeps_state: bool| {
-        let mut nodes = offer_args(&[]).nodes;
-        nodes.nexus_url = nexus_node_submitting(genesis, 10, keeps_state, 1, false);
-        nodes.nexus_cookie = None;
-        let client = nodes.nexus().unwrap();
-        nodes
-            .check_resumed_nexus(&client)
-            .map_err(|e| e.to_string())
-    };
-    assert_eq!(resumed(MAINNET, true), Ok(()));
+/// A resumed swap is never refused for its Nexus node, as its Bitcoin side
+/// must go on: the driver's check, through a public node that takes no
+/// transactions, fails while the node is down, on another Nexus, or keeps
+/// no past state, each time asked, and passes once the node does, never to
+/// read it again.
+#[test]
+fn a_resumed_swap_reads_nexus_only_once_its_node_passes() {
+    let mut nodes = offer_args(&[]).nodes;
+    nodes.nexus_url = nexus_node_submitting(MAINNET, 10, true, 1, false);
+    nodes.nexus_cookie = None;
+    let good = nodes.nexus().unwrap();
+    let down = Client::public("http://127.0.0.1:9", TIMEOUT);
     let other = swap_nexus_tx::cid(b"other");
-    assert!(resumed(&other, true).is_err(), "another Nexus");
-    let refused = resumed(MAINNET, false).unwrap_err();
-    assert!(refused.contains("--state all"), "{refused}");
+    let elsewhere = Client::public(&nexus_node_submitting(&other, 10, true, 1, false), TIMEOUT);
+    let forgetful = Client::public(
+        &nexus_node_submitting(MAINNET, 10, false, 1, false),
+        TIMEOUT,
+    );
+    // Made through a node that is down: the check is the driver's.
+    let mut check = nodes.resumed_check(&down);
+    for _ in 0..2 {
+        let failed = check(&down).unwrap_err();
+        assert!(failed.contains("127.0.0.1:9"), "{failed}");
+        let failed = check(&elsewhere).unwrap_err();
+        assert!(
+            failed.contains(&format!("genesis {other}, not {MAINNET}")),
+            "{failed}"
+        );
+        let failed = check(&forgetful).unwrap_err();
+        assert!(failed.contains("--state all"), "{failed}");
+    }
+    assert_eq!(check(&good), Ok(()));
+    assert_eq!(check(&down), Ok(()), "passed once, not read again");
 }
 
 /// `wallet --withdraw` is refused while a swap in the directory has not

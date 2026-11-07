@@ -37,7 +37,7 @@ use serde_json::{json, Value};
 use swap_nexus_tx::rpc::Client;
 
 use crate::bitcoind::Bitcoin;
-use crate::driver::{bitcoin_view, Driver, Store};
+use crate::driver::{bitcoin_view, Driver, NexusCheck, Store};
 use crate::esplora::Esplora;
 use crate::offer::{self, check_offer, Offer, Place, Policy};
 use crate::session::{self, check_nex_address, Result, Session, SessionFile, TIMEOUT};
@@ -690,8 +690,9 @@ pub struct Buy {
     cancelled: AtomicBool,
     /// Why the offer could not be taken, once it cannot.
     gone: Mutex<Option<String>>,
-    /// The last failure, if any.
-    warning: Mutex<Option<String>>,
+    /// The last failure, if any; once the driver runs a resumed swap, why
+    /// its Nexus node will not do, as its `nexus_check` last found.
+    warning: Arc<Mutex<Option<String>>>,
 }
 
 impl Buy {
@@ -701,7 +702,7 @@ impl Buy {
             record: Mutex::new(record),
             cancelled: AtomicBool::new(false),
             gone: Mutex::new(None),
-            warning: Mutex::new(None),
+            warning: Arc::default(),
         }
     }
 
@@ -776,20 +777,17 @@ impl Buy {
                     .into());
                 }
                 let nexus = wallet.nexus()?;
-                if buyer.resumed().outcome().is_none() {
-                    wallet.esplora().check_network(wallet.config.network)?;
-                    // A taken swap's cancel, refund and the rest are
-                    // Bitcoin's, and go on through a node that takes no
-                    // transactions: its Nexus submits fail, and say so.
-                    if let Some(why) = wallet.takes_no_transactions(&nexus)? {
-                        *self.warning.lock().unwrap() = Some(format!(
-                            "{why}: the swap's Bitcoin side goes on, its Nexus submits fail"
-                        ));
+                let check = match buyer.resumed().outcome() {
+                    None => {
+                        wallet.esplora().check_network(wallet.config.network)?;
+                        Some(self.resumed_check())
                     }
-                    wallet.check_nexus_chain(&nexus)?;
-                }
+                    Some(_) => None,
+                };
                 let store = wallet.store(&record.swap_id)?;
-                break session::resume::<Buyer, _>(wallet.esplora(), nexus, store)?;
+                let mut driver = session::resume::<Buyer, _>(wallet.esplora(), nexus, store)?;
+                driver.nexus_check = check;
+                break driver;
             }
             match self.take() {
                 Ok(Some(driver)) => break driver,
@@ -807,7 +805,41 @@ impl Buy {
         // As the browser funds and prices its own spends: the Esplora's
         // estimate, else the relay floor.
         driver.fallback_fee_rate = FeeRate::from_sat_per_vb_u32(1);
-        Ok(driver.run_until(|_| stop())?)
+        let outcome = driver.run_until(|_| stop())?;
+        if outcome.is_some() {
+            *self.warning.lock().unwrap() = None;
+        }
+        Ok(outcome)
+    }
+
+    /// The driver's `nexus_check` for a taken swap resumed, as the CLI's
+    /// `resume` and the browser's `#checkNexus` check its node, but never
+    /// refusing it: the swap's cancel, refund and the rest are Bitcoin's,
+    /// and go on whatever the node does. Nexus is read only once the node
+    /// passes; until then the status's warning says why, and while a public
+    /// node takes no transactions, that the swap's Nexus submits fail.
+    fn resumed_check(&self) -> NexusCheck {
+        let wallet = self.wallet.clone();
+        let warning = self.warning.clone();
+        let checked = wallet.clone();
+        let mut chain = session::check_once(move |nexus| checked.check_nexus_chain(nexus));
+        Box::new(move |nexus| {
+            let gated = chain(nexus);
+            let unread = gated
+                .as_ref()
+                .err()
+                .map(|e| format!("nexus: {e}: Nexus is not read until it passes; Bitcoin goes on"));
+            let no_submits = wallet
+                .takes_no_transactions(nexus)
+                .ok()
+                .flatten()
+                .map(|why| {
+                    format!("{why}: the swap's Bitcoin side goes on, its Nexus submits fail")
+                });
+            let why: Vec<String> = unread.into_iter().chain(no_submits).collect();
+            *warning.lock().unwrap() = (!why.is_empty()).then(|| why.join("; "));
+            gated
+        })
     }
 
     /// Takes the offer once the wallet's spendable balance pays for the

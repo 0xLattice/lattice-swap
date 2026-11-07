@@ -101,9 +101,9 @@ By default a party needs no node of its own. Bitcoin is read through
 mempool.space's Esplora for `--btc-network` (`https://mempool.space/api`,
 `/signet/api`, `/testnet/api`, `/testnet4/api`; regtest has none), and Nexus
 through the public read node `https://lattice-mainnet-read.fly.dev`, with no
-cookie; `offer`, `take` and `resume` refuse a public Nexus node whose
-`GET /api/chain/info` does not say `acceptsSubmit`, and an Esplora whose
-block 0 is not `--btc-network`'s genesis. Each chain can be your own
+cookie; `offer` and `take` refuse a public Nexus node whose
+`GET /api/chain/info` does not say `acceptsSubmit`, and `offer`, `take` and
+`resume` an Esplora whose block 0 is not `--btc-network`'s genesis. Each chain can be your own
 instead, on its own: `--esplora <url>` for your Esplora or mempool instance,
 or `--btc-wallet` with `--btc-cookie` or `--btc-user` (and `--btc-url`) for
 your bitcoind, not both; `--nexus-url` for another node, and with
@@ -160,7 +160,12 @@ Bitcoin as the OP_RETURN of transaction
 offer's terms also name the seller's genesis, and the buyer refuses one
 other than its own, but each side's protection is its own node's check. The
 swap file keeps that genesis: `resume` refuses a `--nexus-genesis` naming
-another. A private chain
+another. `resume` never refuses the lattice-node itself, as a swap's
+cancel, refund, redeem and punish are Bitcoin's and must not wait on it: it
+goes on from Bitcoin at once, and reads Nexus only once the node passes the
+checks above, asked again at every read and warned of until it does. A
+public node that takes no transactions is warned of too: the swap's Nexus
+submits fail through it. A private chain
 forked from mainnet's genesis passes it: it shares mainnet's identity, so
 trade only through a node that follows the public network, and never use a
 mainnet key on a private or dev chain, where a transfer it signs is valid on

@@ -147,6 +147,10 @@ impl Store {
 /// [`Driver::reconnect`].
 pub type Reconnect<T> = Box<dyn FnMut(&Rejoin) -> Option<io::Result<T>> + Send>;
 
+/// Why the Nexus node will not do yet, if it will not: see
+/// [`Driver::nexus_check`].
+pub type NexusCheck = Box<dyn FnMut(&Client) -> Result<(), String> + Send>;
+
 /// Feeds a machine what its nodes and its counterparty show, and does what
 /// it asks. The state is saved after every step that changes it, before
 /// any of the step's actions, so nothing is sent, broadcast or submitted
@@ -191,6 +195,13 @@ pub struct Driver<M, B, T> {
     /// [`Machine::resend`]; a failed attempt is logged, as the views' are.
     /// See [`crate::transport::in_background`].
     pub reconnect: Option<Reconnect<T>>,
+    /// Asked of the Nexus node at every read of the chains, after Bitcoin's,
+    /// while set: a swap resumed reads Nexus only while its node passes, so
+    /// nothing is concluded from a node on another Nexus, or one that keeps
+    /// no past state, and a node that fails a moment fails no Bitcoin spend.
+    /// A failure skips the round's Nexus view, and is warned of as a failing
+    /// view is; the round that passes again says so.
+    pub nexus_check: Option<NexusCheck>,
     store: Store,
     /// The least time between two reads of the chains. Messages are taken
     /// as they come in between: however many the counterparty sends, the
@@ -244,6 +255,8 @@ pub struct Driver<M, B, T> {
     submit_failed: Option<(String, SystemTime)>,
     /// The last failed attempt to rejoin, and when it was logged.
     rejoin_failed: Option<(String, SystemTime)>,
+    /// The last failure of `nexus_check`, and when it was logged.
+    check_failed: Option<(String, SystemTime)>,
     /// The tip, and when this driver first saw it, in seconds since the
     /// Unix epoch. Kept in memory only: after a restart, the tip is first
     /// seen then.
@@ -310,6 +323,7 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
             nexus,
             transport,
             reconnect: None,
+            nexus_check: None,
             store,
             poll: Duration::from_millis(250),
             message_timeout: Duration::from_secs(60),
@@ -325,6 +339,7 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
             stale_since: None,
             submit_failed: None,
             rejoin_failed: None,
+            check_failed: None,
             first_seen: None,
             punish_child: None,
             _lock: lock,
@@ -640,6 +655,21 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
     }
 
     fn observe_nexus(&mut self) -> io::Result<()> {
+        if let Some(check) = &mut self.nexus_check {
+            match check(&self.nexus) {
+                Ok(()) => {
+                    if self.check_failed.take().is_some() {
+                        warn("nexus: the node passes its check: Nexus is read again");
+                    }
+                }
+                Err(e) => {
+                    let e =
+                        format!("nexus: {e}: Nexus is not read until it passes; Bitcoin goes on");
+                    warn_again(&mut self.check_failed, e, (self.clock)());
+                    return Ok(());
+                }
+            }
+        }
         let Some(watch) = self.state.watch().nexus else {
             return Ok(());
         };

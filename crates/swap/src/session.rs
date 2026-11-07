@@ -16,7 +16,7 @@ use swap_nexus_tx::rpc::parse::NodeRefusal;
 use swap_nexus_tx::rpc::{self, Client};
 
 use crate::bitcoind::Bitcoin;
-use crate::driver::{Driver, Reconnect, Store};
+use crate::driver::{Driver, NexusCheck, Reconnect, Store};
 use crate::offer::{check_offer, Offer, Place, Policy};
 use crate::transport::{Ivy, Relayed, Transport};
 use crate::{Action, Buyer, Machine, Message, Seller, Terms};
@@ -291,6 +291,19 @@ pub fn check_nexus(
         }),
     };
     Ok(check_node(genesis, &chain_info, height, past_state))
+}
+
+/// A [`Driver::nexus_check`] for a swap resumed: asks `check`, such as
+/// [`check_nexus`] made an error, until it passes once, and nothing after.
+pub fn check_once(mut check: impl FnMut(&Client) -> Result<()> + Send + 'static) -> NexusCheck {
+    let mut passed = false;
+    Box::new(move |client| {
+        if !passed {
+            check(client).map_err(|e| e.to_string())?;
+            passed = true;
+        }
+        Ok(())
+    })
 }
 
 /// A Nexus address as Lattice prints one: a CIDv1, dag-cbor, sha2-256, in

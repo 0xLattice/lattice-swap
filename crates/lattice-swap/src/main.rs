@@ -28,7 +28,7 @@ use rand_core::{OsRng, RngCore};
 use serde_json::json;
 use swap::app::{self, Wallet};
 use swap::bitcoind::{Bitcoin, Bitcoind, Tip};
-use swap::driver::{Driver, Store};
+use swap::driver::{Driver, NexusCheck, Store};
 use swap::esplora::Esplora;
 use swap::offer::{self, check_offer, Answer, Bounds, Offer, Place, Policy, Quote, Template};
 use swap::session::{
@@ -327,17 +327,23 @@ impl NodeArgs {
         self.check_nexus_chain(client)
     }
 
-    /// As [`NodeArgs::check_nexus`], for a swap resumed: a public node that
-    /// takes no transactions is warned of, not refused. A taken swap's
-    /// cancel, refund, redeem and punish are Bitcoin's, and go on; its
-    /// Nexus submits fail, and the driver warns of each.
-    fn check_resumed_nexus(&self, client: &Client) -> Result<()> {
-        if let Some(why) = self.takes_no_transactions(client)? {
-            log(&format!(
+    /// As [`NodeArgs::check_nexus`], for a swap resumed, which it never
+    /// refuses: a taken swap's cancel, refund, redeem and punish are
+    /// Bitcoin's, and a node that fails, even for a moment, must not stop
+    /// them. A public node that takes no transactions is warned of, its
+    /// Nexus submits failing; the rest is the driver's
+    /// [`nexus_check`](swap::driver::Driver::nexus_check), asked at every
+    /// read until the node passes, Nexus unread till then.
+    fn resumed_check(&self, client: &Client) -> NexusCheck {
+        match self.takes_no_transactions(client) {
+            Ok(Some(why)) => log(&format!(
                 "{why}: the swap's Bitcoin side goes on, its Nexus submits fail"
-            ));
+            )),
+            Ok(None) => {}
+            Err(e) => log(&format!("nexus: {e}")),
         }
-        self.check_nexus_chain(client)
+        let genesis = self.nexus_genesis.clone();
+        swap::session::check_once(move |client| check_nexus_chain(client, &genesis))
     }
 
     /// Why a public node takes no transactions, if it takes none.
@@ -349,20 +355,27 @@ impl NodeArgs {
     /// Refuses a Nexus node on another Nexus than `--nexus-genesis` names,
     /// or one that cannot say how deep a transaction is.
     fn check_nexus_chain(&self, client: &Client) -> Result<()> {
-        use swap_nexus_tx::rpc::parse::NodeRefusal;
-        swap::session::check_nexus(client, &self.nexus_genesis)?.map_err(|refusal| {
-            match refusal {
-                NodeRefusal::OtherNexus { .. } => {
-                    format!("{refusal}, the one --nexus-genesis names")
-                }
-                NodeRefusal::NoPastState => {
-                    format!("{refusal}: run it with --state all and --block-bodies all")
-                }
-                NodeRefusal::Malformed(_) => refusal.to_string(),
-            }
-            .into()
-        })
+        check_nexus_chain(client, &self.nexus_genesis)
     }
+}
+
+/// Refuses a Nexus node on another Nexus than `genesis`, the one
+/// `--nexus-genesis` names, or one that cannot say how deep a transaction
+/// is.
+fn check_nexus_chain(client: &Client, genesis: &str) -> Result<()> {
+    use swap_nexus_tx::rpc::parse::NodeRefusal;
+    swap::session::check_nexus(client, genesis)?.map_err(|refusal| {
+        match refusal {
+            NodeRefusal::OtherNexus { .. } => {
+                format!("{refusal}, the one --nexus-genesis names")
+            }
+            NodeRefusal::NoPastState => {
+                format!("{refusal}: run it with --state all and --block-bodies all")
+            }
+            NodeRefusal::Malformed(_) => refusal.to_string(),
+        }
+        .into()
+    })
 }
 
 /// The Esplora at `given`, else mempool.space's for `network`.
@@ -1071,15 +1084,16 @@ fn resume(args: SwapFileArgs) -> Result<Outcome> {
             let key = seller_key(seller.nex_address(), seller.signs_nex(), given)?;
             let bitcoin = resume_bitcoin(&args.nodes, dir, seller.redeem_payout())?;
             let nexus = args.nodes.nexus()?;
-            if seller.outcome().is_none() {
-                args.nodes.check_resumed_nexus(&nexus)?;
+            let check = seller.outcome().is_none().then(|| {
                 args.nodes.trust(SELLER_TRUSTS);
-            }
+                args.nodes.resumed_check(&nexus)
+            });
             let driver = swap::session::resume::<Seller, _>(bitcoin, nexus, store);
             run(
                 &swap_file,
                 driver.map(|mut driver| {
                     driver.nex_key = key;
+                    driver.nexus_check = check;
                     driver
                 }),
                 &args.bump,
@@ -1091,11 +1105,15 @@ fn resume(args: SwapFileArgs) -> Result<Outcome> {
             let buyer = buyer.resumed();
             let bitcoin = resume_bitcoin(&args.nodes, dir, buyer.refund_payout())?;
             let nexus = args.nodes.nexus()?;
-            if buyer.outcome().is_none() {
-                args.nodes.check_resumed_nexus(&nexus)?;
+            let check = buyer.outcome().is_none().then(|| {
                 args.nodes.trust(BUYER_TRUSTS);
-            }
+                args.nodes.resumed_check(&nexus)
+            });
             let driver = swap::session::resume::<Buyer, _>(bitcoin, nexus, store);
+            let driver = driver.map(|mut driver| {
+                driver.nexus_check = check;
+                driver
+            });
             run(&swap_file, driver, &args.bump, args.nodes.poll())
         }
     }
