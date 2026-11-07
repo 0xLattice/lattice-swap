@@ -785,6 +785,7 @@ impl Buy {
                 let store = wallet.store(&record.swap_id)?;
                 let mut driver = session::resume::<Buyer, _>(wallet.esplora(), nexus, store)?;
                 driver.nexus_check = check;
+                driver.nexus_genesis = Some(genesis.clone());
                 break driver;
             }
             match self.take() {
@@ -814,26 +815,27 @@ impl Buy {
     /// `resume` and the browser's `#checkNexus` check its node, but never
     /// refusing it: the swap's cancel, refund and the rest are Bitcoin's,
     /// and go on whatever the node does. Nexus is read only once the node
-    /// passes; until then the status's warning says why, and while a public
-    /// node takes no transactions, that the swap's Nexus submits fail.
+    /// passes; until then the status's warning says why, and if a public
+    /// node takes no transactions, asked until it answers once, that the
+    /// swap's Nexus submits fail.
     fn resumed_check(&self) -> NexusCheck {
         let wallet = self.wallet.clone();
         let warning = self.warning.clone();
         let checked = wallet.clone();
         let mut chain = session::check_once(move |nexus| checked.check_nexus_chain(nexus));
+        let mut takes_none = None;
         Box::new(move |nexus| {
             let gated = chain(nexus);
             let unread = gated
                 .as_ref()
                 .err()
                 .map(|e| format!("nexus: {e}: Nexus is not read until it passes; Bitcoin goes on"));
-            let no_submits = wallet
-                .takes_no_transactions(nexus)
-                .ok()
-                .flatten()
-                .map(|why| {
-                    format!("{why}: the swap's Bitcoin side goes on, its Nexus submits fail")
-                });
+            if takes_none.is_none() {
+                takes_none = wallet.takes_no_transactions(nexus).ok();
+            }
+            let no_submits = takes_none.clone().flatten().map(|why| {
+                format!("{why}: the swap's Bitcoin side goes on, its Nexus submits fail")
+            });
             let why: Vec<String> = unread.into_iter().chain(no_submits).collect();
             *warning.lock().unwrap() = (!why.is_empty()).then(|| why.join("; "));
             gated

@@ -1,0 +1,7 @@
+/private/tmp/claude-501/-Users-josephbao-src-lattice-node/767dd8cd-a7f8-40ec-be28-a16b86516cfc/scratchpad/lattice-swap/target-wasm/debug/deps/secp256kfun_arithmetic_macros-4e56ba903eb28c19.d: /Users/josephbao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/secp256kfun_arithmetic_macros-0.2.0/src/lib.rs /Users/josephbao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/secp256kfun_arithmetic_macros-0.2.0/src/optree.rs /Users/josephbao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/secp256kfun_arithmetic_macros-0.2.0/src/../README.md
+
+/private/tmp/claude-501/-Users-josephbao-src-lattice-node/767dd8cd-a7f8-40ec-be28-a16b86516cfc/scratchpad/lattice-swap/target-wasm/debug/deps/libsecp256kfun_arithmetic_macros-4e56ba903eb28c19.dylib: /Users/josephbao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/secp256kfun_arithmetic_macros-0.2.0/src/lib.rs /Users/josephbao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/secp256kfun_arithmetic_macros-0.2.0/src/optree.rs /Users/josephbao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/secp256kfun_arithmetic_macros-0.2.0/src/../README.md
+
+/Users/josephbao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/secp256kfun_arithmetic_macros-0.2.0/src/lib.rs:
+/Users/josephbao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/secp256kfun_arithmetic_macros-0.2.0/src/optree.rs:
+/Users/josephbao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/secp256kfun_arithmetic_macros-0.2.0/src/../README.md:

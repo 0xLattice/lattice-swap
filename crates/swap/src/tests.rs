@@ -5421,8 +5421,8 @@ fn resumed_check(nexus: Option<Client>) -> crate::driver::NexusCheck {
 }
 
 /// A resumed buyer refunds while its Nexus node fails the check, for a
-/// moment or for good: the driver reads Bitcoin and acts on it first, and
-/// warns why it reads no Nexus.
+/// moment or for good: the driver reads Bitcoin and acts on it first.
+/// Refunding, it watches no Nexus, so the node is not checked at all.
 #[cfg(feature = "native")]
 #[test]
 fn a_resumed_buyer_refunds_while_its_nexus_node_fails_its_check() {
@@ -5430,11 +5430,7 @@ fn a_resumed_buyer_refunds_while_its_nexus_node_fails_its_check() {
     let (swap, lock) = locked.swap();
     let refund = swap.unsigned_tx(lock, Spend::Refund).compute_txid();
     let buyer = watching_nex_lock(&locked);
-    for (failing, why) in [
-        (NexusNode::Down, "503"),
-        (NexusNode::Forgetful, "keeps no state of past blocks"),
-        (NexusNode::Elsewhere, "follows the chain of genesis"),
-    ] {
+    for failing in [NexusNode::Down, NexusNode::Forgetful, NexusNode::Elsewhere] {
         let url = nexus_node(Arc::new(Mutex::new(failing)));
         let nexus = Client::new(&url, "", Duration::from_secs(5));
         let node = pooled(&locked, &[], 50);
@@ -5452,12 +5448,10 @@ fn a_resumed_buyer_refunds_while_its_nexus_node_fails_its_check() {
             .map(|tx| tx.compute_txid())
             .collect();
         assert!(pooled.contains(&refund), "{failing:?}: no refund");
-        let warned = crate::driver::WARNINGS.with(|w| w.borrow().clone());
-        assert!(
-            warned
-                .iter()
-                .any(|w| w.contains(why) && w.contains("Nexus is not read until it passes")),
-            "{failing:?}: {warned:?}"
+        assert_eq!(
+            warnings("nexus"),
+            0,
+            "{failing:?}: checked, watching no Nexus"
         );
     }
 }
@@ -5556,18 +5550,79 @@ fn a_resumed_swap_reads_nexus_only_once_its_node_passes() {
     assert!(stopped.unwrap().is_none());
     assert!(driver.state().views > 0, "read once the node passes");
     assert_eq!(warnings("passes its check"), 1);
+
+    // Passed, it is not checked again; but every view names its genesis,
+    // and a node gone over to another Nexus is not read.
+    driver.nexus_genesis = Some(swap_nexus_tx::MAINNET_GENESIS.into());
+    *mode.lock().unwrap() = NexusNode::Elsewhere;
+    clear_warnings();
+    let views = driver.state().views;
+    let rounds = std::cell::Cell::new(0);
+    let stopped = driver.run_until(|_| {
+        rounds.set(rounds.get() + 1);
+        rounds.get() > 20
+    });
+    assert!(stopped.unwrap().is_none());
+    assert_eq!(driver.state().views, views, "not read on another Nexus");
+    assert_eq!(warnings("follows the chain of genesis"), 1, "warned once");
+    *mode.lock().unwrap() = NexusNode::Good;
+    let start = std::time::Instant::now();
+    let stopped =
+        driver.run_until(|state| state.views > views || start.elapsed() > Duration::from_secs(10));
+    assert!(stopped.unwrap().is_none());
+    assert!(driver.state().views > views, "read again on its own Nexus");
+    assert_eq!(warnings("passes its check"), 1);
+}
+
+/// A Nexus node that takes requests and never answers delays a round by
+/// the driver's Nexus budget, not by its client's timeout per request.
+#[cfg(feature = "native")]
+#[test]
+fn a_silent_nexus_node_delays_a_round_by_the_budget_at_most() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        let held: Vec<_> = listener.incoming().collect();
+        drop(held);
+    });
+    let locked = locked();
+    let node = pooled(&locked, &[], 50);
+    node.0.borrow_mut().height = 105;
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::new(directory.path(), terms().swap_id);
+    let machine = NexusCounting {
+        watcher: watching_nex_lock(&locked),
+        views: 0,
+    };
+    let client = Client::new(&url, "", Duration::from_secs(30));
+    let mut driver =
+        Driver::<_, _, Offline>::start(machine, vec![], node, client, None, store).unwrap();
+    driver.poll = Duration::from_millis(1);
+    driver.nexus_budget = Duration::from_millis(200);
+    let rounds = std::cell::Cell::new(0);
+    let start = std::time::Instant::now();
+    let stopped = driver.run_until(|_| {
+        rounds.set(rounds.get() + 1);
+        rounds.get() > 3
+    });
+    assert!(stopped.unwrap().is_none());
+    let took = start.elapsed();
+    assert!(took < Duration::from_secs(3), "3 rounds took {took:?}");
+    assert_eq!(driver.state().views, 0);
 }
 
 /// A resumed swap on its refund path is never refused for its Nexus node:
 /// refunding is Bitcoin's, and it refunds through one that takes no
-/// transactions, is down, keeps no past state or follows another Nexus,
-/// its status warning why. The warning clears once the node does.
+/// transactions, is down, keeps no past state or follows another Nexus.
+/// Refunding, it watches no Nexus: the node is not asked, and nothing is
+/// warned. A resumed swap that watches Nexus is not refused either: its
+/// status warns why Nexus is not read, and clears once the node passes.
 #[cfg(feature = "native")]
 #[test]
 fn a_resumed_refund_goes_on_whatever_its_nexus_node_does() {
     use bitcoin::consensus::encode::serialize_hex;
     let (_, buyer, _) = locked().nex_locked();
-    let (cancelling, actions) = buyer.step(btc(20, None, None));
+    let (cancelling, actions) = buyer.clone().step(btc(20, None, None));
     assert!(matches!(cancelling, Buyer::Cancelling { .. }));
     let [cancel] = &broadcasts(&actions)[..] else {
         panic!("cancel");
@@ -5575,15 +5630,23 @@ fn a_resumed_refund_goes_on_whatever_its_nexus_node_does() {
     let state = serde_json::to_value(&cancelling).unwrap();
     let funding = state["Cancelling"]["locked"]["funding"].as_str().unwrap();
     let funding: Transaction = bitcoin::consensus::encode::deserialize_hex(funding).unwrap();
-    // The funding in block 101, cancel in 129, the tip at 131.
-    let mined: std::collections::HashMap<String, (String, u32)> = [(&funding, 101), (cancel, 129)]
-        .into_iter()
-        .map(|(tx, height)| (tx.compute_txid().to_string(), (serialize_hex(tx), height)))
-        .collect();
+    // The funding in block 101, cancel in 129, the tip at 131; or, before
+    // anything is due, only the funding, the tip at 105.
+    let chain = |mined: &[(&Transaction, u32)], tip: u32| {
+        let mined: std::collections::HashMap<String, (String, u32)> = (mined.iter())
+            .map(|(tx, height)| (tx.compute_txid().to_string(), (serialize_hex(*tx), *height)))
+            .collect();
+        (mined, tip)
+    };
+    let refunding = chain(&[(&funding, 101), (cancel, 129)], 131);
+    let waiting = chain(&[(&funding, 101)], 105);
+    let at = Arc::new(Mutex::new(refunding.clone()));
+    let read = at.clone();
     let posted = Arc::new(Mutex::new(Vec::<String>::new()));
     let posts = posted.clone();
-    let tip = format!("{:064x}", 131);
     let esplora = serve(move |method, path, body| {
+        let (mined, height) = read.lock().unwrap().clone();
+        let tip = format!("{height:064x}");
         let ok = |answer: String| (200, answer);
         let now = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -5601,9 +5664,9 @@ fn a_resumed_refund_goes_on_whatever_its_nexus_node_does() {
                 .block_hash()
                 .to_string()),
             (_, "/blocks/tip/hash", _) => ok(tip.clone()),
-            (_, "/blocks/tip/height", _) => ok("131".into()),
+            (_, "/blocks/tip/height", _) => ok(height.to_string()),
             (_, "/fee-estimates", _) => ok("{}".into()),
-            _ if path == format!("/block/{tip}") => ok(json!({"height": 131, "timestamp": now}).to_string()),
+            _ if path == format!("/block/{tip}") => ok(json!({"height": height, "timestamp": now}).to_string()),
             _ if path.ends_with("/utxo") => ok("[]".into()),
             (_, _, Some([_, "outspend", _])) => ok(json!({"spent": false}).to_string()),
             (_, _, Some([txid, rest @ ..])) => match (mined.get(*txid), rest) {
@@ -5628,16 +5691,9 @@ fn a_resumed_refund_goes_on_whatever_its_nexus_node_does() {
                 .any(|input| input.previous_output == cancel_output)
         })
     };
-    for (failing, why) in [
-        (NexusNode::NoSubmits, "takes no transactions"),
-        (NexusNode::Down, "503"),
-        (NexusNode::Forgetful, "keeps no state of past blocks"),
-        (NexusNode::Elsewhere, "follows the chain of genesis"),
-    ] {
-        *mode.lock().unwrap() = failing;
-        posted.lock().unwrap().clear();
+    let resumed = |state: &Buyer| {
         let key = wallet::Key::new("regtest").unwrap();
-        let file = recovery(&key.wif, vec![recorded(1, &cancelling, &[], true)]);
+        let file = recovery(&key.wif, vec![recorded(1, state, &[], true)]);
         let dir = tempfile::tempdir().unwrap();
         let mut config = app_config(dir.path());
         config.esplora = esplora.clone();
@@ -5645,22 +5701,44 @@ fn a_resumed_refund_goes_on_whatever_its_nexus_node_does() {
         config.nexus_cookie = None;
         config.poll = Duration::from_millis(20);
         let wallet = app::Wallet::restore(config, &file).unwrap();
-        let buy = wallet.resume(&hex::encode([1; 32])).unwrap();
+        (wallet.resume(&hex::encode([1; 32])).unwrap(), dir)
+    };
+    let warning = |buy: &app::Buy| buy.status().unwrap()["warning"].clone();
+    for (failing, why) in [
+        (NexusNode::NoSubmits, "takes no transactions"),
+        (NexusNode::Down, "503"),
+        (NexusNode::Forgetful, "keeps no state of past blocks"),
+        (NexusNode::Elsewhere, "follows the chain of genesis"),
+    ] {
+        *mode.lock().unwrap() = failing;
+        *at.lock().unwrap() = refunding.clone();
+        posted.lock().unwrap().clear();
+        let (buy, _dir) = resumed(&cancelling);
         let start = std::time::Instant::now();
         let stopped = buy.run(|| refunded() || start.elapsed() > Duration::from_secs(20));
         assert_eq!(stopped.map_err(|e| e.to_string()), Ok(None), "{failing:?}");
         assert!(refunded(), "{failing:?}: no refund broadcast");
-        let warning = buy.status().unwrap()["warning"].clone();
+        assert_eq!(
+            warning(&buy),
+            serde_json::Value::Null,
+            "{failing:?}: checked, watching no Nexus"
+        );
+
+        *at.lock().unwrap() = waiting.clone();
+        let (buy, _dir) = resumed(&buyer);
+        let start = std::time::Instant::now();
+        let stopped = buy.run(|| start.elapsed() > Duration::from_millis(300));
+        assert_eq!(stopped.map_err(|e| e.to_string()), Ok(None), "{failing:?}");
         assert!(
-            warning.as_str().is_some_and(|w| w.contains(why)),
-            "{failing:?}: {warning}"
+            warning(&buy).as_str().is_some_and(|w| w.contains(why)),
+            "{failing:?}: {}",
+            warning(&buy)
         );
         // The node comes good: the next run's first round clears it.
         *mode.lock().unwrap() = NexusNode::Good;
         let start = std::time::Instant::now();
         let stopped = buy.run(|| start.elapsed() > Duration::from_millis(300));
         assert_eq!(stopped.map_err(|e| e.to_string()), Ok(None), "{failing:?}");
-        let warning = buy.status().unwrap()["warning"].clone();
-        assert_eq!(warning, serde_json::Value::Null, "{failing:?}");
+        assert_eq!(warning(&buy), serde_json::Value::Null, "{failing:?}");
     }
 }

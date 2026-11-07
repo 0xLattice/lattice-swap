@@ -333,7 +333,8 @@ impl NodeArgs {
     /// them. A public node that takes no transactions is warned of, its
     /// Nexus submits failing; the rest is the driver's
     /// [`nexus_check`](swap::driver::Driver::nexus_check), asked at every
-    /// read until the node passes, Nexus unread till then.
+    /// read until the node passes, Nexus unread till then, and its genesis
+    /// compared on every view after.
     fn resumed_check(&self, client: &Client) -> NexusCheck {
         match self.takes_no_transactions(client) {
             Ok(Some(why)) => log(&format!(
@@ -1094,6 +1095,7 @@ fn resume(args: SwapFileArgs) -> Result<Outcome> {
                 driver.map(|mut driver| {
                     driver.nex_key = key;
                     driver.nexus_check = check;
+                    driver.nexus_genesis = Some(flag.clone());
                     driver
                 }),
                 &args.bump,
@@ -1112,6 +1114,7 @@ fn resume(args: SwapFileArgs) -> Result<Outcome> {
             let driver = swap::session::resume::<Buyer, _>(bitcoin, nexus, store);
             let driver = driver.map(|mut driver| {
                 driver.nexus_check = check;
+                driver.nexus_genesis = Some(flag.clone());
                 driver
             });
             run(&swap_file, driver, &args.bump, args.nodes.poll())

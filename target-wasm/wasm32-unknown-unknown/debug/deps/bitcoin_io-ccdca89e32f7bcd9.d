@@ -1,0 +1,8 @@
+/private/tmp/claude-501/-Users-josephbao-src-lattice-node/767dd8cd-a7f8-40ec-be28-a16b86516cfc/scratchpad/lattice-swap/target-wasm/wasm32-unknown-unknown/debug/deps/bitcoin_io-ccdca89e32f7bcd9.d: /Users/josephbao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitcoin-io-0.1.101/src/lib.rs /Users/josephbao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitcoin-io-0.1.101/src/error.rs /Users/josephbao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitcoin-io-0.1.101/src/macros.rs /Users/josephbao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitcoin-io-0.1.101/src/bridge.rs
+
+/private/tmp/claude-501/-Users-josephbao-src-lattice-node/767dd8cd-a7f8-40ec-be28-a16b86516cfc/scratchpad/lattice-swap/target-wasm/wasm32-unknown-unknown/debug/deps/libbitcoin_io-ccdca89e32f7bcd9.rmeta: /Users/josephbao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitcoin-io-0.1.101/src/lib.rs /Users/josephbao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitcoin-io-0.1.101/src/error.rs /Users/josephbao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitcoin-io-0.1.101/src/macros.rs /Users/josephbao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitcoin-io-0.1.101/src/bridge.rs
+
+/Users/josephbao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitcoin-io-0.1.101/src/lib.rs:
+/Users/josephbao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitcoin-io-0.1.101/src/error.rs:
+/Users/josephbao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitcoin-io-0.1.101/src/macros.rs:
+/Users/josephbao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitcoin-io-0.1.101/src/bridge.rs:
