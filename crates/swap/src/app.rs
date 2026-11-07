@@ -641,7 +641,7 @@ impl Wallet {
         if let Some(running) = self.running()? {
             return Err(format!("refused: swap {running} is running; one swap at a time").into());
         }
-        self.esplora().check_network(self.config.network)?;
+        self.esplora().check_network(self.config.network)??;
         let nexus = self.nexus();
         self.check_nexus(&nexus)?;
         self.check(&decoded, &parsed, &nexus)?;
@@ -749,9 +749,10 @@ impl Buy {
     /// Runs the swap until it ends, its offer is gone, it is cancelled, or
     /// `stop` holds: the outcome, once it ends. Until it has taken its
     /// offer, it waits for the wallet to fund the lock, a round each
-    /// `poll`, a failed round its [`Buy::status`]'s warning. Then the
-    /// driver runs it, and an error that stops the driver is returned: run
-    /// it again, as the CLI's `resume`.
+    /// `poll`, a failed round its [`Buy::status`]'s warning. A taken swap
+    /// waits so for an Esplora that cannot answer yet, and is refused on
+    /// one on another chain. Then the driver runs it, and an error that
+    /// stops the driver is returned: run it again, as the CLI's `resume`.
     pub fn run(&self, stop: impl Fn() -> bool) -> Result<Option<Outcome>> {
         let wallet = &self.wallet;
         let mut driver = loop {
@@ -774,24 +775,37 @@ impl Buy {
                     )
                     .into());
                 }
-                let nexus = wallet.nexus();
-                let check = match buyer.resumed().outcome() {
-                    None => {
-                        wallet.esplora().check_network(wallet.config.network)?;
-                        Some(self.resumed_check())
-                    }
-                    Some(_) => None,
+                let ended = buyer.resumed().outcome().is_some();
+                let checked = if ended {
+                    Ok(Ok(()))
+                } else {
+                    wallet.esplora().check_network(wallet.config.network)
                 };
-                let store = wallet.store(&record.swap_id)?;
-                let mut driver = session::resume::<Buyer, _>(wallet.esplora(), nexus, store)?;
-                driver.nexus_check = check;
-                driver.nexus_genesis = Some(genesis.clone());
-                break driver;
-            }
-            match self.take() {
-                Ok(Some(driver)) => break driver,
-                Ok(None) => {}
-                Err(e) => *self.warning.lock().unwrap() = Some(e.to_string()),
+                match checked {
+                    // As the CLI's `resume`: an Esplora that cannot answer
+                    // yet is asked again, a poll apart; one on another
+                    // chain is refused.
+                    Err(e) => {
+                        *self.warning.lock().unwrap() = Some(format!("bitcoin: {e}: asked again"))
+                    }
+                    Ok(checked) => {
+                        checked?;
+                        *self.warning.lock().unwrap() = None;
+                        let check = (!ended).then(|| self.resumed_check());
+                        let store = wallet.store(&record.swap_id)?;
+                        let mut driver =
+                            session::resume::<Buyer, _>(wallet.esplora(), wallet.nexus(), store)?;
+                        driver.nexus_check = check;
+                        driver.nexus_genesis = Some(genesis.clone());
+                        break driver;
+                    }
+                }
+            } else {
+                match self.take() {
+                    Ok(Some(driver)) => break driver,
+                    Ok(None) => {}
+                    Err(e) => *self.warning.lock().unwrap() = Some(e.to_string()),
+                }
             }
             let start = Instant::now();
             while start.elapsed() < wallet.config.poll && !stop() {

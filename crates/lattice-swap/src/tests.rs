@@ -988,6 +988,12 @@ fn bitcoind(result: Value) -> String {
 /// every address, but where `replies` names a method and the reply to it,
 /// and that answers every other call with `result`.
 fn node(replies: Value, result: Value) -> String {
+    node_down_for(0, replies, result)
+}
+
+/// [`node`], down for its first `down` calls: it answers them 503, with no
+/// body, as bitcoind does when its work queue is full.
+fn node_down_for(mut down: usize, replies: Value, result: Value) -> String {
     use std::io::BufRead;
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -1009,6 +1015,14 @@ fn node(replies: Value, result: Value) -> String {
             }
             let mut body = vec![0; length];
             reader.read_exact(&mut body).unwrap();
+            if down > 0 {
+                down -= 1;
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                continue;
+            }
             let request: Value = serde_json::from_slice(&body).unwrap();
             let method = request["method"].as_str().unwrap();
             let answer = match method {
@@ -1526,26 +1540,34 @@ fn a_missing_nexus_cookie_stops_only_a_new_swap() {
     assert!(refused.contains(absent), "{refused}");
 }
 
-/// A node without a synced txindex, older than Bitcoin Core 28, on
-/// another chain, in initial block download, or without a wallet that
-/// signs is refused by name.
+/// A node without a txindex, older than Bitcoin Core 28, on another
+/// chain, or without a wallet that signs is refused by name (`Ok(Err)`);
+/// one whose txindex is syncing, in initial block download, without the
+/// wallet loaded, or locked fails the check (`Err`), which may pass when
+/// asked again.
 #[test]
 fn a_node_a_swap_cannot_rely_on_is_refused() {
     let check_on = |network: Network, method: &str, result: Value| {
         let url = node(json!({ method: {"result": result} }), Value::Null);
         Bitcoind::new(&url, "u:p", network, TIMEOUT)
             .check_node()
+            .map(|checked| checked.map_err(|e| e.to_string()))
             .map_err(|e| e.to_string())
     };
     let check = |method: &str, result: Value| check_on(Network::Bitcoin, method, result);
     let synced = json!({"txindex": {"synced": true, "best_block_height": 7}});
-    assert_eq!(check("getindexinfo", synced), Ok(()));
-    assert_eq!(check("getnetworkinfo", json!({"version": 280_000})), Ok(()));
-    let refused = check("getindexinfo", json!({})).unwrap_err();
+    assert_eq!(check("getindexinfo", synced), Ok(Ok(())));
+    assert_eq!(
+        check("getnetworkinfo", json!({"version": 280_000})),
+        Ok(Ok(()))
+    );
+    let refused = check("getindexinfo", json!({})).unwrap().unwrap_err();
     assert!(refused.contains("-txindex"), "{refused}");
-    let refused = check("getindexinfo", json!({"txindex": {"synced": false}})).unwrap_err();
-    assert!(refused.contains("still syncing"), "{refused}");
-    let refused = check("getnetworkinfo", json!({"version": 270_000})).unwrap_err();
+    let failed = check("getindexinfo", json!({"txindex": {"synced": false}})).unwrap_err();
+    assert!(failed.contains("still syncing"), "{failed}");
+    let refused = check("getnetworkinfo", json!({"version": 270_000}))
+        .unwrap()
+        .unwrap_err();
     assert!(refused.contains("Bitcoin Core 28 or later"), "{refused}");
 
     let on = |chain: &str| json!({"chain": chain, "initialblockdownload": false});
@@ -1555,26 +1577,28 @@ fn a_node_a_swap_cannot_rely_on_is_refused() {
         (Network::Testnet4, "test"),
         (Network::Signet, "regtest"),
     ] {
-        let refused = check_on(network, "getblockchaininfo", on(chain)).unwrap_err();
+        let refused = check_on(network, "getblockchaininfo", on(chain))
+            .unwrap()
+            .unwrap_err();
         let expected = format!("on chain \"{chain}\", not {}", network.to_core_arg());
         assert!(refused.contains(&expected), "{refused}");
     }
     assert_eq!(
         check_on(Network::Signet, "getblockchaininfo", on("signet")),
-        Ok(())
+        Ok(Ok(()))
     );
     let downloading = json!({"chain": "main", "initialblockdownload": true});
-    let refused = check("getblockchaininfo", downloading).unwrap_err();
-    assert!(refused.contains("initial block download"), "{refused}");
+    let failed = check("getblockchaininfo", downloading).unwrap_err();
+    assert!(failed.contains("initial block download"), "{failed}");
 
     let watching = json!({"private_keys_enabled": false});
-    let refused = check("getwalletinfo", watching).unwrap_err();
+    let refused = check("getwalletinfo", watching).unwrap().unwrap_err();
     assert!(refused.contains("the wallet cannot sign"), "{refused}");
     let locked = json!({"private_keys_enabled": true, "unlocked_until": 0});
-    let refused = check("getwalletinfo", locked).unwrap_err();
-    assert!(refused.contains("the wallet is locked"), "{refused}");
+    let failed = check("getwalletinfo", locked).unwrap_err();
+    assert!(failed.contains("the wallet is locked"), "{failed}");
     let unlocked = json!({"private_keys_enabled": true, "unlocked_until": 1_900_000_000});
-    assert_eq!(check("getwalletinfo", unlocked), Ok(()));
+    assert_eq!(check("getwalletinfo", unlocked), Ok(Ok(())));
     let url = node(
         json!({"getwalletinfo": {"result": null, "error": {
             "code": -18,
@@ -2415,6 +2439,12 @@ fn a_swap_not_ended_is_found() {
 /// An Esplora whose block 0 is `network`'s genesis, and that has nothing
 /// else.
 fn esplora_of(network: Network) -> String {
+    esplora_down_for(0, network)
+}
+
+/// [`esplora_of`], down for its first `down` requests: it answers them
+/// 503.
+fn esplora_down_for(mut down: usize, network: Network) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let genesis = bitcoin::constants::genesis_block(network)
@@ -2425,7 +2455,10 @@ fn esplora_of(network: Network) -> String {
             let mut stream = stream.unwrap();
             let mut request = [0u8; 4096];
             let n = stream.read(&mut request).unwrap();
-            let (status, body) = if request[..n].starts_with(b"GET /block-height/0 ") {
+            let (status, body) = if down > 0 {
+                down -= 1;
+                ("503 Service Unavailable", "down")
+            } else if request[..n].starts_with(b"GET /block-height/0 ") {
                 ("200 OK", genesis.as_str())
             } else {
                 ("404 Not Found", "")
@@ -2490,6 +2523,70 @@ fn resume_on_an_esplora_takes_only_a_swap_paying_its_wallet() {
     };
     assert!(refused.contains("does not pay the wallet"), "{refused}");
     assert!(resume_bitcoin(&args.nodes, dir, Some(&paid)).is_ok());
+}
+
+/// A resumed swap's Bitcoin that cannot answer yet, down or erring for a
+/// moment, is asked again until it does; one that answers it is on another
+/// chain, or that the swap does not pay its wallet, is refused at once.
+#[test]
+fn resume_asks_a_failing_bitcoin_again_and_refuses_a_wrong_one() {
+    let retry = Duration::from_millis(10);
+    let (buyer, _) = Buyer::start(small(16), ScriptBuf::new(), "b".into()).unwrap();
+    let (directory, path) = swap_file(buyer);
+    let dir = directory.path();
+    let on_esplora = |url: &str| {
+        let args = ["lattice-swap", "resume", &path, "--esplora", url];
+        let cli = Cli::try_parse_from([&args[..], &["--btc-network", "regtest"]].concat());
+        let Command::Resume(args) = cli.unwrap().command else {
+            panic!("not resume")
+        };
+        args.nodes
+    };
+    let nodes = on_esplora(&esplora_down_for(2, Network::Regtest));
+    let wallet_pays = {
+        let bitcoin = nodes.open_bitcoin(dir).unwrap();
+        let Btc::Esplora(esplora, _) = &bitcoin else {
+            panic!("an Esplora")
+        };
+        esplora.key().script_pubkey.clone()
+    };
+    assert!(resume_bitcoin_every(&nodes, dir, Some(&wallet_pays), retry).is_ok());
+    let nodes = on_esplora(&esplora_of(Network::Signet));
+    let refused = match resume_bitcoin_every(&nodes, dir, Some(&wallet_pays), retry) {
+        Ok(_) => panic!("an Esplora on another chain was taken"),
+        Err(e) => e.to_string(),
+    };
+    assert!(refused.contains("not regtest's"), "{refused}");
+
+    let cookie = tempfile::NamedTempFile::new().unwrap();
+    fs::write(cookie.path(), "user:password").unwrap();
+    let on_bitcoind = |url: &str, network: &str| {
+        let cli = Cli::try_parse_from([
+            "lattice-swap",
+            "resume",
+            "f.json",
+            "--btc-url",
+            url,
+            "--btc-wallet",
+            "w",
+            "--btc-cookie",
+            cookie.path().to_str().unwrap(),
+            "--btc-network",
+            network,
+        ]);
+        let Command::Resume(args) = cli.unwrap().command else {
+            panic!("not resume")
+        };
+        args.nodes
+    };
+    let down = on_bitcoind(&node_down_for(2, Value::Null, Value::Null), "bitcoin");
+    assert!(resume_bitcoin_every(&down, dir, Some(&paid()), retry).is_ok());
+    let elsewhere = on_bitcoind(&node(Value::Null, Value::Null), "signet");
+    let refused = match resume_bitcoin_every(&elsewhere, dir, Some(&paid()), retry) {
+        Ok(_) => panic!("a bitcoind on another chain was taken"),
+        Err(e) => e.to_string(),
+    };
+    assert!(refused.contains("not signet"), "{refused}");
 }
 
 /// Resumed on a bitcoind, a swap that does not pay its wallet, as one

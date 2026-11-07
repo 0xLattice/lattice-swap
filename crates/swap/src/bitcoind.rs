@@ -102,38 +102,42 @@ impl Bitcoind {
         }
     }
 
-    /// Refuses a node a swap cannot rely on. Without a synced `-txindex`, a
-    /// confirmed transaction outside the wallet looks unseen, so a buyer
-    /// never cancels or refunds; before Bitcoin Core 28, version 3
-    /// transactions are nonstandard, so its cancel and refund are refused.
-    /// On another chain than this client's network, or still in initial
-    /// block download, the node never shows the swap's transactions; and a
-    /// wallet that cannot sign makes every fee bump fail.
-    pub fn check_node(&self) -> Result<()> {
+    /// Refuses (`Ok(Err)`) a node a swap cannot rely on. Without
+    /// `-txindex`, a confirmed transaction outside the wallet looks unseen,
+    /// so a buyer never cancels or refunds; before Bitcoin Core 28, version
+    /// 3 transactions are nonstandard, so its cancel and refund are
+    /// refused. On another chain than this client's network, the node
+    /// never shows the swap's transactions; and a wallet that cannot sign
+    /// makes every fee bump fail. A node that cannot tell yet fails
+    /// (`Err`): unreachable, erring, its txindex still syncing, in initial
+    /// block download, its wallet not loaded or locked. Asking it again
+    /// may pass.
+    pub fn check_node(&self) -> Result<Result<()>> {
+        let refused = |why: String| Ok(Err(Error(why)));
         let index = self.call("getindexinfo", json!(["txindex"]))?;
         match index["txindex"]["synced"].as_bool() {
             Some(true) => {}
             Some(false) => return Err(Error("the txindex is still syncing: try again".into())),
-            None => return Err(Error("the node needs -txindex: restart it with it".into())),
+            None => return refused("the node needs -txindex: restart it with it".into()),
         }
         let info = self.call("getnetworkinfo", json!([]))?;
         match info["version"].as_u64() {
             Some(version) if version >= MIN_VERSION => {}
             _ => {
-                return Err(Error(format!(
+                return refused(format!(
                     "the node is version {}: the swap needs Bitcoin Core 28 or later, which \
                      relays version 3 transactions",
                     info["version"]
-                )))
+                ))
             }
         }
         let chain = self.call("getblockchaininfo", json!([]))?;
         let expected = self.network.to_core_arg();
         if chain["chain"] != expected {
-            return Err(Error(format!(
+            return refused(format!(
                 "the node is on chain {}, not {expected}",
                 chain["chain"]
-            )));
+            ));
         }
         if chain["initialblockdownload"] != false {
             return Err(Error(
@@ -144,9 +148,7 @@ impl Bitcoind {
             .call("getwalletinfo", json!([]))
             .map_err(|e| Error(format!("the node has no such wallet loaded: {}", e.0)))?;
         if wallet["private_keys_enabled"] != true {
-            return Err(Error(
-                "the wallet cannot sign: the swap needs one with private keys".into(),
-            ));
+            return refused("the wallet cannot sign: the swap needs one with private keys".into());
         }
         // Only an encrypted wallet has it; 0 is locked.
         if wallet["unlocked_until"] == 0 {
@@ -154,7 +156,7 @@ impl Bitcoind {
                 "the wallet is locked: unlock it for longer than the swap may take".into(),
             ));
         }
-        Ok(())
+        Ok(Ok(()))
     }
 
     /// Whether `script` pays an address of this wallet, as `getaddressinfo`

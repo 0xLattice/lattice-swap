@@ -209,6 +209,13 @@ impl NodeArgs {
     /// bitcoind, or the Esplora over the wallet in `dir`, held open while
     /// the swap runs. Says which.
     fn bitcoin(&self, dir: &Path) -> Result<Btc> {
+        let bitcoin = self.open_bitcoin(dir)?;
+        bitcoin.check(self.btc_network)??;
+        Ok(bitcoin)
+    }
+
+    /// [`NodeArgs::bitcoin`], not yet checked.
+    fn open_bitcoin(&self, dir: &Path) -> Result<Btc> {
         let Some(wallet) = &self.btc_wallet else {
             let url = esplora_url(self.esplora.as_deref(), self.btc_network)?;
             let whose = if self.public_bitcoin() {
@@ -228,9 +235,7 @@ impl NodeArgs {
                 String::new(),
             );
             let wallet = Wallet::open(config)?;
-            let esplora = wallet.esplora();
-            esplora.check_network(self.btc_network)?;
-            return Ok(Btc::Esplora(esplora, wallet));
+            return Ok(Btc::Esplora(wallet.esplora(), wallet));
         };
         let auth = match (&self.btc_cookie, &self.btc_user) {
             (Some(path), _) => read(path)?,
@@ -243,7 +248,6 @@ impl NodeArgs {
         };
         log(&format!("bitcoin: your node {}", self.btc_url()));
         let bitcoin = Bitcoind::new(&self.wallet_url(wallet), &auth, self.btc_network, TIMEOUT);
-        bitcoin.check_node()?;
         Ok(Btc::Node(bitcoin))
     }
 
@@ -412,6 +416,18 @@ enum Btc {
     /// The wallet held, as its lock keeps other swaps and a withdrawal out
     /// of the directory.
     Esplora(Esplora, Arc<Wallet>),
+}
+
+impl Btc {
+    /// Whether a swap can rely on this Bitcoin, as
+    /// [`Bitcoind::check_node`] and [`Esplora::check_network`] say: refused
+    /// (`Ok(Err)`), or not told yet (`Err`).
+    fn check(&self, network: Network) -> swap::bitcoind::Result<swap::bitcoind::Result<()>> {
+        match self {
+            Btc::Node(bitcoind) => bitcoind.check_node(),
+            Btc::Esplora(esplora, _) => esplora.check_network(network),
+        }
+    }
 }
 
 /// `$body`, with `$bitcoin` the [`Btc`]'s own client.
@@ -1127,8 +1143,21 @@ fn resume(args: SwapFileArgs) -> Result<Outcome> {
 /// Esplora, one that does not pay the wallet in `dir`, as one made on a
 /// bitcoind does, is refused, and no wallet is made for it; on a bitcoind,
 /// one that does not pay its wallet, as one made on an Esplora does, is
-/// refused too.
+/// refused too. A Bitcoin that cannot answer yet, down or erring for a
+/// moment, is asked again `retry` apart, with a warning, until it answers:
+/// the swap's cancel, refund and punish wait on it, not on the user to run
+/// `resume` again.
 fn resume_bitcoin(nodes: &NodeArgs, dir: &Path, payout: Option<&Script>) -> Result<Btc> {
+    resume_bitcoin_every(nodes, dir, payout, app::POLL)
+}
+
+/// [`resume_bitcoin`], asking again `retry` apart.
+fn resume_bitcoin_every(
+    nodes: &NodeArgs,
+    dir: &Path,
+    payout: Option<&Script>,
+    retry: Duration,
+) -> Result<Btc> {
     let refused = || {
         format!(
             "refused: the swap does not pay the wallet in {}: resume it with the Bitcoin \
@@ -1139,27 +1168,39 @@ fn resume_bitcoin(nodes: &NodeArgs, dir: &Path, payout: Option<&Script>) -> Resu
     if nodes.btc_wallet.is_none() && !dir.join("wallet.json").exists() {
         return Err(refused().into());
     }
-    let bitcoin = nodes.bitcoin(dir)?;
-    match (&bitcoin, payout) {
-        (Btc::Esplora(esplora, _), Some(payout)) => {
-            if esplora.key().script_pubkey.as_script() != payout {
-                return Err(refused().into());
-            }
+    let bitcoin = nodes.open_bitcoin(dir)?;
+    if let (Btc::Esplora(esplora, _), Some(payout)) = (&bitcoin, payout) {
+        if esplora.key().script_pubkey.as_script() != payout {
+            return Err(refused().into());
         }
-        (Btc::Node(bitcoind), Some(payout)) => {
-            if !bitcoind.owns(payout)? {
-                return Err(format!(
-                    "refused: the swap does not pay the bitcoind wallet {}: resume it with \
-                     the Bitcoin flags it was made with, none or --esplora for the wallet in {}",
-                    nodes.btc_wallet.as_deref().unwrap_or_default(),
-                    dir.display()
-                )
-                .into());
-            }
-        }
-        (_, None) => {}
     }
-    Ok(bitcoin)
+    let check = || -> swap::bitcoind::Result<Result<()>> {
+        if let Err(refusal) = bitcoin.check(nodes.btc_network)? {
+            return Ok(Err(refusal.into()));
+        }
+        match (&bitcoin, payout) {
+            (Btc::Node(bitcoind), Some(payout)) if !bitcoind.owns(payout)? => Ok(Err(format!(
+                "refused: the swap does not pay the bitcoind wallet {}: resume it with the \
+                 Bitcoin flags it was made with, none or --esplora for the wallet in {}",
+                nodes.btc_wallet.as_deref().unwrap_or_default(),
+                dir.display()
+            )
+            .into())),
+            _ => Ok(Ok(())),
+        }
+    };
+    loop {
+        match check() {
+            Ok(checked) => return checked.map(|()| bitcoin),
+            Err(e) => {
+                log(&format!(
+                    "bitcoin: {e}: asked again in {}s",
+                    retry.as_secs_f64()
+                ));
+                std::thread::sleep(retry);
+            }
+        }
+    }
 }
 
 #[derive(Args)]
@@ -1193,7 +1234,7 @@ fn wallet(args: WalletArgs) -> Result<()> {
     );
     // Refused while a swap runs in the directory, which holds it open.
     let wallet = Wallet::open(config)?;
-    wallet.esplora().check_network(network)?;
+    wallet.esplora().check_network(network)??;
     if let Some(to) = &args.withdraw {
         if let Some(swap_id) = unended(&args.dir)? {
             return Err(format!(

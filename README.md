@@ -162,10 +162,17 @@ other than its own, but each side's protection is its own node's check. The
 swap file keeps that genesis: `resume` refuses a `--nexus-genesis` naming
 another. `resume` never refuses the lattice-node itself, as a swap's
 cancel, refund, redeem and punish are Bitcoin's and must not wait on it: it
-goes on from Bitcoin at once, and reads Nexus only once the node passes the
-checks above, asked again at every read and warned of until it does. A
-public node that takes no transactions is warned of too: the swap's Nexus
-submits fail through it. A private chain
+goes on from Bitcoin at once, even with the lattice-node stopped and its
+cookie file gone, and reads Nexus only once the node passes the checks
+above, asked at every read while the swap watches Nexus, and warned of,
+until it passes; after that, every read compares the genesis the node names
+with `--nexus-genesis`'s, and a node on another Nexus is not read. A round's
+Nexus reads take 10 seconds at most, so a slow or silent node never holds
+up the next look at Bitcoin. A public node that takes no transactions is
+warned of too: the swap's Nexus submits fail through it. `resume` refuses a
+Bitcoin node or Esplora on another chain, or one the swap does not pay, but
+one that cannot answer yet, down or erring, is asked again every 10 seconds,
+with a warning, until it does. A private chain
 forked from mainnet's genesis passes it: it shares mainnet's identity, so
 trade only through a node that follows the public network, and never use a
 mainnet key on a private or dev chain, where a transfer it signs is valid on

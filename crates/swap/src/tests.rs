@@ -5098,11 +5098,10 @@ fn a_taken_swap_resumes_on_its_nexus_and_a_punished_one_is_listed() {
         })
         .map_err(|e| e.to_string())
     };
-    // The Esplora is checked first: one that cannot be reached refuses.
-    let failed = run(&wallet, &running).unwrap_err();
-    assert!(failed.contains("127.0.0.1:9"), "{failed}");
-    let failed = run(&wallet, &hex::encode([3; 32])).unwrap_err();
-    assert!(failed.contains("127.0.0.1:9"), "{failed}");
+    // The Esplora is checked first: one that cannot be reached refuses
+    // nothing, and is asked again, a poll apart.
+    assert_eq!(run(&wallet, &running), Ok(None));
+    assert_eq!(run(&wallet, &hex::encode([3; 32])), Ok(None));
     drop(wallet);
     // Another Nexus than the swap's.
     let mut config = app_config(dir.path());
@@ -5249,12 +5248,23 @@ fn an_esplora_on_another_network_is_refused() {
         wallet::Key::new("regtest").unwrap(),
         Duration::from_secs(5),
     );
-    assert!(esplora.check_network(bitcoin::Network::Bitcoin).is_ok());
+    assert!(esplora
+        .check_network(bitcoin::Network::Bitcoin)
+        .unwrap()
+        .is_ok());
     let refused = esplora
         .check_network(bitcoin::Network::Signet)
+        .unwrap()
         .unwrap_err()
         .to_string();
     assert!(refused.contains("not signet's"), "{refused}");
+    // One that cannot be read refuses nothing: asked again, it may pass.
+    let down = crate::esplora::Esplora::new(
+        "http://127.0.0.1:9",
+        wallet::Key::new("regtest").unwrap(),
+        Duration::from_secs(5),
+    );
+    assert!(down.check_network(bitcoin::Network::Bitcoin).is_err());
 }
 
 /// With no cookie the app reads a public read port, sending none, and
@@ -5644,7 +5654,16 @@ fn a_resumed_refund_goes_on_whatever_its_nexus_node_does() {
     let read = at.clone();
     let posted = Arc::new(Mutex::new(Vec::<String>::new()));
     let posts = posted.clone();
+    // Down for its first two reads of block 0: a resumed swap asks again.
+    let unanswered = Arc::new(Mutex::new(2));
+    let failing = unanswered.clone();
     let esplora = serve(move |method, path, body| {
+        let mut failing = failing.lock().unwrap();
+        if path == "/block-height/0" && *failing > 0 {
+            *failing -= 1;
+            return (503, "down".into());
+        }
+        drop(failing);
         let (mined, height) = read.lock().unwrap().clone();
         let tip = format!("{height:064x}");
         let ok = |answer: String| (200, answer);
@@ -5718,6 +5737,8 @@ fn a_resumed_refund_goes_on_whatever_its_nexus_node_does() {
         let stopped = buy.run(|| refunded() || start.elapsed() > Duration::from_secs(20));
         assert_eq!(stopped.map_err(|e| e.to_string()), Ok(None), "{failing:?}");
         assert!(refunded(), "{failing:?}: no refund broadcast");
+        let unanswered = *unanswered.lock().unwrap();
+        assert_eq!(unanswered, 0, "asked again past an Esplora down");
         assert_eq!(
             warning(&buy),
             serde_json::Value::Null,
