@@ -302,15 +302,15 @@ impl NodeArgs {
 
     /// A client for the Nexus node: your lattice-node's RPC, which reads
     /// its cookie file again on a 401, as the node writes a new cookie at
-    /// every restart; else a public read port, with no cookie. Says which.
-    fn nexus(&self) -> Result<Client> {
+    /// every restart, and fails each request while there is none; else a
+    /// public read port, with no cookie. Says which.
+    fn nexus(&self) -> Client {
         let Some(cookie) = &self.nexus_cookie else {
             log(&format!("nexus: public {}", self.nexus_url));
-            return Ok(Client::public(&self.nexus_url, TIMEOUT));
+            return Client::public(&self.nexus_url, TIMEOUT);
         };
         log(&format!("nexus: your node {}", self.nexus_url));
         Client::from_cookie_file(&self.nexus_url, cookie, TIMEOUT)
-            .map_err(|e| format!("{}: {e}", cookie.display()).into())
     }
 
     /// Refuses a public node that takes no transactions, then a Nexus
@@ -830,7 +830,7 @@ fn offer(args: OfferArgs) -> Result<Outcome> {
         )
         .into());
     }
-    let nexus = args.nodes.nexus()?;
+    let nexus = args.nodes.nexus();
     args.nodes.check_nexus(&nexus)?;
     let floor = nex_fee_floor(&nexus, args.min_nex_fee)?;
     if template.nex_fee < floor {
@@ -1010,7 +1010,7 @@ fn take(args: TakeArgs) -> Result<Outcome> {
         }
     }
     let floor = btc_fee_floor(&bitcoin, args.policy.min_btc_fee_rate)?;
-    let nexus = args.nodes.nexus()?;
+    let nexus = args.nodes.nexus();
     args.nodes.check_nexus(&nexus)?;
     let nex_floor = nex_fee_floor(&nexus, args.policy.min_nex_fee)?;
     let (network, genesis) = (args.nodes.btc_network, &args.nodes.nexus_genesis);
@@ -1083,7 +1083,7 @@ fn resume(args: SwapFileArgs) -> Result<Outcome> {
             let given = args.key.given()?;
             let key = seller_key(seller.nex_address(), seller.signs_nex(), given)?;
             let bitcoin = resume_bitcoin(&args.nodes, dir, seller.redeem_payout())?;
-            let nexus = args.nodes.nexus()?;
+            let nexus = args.nodes.nexus();
             let check = seller.outcome().is_none().then(|| {
                 args.nodes.trust(SELLER_TRUSTS);
                 args.nodes.resumed_check(&nexus)
@@ -1104,7 +1104,7 @@ fn resume(args: SwapFileArgs) -> Result<Outcome> {
             // A punished buyer asks the seller for `s` again.
             let buyer = buyer.resumed();
             let bitcoin = resume_bitcoin(&args.nodes, dir, buyer.refund_payout())?;
-            let nexus = args.nodes.nexus()?;
+            let nexus = args.nodes.nexus();
             let check = buyer.outcome().is_none().then(|| {
                 args.nodes.trust(BUYER_TRUSTS);
                 args.nodes.resumed_check(&nexus)

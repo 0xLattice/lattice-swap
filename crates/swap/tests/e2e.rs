@@ -212,7 +212,7 @@ impl Nexus {
     }
 
     fn client(&self) -> Client {
-        Client::from_cookie_file(&self.url, self.cookie_file.path(), TIMEOUT).unwrap()
+        Client::from_cookie_file(&self.url, self.cookie_file.path(), TIMEOUT)
     }
 
     fn balance(&self, address: &str) -> u64 {

@@ -5308,7 +5308,7 @@ fn the_app_reads_a_public_nexus_only_where_it_takes_submits() {
         app::Wallet::open(config).unwrap()
     };
     let public = wallet(None);
-    let nexus = public.nexus().unwrap();
+    let nexus = public.nexus();
     assert_eq!(nexus.chain_info().unwrap()["authorized"], false);
     public.check_nexus(&nexus).unwrap();
     accepts.store(false, Ordering::SeqCst);
@@ -5317,7 +5317,7 @@ fn the_app_reads_a_public_nexus_only_where_it_takes_submits() {
     drop(public);
 
     let own = wallet(Some(cookie));
-    let nexus = own.nexus().unwrap();
+    let nexus = own.nexus();
     assert_eq!(nexus.chain_info().unwrap()["authorized"], true);
     own.check_nexus(&nexus).unwrap();
 }

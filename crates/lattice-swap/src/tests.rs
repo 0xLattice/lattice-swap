@@ -1478,6 +1478,54 @@ fn resume_exits_with_the_outcome_and_needs_no_key_once_signed() {
     );
 }
 
+/// lattice-node removes its cookie file when it stops: a swap resumed
+/// meanwhile still runs, here to its outcome; a new one is refused at
+/// once, naming the file.
+#[cfg(unix)]
+#[test]
+fn a_missing_nexus_cookie_stops_only_a_new_swap() {
+    let (_directory, path) = swap_file(Seller::Done(Outcome::Refunded));
+    let btc_cookie = tempfile::NamedTempFile::new().unwrap();
+    let btc_cookie = btc_cookie.path().to_str().unwrap();
+    let stopped = tempfile::tempdir().unwrap();
+    let absent = stopped.path().join(".cookie");
+    let absent = absent.to_str().unwrap();
+    let url = bitcoind(estimate());
+    let nodes = [
+        "--btc-url",
+        &url,
+        "--btc-wallet",
+        "w",
+        "--btc-cookie",
+        btc_cookie,
+        "--nexus-url",
+        "http://127.0.0.1:1",
+        "--nexus-cookie",
+        absent,
+    ];
+    let run = |args: &[&str]| {
+        let cli = Cli::try_parse_from(["lattice-swap"].iter().chain(args).chain(&nodes)).unwrap();
+        exit_status(cli.command)
+    };
+    assert_eq!(run(&["resume", &path]).unwrap(), 3);
+
+    let mut offer = takeable();
+    offer.sign(&SigningKey::from_bytes(&[1; 32]));
+    let file = tempfile::NamedTempFile::new().unwrap();
+    fs::write(file.path(), offer.encode()).unwrap();
+    let address = swap_nexus_tx::address(&[9; 32]);
+    let take = [
+        "take",
+        file.path().to_str().unwrap(),
+        "--nex-address",
+        &address,
+        "--price",
+        "50000000",
+    ];
+    let refused = run(&take).unwrap_err().to_string();
+    assert!(refused.contains(absent), "{refused}");
+}
+
 /// A node without a synced txindex, older than Bitcoin Core 28, on
 /// another chain, in initial block download, or without a wallet that
 /// signs is refused by name.
@@ -1763,7 +1811,7 @@ fn a_nexus_node_that_keeps_no_past_state_is_refused() {
         let mut nodes = offer_args(&[]).nodes;
         nodes.nexus_url = nexus_node(height, keeps_state);
         nodes.nexus_cookie = Some(cookie.path().to_path_buf());
-        let client = nodes.nexus().unwrap();
+        let client = nodes.nexus();
         nodes.check_nexus(&client).map_err(|e| e.to_string())
     };
     assert_eq!(check(10, true), Ok(()));
@@ -2175,7 +2223,7 @@ fn the_nexus_client_reads_a_rotated_cookie_again() {
     let Command::Resume(args) = cli.command else {
         panic!("not resume")
     };
-    let nexus = args.nodes.nexus().unwrap();
+    let nexus = args.nodes.nexus();
     assert_eq!(nexus.health().unwrap().height, 7);
     fs::write(&cookie, "__cookie__:second\n").unwrap();
     assert_eq!(nexus.health().unwrap().height, 7);
@@ -2293,7 +2341,7 @@ fn a_public_nexus_node_must_take_submits() {
         let mut nodes = offer_args(&[]).nodes;
         nodes.nexus_url = nexus_node_submitting(MAINNET, 10, true, 1, accepts);
         nodes.nexus_cookie = cookie;
-        let client = nodes.nexus().unwrap();
+        let client = nodes.nexus();
         nodes.check_nexus(&client).map_err(|e| e.to_string())
     };
     assert_eq!(check(true, None), Ok(()));
@@ -2313,7 +2361,7 @@ fn a_resumed_swap_reads_nexus_only_once_its_node_passes() {
     let mut nodes = offer_args(&[]).nodes;
     nodes.nexus_url = nexus_node_submitting(MAINNET, 10, true, 1, false);
     nodes.nexus_cookie = None;
-    let good = nodes.nexus().unwrap();
+    let good = nodes.nexus();
     let down = Client::public("http://127.0.0.1:9", TIMEOUT);
     let other = swap_nexus_tx::cid(b"other");
     let elsewhere = Client::public(&nexus_node_submitting(&other, 10, true, 1, false), TIMEOUT);

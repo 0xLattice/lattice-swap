@@ -18,9 +18,9 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "native")]
 use std::sync::Mutex;
 #[cfg(feature = "native")]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 #[cfg(feature = "native")]
-use std::{fmt, fs, io};
+use std::{fmt, fs};
 
 #[cfg(feature = "native")]
 use base64::Engine;
@@ -117,8 +117,14 @@ const MAX_RESPONSE_BYTES: u64 = 1 << 20;
 pub struct Client {
     agent: ureq::Agent,
     base: String,
+    /// What bounds each request, see [`Client::new`].
+    timeout: Duration,
+    /// When every request must have ended by, if anything bounds them so:
+    /// see [`Client::set_deadline`].
+    deadline: Mutex<Option<Instant>>,
     authorization: Mutex<String>,
-    /// The cookie file, for a client made from one: read again on a 401.
+    /// The cookie file, for a client made from one: read again on a 401,
+    /// and before a request while it holds none.
     cookie: Option<PathBuf>,
     /// A public read port's, see [`Client::public`].
     public: bool,
@@ -133,6 +139,8 @@ impl Client {
         Self {
             agent: ureq::AgentBuilder::new().timeout(timeout).build(),
             base: base.trim_end_matches('/').into(),
+            timeout,
+            deadline: Mutex::new(None),
             authorization: Mutex::new(authorization(cookie)),
             cookie: None,
             public: false,
@@ -144,16 +152,36 @@ impl Client {
     /// writes a new cookie at every start, so a client that outlives one
     /// restart of its node goes on with the new cookie. Bitcoin Core's
     /// `bitcoin-cli` reads its node's cookie file on every call, and btcd's
-    /// `rpcclient` reads it again whenever the file changes.
-    pub fn from_cookie_file(
-        base: &str,
-        path: impl AsRef<Path>,
-        timeout: Duration,
-    ) -> io::Result<Self> {
+    /// `rpcclient` reads it again whenever the file changes. The node
+    /// removes the file when it stops: a client made while there is none
+    /// holds no cookie, and reads the file before each request until it
+    /// has one, each request failing, unasked, while the file is missing.
+    pub fn from_cookie_file(base: &str, path: impl AsRef<Path>, timeout: Duration) -> Self {
         let path = path.as_ref();
-        let mut client = Self::new(base, &fs::read_to_string(path)?, timeout);
+        let held = fs::read_to_string(path).map(|cookie| authorization(&cookie));
+        let mut client = Self::new(base, "", timeout);
+        client.authorization = Mutex::new(held.unwrap_or_default());
         client.cookie = Some(path.into());
-        Ok(client)
+        client
+    }
+
+    /// Bounds every request from now on to end by `deadline`, as well as
+    /// by the client's timeout; one asked after it fails at once, unsent.
+    /// `None` lifts the bound.
+    pub fn set_deadline(&self, deadline: Option<Instant>) {
+        *self.deadline.lock().expect("not poisoned") = deadline;
+    }
+
+    /// `request` bounded by the client's deadline, if it has one; an error
+    /// once that has passed.
+    fn bounded(&self, request: ureq::Request) -> Result<ureq::Request> {
+        let Some(deadline) = *self.deadline.lock().expect("not poisoned") else {
+            return Ok(request);
+        };
+        match deadline.checked_duration_since(Instant::now()) {
+            Some(left) if !left.is_zero() => Ok(request.timeout(left.min(self.timeout))),
+            _ => Err(Error::Transport("out of time for this round".into())),
+        }
     }
 
     /// A client for a node's public read port, which takes no cookie.
@@ -161,6 +189,8 @@ impl Client {
         Self {
             agent: ureq::AgentBuilder::new().timeout(timeout).build(),
             base: base.trim_end_matches('/').into(),
+            timeout,
+            deadline: Mutex::new(None),
             authorization: Mutex::new(String::new()),
             cookie: None,
             public: true,
@@ -249,7 +279,7 @@ impl Client {
     /// signed transaction, not of its body: [`Transaction::cid`]).
     pub fn submit(&self, transaction: &Transaction) -> Result<String> {
         let json = self.authorized(|authorization| {
-            let request = self.agent.post(&format!("{}/transactions", self.base));
+            let request = self.bounded(self.agent.post(&format!("{}/transactions", self.base)))?;
             read(authorize(request, authorization).send_json(transaction.to_submit_json()))
         })?;
         json["transactionCID"]
@@ -297,25 +327,33 @@ impl Client {
 
     fn get(&self, path: &str) -> Result<Value> {
         self.authorized(|authorization| {
-            let request = self.agent.get(&format!("{}{path}", self.base));
+            let request = self.bounded(self.agent.get(&format!("{}{path}", self.base)))?;
             read(authorize(request, authorization).call())
         })
     }
 
-    /// `request`'s answer under the cookie held; on a 401, under the cookie
-    /// file's, read again, if this client has one.
+    /// `request`'s answer under the cookie held, the cookie file's read
+    /// first if it holds none; on a 401, under the cookie file's, read
+    /// again, if this client has one.
     fn authorized(&self, request: impl Fn(&str) -> Result<Value>) -> Result<Value> {
-        let held = self.authorization.lock().expect("not poisoned").clone();
+        let mut held = self.authorization.lock().expect("not poisoned").clone();
+        if held.is_empty() && self.cookie.is_some() {
+            held = self.read_cookie()?;
+        }
         match (request(&held), &self.cookie) {
-            (Err(Error::Status { status: 401, .. }), Some(path)) => {
-                let cookie = fs::read_to_string(path)
-                    .map_err(|e| Error::Transport(format!("{}: {e}", path.display())))?;
-                let fresh = authorization(&cookie);
-                *self.authorization.lock().expect("not poisoned") = fresh.clone();
-                request(&fresh)
-            }
+            (Err(Error::Status { status: 401, .. }), Some(_)) => request(&self.read_cookie()?),
             (answer, _) => answer,
         }
+    }
+
+    /// The authorization of the cookie file's cookie, now held.
+    fn read_cookie(&self) -> Result<String> {
+        let path = self.cookie.as_ref().expect("a cookie client");
+        let cookie = fs::read_to_string(path)
+            .map_err(|e| Error::Transport(format!("{}: {e}", path.display())))?;
+        let fresh = authorization(&cookie);
+        *self.authorization.lock().expect("not poisoned") = fresh.clone();
+        Ok(fresh)
     }
 }
 
@@ -736,7 +774,7 @@ mod tests {
         let (url, counts) = guarded(cookie.clone());
         let [asked, refused] = &*counts;
         let timeout = Duration::from_secs(5);
-        let client = Client::from_cookie_file(&url, &cookie, timeout).unwrap();
+        let client = Client::from_cookie_file(&url, &cookie, timeout);
         let given = Client::new(&url, "__cookie__:first", timeout);
         assert_eq!(client.health().unwrap().height, 7);
         assert_eq!(given.health().unwrap().height, 7);
@@ -757,6 +795,56 @@ mod tests {
             "{stale:?}"
         );
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The node removes its cookie file when it stops: a client made while
+    /// there is none fails each request, unasked, and goes on under the
+    /// cookie the node writes once it is back, with no 401 first.
+    #[test]
+    fn a_client_made_without_its_cookie_file_reads_it_once_there() {
+        let dir = std::env::temp_dir().join(format!("swap-no-cookie-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let cookie = dir.join(".cookie");
+        let (url, counts) = guarded(cookie.clone());
+        let [asked, refused] = &*counts;
+        let client = Client::from_cookie_file(&url, &cookie, Duration::from_secs(5));
+        let missing = client.health();
+        assert!(
+            matches!(&missing, Err(Error::Transport(e)) if e.contains(".cookie")),
+            "{missing:?}"
+        );
+        assert_eq!(asked.load(Ordering::SeqCst), 0);
+
+        fs::write(&cookie, "__cookie__:back").unwrap();
+        assert_eq!(client.health().unwrap().height, 7);
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+        assert_eq!(refused.load(Ordering::SeqCst), 0);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A request asked once the deadline has passed fails, unsent; one
+    /// asked before it ends by it, whatever the client's own timeout.
+    #[test]
+    fn a_deadline_bounds_every_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        // Takes every connection and never answers.
+        std::thread::spawn(move || {
+            let held: Vec<_> = listener.incoming().collect();
+            drop(held);
+        });
+        let client = Client::new(&url, "c", Duration::from_secs(30));
+        let start = Instant::now();
+        client.set_deadline(Some(start + Duration::from_millis(300)));
+        assert!(client.health().is_err());
+        let took = start.elapsed();
+        assert!(took < Duration::from_secs(5), "{took:?}");
+        let late = client.health();
+        assert!(
+            matches!(&late, Err(Error::Transport(e)) if e.contains("out of time")),
+            "{late:?}"
+        );
+        client.set_deadline(None);
     }
 
     #[test]

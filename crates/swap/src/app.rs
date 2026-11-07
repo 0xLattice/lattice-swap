@@ -306,16 +306,14 @@ impl Wallet {
         Esplora::new(&self.config.esplora, self.key.clone(), TIMEOUT)
     }
 
-    /// The Nexus node's RPC, which reads its cookie file again on a 401;
-    /// with no cookie, a public read port, its tip read live.
-    pub(crate) fn nexus(&self) -> Result<Client> {
+    /// The Nexus node's RPC, which reads its cookie file again on a 401,
+    /// and fails each request while there is none; with no cookie, a
+    /// public read port, its tip read live.
+    pub(crate) fn nexus(&self) -> Client {
         let Some(cookie) = &self.config.nexus_cookie else {
-            return Ok(Client::public(&self.config.nexus, TIMEOUT));
+            return Client::public(&self.config.nexus, TIMEOUT);
         };
-        Ok(
-            Client::from_cookie_file(&self.config.nexus, cookie, TIMEOUT)
-                .map_err(|e| format!("{}: {e}", cookie.display()))?,
-        )
+        Client::from_cookie_file(&self.config.nexus, cookie, TIMEOUT)
     }
 
     /// `(confirmed, unconfirmed)`, in sat: what the wallet can spend, and
@@ -644,7 +642,7 @@ impl Wallet {
             return Err(format!("refused: swap {running} is running; one swap at a time").into());
         }
         self.esplora().check_network(self.config.network)?;
-        let nexus = self.nexus()?;
+        let nexus = self.nexus();
         self.check_nexus(&nexus)?;
         self.check(&decoded, &parsed, &nexus)?;
         for id in self.swaps()? {
@@ -776,7 +774,7 @@ impl Buy {
                     )
                     .into());
                 }
-                let nexus = wallet.nexus()?;
+                let nexus = wallet.nexus();
                 let check = match buyer.resumed().outcome() {
                     None => {
                         wallet.esplora().check_network(wallet.config.network)?;
@@ -870,7 +868,7 @@ impl Buy {
             return Ok(None);
         }
         let offer: Offer = serde_json::from_value(record.offer.clone())?;
-        let nexus = wallet.nexus()?;
+        let nexus = wallet.nexus();
         wallet.check_nexus(&nexus)?;
         wallet.check(&offer, &policy, &nexus)?;
         let config = ivy::Config::new(SigningKey::from_bytes(&offer.buyer_session));
