@@ -591,8 +591,13 @@ struct BumpArgs {
     /// The most, in seconds, a round's Nexus requests may take, its reads
     /// and the submits they lead to: a slow or silent Nexus node delays
     /// the next look at Bitcoin by this at most. Raise it for a node far
-    /// away, as over Tor, whose dozen reads a round take longer.
-    #[arg(long, default_value_t = swap::driver::NEXUS_BUDGET.as_secs())]
+    /// away, as over Tor, whose dozen reads a round take longer. From 1
+    /// to 3600.
+    #[arg(
+        long,
+        default_value_t = swap::driver::NEXUS_BUDGET.as_secs(),
+        value_parser = clap::value_parser!(u64).range(1..=3600)
+    )]
     nexus_budget: u64,
 }
 
@@ -1205,8 +1210,8 @@ fn resume_bitcoin_every(
         // Cancel, refund and punish are signed already: broadcast and
         // read, they need no wallet, and only bumps do. A wallet not
         // loaded or locked is warned of, never waited on, its bumps
-        // failing, loudly, until it is back; and one not loaded is not
-        // asked whether the swap pays it.
+        // failing, loudly, until it is back; and while it is not, only a
+        // wallet's answer that the swap does not pay it refuses.
         let ready = match bitcoind.check_wallet() {
             Ok(Err(refusal)) => return Ok(Err(refusal.into())),
             Ok(Ok(())) => true,

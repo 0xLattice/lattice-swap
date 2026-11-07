@@ -788,6 +788,14 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
                     Ok(_) => self.submit_failed = None,
                     Err(e) => {
                         let e = format!("nexus submit {}: {e}", transaction.cid());
+                        // Cut short by the round's budget, which reads left
+                        // too little of.
+                        let e = match self.nexus_round {
+                            Some(end) if Instant::now() >= end => {
+                                format!("{e}; raise the Nexus budget (--nexus-budget)")
+                            }
+                            _ => e,
+                        };
                         warn_again(&mut self.submit_failed, e, (self.clock)());
                     }
                 }

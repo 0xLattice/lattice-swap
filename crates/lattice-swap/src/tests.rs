@@ -1346,6 +1346,18 @@ fn the_bump_settings_default_to_the_drivers() {
     for fraction in ["0", "1"] {
         assert!(parse(&["resume", "x.json", "--max-fee-fraction", fraction]).is_ok());
     }
+    // A budget of none starves every Nexus request; one past an hour is no
+    // bound, and a huge one overflows the clock.
+    for budget in ["1", "3600"] {
+        assert!(parse(&["resume", "x.json", "--nexus-budget", budget]).is_ok());
+    }
+    for budget in ["0", "3601", "18446744073709551615"] {
+        let refused = parse(&["resume", "x.json", "--nexus-budget", budget])
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(refused.contains("--nexus-budget"), "{budget}: {refused}");
+    }
     for fraction in ["NaN", "-0.1", "1.01", "inf", "x"] {
         let flag = format!("--max-fee-fraction={fraction}");
         let refused = parse(&["resume", "x.json", &flag])
