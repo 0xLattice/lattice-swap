@@ -928,6 +928,7 @@ impl Buy {
             pending,
             wallet.esplora(),
             nexus,
+            &wallet.config.nexus_genesis,
             transport,
             store,
             rejoin,

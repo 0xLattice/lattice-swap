@@ -888,6 +888,7 @@ fn offer(args: OfferArgs) -> Result<Outcome> {
     let start = Start {
         bitcoin,
         nexus,
+        nexus_genesis: args.nodes.nexus_genesis.clone(),
         store,
         nex_key: Some(key.clone()),
         bump: &args.bump,
@@ -962,6 +963,7 @@ fn answer_request<T: Transport>(transport: &mut T, offer: &Offer) -> Result<Term
 struct Start<'a> {
     bitcoin: Btc,
     nexus: Client,
+    nexus_genesis: String,
     store: Store,
     nex_key: Option<SecretBytes>,
     bump: &'a BumpArgs,
@@ -986,6 +988,7 @@ impl Start<'_> {
             actions,
             self.bitcoin,
             self.nexus,
+            &self.nexus_genesis,
             transport,
             self.store,
             rejoin,

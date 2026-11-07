@@ -155,12 +155,15 @@ pub fn request_terms<T: Transport>(
 /// A driver for `machine`, which asks for `actions` first, over `transport`,
 /// meeting the counterparty again by `rejoin`, saved beside the swap file,
 /// whenever the session is lost: the seller on `listener`, if it listens.
+/// Its Nexus node is checked to follow the Nexus of `nexus_genesis` at
+/// every view, as a resumed swap's is: see [`Driver::nexus_genesis`].
 #[allow(clippy::too_many_arguments)]
 pub fn start<M: Machine, B: Bitcoin>(
     machine: M,
     actions: Vec<Action>,
     bitcoin: B,
     nexus: Client,
+    nexus_genesis: &str,
     transport: Session,
     store: Store,
     rejoin: SessionFile,
@@ -171,6 +174,7 @@ pub fn start<M: Machine, B: Bitcoin>(
     rejoin.save(&store)?;
     let mut driver = Driver::start(machine, actions, bitcoin, nexus, Some(transport), store)?;
     driver.reconnect = Some(reconnect);
+    driver.nexus_genesis = Some(nexus_genesis.into());
     Ok(driver)
 }
 
@@ -223,7 +227,15 @@ pub fn take<B: Bitcoin>(
         listen: None,
     };
     start(
-        buyer, actions, bitcoin, nexus, transport, store, rejoin, None,
+        buyer,
+        actions,
+        bitcoin,
+        nexus,
+        nexus_genesis,
+        transport,
+        store,
+        rejoin,
+        None,
     )
 }
 

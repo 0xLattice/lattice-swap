@@ -5584,6 +5584,68 @@ fn a_resumed_swap_reads_nexus_only_once_its_node_passes() {
     assert_eq!(warnings("passes its check"), 1);
 }
 
+/// A swap started, not only one resumed, reads Nexus only from a node on
+/// its own Nexus: one that went over to another mid-swap, restarted on
+/// another config or behind a balancer that moved, is not read.
+#[cfg(feature = "native")]
+#[test]
+fn a_new_swap_reads_no_nexus_node_on_another_nexus() {
+    struct Quiet;
+    impl Transport for Quiet {
+        fn send(&mut self, _: &[u8]) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn recv(&mut self, _: Duration) -> std::io::Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+    }
+    let locked = locked();
+    let mode = Arc::new(Mutex::new(NexusNode::Elsewhere));
+    let url = nexus_node(mode.clone());
+    let node = pooled(&locked, &[], 50);
+    node.0.borrow_mut().height = 105;
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::new(directory.path(), terms().swap_id);
+    let machine = NexusCounting {
+        watcher: watching_nex_lock(&locked),
+        views: 0,
+    };
+    let offer = recorded(1, &(), &[], false)["offer"].clone();
+    let rejoin = session::SessionFile {
+        offer: serde_json::from_value(offer).unwrap(),
+        key: None,
+        listen: None,
+    };
+    let mut driver = session::start(
+        machine,
+        vec![],
+        node,
+        Client::new(&url, "", Duration::from_secs(5)),
+        swap_nexus_tx::MAINNET_GENESIS,
+        Box::new(Quiet),
+        store,
+        rejoin,
+        None,
+    )
+    .unwrap();
+    driver.poll = Duration::from_millis(1);
+    clear_warnings();
+    let rounds = std::cell::Cell::new(0);
+    let stopped = driver.run_until(|_| {
+        rounds.set(rounds.get() + 1);
+        rounds.get() > 20
+    });
+    assert!(stopped.unwrap().is_none());
+    assert_eq!(driver.state().views, 0, "not read on another Nexus");
+    assert_eq!(warnings("follows the chain of genesis"), 1);
+    *mode.lock().unwrap() = NexusNode::Good;
+    let start = std::time::Instant::now();
+    let stopped =
+        driver.run_until(|state| state.views > 0 || start.elapsed() > Duration::from_secs(10));
+    assert!(stopped.unwrap().is_none());
+    assert!(driver.state().views > 0, "read on its own Nexus");
+}
+
 /// A Nexus node that takes requests and never answers delays a round by
 /// the driver's Nexus budget, not by its client's timeout per request.
 #[cfg(feature = "native")]
