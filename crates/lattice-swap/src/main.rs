@@ -28,7 +28,7 @@ use rand_core::{OsRng, RngCore};
 use serde_json::json;
 use swap::app::{self, Wallet};
 use swap::bitcoind::{Bitcoin, Bitcoind, Tip};
-use swap::driver::{Driver, Store};
+use swap::driver::{Driver, NexusCheck, Store};
 use swap::esplora::Esplora;
 use swap::offer::{self, check_offer, Answer, Bounds, Offer, Place, Policy, Quote, Template};
 use swap::session::{
@@ -209,12 +209,19 @@ impl NodeArgs {
     /// bitcoind, or the Esplora over the wallet in `dir`, held open while
     /// the swap runs. Says which.
     fn bitcoin(&self, dir: &Path) -> Result<Btc> {
+        let bitcoin = self.open_bitcoin(dir)?;
+        bitcoin.check(self.btc_network)??;
+        Ok(bitcoin)
+    }
+
+    /// [`NodeArgs::bitcoin`], not yet checked.
+    fn open_bitcoin(&self, dir: &Path) -> Result<Btc> {
         let Some(wallet) = &self.btc_wallet else {
             let url = esplora_url(self.esplora.as_deref(), self.btc_network)?;
-            let whose = if self.esplora.is_some() {
-                "your node"
-            } else {
+            let whose = if self.public_bitcoin() {
                 "public"
+            } else {
+                "your node"
             };
             log(&format!("bitcoin: {whose} {url}"));
             // Only the Esplora and the directory are read: Nexus is this
@@ -224,13 +231,11 @@ impl NodeArgs {
                 self.btc_network,
                 url,
                 String::new(),
-                PathBuf::new(),
+                None,
                 String::new(),
             );
             let wallet = Wallet::open(config)?;
-            let esplora = wallet.esplora();
-            esplora.check_network(self.btc_network)?;
-            return Ok(Btc::Esplora(esplora, wallet));
+            return Ok(Btc::Esplora(wallet.esplora(), wallet));
         };
         let auth = match (&self.btc_cookie, &self.btc_user) {
             (Some(path), _) => read(path)?,
@@ -243,7 +248,6 @@ impl NodeArgs {
         };
         log(&format!("bitcoin: your node {}", self.btc_url()));
         let bitcoin = Bitcoind::new(&self.wallet_url(wallet), &auth, self.btc_network, TIMEOUT);
-        bitcoin.check_node()?;
         Ok(Btc::Node(bitcoin))
     }
 
@@ -265,9 +269,13 @@ impl NodeArgs {
         format!("{}/wallet/{wallet}", self.btc_url().trim_end_matches('/'))
     }
 
-    /// Whether Bitcoin is read through mempool.space's Esplora.
+    /// Whether Bitcoin is read through mempool.space's Esplora: by
+    /// default, or named by --esplora.
     fn public_bitcoin(&self) -> bool {
-        self.btc_wallet.is_none() && self.esplora.is_none()
+        self.btc_wallet.is_none()
+            && self.esplora.as_deref().is_none_or(|url| {
+                Some(url.trim_end_matches('/')) == app::default_esplora(self.btc_network)
+            })
     }
 
     /// Whether Nexus is read through a public read port.
@@ -298,15 +306,15 @@ impl NodeArgs {
 
     /// A client for the Nexus node: your lattice-node's RPC, which reads
     /// its cookie file again on a 401, as the node writes a new cookie at
-    /// every restart; else a public read port, with no cookie. Says which.
-    fn nexus(&self) -> Result<Client> {
+    /// every restart, and fails each request while there is none; else a
+    /// public read port, with no cookie. Says which.
+    fn nexus(&self) -> Client {
         let Some(cookie) = &self.nexus_cookie else {
             log(&format!("nexus: public {}", self.nexus_url));
-            return Ok(Client::public(&self.nexus_url, TIMEOUT));
+            return Client::public(&self.nexus_url, TIMEOUT);
         };
         log(&format!("nexus: your node {}", self.nexus_url));
         Client::from_cookie_file(&self.nexus_url, cookie, TIMEOUT)
-            .map_err(|e| format!("{}: {e}", cookie.display()).into())
     }
 
     /// Refuses a public node that takes no transactions, then a Nexus
@@ -314,28 +322,65 @@ impl NodeArgs {
     /// cannot say how deep a transaction is: see
     /// [`swap::session::check_nexus`].
     fn check_nexus(&self, client: &Client) -> Result<()> {
-        use swap_nexus_tx::rpc::parse::NodeRefusal;
-        if self.nexus_cookie.is_none() && client.chain_info()?["acceptsSubmit"] != true {
+        if let Some(why) = self.takes_no_transactions(client)? {
             return Err(format!(
-                "refused: {} takes no transactions: give a public node that does, or your \
-                 own with --nexus-cookie",
-                self.nexus_url
+                "refused: {why}: give a public node that does, or your own with --nexus-cookie"
             )
             .into());
         }
-        swap::session::check_nexus(client, &self.nexus_genesis)?.map_err(|refusal| {
-            match refusal {
-                NodeRefusal::OtherNexus { .. } => {
-                    format!("{refusal}, the one --nexus-genesis names")
-                }
-                NodeRefusal::NoPastState => {
-                    format!("{refusal}: run it with --state all and --block-bodies all")
-                }
-                NodeRefusal::Malformed(_) => refusal.to_string(),
-            }
-            .into()
-        })
+        self.check_nexus_chain(client)
     }
+
+    /// As [`NodeArgs::check_nexus`], for a swap resumed, which it never
+    /// refuses: a taken swap's cancel, refund, redeem and punish are
+    /// Bitcoin's, and a node that fails, even for a moment, must not stop
+    /// them. A public node that takes no transactions is warned of, its
+    /// Nexus submits failing; the rest is the driver's
+    /// [`nexus_check`](swap::driver::Driver::nexus_check), asked at every
+    /// read until the node passes, Nexus unread till then, and its genesis
+    /// compared on every view after.
+    fn resumed_check(&self, client: &Client) -> NexusCheck {
+        match self.takes_no_transactions(client) {
+            Ok(Some(why)) => log(&format!(
+                "{why}: the swap's Bitcoin side goes on, its Nexus submits fail"
+            )),
+            Ok(None) => {}
+            Err(e) => log(&format!("nexus: {e}")),
+        }
+        let genesis = self.nexus_genesis.clone();
+        swap::session::check_once(move |client| check_nexus_chain(client, &genesis))
+    }
+
+    /// Why a public node takes no transactions, if it takes none.
+    fn takes_no_transactions(&self, client: &Client) -> Result<Option<String>> {
+        let none = self.nexus_cookie.is_none() && client.chain_info()?["acceptsSubmit"] != true;
+        Ok(none.then(|| format!("{} takes no transactions", self.nexus_url)))
+    }
+
+    /// Refuses a Nexus node on another Nexus than `--nexus-genesis` names,
+    /// or one that cannot say how deep a transaction is.
+    fn check_nexus_chain(&self, client: &Client) -> Result<()> {
+        check_nexus_chain(client, &self.nexus_genesis)
+    }
+}
+
+/// Refuses a Nexus node on another Nexus than `genesis`, the one
+/// `--nexus-genesis` names, or one that cannot say how deep a transaction
+/// is.
+fn check_nexus_chain(client: &Client, genesis: &str) -> Result<()> {
+    use swap_nexus_tx::rpc::parse::NodeRefusal;
+    swap::session::check_nexus(client, genesis)?.map_err(|refusal| {
+        match refusal {
+            NodeRefusal::OtherNexus { .. } => {
+                format!("{refusal}, the one --nexus-genesis names")
+            }
+            NodeRefusal::NoPastState => {
+                format!("{refusal}: run it with --state all and --block-bodies all")
+            }
+            NodeRefusal::Malformed(_) => refusal.to_string(),
+        }
+        .into()
+    })
 }
 
 /// The Esplora at `given`, else mempool.space's for `network`.
@@ -371,6 +416,18 @@ enum Btc {
     /// The wallet held, as its lock keeps other swaps and a withdrawal out
     /// of the directory.
     Esplora(Esplora, Arc<Wallet>),
+}
+
+impl Btc {
+    /// Whether a swap can rely on this Bitcoin, as
+    /// [`Bitcoind::check_node`] and [`Esplora::check_network`] say: refused
+    /// (`Ok(Err)`), or not told yet (`Err`).
+    fn check(&self, network: Network) -> swap::bitcoind::Result<swap::bitcoind::Result<()>> {
+        match self {
+            Btc::Node(bitcoind) => bitcoind.check_node(),
+            Btc::Esplora(esplora, _) => esplora.check_network(network),
+        }
+    }
 }
 
 /// `$body`, with `$bitcoin` the [`Btc`]'s own client.
@@ -790,7 +847,7 @@ fn offer(args: OfferArgs) -> Result<Outcome> {
         )
         .into());
     }
-    let nexus = args.nodes.nexus()?;
+    let nexus = args.nodes.nexus();
     args.nodes.check_nexus(&nexus)?;
     let floor = nex_fee_floor(&nexus, args.min_nex_fee)?;
     if template.nex_fee < floor {
@@ -970,7 +1027,7 @@ fn take(args: TakeArgs) -> Result<Outcome> {
         }
     }
     let floor = btc_fee_floor(&bitcoin, args.policy.min_btc_fee_rate)?;
-    let nexus = args.nodes.nexus()?;
+    let nexus = args.nodes.nexus();
     args.nodes.check_nexus(&nexus)?;
     let nex_floor = nex_fee_floor(&nexus, args.policy.min_nex_fee)?;
     let (network, genesis) = (args.nodes.btc_network, &args.nodes.nexus_genesis);
@@ -1043,16 +1100,18 @@ fn resume(args: SwapFileArgs) -> Result<Outcome> {
             let given = args.key.given()?;
             let key = seller_key(seller.nex_address(), seller.signs_nex(), given)?;
             let bitcoin = resume_bitcoin(&args.nodes, dir, seller.redeem_payout())?;
-            let nexus = args.nodes.nexus()?;
-            if seller.outcome().is_none() {
-                args.nodes.check_nexus(&nexus)?;
+            let nexus = args.nodes.nexus();
+            let check = seller.outcome().is_none().then(|| {
                 args.nodes.trust(SELLER_TRUSTS);
-            }
+                args.nodes.resumed_check(&nexus)
+            });
             let driver = swap::session::resume::<Seller, _>(bitcoin, nexus, store);
             run(
                 &swap_file,
                 driver.map(|mut driver| {
                     driver.nex_key = key;
+                    driver.nexus_check = check;
+                    driver.nexus_genesis = Some(flag.clone());
                     driver
                 }),
                 &args.bump,
@@ -1063,12 +1122,17 @@ fn resume(args: SwapFileArgs) -> Result<Outcome> {
             // A punished buyer asks the seller for `s` again.
             let buyer = buyer.resumed();
             let bitcoin = resume_bitcoin(&args.nodes, dir, buyer.refund_payout())?;
-            let nexus = args.nodes.nexus()?;
-            if buyer.outcome().is_none() {
-                args.nodes.check_nexus(&nexus)?;
+            let nexus = args.nodes.nexus();
+            let check = buyer.outcome().is_none().then(|| {
                 args.nodes.trust(BUYER_TRUSTS);
-            }
+                args.nodes.resumed_check(&nexus)
+            });
             let driver = swap::session::resume::<Buyer, _>(bitcoin, nexus, store);
+            let driver = driver.map(|mut driver| {
+                driver.nexus_check = check;
+                driver.nexus_genesis = Some(flag.clone());
+                driver
+            });
             run(&swap_file, driver, &args.bump, args.nodes.poll())
         }
     }
@@ -1077,8 +1141,23 @@ fn resume(args: SwapFileArgs) -> Result<Outcome> {
 /// The Bitcoin to resume a swap in `dir` on whose BTC is paid to
 /// `payout`. A swap file does not say which Bitcoin it was made on: on an
 /// Esplora, one that does not pay the wallet in `dir`, as one made on a
-/// bitcoind does, is refused, and no wallet is made for it.
+/// bitcoind does, is refused, and no wallet is made for it; on a bitcoind,
+/// one that does not pay its wallet, as one made on an Esplora does, is
+/// refused too. A Bitcoin that cannot answer yet, down or erring for a
+/// moment, is asked again `retry` apart, with a warning, until it answers:
+/// the swap's cancel, refund and punish wait on it, not on the user to run
+/// `resume` again.
 fn resume_bitcoin(nodes: &NodeArgs, dir: &Path, payout: Option<&Script>) -> Result<Btc> {
+    resume_bitcoin_every(nodes, dir, payout, app::POLL)
+}
+
+/// [`resume_bitcoin`], asking again `retry` apart.
+fn resume_bitcoin_every(
+    nodes: &NodeArgs,
+    dir: &Path,
+    payout: Option<&Script>,
+    retry: Duration,
+) -> Result<Btc> {
     let refused = || {
         format!(
             "refused: the swap does not pay the wallet in {}: resume it with the Bitcoin \
@@ -1089,13 +1168,39 @@ fn resume_bitcoin(nodes: &NodeArgs, dir: &Path, payout: Option<&Script>) -> Resu
     if nodes.btc_wallet.is_none() && !dir.join("wallet.json").exists() {
         return Err(refused().into());
     }
-    let bitcoin = nodes.bitcoin(dir)?;
+    let bitcoin = nodes.open_bitcoin(dir)?;
     if let (Btc::Esplora(esplora, _), Some(payout)) = (&bitcoin, payout) {
         if esplora.key().script_pubkey.as_script() != payout {
             return Err(refused().into());
         }
     }
-    Ok(bitcoin)
+    let check = || -> swap::bitcoind::Result<Result<()>> {
+        if let Err(refusal) = bitcoin.check(nodes.btc_network)? {
+            return Ok(Err(refusal.into()));
+        }
+        match (&bitcoin, payout) {
+            (Btc::Node(bitcoind), Some(payout)) if !bitcoind.owns(payout)? => Ok(Err(format!(
+                "refused: the swap does not pay the bitcoind wallet {}: resume it with the \
+                 Bitcoin flags it was made with, none or --esplora for the wallet in {}",
+                nodes.btc_wallet.as_deref().unwrap_or_default(),
+                dir.display()
+            )
+            .into())),
+            _ => Ok(Ok(())),
+        }
+    };
+    loop {
+        match check() {
+            Ok(checked) => return checked.map(|()| bitcoin),
+            Err(e) => {
+                log(&format!(
+                    "bitcoin: {e}: asked again in {}s",
+                    retry.as_secs_f64()
+                ));
+                std::thread::sleep(retry);
+            }
+        }
+    }
 }
 
 #[derive(Args)]
@@ -1124,12 +1229,12 @@ fn wallet(args: WalletArgs) -> Result<()> {
         network,
         url,
         String::new(),
-        PathBuf::new(),
+        None,
         String::new(),
     );
     // Refused while a swap runs in the directory, which holds it open.
     let wallet = Wallet::open(config)?;
-    wallet.esplora().check_network(network)?;
+    wallet.esplora().check_network(network)??;
     if let Some(to) = &args.withdraw {
         if let Some(swap_id) = unended(&args.dir)? {
             return Err(format!(

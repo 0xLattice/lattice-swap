@@ -355,7 +355,7 @@ impl World {
         bitcoind.client.generate_to_address(1, &miner).unwrap();
         // The parties refuse a node whose index is still catching up.
         wait_for("the txindex", || {
-            wallet_client(&bitcoind, "buyer").check_node().ok()
+            wallet_client(&bitcoind, "buyer").check_node().ok()?.ok()
         });
 
         let nexus = Nexus::start(rates);

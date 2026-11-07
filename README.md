@@ -101,15 +101,16 @@ By default a party needs no node of its own. Bitcoin is read through
 mempool.space's Esplora for `--btc-network` (`https://mempool.space/api`,
 `/signet/api`, `/testnet/api`, `/testnet4/api`; regtest has none), and Nexus
 through the public read node `https://lattice-mainnet-read.fly.dev`, with no
-cookie; `offer`, `take` and `resume` refuse a public Nexus node whose
-`GET /api/chain/info` does not say `acceptsSubmit`, and an Esplora whose
-block 0 is not `--btc-network`'s genesis. Each chain can be your own
+cookie; `offer` and `take` refuse a public Nexus node whose
+`GET /api/chain/info` does not say `acceptsSubmit`, and `offer`, `take` and
+`resume` an Esplora whose block 0 is not `--btc-network`'s genesis. Each chain can be your own
 instead, on its own: `--esplora <url>` for your Esplora or mempool instance,
 or `--btc-wallet` with `--btc-cookie` or `--btc-user` (and `--btc-url`) for
 your bitcoind, not both; `--nexus-url` for another node, and with
 `--nexus-cookie` your own lattice-node's RPC. At startup each prints
 `bitcoin: public <url>` or `bitcoin: your node <url>`, and the same for
-nexus. A public node is trusted for what it shows: a seller trusts
+nexus; `--esplora` naming the mempool.space URL for `--btc-network` is
+public too. A public node is trusted for what it shows: a seller trusts
 mempool.space for how deep the buyer's BTC lock is before it locks its NEX,
 and a public Nexus node for its claim of the NEX back on a refund, so keep
 `--max-btc-amount` small; a buyer trusts mempool.space to show Bitcoin in
@@ -130,8 +131,9 @@ directory on an Esplora: `take` is refused while one there has not ended,
 or while the wallet's confirmed balance does not fund the lock. A swap file
 does not say which Bitcoin it was made on: `resume` with no Bitcoin flags,
 or `--esplora`, refuses a swap that does not pay the wallet in its
-directory, as one made on a bitcoind does not; resume that with the flags
-it was made with.
+directory, as one made on a bitcoind does not, and `resume` with the
+bitcoind flags refuses one that does not pay that bitcoind wallet, as one
+made on an Esplora does not; resume each with the flags it was made with.
 
 ```sh
 lattice-swap offer --nex-key-file ~/.lattice-swap/nex.key \
@@ -158,7 +160,19 @@ Bitcoin as the OP_RETURN of transaction
 offer's terms also name the seller's genesis, and the buyer refuses one
 other than its own, but each side's protection is its own node's check. The
 swap file keeps that genesis: `resume` refuses a `--nexus-genesis` naming
-another. A private chain
+another. `resume` never refuses the lattice-node itself, as a swap's
+cancel, refund, redeem and punish are Bitcoin's and must not wait on it: it
+goes on from Bitcoin at once, even with the lattice-node stopped and its
+cookie file gone, and reads Nexus only once the node passes the checks
+above, asked at every read while the swap watches Nexus, and warned of,
+until it passes; after that, every read compares the genesis the node names
+with `--nexus-genesis`'s, and a node on another Nexus is not read. A round's
+Nexus reads take 10 seconds at most, so a slow or silent node never holds
+up the next look at Bitcoin. A public node that takes no transactions is
+warned of too: the swap's Nexus submits fail through it. `resume` refuses a
+Bitcoin node or Esplora on another chain, or one the swap does not pay, but
+one that cannot answer yet, down or erring, is asked again every 10 seconds,
+with a warning, until it does. A private chain
 forked from mainnet's genesis passes it: it shares mainnet's identity, so
 trade only through a node that follows the public network, and never use a
 mainnet key on a private or dev chain, where a transfer it signs is valid on

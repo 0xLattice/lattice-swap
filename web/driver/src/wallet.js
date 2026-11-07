@@ -10,7 +10,7 @@
 
 import { call, wasm } from './wasm.js';
 import { Esplora } from './esplora.js';
-import { Nexus } from './views.js';
+import { checkNexus, Nexus } from './views.js';
 import { IndexedDBStore } from './store.js';
 
 /** The default Esplora for each network: mempool.space's. Regtest has
@@ -178,6 +178,17 @@ export class Wallet {
    * @returns {string} */
   get address() {
     return this.key.address;
+  }
+
+  /** Refuses backends a swap cannot rely on, as the CLI checks its nodes
+   * before a swap: an Esplora on another network than `network`, and a
+   * Nexus node that takes no transactions, follows another Nexus than
+   * `nexusGenesis`, or keeps no state of past blocks. Its error, starting
+   * `refused:`, says which, for a page to show where its backends are set.
+   * @returns {Promise<void>} */
+  async check() {
+    await this.esplora.checkNetwork(this.config.network);
+    await checkNexus(this.nexus, this.config.nexusGenesis);
   }
 
   /** The outputs the wallet holds: those in a block are spendable, as

@@ -67,6 +67,22 @@ export class Nexus {
     return response.json();
   }
 
+  /** `/health`, its height and tip read live from `/api/chain/info`, as
+   * the native `Client::public` reads them: a public read port answers
+   * `/health` from a snapshot up to a few seconds old and every other read
+   * live, so a depth worked out against the snapshot's height would miss a
+   * block the other reads show. `/api/chain/info` names no best header,
+   * so, as there, the node counts as synced only if the snapshot was (its
+   * best header at its height) and the live tip has reached that header;
+   * otherwise no best header is given. */
+  async health() {
+    const { bestHeaderHeight, ...health } = await this.get('/health');
+    const { height, tipCID } = await this.get('/api/chain/info');
+    const synced = bestHeaderHeight != null && health.height != null && height != null
+      && BigInt(bestHeaderHeight) === BigInt(health.height) && BigInt(height) >= BigInt(bestHeaderHeight);
+    return { ...health, height, tipCID, ...(synced ? { bestHeaderHeight: height } : {}) };
+  }
+
   /** Submits `body`, from `nexusSubmitBody`. As plain text: a JSON body
    * would need a CORS preflight, which a public read port behind a proxy
    * may refuse, and the node reads the body as JSON whatever its type. */
@@ -85,18 +101,18 @@ export class Nexus {
 export async function nexusView(nexus, watch) {
   const account = (address) => nexus.get(`/api/state/account/${encodeURIComponent(address)}`);
   const transaction = (cid) => nexus.get(`/api/transaction/${encodeURIComponent(cid)}`, true);
-  const health = await nexus.get('/health');
+  const health = await nexus.health();
   const own = await account(watch.own_address);
   const lock = await account(watch.lock_address);
   const chainInfo = await nexus.get('/api/chain/info');
   let watched = null;
   if (watch.cid !== null) {
     const before = await transaction(watch.cid);
-    const tip = await nexus.get('/health');
+    const tip = await nexus.health();
     watched = { before, health: tip, after: before === null ? null : await transaction(watch.cid) };
   }
   const blockAt = watch.block_at === null ? null : await nexus.get(`/api/block/${watch.block_at}`, true);
-  const after = await nexus.get('/health');
+  const after = await nexus.health();
   return call('nexusView', {
     health,
     own,
@@ -108,13 +124,15 @@ export async function nexusView(nexus, watch) {
   });
 }
 
-/** Refuses a node on another Nexus than `genesis`, where a NEX lock is
- * worthless, or one that keeps no state of past blocks and so cannot say
- * how deep a transaction is: the CLI's own checks, swap-wasm's
- * `checkNexus`, on what this reads. */
+/** Refuses a node that takes no transactions, as the page submits its
+ * claim through it, then a node on another Nexus than `genesis`, where a
+ * NEX lock is worthless, or one that keeps no state of past blocks and so
+ * cannot say how deep a transaction is: the CLI's own checks of a public
+ * node, swap-wasm's `checkNexus`, on what this reads. */
 export async function checkNexus(nexus, genesis) {
   const chainInfo = await nexus.get('/api/chain/info');
-  const health = await nexus.get('/health');
+  if (chainInfo.acceptsSubmit !== true) throw new Error(`refused: ${nexus.url} takes no transactions: give a Nexus node that does`);
+  const health = await nexus.health();
   const at = call('nexusProbeHeight', health);
   let pastState = null;
   if (at !== null) {

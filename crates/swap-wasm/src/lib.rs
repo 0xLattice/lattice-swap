@@ -361,6 +361,16 @@ pub fn script_of(address: &str, network: &str) -> Result<String> {
     Ok(address.script_pubkey().to_hex_string())
 }
 
+/// The hash of block 0 of `network`: an Esplora's `/block-height/0` must
+/// answer it, as the native app's `Esplora::check_network` checks.
+#[wasm_bindgen(js_name = bitcoinGenesis)]
+pub fn bitcoin_genesis(network: &str) -> Result<String> {
+    let network = Network::from_str(network).map_err(|e| e.to_string())?;
+    Ok(bitcoin::constants::genesis_block(network)
+        .block_hash()
+        .to_string())
+}
+
 /// The txid of the Bitcoin transaction `hex`: what an Esplora answers for
 /// a txid is checked to be that transaction.
 #[wasm_bindgen(js_name = txidOf)]

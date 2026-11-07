@@ -18,6 +18,16 @@ export class Esplora {
     return response.text();
   }
 
+  /** Refuses an Esplora on another chain than `network`, whose blocks
+   * would never show the swap's transactions: its block 0 must be
+   * `network`'s genesis, as the native app's `Esplora::check_network`
+   * checks. */
+  async checkNetwork(network) {
+    const expected = wasm.bitcoinGenesis(network);
+    const genesis = (await this.#get('/block-height/0')).trim();
+    if (genesis !== expected) throw new Error(`refused: the Esplora's genesis is ${genesis}, not ${network}'s ${expected}`);
+  }
+
   /** The tip as `swap::view::Tip`: Esplora shows its blocks, not a header
    * chain ahead of them, so `headers` is the tip's own height. */
   async tip() {

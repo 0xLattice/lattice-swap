@@ -147,6 +147,10 @@ impl Store {
 /// [`Driver::reconnect`].
 pub type Reconnect<T> = Box<dyn FnMut(&Rejoin) -> Option<io::Result<T>> + Send>;
 
+/// Why the Nexus node will not do yet, if it will not: see
+/// [`Driver::nexus_check`].
+pub type NexusCheck = Box<dyn FnMut(&Client) -> Result<(), String> + Send>;
+
 /// Feeds a machine what its nodes and its counterparty show, and does what
 /// it asks. The state is saved after every step that changes it, before
 /// any of the step's actions, so nothing is sent, broadcast or submitted
@@ -191,6 +195,22 @@ pub struct Driver<M, B, T> {
     /// [`Machine::resend`]; a failed attempt is logged, as the views' are.
     /// See [`crate::transport::in_background`].
     pub reconnect: Option<Reconnect<T>>,
+    /// Asked of the Nexus node at every read of the chains, after Bitcoin's,
+    /// while set: a swap resumed reads Nexus only while its node passes, so
+    /// nothing is concluded from a node on another Nexus, or one that keeps
+    /// no past state, and a node that fails a moment fails no Bitcoin spend.
+    /// A failure skips the round's Nexus view, and is warned of as a failing
+    /// view is; the round that passes again says so.
+    pub nexus_check: Option<NexusCheck>,
+    /// The genesis of the Nexus the node must follow, compared on every
+    /// view, while set: the view of a node on another Nexus is skipped as
+    /// a failed [`Driver::nexus_check`] is. Read from the `/api/chain/info`
+    /// the view reads anyway.
+    pub nexus_genesis: Option<String>,
+    /// How long a round's Nexus check and view may take: every request
+    /// ends by then, and one past it is not asked, so a slow or silent
+    /// Nexus node delays the next Bitcoin round by this at most.
+    pub nexus_budget: Duration,
     store: Store,
     /// The least time between two reads of the chains. Messages are taken
     /// as they come in between: however many the counterparty sends, the
@@ -244,6 +264,8 @@ pub struct Driver<M, B, T> {
     submit_failed: Option<(String, SystemTime)>,
     /// The last failed attempt to rejoin, and when it was logged.
     rejoin_failed: Option<(String, SystemTime)>,
+    /// The last failure of `nexus_check`, and when it was logged.
+    check_failed: Option<(String, SystemTime)>,
     /// The tip, and when this driver first saw it, in seconds since the
     /// Unix epoch. Kept in memory only: after a restart, the tip is first
     /// seen then.
@@ -310,6 +332,9 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
             nexus,
             transport,
             reconnect: None,
+            nexus_check: None,
+            nexus_genesis: None,
+            nexus_budget: NEXUS_BUDGET,
             store,
             poll: Duration::from_millis(250),
             message_timeout: Duration::from_secs(60),
@@ -325,6 +350,7 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
             stale_since: None,
             submit_failed: None,
             rejoin_failed: None,
+            check_failed: None,
             first_seen: None,
             punish_child: None,
             _lock: lock,
@@ -643,13 +669,35 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
         let Some(watch) = self.state.watch().nexus else {
             return Ok(());
         };
-        match nexus_view(&self.nexus, &watch) {
-            Ok(Some(view)) => self.apply(Event::Nexus(view)),
-            // The tip moved while the view was read: read again next time.
-            Ok(None) => Ok(()),
-            Err(e) => {
+        self.nexus
+            .set_deadline(Some(Instant::now() + self.nexus_budget));
+        let genesis = self.nexus_genesis.as_deref();
+        let read = match &mut self.nexus_check {
+            Some(check) => check(&self.nexus).map(|()| nexus_view(&self.nexus, &watch, genesis)),
+            None => Ok(nexus_view(&self.nexus, &watch, genesis)),
+        };
+        // Submits, which the view may lead to, are not the round's reads.
+        self.nexus.set_deadline(None);
+        match read {
+            Err(e) | Ok(Ok(Err(e))) => {
+                let e = format!("nexus: {e}: Nexus is not read until it passes; Bitcoin goes on");
+                warn_again(&mut self.check_failed, e, (self.clock)());
+                Ok(())
+            }
+            Ok(Err(e)) => {
                 warn(&format!("nexus: {e}"));
                 Ok(())
+            }
+            Ok(Ok(Ok(view))) => {
+                if self.check_failed.take().is_some() {
+                    warn("nexus: the node passes its check: Nexus is read again");
+                }
+                match view {
+                    Some(view) => self.apply(Event::Nexus(view)),
+                    // The tip moved while the view was read: read again next
+                    // time.
+                    None => Ok(()),
+                }
             }
         }
     }
@@ -728,6 +776,11 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
         Ok(())
     }
 }
+
+/// [`Driver::nexus_budget`]'s default: time for a view's dozen reads of a
+/// public node across the internet, a few hundred milliseconds each, and
+/// little next to a Bitcoin block.
+pub const NEXUS_BUDGET: Duration = Duration::from_secs(10);
 
 /// How many times a failed bump near its deadline is tried again within one
 /// block, a poll apart.
@@ -893,15 +946,33 @@ fn punish_child(
 /// The lock account is read before the watched transaction: a lock that
 /// has signed something, read first, shows that transaction mined in the
 /// later read if it is ours. The view is one tip's: `None` unless
-/// [`view::one_tip`] holds, so no read in it comes from another block.
+/// [`view::one_tip`] holds, so no read in it comes from another block. A
+/// node on another Nexus than `genesis`, if given, is refused (`Ok(Err)`)
+/// at its first read, which names its genesis.
 fn nexus_view(
     client: &Client,
     watch: &NexusWatch,
-) -> swap_nexus_tx::rpc::Result<Option<NexusView>> {
+    genesis: Option<&str>,
+) -> swap_nexus_tx::rpc::Result<Result<Option<NexusView>, String>> {
+    use swap_nexus_tx::rpc::parse::{self, NodeRefusal};
+    use swap_nexus_tx::rpc::Error;
+    let chain_info = client.chain_info()?;
+    if let Some(expected) = genesis {
+        match parse::genesis(&chain_info) {
+            Ok(genesis) if genesis == expected => {}
+            Ok(genesis) => {
+                let expected = expected.into();
+                return Ok(Err(
+                    NodeRefusal::OtherNexus { genesis, expected }.to_string()
+                ));
+            }
+            Err(e) => return Ok(Err(NodeRefusal::Malformed(e).to_string())),
+        }
+    }
+    let min_relay_fee = parse::min_relay_fee(&chain_info).map_err(Error::Malformed)?;
     let health = client.health()?;
     let own = client.account(&watch.own_address)?;
     let lock = client.account(&watch.lock_address)?;
-    let min_relay_fee = client.min_relay_fee()?;
     let watched = match &watch.cid {
         Some(cid) => match client.transaction(cid)? {
             Some(transaction) => Some((transaction, client.confirmations(cid)?)),
@@ -915,14 +986,14 @@ fn nexus_view(
     };
     let after = client.health()?;
     if !view::one_tip(&health, &after) {
-        return Ok(None);
+        return Ok(Ok(None));
     }
-    Ok(Some(NexusView {
+    Ok(Ok(Some(NexusView {
         health,
         own,
         lock,
         min_relay_fee,
         watched,
         block_at,
-    }))
+    })))
 }
