@@ -167,12 +167,17 @@ cookie file gone, and reads Nexus only once the node passes the checks
 above, asked at every read while the swap watches Nexus, and warned of,
 until it passes; after that, every read compares the genesis the node names
 with `--nexus-genesis`'s, and a node on another Nexus is not read. A round's
-Nexus reads take 10 seconds at most, so a slow or silent node never holds
-up the next look at Bitcoin. A public node that takes no transactions is
-warned of too: the swap's Nexus submits fail through it. `resume` refuses a
-Bitcoin node or Esplora on another chain, or one the swap does not pay, but
-one that cannot answer yet, down or erring, is asked again every 10 seconds,
-with a warning, until it does. A private chain
+Nexus requests, its reads and the submits they lead to, take
+`--nexus-budget` seconds at most, 10 by default, so a slow or silent node
+never holds up the next look at Bitcoin for longer; raise it for a node far
+away, as over Tor, whose reads take longer. A public node that takes no
+transactions is warned of too: the swap's Nexus submits fail through it.
+`resume` refuses a Bitcoin node or Esplora on another chain, or one the swap
+does not pay, but one that cannot answer yet, down or erring, is asked again
+every 10 seconds, with a warning, until it does. A bitcoind wallet not
+loaded, or locked, is only warned of: the swap's cancel, refund and punish
+are signed already and need no wallet, only their fee bumps do, and those
+fail until it is back. A private chain
 forked from mainnet's genesis passes it: it shares mainnet's identity, so
 trade only through a node that follows the public network, and never use a
 mainnet key on a private or dev chain, where a transfer it signs is valid on
@@ -236,8 +241,8 @@ the offer and the seller's session key, is kept beside the swap file in
 - `lattice-swap resume <swap file>` carries on after a restart, from the
   chains and, while the swap still needs it, a new session to the
   counterparty, with the same flags: the node flags, and `--max-fee-rate`,
-  `--fallback-fee-rate`, `--max-fee-fraction` and `--max-tip-age`, which are
-  not saved. A
+  `--fallback-fee-rate`, `--max-fee-fraction`, `--max-tip-age` and
+  `--nexus-budget`, which are not saved. A
   seller also needs its Nexus key until the NEX lock is signed; a key given
   later must still be the swap's. `refund` is the same command: a swap cancels
   and refunds by itself once its timelocks allow.

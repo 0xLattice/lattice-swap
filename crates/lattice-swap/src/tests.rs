@@ -794,7 +794,8 @@ fn a_failure_after_the_swap_file_exists_says_how_to_resume() {
     let hinted = resume_hint(file.path(), "lost".into()).to_string();
     let hint = format!(
         "lost\nto carry on, run with the same flags, the node and key flags and \
-         --max-fee-rate, --fallback-fee-rate, --max-fee-fraction and --max-tip-age: \
+         --max-fee-rate, --fallback-fee-rate, --max-fee-fraction, --max-tip-age and \
+         --nexus-budget: \
          lattice-swap resume {}",
         file.path().display()
     );
@@ -1318,6 +1319,7 @@ fn the_bump_settings_default_to_the_drivers() {
             d.fallback_fee_rate,
             d.max_fee_fraction,
             d.max_tip_age,
+            d.nexus_budget,
         )
     };
     let before = defaults(&driver);
@@ -1333,11 +1335,14 @@ fn the_bump_settings_default_to_the_drivers() {
         "0.25",
         "--max-tip-age",
         "30",
+        "--nexus-budget",
+        "25",
     ]);
     args.bump.apply(&mut driver);
     let rate = |sat| FeeRate::from_sat_per_vb(sat).unwrap();
     let age = Duration::from_secs(30 * 60);
-    assert_eq!(defaults(&driver), (rate(50), rate(5), 0.25, age));
+    let budget = Duration::from_secs(25);
+    assert_eq!(defaults(&driver), (rate(50), rate(5), 0.25, age, budget));
     for fraction in ["0", "1"] {
         assert!(parse(&["resume", "x.json", "--max-fee-fraction", fraction]).is_ok());
     }

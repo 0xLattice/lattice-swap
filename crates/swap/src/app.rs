@@ -93,6 +93,9 @@ pub struct Config {
     pub message_timeout: Duration,
     /// The oldest a Bitcoin tip may be for a view not to be stale.
     pub max_tip_age: Duration,
+    /// The most a round's Nexus requests may take: the driver's
+    /// [`nexus_budget`](crate::driver::Driver::nexus_budget).
+    pub nexus_budget: Duration,
 }
 
 impl Config {
@@ -116,6 +119,7 @@ impl Config {
             poll: POLL,
             message_timeout: Duration::from_secs(60),
             max_tip_age: Duration::from_secs(90 * 60),
+            nexus_budget: crate::driver::NEXUS_BUDGET,
         }
     }
 }
@@ -815,6 +819,7 @@ impl Buy {
         driver.poll = wallet.config.poll;
         driver.message_timeout = wallet.config.message_timeout;
         driver.max_tip_age = wallet.config.max_tip_age;
+        driver.nexus_budget = wallet.config.nexus_budget;
         // As the browser funds and prices its own spends: the Esplora's
         // estimate, else the relay floor.
         driver.fallback_fee_rate = FeeRate::from_sat_per_vb_u32(1);

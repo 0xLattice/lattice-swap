@@ -798,8 +798,10 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
 }
 
 /// [`Driver::nexus_budget`]'s default: time for a view's dozen reads of a
-/// public node across the internet, a few hundred milliseconds each, and
-/// little next to a Bitcoin block.
+/// public node across the internet, a few hundred milliseconds each, and a
+/// submit, and little next to a Bitcoin block. A node farther away, as over
+/// Tor, may need more: its views fail, and Nexus is not read, until the
+/// budget is raised.
 pub const NEXUS_BUDGET: Duration = Duration::from_secs(10);
 
 /// How many times a failed bump near its deadline is tried again within one

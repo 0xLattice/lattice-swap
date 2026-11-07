@@ -565,8 +565,8 @@ impl NexKeyArgs {
 }
 
 /// How the driver bumps, by CPFP from their payout, the swap transactions
-/// that pay this party, and how old a Bitcoin tip it trusts. The defaults
-/// are the driver's.
+/// that pay this party, how old a Bitcoin tip it trusts, and how long it
+/// gives Nexus each round. The defaults are the driver's.
 #[derive(Args)]
 struct BumpArgs {
     /// The most a bump pays for, in sat/vB.
@@ -588,6 +588,12 @@ struct BumpArgs {
     /// seller to start a redeem or lock its NEX on it.
     #[arg(long, default_value_t = 90)]
     max_tip_age: u64,
+    /// The most, in seconds, a round's Nexus requests may take, its reads
+    /// and the submits they lead to: a slow or silent Nexus node delays
+    /// the next look at Bitcoin by this at most. Raise it for a node far
+    /// away, as over Tor, whose dozen reads a round take longer.
+    #[arg(long, default_value_t = swap::driver::NEXUS_BUDGET.as_secs())]
+    nexus_budget: u64,
 }
 
 impl BumpArgs {
@@ -596,6 +602,7 @@ impl BumpArgs {
         driver.fallback_fee_rate = self.fallback_fee_rate;
         driver.max_fee_fraction = self.max_fee_fraction;
         driver.max_tip_age = Duration::from_secs(self.max_tip_age.saturating_mul(60));
+        driver.nexus_budget = Duration::from_secs(self.nexus_budget);
     }
 }
 
@@ -1351,7 +1358,8 @@ fn resume_hint(swap_file: &Path, error: Box<dyn std::error::Error>) -> Box<dyn s
     }
     format!(
         "{error}\nto carry on, run with the same flags, the node and key flags and \
-         --max-fee-rate, --fallback-fee-rate, --max-fee-fraction and --max-tip-age: \
+         --max-fee-rate, --fallback-fee-rate, --max-fee-fraction, --max-tip-age and \
+         --nexus-budget: \
          lattice-swap resume {}",
         swap_file.display()
     )
