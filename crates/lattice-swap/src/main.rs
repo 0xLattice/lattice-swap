@@ -160,7 +160,7 @@ impl TermsArgs {
 /// Bitcoin through mempool.space's Esplora for --btc-network, or --esplora,
 /// or your bitcoind with --btc-wallet; Nexus through the public read node,
 /// or --nexus-url, your own node's RPC with --nexus-cookie.
-#[derive(Args)]
+#[derive(Args, Clone)]
 struct NodeArgs {
     /// Your own Esplora API, as a mempool instance serves one, e.g.
     /// `http://127.0.0.1:3006/api`, instead of mempool.space's. On an
@@ -334,21 +334,31 @@ impl NodeArgs {
     /// As [`NodeArgs::check_nexus`], for a swap resumed, which it never
     /// refuses: a taken swap's cancel, refund, redeem and punish are
     /// Bitcoin's, and a node that fails, even for a moment, must not stop
-    /// them. A public node that takes no transactions is warned of, its
-    /// Nexus submits failing; the rest is the driver's
-    /// [`nexus_check`](swap::driver::Driver::nexus_check), asked at every
-    /// read until the node passes, Nexus unread till then, and its genesis
-    /// compared on every view after.
-    fn resumed_check(&self, client: &Client) -> NexusCheck {
-        match self.takes_no_transactions(client) {
-            Ok(Some(why)) => log(&format!(
-                "{why}: the swap's Bitcoin side goes on, its Nexus submits fail"
-            )),
-            Ok(None) => {}
-            Err(e) => log(&format!("nexus: {e}")),
-        }
+    /// them. The driver's [`nexus_check`](swap::driver::Driver::nexus_check),
+    /// asked at every read, under its Nexus budget, until the node passes,
+    /// Nexus unread till then, and its genesis compared on every view
+    /// after. A public node that takes no transactions is warned of, asked
+    /// until it answers once, its Nexus submits failing.
+    fn resumed_check(&self) -> NexusCheck {
         let genesis = self.nexus_genesis.clone();
-        swap::session::check_once(move |client| check_nexus_chain(client, &genesis))
+        let mut chain =
+            swap::session::check_once(move |client| check_nexus_chain(client, &genesis));
+        let nodes = self.clone();
+        let mut told = false;
+        Box::new(move |client| {
+            let gated = chain(client);
+            if !told {
+                if let Ok(takes_none) = nodes.takes_no_transactions(client) {
+                    told = true;
+                    if let Some(why) = takes_none {
+                        log(&format!(
+                            "{why}: the swap's Bitcoin side goes on, its Nexus submits fail"
+                        ));
+                    }
+                }
+            }
+            gated
+        })
     }
 
     /// Why a public node takes no transactions, if it takes none.
@@ -1106,7 +1116,7 @@ fn resume(args: SwapFileArgs) -> Result<Outcome> {
             let nexus = args.nodes.nexus();
             let check = seller.outcome().is_none().then(|| {
                 args.nodes.trust(SELLER_TRUSTS);
-                args.nodes.resumed_check(&nexus)
+                args.nodes.resumed_check()
             });
             let driver = swap::session::resume::<Seller, _>(bitcoin, nexus, store);
             run(
@@ -1128,7 +1138,7 @@ fn resume(args: SwapFileArgs) -> Result<Outcome> {
             let nexus = args.nodes.nexus();
             let check = buyer.outcome().is_none().then(|| {
                 args.nodes.trust(BUYER_TRUSTS);
-                args.nodes.resumed_check(&nexus)
+                args.nodes.resumed_check()
             });
             let driver = swap::session::resume::<Buyer, _>(bitcoin, nexus, store);
             let driver = driver.map(|mut driver| {

@@ -2393,8 +2393,8 @@ fn a_resumed_swap_reads_nexus_only_once_its_node_passes() {
         &nexus_node_submitting(MAINNET, 10, false, 1, false),
         TIMEOUT,
     );
-    // Made through a node that is down: the check is the driver's.
-    let mut check = nodes.resumed_check(&down);
+    // Made asking no node: the check is the driver's, under its budget.
+    let mut check = nodes.resumed_check();
     for _ in 0..2 {
         let failed = check(&down).unwrap_err();
         assert!(failed.contains("127.0.0.1:9"), "{failed}");
