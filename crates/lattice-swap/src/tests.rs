@@ -2635,6 +2635,61 @@ fn resume_on_a_bitcoind_takes_only_a_swap_paying_its_wallet() {
     assert!(resume_bitcoin(&resume_on(false), dir, None).is_ok());
 }
 
+/// Resumed on a bitcoind whose wallet is locked or not loaded, a swap
+/// goes on at once: its cancel, refund and punish are signed already, and
+/// only their bumps need the wallet. A locked wallet the swap does not pay
+/// is refused still.
+#[test]
+fn resume_on_a_bitcoind_does_not_wait_for_its_wallet() {
+    let directory = tempfile::tempdir().unwrap();
+    let dir = directory.path();
+    let cookie = tempfile::NamedTempFile::new().unwrap();
+    fs::write(cookie.path(), "user:password").unwrap();
+    let resume_on = |replies: Value| {
+        let cli = Cli::try_parse_from([
+            "lattice-swap",
+            "resume",
+            "f.json",
+            "--btc-url",
+            &node(replies, Value::Null),
+            "--btc-wallet",
+            "w",
+            "--btc-cookie",
+            cookie.path().to_str().unwrap(),
+        ])
+        .unwrap();
+        let Command::Resume(args) = cli.command else {
+            panic!("not resume")
+        };
+        args.nodes
+    };
+    let locked = json!({"private_keys_enabled": true, "unlocked_until": 0});
+    let not_loaded = json!({"result": null, "error": {
+        "code": -18,
+        "message": "Requested wallet does not exist or is not loaded",
+    }});
+    let never = Duration::from_secs(3600);
+    let locked_mine = resume_on(json!({"getwalletinfo": {"result": locked}}));
+    assert!(resume_bitcoin_every(&locked_mine, dir, Some(&paid()), never).is_ok());
+    let unloaded = resume_on(json!({
+        "getwalletinfo": not_loaded,
+        "getaddressinfo": not_loaded,
+    }));
+    assert!(resume_bitcoin_every(&unloaded, dir, Some(&paid()), never).is_ok());
+    let locked_not_mine = resume_on(json!({
+        "getwalletinfo": {"result": locked},
+        "getaddressinfo": {"result": {"ismine": false}},
+    }));
+    let refused = match resume_bitcoin_every(&locked_not_mine, dir, Some(&paid()), never) {
+        Ok(_) => panic!("a swap not paying the wallet was resumed"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        refused.contains("does not pay the bitcoind wallet w"),
+        "{refused}"
+    );
+}
+
 /// On an Esplora, `take` is refused while a swap in the directory has not
 /// ended, as the app's: it may yet broadcast a funding it signed from the
 /// wallet.

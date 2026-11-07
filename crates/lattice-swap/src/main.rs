@@ -1146,7 +1146,8 @@ fn resume(args: SwapFileArgs) -> Result<Outcome> {
 /// refused too. A Bitcoin that cannot answer yet, down or erring for a
 /// moment, is asked again `retry` apart, with a warning, until it answers:
 /// the swap's cancel, refund and punish wait on it, not on the user to run
-/// `resume` again.
+/// `resume` again. A bitcoind wallet not loaded or locked is warned of,
+/// not waited on: those spends need no wallet, only their fee bumps do.
 fn resume_bitcoin(nodes: &NodeArgs, dir: &Path, payout: Option<&Script>) -> Result<Btc> {
     resume_bitcoin_every(nodes, dir, payout, app::POLL)
 }
@@ -1175,18 +1176,38 @@ fn resume_bitcoin_every(
         }
     }
     let check = || -> swap::bitcoind::Result<Result<()>> {
-        if let Err(refusal) = bitcoin.check(nodes.btc_network)? {
+        let Btc::Node(bitcoind) = &bitcoin else {
+            return Ok(bitcoin.check(nodes.btc_network)?.map_err(Into::into));
+        };
+        if let Err(refusal) = bitcoind.check_chain()? {
             return Ok(Err(refusal.into()));
         }
-        match (&bitcoin, payout) {
-            (Btc::Node(bitcoind), Some(payout)) if !bitcoind.owns(payout)? => Ok(Err(format!(
+        // Cancel, refund and punish are signed already: broadcast and
+        // read, they need no wallet, and only bumps do. A wallet not
+        // loaded or locked is warned of, never waited on, its bumps
+        // failing, loudly, until it is back; and one not loaded is not
+        // asked whether the swap pays it.
+        let ready = match bitcoind.check_wallet() {
+            Ok(Err(refusal)) => return Ok(Err(refusal.into())),
+            Ok(Ok(())) => true,
+            Err(e) => {
+                log(&format!(
+                    "{e}: the swap goes on, its fee bumps fail until the wallet is loaded \
+                     and unlocked"
+                ));
+                false
+            }
+        };
+        match payout.map(|payout| bitcoind.owns(payout)) {
+            Some(Ok(false)) => Ok(Err(format!(
                 "refused: the swap does not pay the bitcoind wallet {}: resume it with the \
                  Bitcoin flags it was made with, none or --esplora for the wallet in {}",
                 nodes.btc_wallet.as_deref().unwrap_or_default(),
                 dir.display()
             )
             .into())),
-            _ => Ok(Ok(())),
+            Some(Err(e)) if ready => Err(e),
+            Some(_) | None => Ok(Ok(())),
         }
     };
     loop {

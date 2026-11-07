@@ -113,6 +113,15 @@ impl Bitcoind {
     /// block download, its wallet not loaded or locked. Asking it again
     /// may pass.
     pub fn check_node(&self) -> Result<Result<()>> {
+        if let Err(refusal) = self.check_chain()? {
+            return Ok(Err(refusal));
+        }
+        self.check_wallet()
+    }
+
+    /// [`Bitcoind::check_node`] without the wallet: what reading the
+    /// chain and broadcasting a signed transaction need.
+    pub fn check_chain(&self) -> Result<Result<()>> {
         let refused = |why: String| Ok(Err(Error(why)));
         let index = self.call("getindexinfo", json!(["txindex"]))?;
         match index["txindex"]["synced"].as_bool() {
@@ -144,6 +153,13 @@ impl Bitcoind {
                 "the node is in initial block download: try again once it is synced".into(),
             ));
         }
+        Ok(Ok(()))
+    }
+
+    /// The wallet half of [`Bitcoind::check_node`]: what funding the lock
+    /// and bumping need.
+    pub fn check_wallet(&self) -> Result<Result<()>> {
+        let refused = |why: String| Ok(Err(Error(why)));
         let wallet = self
             .call("getwalletinfo", json!([]))
             .map_err(|e| Error(format!("the node has no such wallet loaded: {}", e.0)))?;
