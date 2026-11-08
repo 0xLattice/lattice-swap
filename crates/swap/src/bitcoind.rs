@@ -94,7 +94,12 @@ impl Bitcoind {
     pub fn new(url: &str, cookie: &str, network: Network, timeout: Duration) -> Self {
         let token = base64::engine::general_purpose::STANDARD.encode(cookie.trim());
         Self {
-            agent: ureq::AgentBuilder::new().timeout(timeout).build(),
+            // A new connection per call: bitcoind closes an idle one, and a
+            // call it cuts off is not retried, an RPC being a POST.
+            agent: ureq::AgentBuilder::new()
+                .timeout(timeout)
+                .max_idle_connections(0)
+                .build(),
             url: url.into(),
             authorization: format!("Basic {token}"),
             network,

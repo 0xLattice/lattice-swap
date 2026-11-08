@@ -5881,3 +5881,53 @@ fn a_resumed_refund_goes_on_whatever_its_nexus_node_does() {
         assert_eq!(warning(&buy), serde_json::Value::Null, "{failing:?}");
     }
 }
+
+/// bitcoind closes an idle RPC connection (`-rpcservertimeout`, 30s by
+/// default), and may as a call goes out on it; that call still reaches it.
+#[cfg(feature = "native")]
+#[test]
+fn bitcoind_calls_as_it_closes_an_idle_connection() {
+    use crate::bitcoind::Bitcoind;
+    use std::io::{BufRead, Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            // The first call on a connection is answered, kept alive as
+            // bitcoind answers; one more is cut off unanswered.
+            for answered in [true, false] {
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some(n) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = n.trim().parse().unwrap();
+                    }
+                }
+                if reader.read_exact(&mut vec![0; length]).is_err() || !answered {
+                    break;
+                }
+                let answer = r#"{"result":7,"error":null,"id":0}"#;
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{answer}",
+                    answer.len()
+                );
+            }
+        }
+    });
+    let bitcoind = Bitcoind::new(
+        &url,
+        "u:p",
+        bitcoin::Network::Regtest,
+        Duration::from_secs(5),
+    );
+    for _ in 0..2 {
+        let call = bitcoind.call("getblockcount", json!([]));
+        assert_eq!(call.map_err(|e| e.to_string()), Ok(json!(7)));
+    }
+}
