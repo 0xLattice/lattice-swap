@@ -853,6 +853,7 @@ test('status() carries the amounts, the confirmations asked for, the NEX address
     btc_amount: TERMS.btc_amount,
     price: POLICY.price,
     nex_amount: TERMS.nex_amount,
+    nex_fee: OFFER.template.nex_fee,
     btc_confirmations: OFFER.template.btc_confirmations,
     nex_confirmations: OFFER.template.nex_confirmations,
     nexAddress: w.nexAddress,
@@ -860,6 +861,7 @@ test('status() carries the amounts, the confirmations asked for, the NEX address
   const pick = (status) => Object.fromEntries(Object.keys(terms).map((key) => [key, status[key]]));
   assert.deepEqual(pick(w.buyer.status()), terms);
   assert.equal(TERMS.nex_amount, 500_000);
+  assert.equal(OFFER.template.nex_fee, 100);
   assert.equal(w.buyer.status().running, false, 'not taken');
   deposit(w, 1_100_000);
   const run = running(w.buyer);
