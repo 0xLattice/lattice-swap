@@ -95,10 +95,13 @@ impl Bitcoind {
         let token = base64::engine::general_purpose::STANDARD.encode(cookie.trim());
         Self {
             // A new connection per call: bitcoind closes an idle one, and a
-            // call it cuts off is not retried, an RPC being a POST.
+            // call it cuts off is not retried, an RPC being a POST. No
+            // redirects: bitcoind sends none, and one could move the calls
+            // to plain http.
             agent: ureq::AgentBuilder::new()
                 .timeout(timeout)
                 .max_idle_connections(0)
+                .redirects(0)
                 .build(),
             url: url.into(),
             authorization: format!("Basic {token}"),

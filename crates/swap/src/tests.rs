@@ -5267,6 +5267,45 @@ fn an_esplora_on_another_network_is_refused() {
     assert!(down.check_network(bitcoin::Network::Bitcoin).is_err());
 }
 
+/// No client follows a redirect: one from an https server to a plain http
+/// one would hand its reads to anyone on the way, to change as they like.
+#[cfg(feature = "native")]
+#[test]
+fn no_client_follows_a_redirect() {
+    let asked = Arc::new(Mutex::new(Vec::<String>::new()));
+    let log = asked.clone();
+    let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest)
+        .block_hash()
+        .to_string();
+    let elsewhere = serve(move |_, path, _| {
+        log.lock().unwrap().push(path.into());
+        match path {
+            "/block-height/0" => (200, genesis.clone()),
+            _ => (200, json!({"result": 1, "error": null}).to_string()),
+        }
+    });
+    let redirecting = serve(move |_, path, _| (302, format!("{elsewhere}{path}")));
+    let timeout = Duration::from_secs(5);
+
+    let esplora =
+        crate::esplora::Esplora::new(&redirecting, wallet::Key::new("regtest").unwrap(), timeout);
+    let refused = esplora
+        .check_network(bitcoin::Network::Regtest)
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("not followed"), "{refused}");
+    let bitcoind = crate::bitcoind::Bitcoind::new(
+        &redirecting,
+        "user:password",
+        bitcoin::Network::Regtest,
+        timeout,
+    );
+    assert!(bitcoind.call("getblockcount", json!([])).is_err());
+    assert!(Client::new(&redirecting, "", timeout).chain_info().is_err());
+    assert!(Client::public(&redirecting, timeout).chain_info().is_err());
+    assert_eq!(*asked.lock().unwrap(), Vec::<String>::new());
+}
+
 /// With no cookie the app reads a public read port, sending none, and
 /// refuses one that takes no submits, as the CLI's public Nexus; your own
 /// node's RPC, with its cookie, is not asked.
@@ -5334,7 +5373,8 @@ fn the_app_reads_a_public_nexus_only_where_it_takes_submits() {
 
 /// Serves HTTP on a port of its own, answering each request, its body read
 /// by its Content-Length, with `route(method, path, body)`, each on a
-/// thread of its own: one that hangs holds up no other.
+/// thread of its own: one that hangs holds up no other. A 3xx answer is
+/// also its `Location`.
 #[cfg(feature = "native")]
 fn serve(route: impl Fn(&str, &str, &str) -> (u16, String) + Send + Sync + 'static) -> String {
     use std::io::{BufRead, Read, Write};
@@ -5366,9 +5406,13 @@ fn serve(route: impl Fn(&str, &str, &str) -> (u16, String) + Send + Sync + 'stat
                 let mut line = request.split(' ');
                 let (method, path) = (line.next().unwrap_or(""), line.next().unwrap_or(""));
                 let (status, answer) = route(method, path, &String::from_utf8_lossy(&body));
+                let location = match status {
+                    300..=399 => format!("Location: {answer}\r\n"),
+                    _ => String::new(),
+                };
                 let _ = write!(
                 stream,
-                "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}",
+                "HTTP/1.1 {status} X\r\n{location}Content-Length: {}\r\nConnection: close\r\n\r\n{answer}",
                 answer.len()
             );
             });
