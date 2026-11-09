@@ -887,6 +887,25 @@ fn a_nexus_node_is_checked_as_the_cli_checks_one() {
     }
 }
 
+/// A round's genesis check refuses a node on another Nexus, or one that
+/// names none, in the native driver's words.
+#[test]
+fn a_round_refuses_a_node_on_another_nexus() {
+    let check = |chain_info: Value| {
+        check_genesis(&json!({"genesis": "genesis", "chain_info": chain_info}).to_string()).unwrap()
+    };
+    assert_eq!(
+        check(json!({"chain": ["Nexus"], "genesisHash": "genesis"})),
+        None
+    );
+    assert_eq!(
+        check(json!({"chain": ["Nexus"], "genesisHash": "other"})).as_deref(),
+        Some("refused: the Nexus node follows the chain of genesis other, not genesis")
+    );
+    let child = check(json!({"chain": ["Nexus", "Child"], "genesisHash": "genesis"})).unwrap();
+    assert!(child.contains("not the Nexus chain"), "{child}");
+}
+
 /// An Esplora's block 0 is checked against its network's genesis.
 #[test]
 fn each_network_names_its_own_genesis() {
