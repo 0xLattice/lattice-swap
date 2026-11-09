@@ -5156,6 +5156,62 @@ fn a_swap_cancels_until_it_takes_its_offer() {
     assert_eq!(buy.run(|| false).map_err(|e| e.to_string()), Ok(None));
 }
 
+/// A round whose take fails warns why, and a later round that takes, or
+/// waits on the wallet, clears it: no error outlives the round it was.
+#[cfg(feature = "native")]
+#[test]
+fn a_failed_take_warns_only_until_a_take_succeeds() {
+    let key = wallet::Key::new("regtest").unwrap();
+    let Locked { buyer, .. } = locked();
+    let (fresh, hello) =
+        Buyer::start(terms(), key.script_pubkey.clone(), BUYER_NEX.into()).unwrap();
+    // Swap 1 runs, so swap 2's take is refused until it is gone.
+    let file = recovery(
+        &key.wif,
+        vec![
+            recorded(1, &buyer, &[], true),
+            recorded(2, &fresh, &hello, false),
+        ],
+    );
+    // An empty wallet: once nothing refuses it, the take waits on it.
+    let esplora = serve(|_, path, _| match path {
+        "/fee-estimates" => (200, "{}".into()),
+        _ if path.ends_with("/utxo") => (200, "[]".into()),
+        _ => (404, String::new()),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = app_config(dir.path());
+    config.esplora = esplora;
+    config.poll = Duration::from_millis(20);
+    let wallet = app::Wallet::restore(config, &file).unwrap();
+    let buy = wallet.resume(&hex::encode([2; 32])).unwrap();
+    let warning = || buy.status().unwrap()["warning"].clone();
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let until = |what: &str, holds: &dyn Fn() -> bool| {
+        let start = std::time::Instant::now();
+        while !holds() {
+            if start.elapsed() > Duration::from_secs(10) {
+                done.store(true, std::sync::atomic::Ordering::SeqCst);
+                panic!("{what}: {}", warning());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    std::thread::scope(|scope| {
+        let running = scope.spawn(|| {
+            let stopped = buy.run(|| done.load(std::sync::atomic::Ordering::SeqCst));
+            stopped.map_err(|e| e.to_string())
+        });
+        until("the take is refused", &|| {
+            warning().as_str().is_some_and(|w| w.contains("is running"))
+        });
+        std::fs::remove_file(dir.path().join(format!("{}.record", hex::encode([1; 32])))).unwrap();
+        until("the warning clears", &|| warning().is_null());
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(running.join().unwrap(), Ok(None));
+    });
+}
+
 /// An Esplora that names an unrelated transaction, real and in a block, as
 /// what spends cancel's output: the view is refused, a round's failure,
 /// and the buyer stays on its refund path, never reading it as the

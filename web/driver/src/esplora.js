@@ -9,18 +9,24 @@ export const ESPLORA_TIMEOUT = 30_000;
 
 /** One Esplora API at `url`, e.g. `https://mempool.space/api`. */
 export class Esplora {
-  constructor(url, fetchImpl = globalThis.fetch) {
+  constructor(url, fetchImpl = globalThis.fetch, timeout = ESPLORA_TIMEOUT) {
     this.url = url.replace(/\/+$/, '');
     this.fetch = fetchImpl;
+    this.timeout = timeout;
   }
 
-  /** `path` fetched, its answer read within {@link ESPLORA_TIMEOUT}. No
-   * redirects, as the native client follows none: one could move an https
-   * Esplora's reads to plain http, where anyone on the way can change
-   * them. */
+  /** `path` fetched, its answer read within `timeout` ms. No redirects, as
+   * the native client follows none: one could move an https Esplora's
+   * reads to plain http, where anyone on the way can change them. */
   async #fetch(path, init, read) {
-    const signal = AbortSignal.timeout(ESPLORA_TIMEOUT);
-    return read(await this.fetch(`${this.url}${path}`, { ...init, redirect: 'error', signal }));
+    const signal = AbortSignal.timeout(this.timeout);
+    try {
+      return await read(await this.fetch(`${this.url}${path}`, { ...init, redirect: 'error', signal }));
+    } catch (e) {
+      // As the Nexus client's: which server failed to answer, not a bare abort.
+      if (signal.aborted) throw new Error(`${this.url}${path}: no answer within ${this.timeout} ms`);
+      throw e;
+    }
   }
 
   /** The answer's text; null on 404 if `missing` is allowed. */

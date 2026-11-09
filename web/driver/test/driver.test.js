@@ -7,7 +7,7 @@ import { Esplora } from '../src/esplora.js';
 import { Nexus, nexusView } from '../src/views.js';
 import { call, wasm } from '../src/wasm.js';
 import { offers, PINGS_MISSED, Session } from '../src/relay.js';
-import { Chain, esplora, kind, Locks, loadWasm, nexus, parseTx, POLICY, redirecting, seller, serve, testOffer, until } from './fakes.js';
+import { Chain, esplora, kind, Locks, loadWasm, nexus, parseTx, POLICY, redirecting, seller, serve, stalling, testOffer, until } from './fakes.js';
 
 before(loadWasm);
 
@@ -1404,6 +1404,25 @@ test('a node moved to another Nexus sets no fee floor for the offer', async () =
   assert.match(w.buyer.status().warning, /another/);
   assert.doesNotMatch(w.buyer.status().warning, /minRelayFee/);
   assert.equal(w.seller.log.length, 0, 'not taken');
+});
+
+/** `promise`, else a rejection once 5s pass: a read that hangs fails the
+ * test fast. */
+const within5s = (promise) =>
+  Promise.race([promise, new Promise((_resolve, reject) => setTimeout(() => reject(new Error('still waiting after 5s')), 5_000))]);
+
+test('a relay that stalls its offer list is cut off, naming it', async () => {
+  const relay = await stalling();
+  servers.push(relay);
+  await assert.rejects(within5s(offers(relay.url, globalThis.fetch, 100)), { message: `${relay.url}/offers: no answer within 100 ms` });
+});
+
+test("an Esplora's timeout names the Esplora", async () => {
+  const server = await stalling();
+  servers.push(server);
+  await assert.rejects(within5s(new Esplora(server.url, globalThis.fetch, 100).tip()), {
+    message: `${server.url}/blocks/tip/hash: no answer within 100 ms`,
+  });
 });
 
 test('no client follows a redirect', async () => {
