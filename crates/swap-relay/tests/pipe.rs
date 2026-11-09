@@ -231,3 +231,46 @@ fn only_the_seller_passes_a_rejoin_handshake() {
     assert!(buyer.is_err());
     assert!(impostor.join().unwrap().is_err());
 }
+
+/// A frame that announces more than a message may hold ends the connection
+/// at its header: the relay never sets aside room for it, which would let
+/// a few connections, each sending one such frame, hold the relay's memory.
+#[test]
+fn a_frame_past_the_message_bound_ends_the_connection_at_its_header() {
+    use std::io::{Read, Write};
+    let url = relay(10);
+    let mut socket = std::net::TcpStream::connect(url.trim_start_matches("http://")).unwrap();
+    write!(
+        socket,
+        "GET /rejoin/{} HTTP/1.1\r\nHost: relay\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
+         Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+        id(9)
+    )
+    .unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        let mut byte = [0];
+        socket.read_exact(&mut byte).unwrap();
+        head.push(byte[0]);
+    }
+    assert!(
+        head.starts_with(b"HTTP/1.1 101"),
+        "{}",
+        String::from_utf8_lossy(&head)
+    );
+
+    // A binary frame, masked, of one byte more than a message may hold.
+    let mut header = vec![0x82, 0x80 | 127];
+    header.extend_from_slice(&(swap_relay::MAX_MESSAGE as u64 + 1).to_be_bytes());
+    header.extend_from_slice(&[0; 4]);
+    socket.write_all(&header).unwrap();
+    let mut rest = Vec::new();
+    match socket.read_to_end(&mut rest) {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
+        Err(e) => panic!("the relay held the connection open, waiting for the frame: {e}"),
+    }
+}
