@@ -352,6 +352,31 @@ impl Swap {
         tx
     }
 
+    /// Whether `tx` spends the cancel output of `lock`, its only input,
+    /// through the punish leaf with the seller's signature on it
+    /// (`SIGHASH_DEFAULT`): only the seller can make one, whatever it pays.
+    /// Its timelock is not checked.
+    pub fn punish_signed(&self, lock: OutPoint, tx: &Transaction) -> bool {
+        let [input] = &tx.input[..] else {
+            return false;
+        };
+        let witness = &input.witness;
+        let signature = witness
+            .nth(0)
+            .and_then(|bytes| <[u8; 64]>::try_from(bytes).ok())
+            .and_then(Signature::from_bytes);
+        match signature {
+            Some(signature)
+                if input.previous_output == self.cancel_outpoint(lock) && witness.len() == 3 =>
+            {
+                let sighash = self.sighash_of(tx, Spend::Punish);
+                self.schnorr
+                    .verify(&self.key(Party::Seller), Message::raw(&sighash), &signature)
+            }
+            _ => false,
+        }
+    }
+
     /// The sighash of `tx`, whose one input spends what `spend` spends,
     /// through the same leaf.
     fn sighash_of(&self, tx: &Transaction, spend: Spend) -> [u8; 32] {
@@ -868,6 +893,59 @@ mod tests {
         let other = OutPoint::new(lock().txid, 1);
         let elsewhere = swap.encrypted_sign(other, Spend::Redeem, &key(2)).unwrap();
         assert_ne!(redeem.R, elsewhere.R);
+    }
+
+    /// A buyer copy that never kept its redeem adaptor derives it again to
+    /// recover `s`: a library that changed how the nonce is derived would
+    /// leave it with another one, and `s` out of reach.
+    #[test]
+    fn the_redeem_adaptor_signature_is_pinned() {
+        let swap = Swap::new(params()).unwrap();
+        let hex = |bytes: &[u8]| -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() };
+        assert_eq!(
+            hex(&swap.sighash(lock(), Spend::Redeem)),
+            "91d780fc1e530eb0f01737a23cbb6fc8cb0698072060e0436f1b5cfdaf256c44"
+        );
+        let encrypted = swap.encrypted_sign(lock(), Spend::Redeem, &key(2)).unwrap();
+        assert_eq!(
+            hex(&encrypted.R.to_bytes()),
+            "0272a2d1b498725bf48e9eec3ff4adb5038e71490d239b4ef3220134b8c4f9a39b"
+        );
+        assert_eq!(
+            hex(&encrypted.s_hat.to_bytes()),
+            "5c16b0885ca02627ff82ba892c58827f2bfdcbbe104da113b318d59425e24d24"
+        );
+        assert!(encrypted.needs_negation);
+    }
+
+    /// Only the seller's signature through the punish leaf, on the very
+    /// transaction, and spending this swap's cancel output.
+    #[test]
+    fn punish_signed_takes_only_the_sellers_punish_leaf_signature() {
+        let swap = Swap::new(params()).unwrap();
+        let (seller, buyer) = (key(1), key(2));
+        let mut other = swap.unsigned_tx(lock(), Spend::Punish);
+        other.output[0].script_pubkey =
+            ScriptBuf::new_p2wpkh(&WPubkeyHash::from_byte_array([8; 20]));
+        let signed = swap.sign_punish_leaf(other.clone(), &seller);
+        assert!(swap.punish_signed(lock(), &signed));
+        let a = swap.sign(lock(), Spend::Punish, &seller);
+        let agreed = swap.finalize(lock(), Spend::Punish, &a, None).unwrap();
+        assert!(swap.punish_signed(lock(), &agreed));
+
+        assert!(!swap.punish_signed(lock(), &other), "unsigned");
+        assert!(!swap.punish_signed(lock(), &swap.sign_punish_leaf(other.clone(), &buyer)));
+        let mut moved = signed.clone();
+        moved.output[0].value -= Amount::from_sat(1);
+        assert!(!swap.punish_signed(lock(), &moved), "another transaction");
+        let elsewhere = OutPoint::new(lock().txid, 1);
+        assert!(
+            !swap.punish_signed(elsewhere, &signed),
+            "another cancel output"
+        );
+        let mut two = signed.clone();
+        two.input.push(two.input[0].clone());
+        assert!(!swap.punish_signed(lock(), &two), "two inputs");
     }
 
     #[test]

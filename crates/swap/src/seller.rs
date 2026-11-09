@@ -865,16 +865,19 @@ impl SellerLocked {
                 }
                 // One that does not give `b`: never our punish.
                 Some((Spend::Refund, _)) => {}
-                // Anything but the refund is our punish: its leaf takes our
-                // signature alone, on any transaction. Unconfirmed, it is
-                // waited for; another punish would only conflict with it.
-                // Deep, it leaves a claim still pending to finish: its secrets
-                // and its signed claim are kept until the NEX is back or gone.
-                _ if view
-                    .cancel_spend
-                    .as_ref()
-                    .is_some_and(|spent| spent.confirmations >= terms.btc_confirmations)
-                    && !unweighed =>
+                // Our punish, the only one we sign, deep where its `t2`
+                // lets it be: the BTC is ours. It leaves a claim still
+                // pending to finish: its secrets and its signed claim are
+                // kept until the NEX is back or gone.
+                Some((Spend::Punish, depth))
+                    if depth >= terms.btc_confirmations
+                        && !unweighed
+                        && setup.punish(
+                            self.lock,
+                            cancel_depth,
+                            view.cancel_spend.as_ref().expect("matched"),
+                            false,
+                        ) =>
                 {
                     return match claim {
                         Claiming::Pending(mut claim) => {
@@ -901,12 +904,17 @@ impl SellerLocked {
                         _ => (Seller::Done(Outcome::Punished), vec![]),
                     };
                 }
+                // Unconfirmed, it is waited for; another punish would only
+                // conflict with it. So is one not yet weighed, or shown
+                // where it cannot be.
+                Some(_) => {}
                 // Whatever the claim: recovering the BTC must not wait on
-                // Nexus.
-                None if view.cancel_spend.is_none() && cancel_depth >= u32::from(terms.t2) => {
+                // Nexus. Nor on a spend that is neither refund nor our
+                // punish: no such spend can be, whatever a backend names.
+                None if cancel_depth >= u32::from(terms.t2) => {
                     actions.push(self.punish());
                 }
-                _ => {}
+                None => {}
             },
         }
         let locked = self;

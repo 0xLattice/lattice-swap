@@ -541,37 +541,45 @@ impl BuyerLocked {
             // seller `b`. A seller holding our redeem signature that orphans
             // the block could do just that, and no copy of this state can
             // tell whether another copy sent it, so the depth holds always.
-            Some((_, cancel_depth)) => match &view.cancel_spend {
-                Some(spent) if spent.confirmations >= terms.btc_confirmations => {
-                    return match setup.spend(self.lock, &view.cancel_spend) {
-                        Some((Spend::Refund, _)) => (Buyer::Done(Outcome::Refunded), vec![]),
-                        // Anything but our refund is the seller's punish: its
-                        // leaf takes the seller's signature alone, on any
-                        // transaction. The BTC is the seller's: `s` can
-                        // only give us the NEX.
-                        _ => {
-                            let seen = redeem.is_some();
-                            let setup = self.setup;
-                            let ask = vec![Action::Send(Message::ShareRequest)];
-                            (
-                                Buyer::AskingShare {
-                                    setup,
-                                    seen,
-                                    again: false,
-                                },
-                                ask,
-                            )
-                        }
-                    };
+            Some((_, cancel_depth)) => {
+                // The seller's punish: the agreed one, or any transaction it
+                // signed through the punish leaf, which takes its signature
+                // alone, in a block where its `t2` lets it be. Whatever else
+                // a backend names as spending the cancel output is not one.
+                let punished = view
+                    .cancel_spend
+                    .as_ref()
+                    .filter(|spent| {
+                        spent.confirmations > 0
+                            && setup.punish(self.lock, cancel_depth, spent, true)
+                    })
+                    .map(|spent| spent.confirmations);
+                match (setup.spend(self.lock, &view.cancel_spend), punished) {
+                    (Some((Spend::Refund, depth)), _) if depth >= terms.btc_confirmations => {
+                        return (Buyer::Done(Outcome::Refunded), vec![]);
+                    }
+                    (Some((Spend::Refund, depth)), _) if depth > 0 => {}
+                    // The BTC is the seller's: `s` can only give us the NEX.
+                    (_, Some(depth)) if depth >= terms.btc_confirmations => {
+                        let seen = redeem.is_some();
+                        let setup = self.setup;
+                        let ask = vec![Action::Send(Message::ShareRequest)];
+                        let state = Buyer::AskingShare {
+                            setup,
+                            seen,
+                            again: false,
+                        };
+                        return (state, ask);
+                    }
+                    (_, Some(_)) => {}
+                    // A spend still in the mempool may yet be replaced by the
+                    // refund, so the refund goes out until one is in a block.
+                    _ if cancel_depth >= terms.btc_confirmations => {
+                        actions.push(Action::Broadcast(self.refund()));
+                    }
+                    _ => {}
                 }
-                Some(spent) if spent.confirmations > 0 => {}
-                // A spend still in the mempool may yet be replaced by the
-                // refund, so the refund goes out until one is in a block.
-                _ if cancel_depth >= terms.btc_confirmations => {
-                    actions.push(Action::Broadcast(self.refund()));
-                }
-                _ => {}
-            },
+            }
         }
         (
             Buyer::Cancelling {

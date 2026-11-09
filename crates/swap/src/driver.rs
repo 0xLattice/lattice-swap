@@ -116,18 +116,7 @@ impl Store {
 
     fn write_temporary<M: Machine>(&self, state: &M) -> io::Result<PathBuf> {
         let temporary = self.path.with_extension("json.tmp");
-        // Left by a crash, or planted: removed, never followed. A new file,
-        // made here, is the only one written; anything put back in between
-        // fails the save.
-        match fs::remove_file(&temporary) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
-            _ => {}
-        }
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        let mut file = options.open(&temporary)?;
+        let mut file = create_temporary(&temporary)?;
         let file_state = serde_json::json!({"version": STATE_VERSION, "state": state});
         file.write_all(&serde_json::to_vec_pretty(&file_state).map_err(io::Error::other)?)?;
         file.sync_all()?;
@@ -141,6 +130,21 @@ impl Store {
         }
         Ok(())
     }
+}
+
+/// `temporary` made anew, readable by its owner alone. One left by a crash,
+/// or planted: removed, never followed. A new file, made here, is the only
+/// one written; anything put back in between fails the open.
+pub(crate) fn create_temporary(temporary: &Path) -> io::Result<File> {
+    match fs::remove_file(temporary) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(temporary)
 }
 
 /// Answers at once: a new session given how to meet ([`Rejoin`]) once one
