@@ -224,7 +224,8 @@ async fn take(
 }
 
 /// Carries binary messages between `a` and `b` until either closes, says
-/// anything else, cannot be pinged, or is silent past [`SILENCE`].
+/// anything else, cannot be pinged, or is silent past [`SILENCE`], or takes
+/// no message for as long.
 async fn pipe(mut a: WebSocket, mut b: WebSocket) {
     let mut ping = pinger();
     let mut heard = [Instant::now(); 2];
@@ -241,8 +242,8 @@ async fn pipe(mut a: WebSocket, mut b: WebSocket) {
             _ = ping.tick() => {
                 let ping = || Message::Ping(Bytes::new());
                 if heard.iter().any(|heard| heard.elapsed() > SILENCE)
-                    || a.send(ping()).await.is_err()
-                    || b.send(ping()).await.is_err()
+                    || !sent(&mut a, ping()).await
+                    || !sent(&mut b, ping()).await
                 {
                     break;
                 }
@@ -251,7 +252,7 @@ async fn pipe(mut a: WebSocket, mut b: WebSocket) {
         };
         match message {
             Some(Ok(Message::Binary(bytes))) => {
-                if to.send(Message::Binary(bytes)).await.is_err() {
+                if !sent(to, Message::Binary(bytes)).await {
                     break;
                 }
             }
@@ -259,8 +260,19 @@ async fn pipe(mut a: WebSocket, mut b: WebSocket) {
             _ => break,
         }
     }
-    let _ = a.send(Message::Close(None)).await;
-    let _ = b.send(Message::Close(None)).await;
+    // Side by side: one stuck closing does not keep the other waiting.
+    tokio::join!(
+        sent(&mut a, Message::Close(None)),
+        sent(&mut b, Message::Close(None))
+    );
+}
+
+/// Whether `message` went out on `socket` within [`SILENCE`]. A party that
+/// stops reading, its connection open, would otherwise hold the pipe on a
+/// write for good: past its pings, its silence, and the other party's
+/// messages, unread meanwhile.
+async fn sent(socket: &mut WebSocket, message: Message) -> bool {
+    matches!(timeout(SILENCE, socket.send(message)).await, Ok(Ok(())))
 }
 
 fn pinger() -> tokio::time::Interval {
