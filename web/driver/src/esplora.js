@@ -9,23 +9,35 @@ import { wasm } from './wasm.js';
  * timeout. */
 export const ESPLORA_TIMEOUT = 30_000;
 
+/** How long a round's refund bump may take, in ms, all its requests
+ * together: as the Nexus reads' `NEXUS_BUDGET`, an Esplora that hangs
+ * delays the next round by this at most. */
+export const BUMP_BUDGET = 10_000;
+
 /** One Esplora API at `url`, e.g. `https://mempool.space/api`. */
 export class Esplora {
   constructor(url, fetchImpl = globalThis.fetch, timeout = ESPLORA_TIMEOUT) {
     this.url = url.replace(/\/+$/, '');
     this.fetch = fetchImpl;
     this.timeout = timeout;
+    /** What also ends each request, while a round's bump reads it: its
+     * share of {@link BUMP_BUDGET}. */
+    this.deadline = null;
   }
 
-  /** `path` fetched, its answer read within `timeout` ms. No redirects, as
-   * the native client follows none: one could move an https Esplora's
-   * reads to plain http, where anyone on the way can change them. */
+  /** `path` fetched, its answer read within `timeout` ms, and before the
+   * `deadline`, if set. No redirects, as the native client follows none:
+   * one could move an https Esplora's reads to plain http, where anyone on
+   * the way can change them. */
   async #fetch(path, init, read) {
-    const signal = AbortSignal.timeout(this.timeout);
+    const timeout = AbortSignal.timeout(this.timeout);
+    const deadline = this.deadline;
+    const signal = deadline === null ? timeout : AbortSignal.any([timeout, deadline]);
     try {
       return await read(await this.fetch(`${this.url}${path}`, { ...init, redirect: 'error', signal }));
     } catch (e) {
       // As the Nexus client's: which server failed to answer, not a bare abort.
+      if (deadline?.aborted) throw new Error(`${this.url}${path}: no answer within the round's bump budget`);
       if (signal.aborted) throw new Error(`${this.url}${path}: no answer within ${this.timeout} ms`);
       throw e;
     }

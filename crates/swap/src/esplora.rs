@@ -344,12 +344,13 @@ impl Bitcoin for Esplora {
             Some((txid, shown)) if txid != parent.compute_txid() => shown,
             _ => return Ok(MIN_RELAY),
         };
-        let ours = bump::package_vsize(&self.key, parent).map_err(Error)?;
+        let vsize = parent.vsize() as u64;
+        let ours = bump::package_vsize(&self.key, parent, vsize).map_err(Error)?;
         let (spent, _) = self
             .transaction(input.txid)?
             .ok_or_else(|| Error(format!("input {input} unseen")))?;
         let paid = spent.output[input.vout as usize].value.to_sat();
-        bump::floor(parent, paid, (other.fee, other.vsize()), ours).map_err(Error)
+        bump::floor(parent, vsize, paid, (other.fee, other.vsize()), ours).map_err(Error)
     }
 
     /// `parent`'s feerate with the unconfirmed child spending its payout,
@@ -375,7 +376,8 @@ impl Bitcoin for Esplora {
     fn bump(&self, parent: &Transaction, fee: Amount, rate: FeeRate, max: Amount) -> Result<Txid> {
         let last = self.pooled_spender(OutPoint::new(parent.compute_txid(), 0))?;
         let last = last.map(|(_, shown)| (shown.fee, shown.vsize()));
-        let signed = bump::child(&self.key, parent, fee, rate, max, last).map_err(Error)?;
+        let vsize = parent.vsize() as u64;
+        let signed = bump::child(&self.key, parent, vsize, fee, rate, max, last).map_err(Error)?;
         let package = serde_json::json!([serialize_hex(parent), serialize_hex(&signed)]);
         let answer = self.post("/txs/package", "application/json", &package.to_string())?;
         let answer: Value =

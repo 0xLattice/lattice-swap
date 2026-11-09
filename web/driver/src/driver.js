@@ -16,6 +16,7 @@
 
 import { call, safe, wasm } from './wasm.js';
 import { bitcoinView, checkNexus, nexusGenesis, nexusView } from './views.js';
+import { BUMP_BUDGET } from './esplora.js';
 import { Session } from './relay.js';
 import { ended, isRunning, swapKey } from './wallet.js';
 
@@ -576,38 +577,49 @@ export class Buyer extends EventTarget {
       .filter((spent) => spent !== null && spent.confirmations === 0)
       .map((spent) => [spent.tx, false]);
     await this.#apply({ Bitcoin: this.#view });
-    // What the machine broadcast was not in the view at all.
-    waiting.push(...this.#broadcast.splice(0));
     await this.#bump(waiting);
   }
 
-  /** Bumps the buyer's own transactions in `waiting`, its refund, each
-   * marked with whether the mempool refused it, as the native driver's
-   * `bump`: `buyerBumps` says which are due, by `swap::bump::schedule`,
-   * and the rest is the native Esplora's bump over this page's Esplora,
-   * each step through swap-wasm. A failure is the round's warning, then
-   * tried again quietly at every block until the deadline nears. */
+  /** Bumps the buyer's own transactions among the view's `waiting` and
+   * what the machine broadcast since, which was not in the view at all,
+   * its refund, each marked with whether the mempool refused it, as the
+   * native driver's `bump`: `buyerBumps` says which are due, by
+   * `swap::bump::schedule`, and the rest is the native Esplora's bump over
+   * this page's Esplora, each step through swap-wasm. A failure is the
+   * round's warning, then tried again quietly at every block until the
+   * deadline nears. Every request of it ends within {@link BUMP_BUDGET},
+   * so a slow Esplora delays the round by that at most, and nothing here
+   * fails the round. */
   async #bump(waiting) {
-    // The state as it is kept, not through a JavaScript number.
-    const rest = JSON.stringify({ view: this.#view, waiting, last: this.#waiting });
-    const rounds = JSON.parse(wasm.buyerBumps(`{"state":${this.#r.state},${rest.slice(1)}`));
-    const still = {};
-    for (const round of rounds) {
-      const { now } = round;
-      if (round.due) {
-        try {
-          now.rate = await this.#bumpOne(round, now);
-          now.failed = false;
-        } catch (e) {
-          // swap-wasm throws its refusal as a string.
-          const why = e instanceof Error ? e.message : String(e);
-          if (!now.failed || round.again) this.#raise(`bump ${round.txid}: ${why}`);
-          now.failed = true;
+    const { esplora } = this.#wallet;
+    esplora.deadline = AbortSignal.timeout(BUMP_BUDGET);
+    try {
+      // The state as it is kept, not through a JavaScript number.
+      const all = [...waiting, ...this.#broadcast];
+      const rest = JSON.stringify({ view: this.#view, waiting: all, last: this.#waiting });
+      const rounds = JSON.parse(wasm.buyerBumps(`{"state":${this.#r.state},${rest.slice(1)}`));
+      // Taken only once read: a failure keeps them for the next view.
+      this.#broadcast = [];
+      const still = {};
+      for (const round of rounds) {
+        const { now } = round;
+        if (round.due) {
+          try {
+            now.rate = await this.#bumpOne(round, now);
+            now.failed = false;
+          } catch (e) {
+            if (!now.failed || round.again) this.#raise(`bump ${round.txid}: ${reason(e)}`);
+            now.failed = true;
+          }
         }
+        still[round.txid] = now;
       }
-      still[round.txid] = now;
+      this.#waiting = still;
+    } catch (e) {
+      this.#raise(`bump: ${reason(e)}`);
+    } finally {
+      esplora.deadline = null;
     }
-    this.#waiting = still;
   }
 
   /** What `round`'s transaction is raised to: its target, from the
@@ -618,7 +630,7 @@ export class Buyer extends EventTarget {
    * `bump_one`. */
   async #bumpOne(round, now) {
     const { esplora, key } = this.#wallet;
-    const signer = { wif: key.wif, network: this.#c.network, tx: round.tx };
+    const signer = { wif: key.wif, network: this.#c.network, tx: round.tx, vsize: round.vsize };
     const estimate = await esplora.feeRate(round.urgent ? 1 : 2);
     let floor = null;
     if (round.refused) {
@@ -629,18 +641,21 @@ export class Buyer extends EventTarget {
       if (other !== null && spent === null) throw new Error(`input ${round.input} unseen`);
       floor = call('bumpFloor', { ...signer, other, spent: spent?.hex ?? null });
     }
-    const target = call('bumpTarget', { tx: round.tx, fee: round.fee, estimate, floor, again: round.again, clamped: now.clamped });
+    const { tx, vsize, fee, again } = round;
+    const target = call('bumpTarget', { tx, vsize, fee, estimate, floor, again, clamped: now.clamped });
     now.clamped = target.clamped;
     if (target.warning !== null) this.#raise(target.warning);
     if (target.target === null || target.target <= now.rate) return now.rate;
     const parent = await esplora.shown(round.txid);
+    // The child already pooled, which a new one replaces: none while the
+    // parent is unseen.
+    let last = null;
     if (parent !== null && !parent.confirmed) {
-      const child = await esplora.pooledSpender(round.txid, 0);
-      const pooled = call('packageRate', { parent, child });
+      last = await esplora.pooledSpender(round.txid, 0);
+      const pooled = call('packageRate', { vsize, parent, child: last });
       if (pooled >= target.target) return pooled;
     }
-    const last = await esplora.pooledSpender(round.txid, 0);
-    const child = wasm.bumpChild(JSON.stringify({ ...signer, fee: round.fee, rate: target.target, last }));
+    const child = wasm.bumpChild(JSON.stringify({ ...signer, fee, rate: target.target, last }));
     await esplora.submitPackage([round.tx, child]);
     return target.target;
   }
@@ -707,6 +722,9 @@ export class Buyer extends EventTarget {
     }
   }
 }
+
+/** What `e` says: swap-wasm throws its refusal as a string. */
+const reason = (e) => (e instanceof Error ? e.message : String(e));
 
 /** Why the buyer refuses `offer` under `policy`, as the CLI's `take`, at
  * the wallet's Esplora's estimate, or null. */

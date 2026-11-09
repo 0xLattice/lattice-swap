@@ -87,7 +87,8 @@ pub fn schedule(last: Option<Waiting>, height: u32, refused: bool, urgent: bool)
     Round { now, due, again }
 }
 
-/// The feerate to raise `tx`, which pays `fee`, to: `estimate`, else
+/// The feerate to raise `tx`, of `vsize` vbytes, which pays `fee`, to:
+/// `estimate`, else
 /// `fallback`, at least `floor` if the mempool refused it, clamped to
 /// `max`; `None` if it was not refused and already pays it alone. A
 /// refused `tx` needs a package whatever it pays. A clamp is logged once
@@ -96,6 +97,7 @@ pub fn schedule(last: Option<Waiting>, height: u32, refused: bool, urgent: bool)
 #[allow(clippy::too_many_arguments)]
 pub fn target(
     tx: &Transaction,
+    vsize: u64,
     fee: Amount,
     estimate: Option<FeeRate>,
     fallback: FeeRate,
@@ -119,7 +121,7 @@ pub fn target(
         *clamped = Some(rate);
         rate = max;
     }
-    let alone = rate.fee_vb(tx.vsize() as u64);
+    let alone = rate.fee_vb(vsize);
     let target = (floor.is_some() || alone.is_some_and(|alone| alone > fee)).then_some(rate);
     (target, warning)
 }
@@ -171,13 +173,15 @@ fn over(fee: u64, vsize: u64) -> FeeRate {
     FeeRate::from_sat_per_kwu((fee * 250).div_ceil(vsize.max(1)))
 }
 
-/// An Esplora's floor for `parent`, which the mempool refused while
+/// An Esplora's floor for `parent`, of `vsize` vbytes, which the mempool
+/// refused while
 /// `other`, `(fee, vsize)`, unconfirmed, spends its input, worth `paid`:
 /// enough for `parent` and a child of `package_vsize` vbytes in all to
 /// replace it, above `parent`'s own feerate. An Esplora shows no
 /// descendants, so only the conflict's own fee counts.
 pub fn floor(
     parent: &Transaction,
+    vsize: u64,
     paid: u64,
     other: (u64, u64),
     package_vsize: u64,
@@ -188,7 +192,7 @@ pub fn floor(
         .ok_or("the parent pays out more than its input")?;
     let beat = over(other_fee, other_vsize)
         .max(over(other_fee, package_vsize))
-        .max(over(fee, parent.vsize() as u64));
+        .max(over(fee, vsize));
     let above = beat.to_sat_per_kwu() + MIN_RELAY.to_sat_per_kwu();
     Ok(MIN_RELAY.max(FeeRate::from_sat_per_kwu(above)))
 }
@@ -204,29 +208,33 @@ pub fn package_rate(fee: u64, vsize: u64, child: Option<(u64, u64)>) -> FeeRate 
     FeeRate::from_sat_per_kwu(fee * 250 / size.max(1))
 }
 
-/// The child that raises `parent`, which pays `fee`, to `rate`, spending
-/// its payout to `key` and paying at most `max`: signed by `key`, which
-/// only a payout to it can be. `last`, `(fee, vsize)`, is the unconfirmed
-/// child spending the payout already, which this one must pay enough to
-/// replace.
+/// The child that raises `parent`, of `vsize` vbytes, which pays `paid`,
+/// to `rate`, spending its payout to `key` and paying at most `max`:
+/// signed by `key`, which only a payout to it can be. `last`, `(fee,
+/// vsize)`, is the unconfirmed child spending the payout already, which
+/// this one must pay enough to replace, up to [`MAX_FEE_RATE`] over the
+/// package: what a node shows of `last` is not ours to vouch for.
 pub fn child(
     key: &Key,
     parent: &Transaction,
-    fee: Amount,
+    vsize: u64,
+    paid: Amount,
     rate: FeeRate,
     max: Amount,
     last: Option<(u64, u64)>,
 ) -> Result<Transaction, String> {
-    let size = package_vsize(key, parent)?;
-    let mut fee = rate
-        .fee_vb(size + 1)
-        .and_then(|package| package.checked_sub(fee))
-        .ok_or_else(|| format!("feerate {rate}"))?;
+    let size = package_vsize(key, parent, vsize)?;
+    let package = |rate: FeeRate| {
+        rate.fee_vb(size + 1)
+            .and_then(|package| package.checked_sub(paid))
+    };
+    let mut fee = package(rate).ok_or_else(|| format!("feerate {rate}"))?;
     if let Some((last_fee, last_vsize)) = last {
-        let own = size - parent.vsize() as u64 + 1;
+        let own = size - vsize + 1;
         let replace = replacing(Amount::from_sat(last_fee), last_vsize, own, MIN_RELAY)
             .ok_or_else(|| format!("the last child's fee {last_fee}"))?;
-        fee = fee.max(replace);
+        let cap = package(MAX_FEE_RATE).unwrap_or(Amount::ZERO);
+        fee = fee.max(replace.min(cap));
     }
     let change = key.script_pubkey.clone();
     let spendable = parent.output[0]
@@ -251,9 +259,10 @@ fn sign_child(key: &Key, parent: &Transaction, child: Transaction) -> Result<Tra
     wallet::sign(&key.wif, child, &[payout.value.to_sat()])
 }
 
-/// `parent` and a child signed by `key` spending its payout, in vbytes.
-pub fn package_vsize(key: &Key, parent: &Transaction) -> Result<u64, String> {
+/// `parent`, of `vsize` vbytes, and a child signed by `key` spending its
+/// payout, in vbytes.
+pub fn package_vsize(key: &Key, parent: &Transaction, vsize: u64) -> Result<u64, String> {
     let change = key.script_pubkey.clone();
     let child = swap_bitcoin::cpfp(parent, change, Amount::ZERO).ok_or("the payout is dust")?;
-    Ok((parent.vsize() + sign_child(key, parent, child)?.vsize()) as u64)
+    Ok(vsize + sign_child(key, parent, child)?.vsize() as u64)
 }

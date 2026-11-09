@@ -171,7 +171,8 @@ function feeOf(chain, posted, hex) {
 
 /** An Esplora over `chain`: what it takes is logged in `posted`, and
  * `onPost(hex)` runs first; it refuses a transaction that spends what it
- * cannot. A package to `POST /txs/package` is logged in `packages`, and
+ * cannot, or `chain.refuse(hex)` names a reason for. A package to
+ * `POST /txs/package` is logged in `packages`, and
  * its transactions go into its mempool. It logs each path asked in
  * `chain.paths`, if given. */
 export async function esplora(chain, onPost = () => {}) {
@@ -196,7 +197,7 @@ export async function esplora(chain, onPost = () => {}) {
     if (method === 'POST' && path === '/tx') {
       if (chain.postDown) return [503, 'down'];
       await onPost(body);
-      const refused = unspendable(chain, posted, body);
+      const refused = chain.refuse?.(body) ?? unspendable(chain, posted, body);
       if (refused) return [400, `sendrawtransaction RPC error: ${refused}`];
       posted.push(body);
       return [200, parseTx(body).txid];

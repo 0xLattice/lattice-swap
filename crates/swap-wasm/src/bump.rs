@@ -49,10 +49,14 @@ fn tx(hex: &str) -> Result<Transaction> {
 /// `waiting` `[hex, refused]` pairs, the view's unconfirmed spends and what
 /// the machine broadcast since the last view, `refused` if the mempool
 /// refused it, and `last` what the last round kept, by txid. Out, for each
-/// of the buyer's own: `{"txid", "tx", "input", "fee", "refused",
-/// "urgent", "again", "due", "now"}`, `input` the outpoint it spends, `fee`
-/// in sat what it pays, `now` what to keep for it, once due with `rate` and
-/// `failed` set from how its bump went. Those left out are forgotten.
+/// of the buyer's own: `{"txid", "tx", "vsize", "input", "fee", "refused",
+/// "urgent", "again", "due", "now"}`, `refused` as its first entry says,
+/// `input` the outpoint it spends, `fee` in sat what it pays, `now` what to
+/// keep for it, once due with `rate` and `failed` set from how its bump
+/// went. Those left out are forgotten. `vsize` is the swap's own size of
+/// it, which every step is sized by, and `tx` an entry of that size, the
+/// machine's own, if one is: an Esplora vouches for a txid, and its
+/// witness could be padded to make a child pay for more vbytes.
 #[wasm_bindgen(js_name = buyerBumps)]
 pub fn buyer_bumps(input: &str) -> Result<String> {
     #[derive(Deserialize)]
@@ -72,18 +76,23 @@ pub fn buyer_bumps(input: &str) -> Result<String> {
     let own: Vec<_> = (input.state.own_spends().iter())
         .map(|&spend| (swap.unsigned_tx(lock, spend).compute_txid(), spend))
         .collect();
-    let mut rounds = vec![];
-    let mut seen = vec![];
+    // Each of our own once, in order: `(txid, spend, parent, refused)`.
+    let mut waiting: Vec<(Txid, _, Transaction, bool)> = vec![];
     for (hex, refused) in input.waiting {
         let parent = tx(&hex)?;
         let txid = parent.compute_txid();
         let Some(&(_, spend)) = own.iter().find(|(own, _)| *own == txid) else {
             continue;
         };
-        if seen.contains(&txid) {
-            continue;
+        let sized = parent.vsize() as u64 == swap.vsize(spend);
+        match waiting.iter_mut().find(|(seen, ..)| *seen == txid) {
+            Some((.., kept, _)) if sized => *kept = parent,
+            Some(_) => {}
+            None => waiting.push((txid, spend, parent, refused)),
         }
-        seen.push(txid);
+    }
+    let mut rounds = vec![];
+    for (txid, spend, parent, refused) in waiting {
         let urgent = urgent.contains(&spend);
         let round = bump::schedule(
             input.last.get(&txid).copied(),
@@ -93,7 +102,8 @@ pub fn buyer_bumps(input: &str) -> Result<String> {
         );
         rounds.push(json!({
             "txid": txid,
-            "tx": hex.trim(),
+            "tx": serialize_hex(&parent),
+            "vsize": swap.vsize(spend),
             "input": parent.input[0].previous_output.to_string(),
             "fee": swap.fee(spend).to_sat(),
             "refused": refused,
@@ -107,7 +117,8 @@ pub fn buyer_bumps(input: &str) -> Result<String> {
 }
 
 /// The feerate to raise a waiting transaction to, as the native driver's
-/// target: `{"tx", "fee", "estimate", "floor", "again", "clamped"}` in,
+/// target: `{"tx", "vsize", "fee", "estimate", "floor", "again",
+/// "clamped"}` in, `vsize` the round's,
 /// `estimate` the Esplora's in sat/vB for 1 block if urgent, else 2, or
 /// null, `floor` from [`bump_floor`] if the mempool refused it, else null,
 /// and `clamped` the `now`'s. `{"target", "clamped", "warning"}` out:
@@ -118,6 +129,7 @@ pub fn bump_target(input: &str) -> Result<String> {
     #[derive(Deserialize)]
     struct Input {
         tx: String,
+        vsize: u64,
         fee: u64,
         estimate: Option<f64>,
         floor: Option<FeeRate>,
@@ -129,6 +141,7 @@ pub fn bump_target(input: &str) -> Result<String> {
     // `fallback_fee_rate`, as it funds and prices its own spends.
     let (target, warning) = bump::target(
         &tx(&input.tx)?,
+        input.vsize,
         Amount::from_sat(input.fee),
         input.estimate.map(bump::per_vb),
         MIN_RELAY,
@@ -141,7 +154,8 @@ pub fn bump_target(input: &str) -> Result<String> {
 }
 
 /// The floor a transaction the mempool refused is raised to, as the native
-/// Esplora's: `{"wif", "network", "tx", "other", "spent"}` in, `other` the
+/// Esplora's: `{"wif", "network", "tx", "vsize", "other", "spent"}` in,
+/// `vsize` the round's, `other` the
 /// unconfirmed transaction spending its input, as `/tx/:txid` shows it, or
 /// null where there is none but itself, and `spent` the hex of the
 /// transaction whose output it spends. The relay floor without `other`.
@@ -152,6 +166,7 @@ pub fn bump_floor(input: &str) -> Result<String> {
         wif: String,
         network: String,
         tx: String,
+        vsize: u64,
         other: Option<Shown>,
         spent: Option<String>,
     }
@@ -173,32 +188,38 @@ pub fn bump_floor(input: &str) -> Result<String> {
         .value
         .to_sat();
     let key = Key::of(&input.wif, &input.network)?;
-    let package = bump::package_vsize(&key, &parent)?;
-    text(&bump::floor(&parent, paid, other.paid(), package)?)
+    let package = bump::package_vsize(&key, &parent, input.vsize)?;
+    text(&bump::floor(
+        &parent,
+        input.vsize,
+        paid,
+        other.paid(),
+        package,
+    )?)
 }
 
 /// What a transaction pays with the unconfirmed child spending its payout,
-/// as the native Esplora's package rate: `{"parent", "child"}` in, each as
+/// as the native Esplora's package rate: `{"vsize", "parent", "child"}`
+/// in, `vsize` the round's, which the parent is sized by, and each as
 /// `/tx/:txid` shows it, `child` null if there is none.
 #[wasm_bindgen(js_name = packageRate)]
 pub fn package_rate(input: &str) -> Result<String> {
     #[derive(Deserialize)]
     struct Input {
+        vsize: u64,
         parent: Shown,
         child: Option<Shown>,
     }
     let input: Input = parse(input)?;
-    let (fee, vsize) = input.parent.paid();
-    text(&bump::package_rate(
-        fee,
-        vsize,
-        input.child.map(Shown::paid),
-    ))
+    let (fee, _) = input.parent.paid();
+    let child = input.child.map(Shown::paid);
+    text(&bump::package_rate(fee, input.vsize, child))
 }
 
 /// The signed child that raises a transaction paying the wallet to `rate`,
-/// as the native Esplora's bump: `{"wif", "network", "tx", "fee", "rate",
-/// "last"}` in, `fee` what it pays, in sat, and `last` the unconfirmed
+/// as the native Esplora's bump: `{"wif", "network", "tx", "vsize", "fee",
+/// "rate", "last"}` in, `vsize` the round's, `fee` what it pays, in sat,
+/// and `last` the unconfirmed
 /// child spending its payout already, as `/tx/:txid` shows it, or null. The
 /// child's hex out, to submit after the parent to `POST /txs/package`.
 #[wasm_bindgen(js_name = bumpChild)]
@@ -208,6 +229,7 @@ pub fn bump_child(input: &str) -> Result<String> {
         wif: String,
         network: String,
         tx: String,
+        vsize: u64,
         fee: u64,
         rate: FeeRate,
         last: Option<Shown>,
@@ -218,6 +240,6 @@ pub fn bump_child(input: &str) -> Result<String> {
     let max = bump::max_fee(&parent, MAX_FEE_FRACTION);
     let fee = Amount::from_sat(input.fee);
     let last = input.last.map(Shown::paid);
-    let child = bump::child(&key, &parent, fee, input.rate, max, last)?;
+    let child = bump::child(&key, &parent, input.vsize, fee, input.rate, max, last)?;
     Ok(serialize_hex(&child))
 }

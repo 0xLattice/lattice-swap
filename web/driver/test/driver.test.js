@@ -296,6 +296,31 @@ test('a refund below the fee rate is bumped by CPFP from its own output, the pai
   assert.deepEqual(w.unsaved, []);
 });
 
+test('a refund the mempool refuses alone goes out as a package with a child', async () => {
+  // Refused alone, as below a mempool's minimum that rose with fees: the
+  // refund goes out as a package, its target read at once.
+  const chain = new Chain();
+  const lookups = {};
+  chain.refuse = (hex) => (parseTx(hex).txid === lookups.refund ? 'min relay fee not met' : null);
+  const { w, run, funding } = await funded({ chain });
+  lookups.refund = call('watchBuyer', (await w.store.get(`swap:${w.buyer.swapId}`)).state).bitcoin.cancel_spends[0];
+  confirm(w, funding);
+  w.chain.mine(TERMS.t1 - 1);
+  const cancel = await broadcast(w, call('watchBuyer', (await w.store.get(`swap:${w.buyer.swapId}`)).state).bitcoin.lock_spends[1]);
+  w.chain.fees = { 1: 20, 2: 20 };
+  confirm(w, cancel);
+  await until(() => w.a.packages.length > 0).catch((e) => assert.fail(`${e.message}: ${JSON.stringify(w.buyer.status())}`));
+  assert.ok(!w.a.posted.some((tx) => parseTx(tx).txid === lookups.refund), 'never taken alone');
+  const [[parent, second]] = w.a.packages;
+  assert.equal(parseTx(parent).txid, lookups.refund);
+  const child = parseTx(second);
+  assert.equal(child.inputs[0].txid, lookups.refund);
+  assert.equal(child.outputs[0].script, w.wallet.key.script_pubkey);
+  confirm(w, parent);
+  assert.equal(await run.done, 'refunded');
+  assert.deepEqual(w.unsaved, []);
+});
+
 test('a refund that pays the fee rate is not bumped', async () => {
   const { w, run, refund } = await refunding({ 1: 2, 2: 2 });
   assert.ok((TERMS.btc_fee * 4) / parseTx(refund).weight > 2, 'the refund alone pays the target');

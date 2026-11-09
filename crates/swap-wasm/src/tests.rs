@@ -1029,6 +1029,7 @@ fn the_refund_alone_is_due_once_a_block() {
     );
     let round = &rounds[0];
     assert_eq!(round["txid"], refund_txid);
+    assert_eq!(round["vsize"], hex_tx(&json!(refund)).vsize());
     assert_eq!(round["fee"], 1_000);
     assert_eq!(
         round["input"],
@@ -1074,8 +1075,9 @@ fn a_refund_below_the_estimate_gets_a_child_that_lifts_the_package() {
     let wif = key["wif"].as_str().unwrap();
     let (_, cancel, refund) = refunding(&key);
     let parent = hex_tx(&json!(refund));
+    let vsize = parent.vsize();
     let target = |estimate: Value, floor: Value, clamped: Value| {
-        let input = json!({"tx": refund, "fee": 1_000, "estimate": estimate, "floor": floor,
+        let input = json!({"tx": refund, "vsize": vsize, "fee": 1_000, "estimate": estimate, "floor": floor,
             "again": false, "clamped": clamped});
         json(&bump_target(&input.to_string()).unwrap())
     };
@@ -1104,8 +1106,8 @@ fn a_refund_below_the_estimate_gets_a_child_that_lifts_the_package() {
     assert_eq!(again["warning"], Value::Null);
 
     let child = |rate: u64, last: Value| {
-        let input = json!({"wif": wif, "network": "regtest", "tx": refund, "fee": 1_000,
-            "rate": rate, "last": last});
+        let input = json!({"wif": wif, "network": "regtest", "tx": refund, "vsize": vsize,
+            "fee": 1_000, "rate": rate, "last": last});
         bump_child(&input.to_string()).map(|hex| hex_tx(&json!(hex)))
     };
     let first = child(50 * 250, Value::Null).unwrap();
@@ -1124,7 +1126,7 @@ fn a_refund_below_the_estimate_gets_a_child_that_lifts_the_package() {
     let shown =
         |fee: u64, tx: &bitcoin::Transaction| json!({"fee": fee, "weight": tx.weight().to_wu()});
     let rate = |child: Value| {
-        let input = json!({"parent": shown(1_000, &parent), "child": child});
+        let input = json!({"vsize": vsize, "parent": shown(1_000, &parent), "child": child});
         json(&package_rate(&input.to_string()).unwrap())
             .as_u64()
             .unwrap()
@@ -1140,16 +1142,16 @@ fn a_refund_below_the_estimate_gets_a_child_that_lifts_the_package() {
     assert!(payout - second.output[0].value.to_sat() > fee);
     // Only a refund paying the wallet can be bumped.
     let other = json(&new_bitcoin_key("regtest").unwrap());
-    let input = json!({"wif": other["wif"], "network": "regtest", "tx": refund, "fee": 1_000,
-        "rate": 50 * 250, "last": null});
+    let input = json!({"wif": other["wif"], "network": "regtest", "tx": refund, "vsize": vsize,
+        "fee": 1_000, "rate": 50 * 250, "last": null});
     assert!(bump_child(&input.to_string())
         .unwrap_err()
         .contains("not this wallet's"));
 
     // The floor: the relay's alone, else above a conflict spending cancel.
     let floor = |other: Value, spent: Value| {
-        let input = json!({"wif": wif, "network": "regtest", "tx": refund, "other": other,
-            "spent": spent});
+        let input = json!({"wif": wif, "network": "regtest", "tx": refund, "vsize": vsize,
+            "other": other, "spent": spent});
         bump_floor(&input.to_string()).map(|floor| json(&floor).as_u64().unwrap())
     };
     assert_eq!(floor(Value::Null, Value::Null), Ok(250));
@@ -1159,4 +1161,47 @@ fn a_refund_below_the_estimate_gets_a_child_that_lifts_the_package() {
         floor(punish, json!(refund)).is_err(),
         "not the transaction it spends"
     );
+
+    // A pooled child an Esplora shows paying a fortune is replaced at no
+    // more than 1,000 sat/vB over the package.
+    let fortune = child(50 * 250, json!({"fee": 500_000, "weight": 440})).unwrap();
+    let paid = payout - fortune.output[0].value.to_sat();
+    let package = vsize as u64 + fortune.vsize() as u64 + 1;
+    assert!(1_000 + paid <= 1_000 * package, "{paid} over {package} vB");
+    assert!(paid > fee, "still above an honest child's");
+}
+
+/// A witness padded under the refund's txid is not what the child pays
+/// for: the round is sized by the swap, and carries the machine's own copy.
+#[test]
+fn a_padded_refund_is_sized_as_the_swaps_own() {
+    let key = json(&new_bitcoin_key("regtest").unwrap());
+    let wif = key["wif"].as_str().unwrap();
+    let (state, cancel, refund) = refunding(&key);
+    let own = hex_tx(&json!(refund));
+    let mut padded = own.clone();
+    let mut witness: Vec<Vec<u8>> = padded.input[0].witness.iter().map(<[u8]>::to_vec).collect();
+    witness.insert(0, vec![0; 4_000]);
+    padded.input[0].witness = bitcoin::Witness::from_slice(&witness);
+    assert_eq!(padded.compute_txid(), own.compute_txid());
+    let padded = bitcoin::consensus::encode::serialize_hex(&padded);
+    let view = json!({"height": 121, "funding": 21, "stale": null, "cancel_spend": null,
+        "lock_spend": {"tx": cancel, "confirmations": 1}});
+    // The Esplora's padded copy first, then the machine's broadcast.
+    let input = json!({"state": json(&state), "view": view,
+        "waiting": [[padded, false], [refund, true]]});
+    let rounds = json(&buyer_bumps(&input.to_string()).unwrap());
+    assert_eq!(rounds[0]["vsize"], own.vsize());
+    assert_eq!(rounds[0]["tx"], refund, "the machine's own copy");
+    assert_eq!(rounds[0]["refused"], false, "as its first entry says");
+    // Given only the padded one, the child is still sized by the swap.
+    let input = json!({"state": json(&state), "view": view, "waiting": [[padded, false]]});
+    let rounds = json(&buyer_bumps(&input.to_string()).unwrap());
+    assert_eq!(rounds[0]["vsize"], own.vsize());
+    let child = |tx: &Value| {
+        let input = json!({"wif": wif, "network": "regtest", "tx": tx, "vsize": own.vsize(),
+            "fee": 1_000, "rate": 50 * 250, "last": null});
+        hex_tx(&json!(bump_child(&input.to_string()).unwrap()))
+    };
+    assert_eq!(child(&rounds[0]["tx"]), child(&json!(refund)));
 }

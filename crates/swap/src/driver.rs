@@ -634,6 +634,7 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
         };
         let (rate, warning) = bump::target(
             tx,
+            tx.vsize() as u64,
             fee,
             estimate,
             self.fallback_fee_rate,
