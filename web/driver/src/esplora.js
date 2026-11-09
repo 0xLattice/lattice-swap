@@ -3,6 +3,10 @@
 
 import { wasm } from './wasm.js';
 
+/** How long one request may take, in ms, as the native Esplora client's
+ * timeout. */
+export const ESPLORA_TIMEOUT = 30_000;
+
 /** One Esplora API at `url`, e.g. `https://mempool.space/api`. */
 export class Esplora {
   constructor(url, fetchImpl = globalThis.fetch) {
@@ -10,12 +14,22 @@ export class Esplora {
     this.fetch = fetchImpl;
   }
 
+  /** `path` fetched, its answer read within {@link ESPLORA_TIMEOUT}. No
+   * redirects, as the native client follows none: one could move an https
+   * Esplora's reads to plain http, where anyone on the way can change
+   * them. */
+  async #fetch(path, init, read) {
+    const signal = AbortSignal.timeout(ESPLORA_TIMEOUT);
+    return read(await this.fetch(`${this.url}${path}`, { ...init, redirect: 'error', signal }));
+  }
+
   /** The answer's text; null on 404 if `missing` is allowed. */
   async #get(path, missing = false) {
-    const response = await this.fetch(`${this.url}${path}`, { cache: 'no-store' });
-    if (missing && response.status === 404) return null;
-    if (!response.ok) throw new Error(`${this.url}${path}: ${response.status} ${await response.text()}`);
-    return response.text();
+    return this.#fetch(path, { cache: 'no-store' }, async (response) => {
+      if (missing && response.status === 404) return null;
+      if (!response.ok) throw new Error(`${this.url}${path}: ${response.status} ${await response.text()}`);
+      return response.text();
+    });
   }
 
   /** Refuses an Esplora on another chain than `network`, whose blocks
@@ -77,13 +91,11 @@ export class Esplora {
 
   /** Broadcasts `hex`; throws with Esplora's reason if it refuses it. */
   async broadcast(hex) {
-    const response = await this.fetch(`${this.url}/tx`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/plain' },
-      body: hex,
+    const init = { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: hex };
+    return this.#fetch('/tx', init, async (response) => {
+      const text = await response.text();
+      if (!response.ok) throw new Error(`${this.url}: ${response.status} ${text}`);
+      return text.trim();
     });
-    const text = await response.text();
-    if (!response.ok) throw new Error(`${this.url}: ${response.status} ${text}`);
-    return text.trim();
   }
 }

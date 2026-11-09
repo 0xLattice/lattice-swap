@@ -566,14 +566,23 @@ export class Buyer extends EventTarget {
   async #observeNexus() {
     const watch = call('watchBuyer', this.#r.state).nexus;
     if (!watch) return;
-    await this.#checkNexus();
-    // The page's genesis: the swap's, as `#checkNexus` refuses a swap on
-    // another.
-    const view = await nexusView(this.#wallet.nexus, watch, this.#c.nexusGenesis);
-    // The tip moved while the view was read: read again next round.
-    if (view === null) return;
-    this.#nexusDepth = view.watched?.[1] ?? null;
-    await this.#apply({ Nexus: view });
+    // The check, the view and the submits it leads to share one budget, as
+    // the native driver's round: a node that hangs delays the next Bitcoin
+    // round by the budget at most.
+    const { nexus } = this.#wallet;
+    nexus.deadline = AbortSignal.timeout(nexus.budget);
+    try {
+      await this.#checkNexus();
+      // The page's genesis: the swap's, as `#checkNexus` refuses a swap on
+      // another.
+      const view = await nexusView(nexus, watch, this.#c.nexusGenesis);
+      // The tip moved while the view was read: read again next round.
+      if (view === null) return;
+      this.#nexusDepth = view.watched?.[1] ?? null;
+      await this.#apply({ Nexus: view });
+    } finally {
+      nexus.deadline = null;
+    }
   }
 
   /** Refuses a node on another Nexus, once per Buyer: a resumed swap's
@@ -621,7 +630,9 @@ export class Buyer extends EventTarget {
  * the wallet's Esplora's estimate, or null. */
 async function refusal(wallet, offer, policy) {
   const estimate = await wallet.esplora.feeRate(6);
-  const minRelayFee = Number((await wallet.nexus.get('/api/chain/info')).minRelayFee);
+  // Through the genesis check: a node moved to another Nexus since it was
+  // checked sets no fee floor.
+  const minRelayFee = Number((await nexusGenesis(wallet.nexus, wallet.config.nexusGenesis)).minRelayFee);
   const refused = wasm.checkOffer(
     JSON.stringify({
       offer,

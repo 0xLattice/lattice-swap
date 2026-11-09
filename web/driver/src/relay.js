@@ -7,7 +7,8 @@ import { wasm } from './wasm.js';
  * its `quote` holds the `price`, in sat a NEX of 1,000,000 base units,
  * and the `min_btc_amount` and `max_btc_amount` a buyer picks between. */
 export async function offers(relay, fetchImpl = globalThis.fetch) {
-  const response = await fetchImpl(`${relay.replace(/\/+$/, '')}/offers`, { cache: 'no-store' });
+  // No redirects, as the native engine's clients follow none.
+  const response = await fetchImpl(`${relay.replace(/\/+$/, '')}/offers`, { cache: 'no-store', redirect: 'error' });
   if (!response.ok) throw new Error(`${relay}/offers: ${response.status}`);
   return (await response.json()).map((offer) => JSON.stringify(offer));
 }

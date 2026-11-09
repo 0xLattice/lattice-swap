@@ -50,21 +50,44 @@ export async function bitcoinView(esplora, lookups) {
   return { tip, view };
 }
 
+/** How long a round's Nexus reads and the submits they lead to may take,
+ * in ms, as the native driver's `NEXUS_BUDGET`. */
+export const NEXUS_BUDGET = 10_000;
+
 /** One Nexus node's read API, at `url`: its public read port. */
 export class Nexus {
-  constructor(url, fetchImpl = globalThis.fetch) {
+  constructor(url, fetchImpl = globalThis.fetch, budget = NEXUS_BUDGET) {
     this.url = url.replace(/\/+$/, '');
     this.fetch = fetchImpl;
+    this.budget = budget;
+    /** What ends the round's Nexus requests, while a round reads it: as the
+     * native driver's `nexus_budget`, a node that hangs delays the next
+     * Bitcoin round by the budget at most. */
+    this.deadline = null;
+  }
+
+  /** `read` of the answer to `path`, fetched and read under the round's
+   * deadline, else a budget of its own. No redirects, as the native client
+   * follows none: one could move an https node's reads to plain http. */
+  async #fetch(path, init, read) {
+    const signal = this.deadline ?? AbortSignal.timeout(this.budget);
+    try {
+      return await read(await this.fetch(`${this.url}${path}`, { ...init, redirect: 'error', signal }));
+    } catch (e) {
+      if (signal.aborted) throw new Error(`${this.url}${path}: no answer within the Nexus budget (nexusBudget)`);
+      throw e;
+    }
   }
 
   /** A route's JSON; null on 404 if `missing` is allowed. The public port
    * marks live reads cacheable for seconds, so none is read from a cache
    * here. */
   async get(path, missing = false) {
-    const response = await this.fetch(`${this.url}${path}`, { cache: 'no-store' });
-    if (missing && response.status === 404) return null;
-    if (!response.ok) throw new Error(`${this.url}${path}: ${response.status} ${await response.text()}`);
-    return response.json();
+    return this.#fetch(path, { cache: 'no-store' }, async (response) => {
+      if (missing && response.status === 404) return null;
+      if (!response.ok) throw new Error(`${this.url}${path}: ${response.status} ${await response.text()}`);
+      return response.json();
+    });
   }
 
   /** `/health`, its height and tip read live from `/api/chain/info`, as
@@ -87,12 +110,10 @@ export class Nexus {
    * would need a CORS preflight, which a public read port behind a proxy
    * may refuse, and the node reads the body as JSON whatever its type. */
   async submit(body) {
-    const response = await this.fetch(`${this.url}/transactions`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/plain' },
-      body,
+    const init = { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body };
+    await this.#fetch('/transactions', init, async (response) => {
+      if (!response.ok) throw new Error(`${this.url}: ${response.status} ${await response.text()}`);
     });
-    if (!response.ok) throw new Error(`${this.url}: ${response.status} ${await response.text()}`);
   }
 }
 
