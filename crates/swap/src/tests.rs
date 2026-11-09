@@ -2374,10 +2374,10 @@ fn a_replacing_child_pays_a_higher_feerate() {
     let incremental = FeeRate::from_sat_per_kwu(25);
     // A 109 vB child paying 1300 sat, replaced by one of 111 vB: the fee and
     // relay come to 1312, but 1312 / 111 is below 1300 / 109.
-    let fee = crate::bitcoind::replacing(Amount::from_sat(1300), 109, 111, incremental).unwrap();
+    let fee = crate::bump::replacing(Amount::from_sat(1300), 109, 111, incremental).unwrap();
     assert!(fee.to_sat() * 109 > 1300 * 111, "{fee}");
     // A larger old child leaves the relay rule binding.
-    let fee = crate::bitcoind::replacing(Amount::from_sat(1300), 400, 111, incremental).unwrap();
+    let fee = crate::bump::replacing(Amount::from_sat(1300), 400, 111, incremental).unwrap();
     assert_eq!(fee, Amount::from_sat(1312));
 }
 
@@ -2405,7 +2405,7 @@ fn a_failing_urgent_bump_is_tried_a_few_times_a_block() {
     node.0.borrow_mut().failing = 100;
     let polls = [117; 20];
     let tried = bumps(seller_watching(&locked, None), &node, &polls, |_| {}).len();
-    assert_eq!(tried, 1 + usize::from(crate::driver::URGENT_RETRIES));
+    assert_eq!(tried, 1 + usize::from(crate::bump::URGENT_RETRIES));
 }
 
 /// Redeem pays two fees: a target its feerate meets with both, though not

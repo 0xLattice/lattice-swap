@@ -57,6 +57,7 @@
 pub mod app;
 #[cfg(feature = "native")]
 pub mod bitcoind;
+pub mod bump;
 mod buyer;
 #[cfg(feature = "native")]
 pub mod driver;

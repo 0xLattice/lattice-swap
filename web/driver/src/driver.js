@@ -9,7 +9,10 @@
 // Each record is saved before anything it asks for is sent or broadcast,
 // as the native driver saves its swap file. There is no watchtower: the
 // buyer opens the page again within the deadlines `status()` shows, as
-// eigenwallet asks its user to resume a swap before its timelocks.
+// eigenwallet asks its user to resume a swap before its timelocks. While
+// the refund waits unconfirmed it is bumped by CPFP, its child paid from
+// the refund's own output back to the wallet, as the native driver bumps
+// it ({@link Buyer#bump}).
 
 import { call, safe, wasm } from './wasm.js';
 import { bitcoinView, checkNexus, nexusGenesis, nexusView } from './views.js';
@@ -85,6 +88,12 @@ export class Buyer extends EventTarget {
    * leaves in flight once it returns. */
   #running = false;
   #halt = new AbortController();
+  /** The buyer's own transactions waiting unconfirmed, by txid, as the
+   * last round kept them (`swap::bump::Waiting`), and what was broadcast
+   * since the last view, `[hex, refused]`: as the native driver's
+   * `waiting` and `broadcast`, kept in memory only. */
+  #waiting = {};
+  #broadcast = [];
 
   constructor(wallet, record, checked) {
     super();
@@ -521,12 +530,15 @@ export class Buyer extends EventTarget {
       });
       await this.#apply({ Funded: funded.tx });
     } else if (action.Broadcast) {
+      let refused = false;
       try {
         await this.#wallet.esplora.broadcast(action.Broadcast);
       } catch (e) {
         // The machine asks again while it is needed.
         this.#raise(`broadcast: ${e.message}`);
+        refused = true;
       }
+      this.#broadcast.push([action.Broadcast, refused]);
     } else if (action.Submit) {
       try {
         await this.#checkNexus();
@@ -560,7 +572,77 @@ export class Buyer extends EventTarget {
     this.#firstSeen = first_seen;
     this.#tip = seen.tip.height;
     this.#view = { ...seen.view, stale };
+    const waiting = [this.#view.lock_spend, this.#view.cancel_spend]
+      .filter((spent) => spent !== null && spent.confirmations === 0)
+      .map((spent) => [spent.tx, false]);
     await this.#apply({ Bitcoin: this.#view });
+    // What the machine broadcast was not in the view at all.
+    waiting.push(...this.#broadcast.splice(0));
+    await this.#bump(waiting);
+  }
+
+  /** Bumps the buyer's own transactions in `waiting`, its refund, each
+   * marked with whether the mempool refused it, as the native driver's
+   * `bump`: `buyerBumps` says which are due, by `swap::bump::schedule`,
+   * and the rest is the native Esplora's bump over this page's Esplora,
+   * each step through swap-wasm. A failure is the round's warning, then
+   * tried again quietly at every block until the deadline nears. */
+  async #bump(waiting) {
+    // The state as it is kept, not through a JavaScript number.
+    const rest = JSON.stringify({ view: this.#view, waiting, last: this.#waiting });
+    const rounds = JSON.parse(wasm.buyerBumps(`{"state":${this.#r.state},${rest.slice(1)}`));
+    const still = {};
+    for (const round of rounds) {
+      const { now } = round;
+      if (round.due) {
+        try {
+          now.rate = await this.#bumpOne(round, now);
+          now.failed = false;
+        } catch (e) {
+          // swap-wasm throws its refusal as a string.
+          const why = e instanceof Error ? e.message : String(e);
+          if (!now.failed || round.again) this.#raise(`bump ${round.txid}: ${why}`);
+          now.failed = true;
+        }
+      }
+      still[round.txid] = now;
+    }
+    this.#waiting = still;
+  }
+
+  /** What `round`'s transaction is raised to: its target, from the
+   * estimate for 1 block near its deadline, else 2, at least the floor if
+   * refused, once that is above `now.rate`, the last bump's; what its
+   * package pays already, if that is enough; else the target, its child
+   * submitted with it as a package. As the native driver's `target` and
+   * `bump_one`. */
+  async #bumpOne(round, now) {
+    const { esplora, key } = this.#wallet;
+    const signer = { wif: key.wif, network: this.#c.network, tx: round.tx };
+    const estimate = await esplora.feeRate(round.urgent ? 1 : 2);
+    let floor = null;
+    if (round.refused) {
+      const [txid, vout] = round.input.split(':');
+      let other = await esplora.pooledSpender(txid, vout);
+      if (other?.txid === round.txid) other = null;
+      const spent = other === null ? null : await esplora.transaction(txid);
+      if (other !== null && spent === null) throw new Error(`input ${round.input} unseen`);
+      floor = call('bumpFloor', { ...signer, other, spent: spent?.hex ?? null });
+    }
+    const target = call('bumpTarget', { tx: round.tx, fee: round.fee, estimate, floor, again: round.again, clamped: now.clamped });
+    now.clamped = target.clamped;
+    if (target.warning !== null) this.#raise(target.warning);
+    if (target.target === null || target.target <= now.rate) return now.rate;
+    const parent = await esplora.shown(round.txid);
+    if (parent !== null && !parent.confirmed) {
+      const child = await esplora.pooledSpender(round.txid, 0);
+      const pooled = call('packageRate', { parent, child });
+      if (pooled >= target.target) return pooled;
+    }
+    const last = await esplora.pooledSpender(round.txid, 0);
+    const child = wasm.bumpChild(JSON.stringify({ ...signer, fee: round.fee, rate: target.target, last }));
+    await esplora.submitPackage([round.tx, child]);
+    return target.target;
   }
 
   async #observeNexus() {

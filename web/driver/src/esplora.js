@@ -1,5 +1,7 @@
 // Bitcoin through an Esplora API, as mempool.space and blockstream.info
-// serve one: the reads a buyer's view needs, and broadcasts.
+// serve one: the reads a buyer's view needs, broadcasts, and the reads and
+// package submit its refund's CPFP bump needs, as the native
+// `swap::esplora` bumps.
 
 import { wasm } from './wasm.js';
 
@@ -70,6 +72,25 @@ export class Esplora {
     return { hex: hex.trim(), height: status.confirmed ? status.block_height : null };
   }
 
+  /** How `/tx/{txid}` shows a transaction: `{fee, weight, confirmed}`, or
+   * null for one it never saw. */
+  async shown(txid) {
+    const tx = await this.#get(`/tx/${txid}`, true);
+    if (tx === null) return null;
+    const { fee, weight, status } = JSON.parse(tx);
+    return { fee, weight, confirmed: status.confirmed };
+  }
+
+  /** The unconfirmed transaction that spends `txid:vout`, if any, as
+   * {@link Esplora#shown} shows it, with its `txid`: as the native
+   * Esplora's `pooled_spender`. */
+  async pooledSpender(txid, vout) {
+    const spend = JSON.parse(await this.#get(`/tx/${txid}/outspend/${vout}`));
+    if (!spend.spent || !spend.txid || spend.status?.confirmed) return null;
+    const shown = await this.shown(spend.txid);
+    return shown === null ? null : { txid: spend.txid, ...shown };
+  }
+
   /** The txid that spends `txid:vout`, in the mempool or a block, if any. */
   async spender(txid, vout) {
     const spend = JSON.parse(await this.#get(`/tx/${txid}/outspend/${vout}`));
@@ -93,6 +114,24 @@ export class Esplora {
     const estimates = JSON.parse(await this.#get('/fee-estimates'));
     const rate = estimates[String(blocks)];
     return typeof rate === 'number' ? rate : null;
+  }
+
+  /** Submits `hexes`, a parent and its child, as one package to
+   * `POST /txs/package`, Bitcoin Core's `submitpackage`; throws unless it
+   * answers success, as the native Esplora's bump. */
+  async submitPackage(hexes) {
+    const init = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(hexes) };
+    return this.#fetch('/txs/package', init, async (response) => {
+      const text = await response.text();
+      if (!response.ok) throw new Error(`${this.url}/txs/package: ${response.status} ${text}`);
+      let answer;
+      try {
+        answer = JSON.parse(text);
+      } catch (e) {
+        throw new Error(`${this.url}/txs/package: ${e.message}`);
+      }
+      if (answer.package_msg !== 'success') throw new Error(`${this.url}/txs/package: ${text}`);
+    });
   }
 
   /** Broadcasts `hex`; throws with Esplora's reason if it refuses it. */
