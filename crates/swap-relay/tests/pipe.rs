@@ -231,3 +231,113 @@ fn only_the_seller_passes_a_rejoin_handshake() {
     assert!(buyer.is_err());
     assert!(impostor.join().unwrap().is_err());
 }
+
+/// A WebSocket to `path` on the relay at `url`, by hand, as a party whose
+/// reads and writes the test controls byte by byte.
+fn raw_socket(url: &str, path: &str) -> std::net::TcpStream {
+    use std::io::{Read, Write};
+    let mut socket = std::net::TcpStream::connect(url.trim_start_matches("http://")).unwrap();
+    write!(
+        socket,
+        "GET /{path} HTTP/1.1\r\nHost: relay\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
+         Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+    )
+    .unwrap();
+    socket.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        let mut byte = [0];
+        socket.read_exact(&mut byte).unwrap();
+        head.push(byte[0]);
+    }
+    assert!(
+        head.starts_with(b"HTTP/1.1 101"),
+        "{}",
+        String::from_utf8_lossy(&head)
+    );
+    socket
+}
+
+/// A client's frame: `opcode`, masked with a zero key.
+fn frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
+    let mut frame = vec![0x80 | opcode, 0x80 | 127];
+    frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+    frame.extend_from_slice(&[0; 4]);
+    frame.extend_from_slice(payload);
+    frame
+}
+
+/// The relay's next message on `socket` that is not a ping: its opcode and
+/// payload.
+fn raw_message(socket: &mut std::net::TcpStream) -> io::Result<(u8, Vec<u8>)> {
+    use std::io::Read;
+    loop {
+        let mut header = [0; 2];
+        socket.read_exact(&mut header)?;
+        let len = match header[1] & 0x7f {
+            126 => {
+                let mut len = [0; 2];
+                socket.read_exact(&mut len)?;
+                u16::from_be_bytes(len) as usize
+            }
+            127 => {
+                let mut len = [0; 8];
+                socket.read_exact(&mut len)?;
+                u64::from_be_bytes(len) as usize
+            }
+            len => len as usize,
+        };
+        let mut payload = vec![0; len];
+        socket.read_exact(&mut payload)?;
+        if header[0] & 0x0f != 9 {
+            return Ok((header[0] & 0x0f, payload));
+        }
+    }
+}
+
+fn raw_text(socket: &mut std::net::TcpStream) -> String {
+    let (opcode, payload) = raw_message(socket).unwrap();
+    assert_eq!(opcode, 1);
+    String::from_utf8(payload).unwrap()
+}
+
+/// A party that stops reading, its connection still open, does not hold
+/// the pipe past [`swap_relay::SILENCE`]: the relay gives up passing a
+/// message on to it, and ends the pipe, so the other party, its own pings
+/// left unanswered meanwhile, is told the session is gone. Before, the
+/// relay waited on the write for good, past its own pings and silence.
+#[test]
+fn a_party_that_stops_reading_ends_the_pipe() {
+    use std::io::Write;
+    let url = relay(10);
+    let mut seller = raw_socket(&url, "sell");
+    seller
+        .write_all(&frame(1, offer(&id(10)).as_bytes()))
+        .unwrap();
+    assert_eq!(raw_text(&mut seller), "listed");
+    let _buyer = raw_socket(&url, &format!("take/{}", id(10)));
+    assert_eq!(raw_text(&mut seller), "paired");
+
+    // The buyer reads nothing: the seller writes until the relay, stuck
+    // writing to the buyer, stops reading from it too.
+    seller
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let piece = frame(2, &vec![7; swap_relay::MAX_MESSAGE]);
+    while seller.write_all(&piece).is_ok() {}
+
+    // Ended within SILENCE of the stuck write: a close, or the connection
+    // gone.
+    let deadline = swap_relay::SILENCE + TIMEOUT;
+    seller.set_read_timeout(Some(deadline)).unwrap();
+    match raw_message(&mut seller) {
+        Ok((8, _)) => {}
+        Ok((opcode, _)) => panic!("not a close: {opcode}"),
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
+            ) => {}
+        Err(e) => panic!("the relay held the pipe past {deadline:?}: {e}"),
+    }
+}
