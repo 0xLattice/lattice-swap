@@ -94,8 +94,9 @@ export class Chain {
   }
 }
 
-/** `hex` as a transaction: `{txid, inputs: [{txid, vout, witness}],
- * outputs: [{value, script}]}`, scripts and witness items in hex. */
+/** `hex` as a transaction: `{txid, weight, inputs: [{txid, vout,
+ * witness}], outputs: [{value, script}]}`, scripts and witness items in
+ * hex. */
 export function parseTx(hex) {
   const b = Buffer.from(hex, 'hex');
   let i = 0;
@@ -124,7 +125,8 @@ export function parseTx(hex) {
   if (segwit) for (const input of inputs) input.witness = Array.from({ length: varint() }, () => take(varint()).toString('hex'));
   const stripped = Buffer.concat([b.subarray(0, 4), b.subarray(body, end), take(4)]);
   const sha = (data) => createHash('sha256').update(data).digest();
-  return { txid: Buffer.from(sha(sha(stripped))).reverse().toString('hex'), inputs, outputs };
+  const weight = stripped.length * 3 + b.length;
+  return { txid: Buffer.from(sha(sha(stripped))).reverse().toString('hex'), weight, inputs, outputs };
 }
 
 /** Why `hex` cannot spend what it spends, as far as an Esplora over
@@ -151,17 +153,51 @@ function unspendable(chain, posted, hex) {
   return null;
 }
 
+/** What `hex` pays in fees, its inputs' values from `chain` and
+ * `posted`, or undefined if one is unknown. */
+function feeOf(chain, posted, hex) {
+  const known = new Map(posted.map((tx) => [parseTx(tx).txid, tx]));
+  for (const [txid, { hex: tx }] of chain.txs) known.set(txid, tx);
+  const tx = parseTx(hex);
+  let paid = 0;
+  for (const input of tx.inputs) {
+    const utxo = [...chain.utxos.values()].flat().find((utxo) => utxo.txid === input.txid && utxo.vout === input.vout);
+    const value = utxo?.value ?? (known.has(input.txid) ? parseTx(known.get(input.txid)).outputs[input.vout]?.value : undefined);
+    if (value === undefined) return undefined;
+    paid += value;
+  }
+  return paid - tx.outputs.reduce((sum, output) => sum + output.value, 0);
+}
+
 /** An Esplora over `chain`: what it takes is logged in `posted`, and
  * `onPost(hex)` runs first; it refuses a transaction that spends what it
- * cannot. It logs each path asked in `chain.paths`, if given. */
+ * cannot, or `chain.refuse(hex)` names a reason for. A package to
+ * `POST /txs/package` is logged in `packages`, and
+ * its transactions go into its mempool. It logs each path asked in
+ * `chain.paths`, if given. */
 export async function esplora(chain, onPost = () => {}) {
   const posted = [];
+  const packages = [];
   const server = await serve(async (method, path, body) => {
     chain.paths?.push(path);
+    if (method === 'POST' && path === '/txs/package') {
+      const hexes = JSON.parse(body);
+      for (const [i, hex] of hexes.entries()) {
+        const refused = unspendable(chain, [...posted, ...hexes.slice(0, i)], hex);
+        if (refused) return [400, `package RPC error: ${refused}`];
+      }
+      packages.push(hexes);
+      for (const hex of hexes) {
+        const tx = parseTx(hex);
+        chain.txs.set(tx.txid, { hex, height: null });
+        for (const input of tx.inputs) chain.spends.set(`${input.txid}:${input.vout}`, tx.txid);
+      }
+      return [200, { package_msg: 'success', 'tx-results': {} }];
+    }
     if (method === 'POST' && path === '/tx') {
       if (chain.postDown) return [503, 'down'];
       await onPost(body);
-      const refused = unspendable(chain, posted, body);
+      const refused = chain.refuse?.(body) ?? unspendable(chain, posted, body);
       if (refused) return [400, `sendrawtransaction RPC error: ${refused}`];
       posted.push(body);
       return [200, parseTx(body).txid];
@@ -176,12 +212,15 @@ export async function esplora(chain, onPost = () => {}) {
       const tx = chain.txs.get(m[1]);
       if (!tx) return [404, 'Transaction not found'];
       if (m[2]) return [200, tx.hex];
-      return [200, { txid: m[1], status: tx.height === null ? { confirmed: false } : { confirmed: true, block_height: tx.height } }];
+      const status = tx.height === null ? { confirmed: false } : { confirmed: true, block_height: tx.height };
+      return [200, { txid: m[1], fee: feeOf(chain, posted, tx.hex), weight: parseTx(tx.hex).weight, status }];
     }
     m = path.match(/^\/tx\/(\w+)\/outspend\/(\d+)$/);
     if (m) {
       const txid = chain.spends.get(`${m[1]}:${m[2]}`);
-      return [200, txid ? { spent: true, txid } : { spent: false }];
+      const height = chain.txs.get(txid)?.height ?? null;
+      const status = height === null ? { confirmed: false } : { confirmed: true, block_height: height };
+      return [200, txid ? { spent: true, txid, status } : { spent: false }];
     }
     m = path.match(/^\/address\/(\w+)\/utxo$/);
     if (m && chain.utxosDown) return [503, 'down'];
@@ -193,7 +232,7 @@ export async function esplora(chain, onPost = () => {}) {
       }))];
     }
   });
-  return { ...server, posted };
+  return { ...server, posted, packages };
 }
 
 /** A Nexus node's public read port at height 1 on the test offer's

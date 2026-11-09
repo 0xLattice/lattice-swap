@@ -54,10 +54,15 @@ waits, holding nothing, until the first closes. Nothing watches a swap while
 the page is closed: `status()` names the cancel, refund and punish heights,
 and a buyer whose swap stalls must come back by the cancel height and keep
 the page open until the refund confirms, which must come before the punish.
-`backup()` gives a recovery file with the wallet key and every running swap;
-`status().backupCovers` says when a file taken now covers the lock. Build it
-with `web/driver/build.sh` (wasm-bindgen-cli 0.2.130) and test it with
-`npm test` there.
+While the refund waits unconfirmed, the page bumps it by CPFP from its own
+payout back to the wallet, submitting the pair to the Esplora's
+`POST /txs/package` (Bitcoin Core's `submitpackage`), which mempool.space
+serves: by the native driver's rules (`swap::bump`, through `swap-wasm`),
+toward the Esplora's estimate, at most 1000 sat/vB and all of the refund
+but dust. `backup()` gives a recovery file with the wallet key and every
+running swap; `status().backupCovers` says when a file taken now covers the
+lock. Build it with `web/driver/build.sh` (wasm-bindgen-cli 0.2.130) and
+test it with `npm test` there.
 
 `swap::app` is the same buyer for a native app: a wallet key of its own and
 each swap's record in one directory, Bitcoin from one Esplora
@@ -65,10 +70,8 @@ each swap's record in one directory, Bitcoin from one Esplora
 waits for the deposit, takes, cancels, shows the same status and withdraws
 as the browser does, runs the swap on the native driver, and carries on the
 one that runs at the next launch. Its recovery file is the browser's, so a
-wallet and its swaps move between the two either way. Unlike the browser,
-it bumps its refund by CPFP, submitting the pair to the Esplora's
-`POST /txs/package` (Bitcoin Core's `submitpackage`), which mempool.space
-serves.
+wallet and its swaps move between the two either way. As the browser does,
+it bumps its refund by CPFP through the Esplora's `POST /txs/package`.
 
 ## Install
 

@@ -263,15 +263,9 @@ impl Swap {
             adaptor: Bip340Adaptor::default(),
         };
 
-        // Size each spend with placeholder signatures: the witness has the
-        // same shape and size once signed.
         let [redeem, cancel, refund, punish] =
-            [Spend::Redeem, Spend::Cancel, Spend::Refund, Spend::Punish].map(|spend| {
-                let buyer = (spend != Spend::Punish).then_some([0; 64]);
-                let mut tx = swap.unsigned_tx(OutPoint::null(), spend);
-                tx.input[0].witness = swap.witness(spend, [0; 64], buyer);
-                tx.vsize() as u64
-            });
+            [Spend::Redeem, Spend::Cancel, Spend::Refund, Spend::Punish]
+                .map(|spend| swap.vsize(spend));
         let largest = redeem.max(cancel).max(refund).max(punish);
         if swap.params.fee < Amount::from_sat(largest) {
             return Err(Error::Fee);
@@ -320,6 +314,16 @@ impl Swap {
                 script_pubkey: payout,
             }],
         }
+    }
+
+    /// The spend's vsize once signed, sized with placeholder signatures: the
+    /// witness has the same shape and size once signed. What a fee bump
+    /// sizes the spend by, whatever witness a node shows for its txid.
+    pub fn vsize(&self, spend: Spend) -> u64 {
+        let buyer = (spend != Spend::Punish).then_some([0; 64]);
+        let mut tx = self.unsigned_tx(OutPoint::null(), spend);
+        tx.input[0].witness = self.witness(spend, [0; 64], buyer);
+        tx.vsize() as u64
     }
 
     /// The absolute fee the spend pays: two fees for redeem, one for the

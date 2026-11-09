@@ -4,6 +4,7 @@ use super::*;
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::Secp256k1;
 use bitcoin::{Amount, CompressedPublicKey, OutPoint, PrivateKey, Txid};
+use bump::{bump_child, bump_floor, bump_target, buyer_bumps, package_rate};
 use ed25519_dalek::SigningKey;
 use session::Ivy;
 use swap::Terms;
@@ -265,16 +266,9 @@ fn messages_match_the_clis() {
     assert!(encode_message(&text(&message).unwrap(), "01").is_err());
 }
 
-/// Once the lock is agreed, both sides watch its output and look up the
-/// same spends; the buyer, told the NEX lock, watches it on Nexus.
-#[test]
-fn a_watch_names_what_to_observe() {
-    let (seller, buyer) = hellos();
-    let seller = text(&seller).unwrap();
-    let nothing = json(&watch_seller(&seller).unwrap());
-    assert_eq!(nothing["bitcoin"], Value::Null);
-    assert_eq!(nothing["nexus"], Value::Null);
-
+/// The seller's and the buyer's states once the lock is agreed and the
+/// buyer holds every signature, and the funding.
+fn locked(seller: String, buyer: Value) -> (Value, Value, bitcoin::Transaction) {
     let fund = &buyer["actions"][0]["FundLock"];
     let funding = bitcoin::Transaction {
         version: bitcoin::transaction::Version::TWO,
@@ -298,6 +292,20 @@ fn a_watch_names_what_to_observe() {
     let sent = text(&json!("Sent")).unwrap();
     let buyer = json(&step_buyer(&text(&buyer["state"]).unwrap(), &sent).unwrap());
     let seller = json(&step_seller(&text(&seller["state"]).unwrap(), &signatures).unwrap());
+    (seller["state"].clone(), buyer, funding)
+}
+
+/// Once the lock is agreed, both sides watch its output and look up the
+/// same spends; the buyer, told the NEX lock, watches it on Nexus.
+#[test]
+fn a_watch_names_what_to_observe() {
+    let (seller, buyer) = hellos();
+    let seller = text(&seller).unwrap();
+    let nothing = json(&watch_seller(&seller).unwrap());
+    assert_eq!(nothing["bitcoin"], Value::Null);
+    assert_eq!(nothing["nexus"], Value::Null);
+
+    let (seller, buyer, funding) = locked(seller, buyer);
 
     let buyer_state = text(&buyer["state"]).unwrap();
     let watched = json(&watch_buyer(&buyer_state).unwrap());
@@ -308,7 +316,7 @@ fn a_watch_names_what_to_observe() {
     assert_eq!(watched["bitcoin"]["cancel_output"], format!("{cancel}:0"));
     assert_eq!(watched["margin"], 3);
     assert_eq!(watched["nexus"], Value::Null);
-    let seller_watched = json(&watch_seller(&text(&seller["state"]).unwrap()).unwrap());
+    let seller_watched = json(&watch_seller(&text(&seller).unwrap()).unwrap());
     assert_eq!(seller_watched["bitcoin"], watched["bitcoin"]);
     assert_eq!(seller_watched["nexus"], Value::Null);
 
@@ -1014,4 +1022,232 @@ fn the_drivers_test_offer_is_signed() {
         std::fs::write(path, &offer).unwrap();
     }
     assert_eq!(std::fs::read_to_string(path).unwrap(), offer);
+}
+
+/// A buyer whose refund pays `key`, cancelled and refunding: its state,
+/// cancel's hex, and the refund's.
+fn refunding(key: &Value) -> (String, String, String) {
+    let seller = new_seller(&terms(), "seller", &payout(), &payout()).unwrap();
+    let refund_payout = key["script_pubkey"].as_str().unwrap();
+    let buyer = json(&start_buyer(&terms(), refund_payout, "buyer-payout").unwrap());
+    let seller = json(&step_seller(&seller, &delivered(&buyer)).unwrap());
+    let buyer = json(&step_buyer(&text(&buyer["state"]).unwrap(), &delivered(&seller)).unwrap());
+    let (_, buyer, _) = locked(text(&seller["state"]).unwrap(), buyer);
+    let broadcast = |state: &str, view: Value| {
+        let event = text(&json!({"Bitcoin": view})).unwrap();
+        let stepped = json(&step_buyer(state, &event).unwrap());
+        let hex = (stepped["actions"].as_array().unwrap().iter())
+            .find_map(|action| action["Broadcast"].as_str().map(String::from))
+            .unwrap_or_else(|| panic!("no broadcast: {stepped}"));
+        (text(&stepped["state"]).unwrap(), hex)
+    };
+    let view = json!({"height": 120, "funding": 20, "lock_spend": null, "cancel_spend": null, "stale": null});
+    let (state, cancel) = broadcast(&text(&buyer["state"]).unwrap(), view);
+    let lock_spend = json!({"tx": cancel, "confirmations": 1});
+    let view = json!({"height": 121, "funding": 21, "lock_spend": lock_spend, "cancel_spend": null, "stale": null});
+    let (state, refund) = broadcast(&state, view);
+    (state, cancel, refund)
+}
+
+/// Only the buyer's own waiting transaction, its refund, is bumped, once a
+/// block unless it fails near its deadline, as the native driver's bump.
+#[test]
+fn the_refund_alone_is_due_once_a_block() {
+    let key = json(&new_bitcoin_key("regtest").unwrap());
+    let (state, cancel, refund) = refunding(&key);
+    let refund_txid = hex_tx(&json!(refund)).compute_txid().to_string();
+    let view = |height: u32, depth: u32| {
+        json!({"height": height, "funding": 20 + depth, "stale": null, "cancel_spend": null,
+            "lock_spend": {"tx": cancel, "confirmations": depth}})
+    };
+    let bumps = |view: Value, waiting: Value, last: Value| {
+        let input = json!({"state": json(&state), "view": view, "waiting": waiting, "last": last});
+        json(&buyer_bumps(&input.to_string()).unwrap())
+    };
+    let waiting = json!([[cancel, false], [refund, false], [refund, true]]);
+    let first = bumps(view(121, 1), waiting, json!({}));
+    let rounds = first.as_array().unwrap();
+    assert_eq!(
+        rounds.len(),
+        1,
+        "cancel is not the buyer's to bump: {first}"
+    );
+    let round = &rounds[0];
+    assert_eq!(round["txid"], refund_txid);
+    assert_eq!(round["vsize"], hex_tx(&json!(refund)).vsize());
+    assert_eq!(round["fee"], 1_000);
+    assert_eq!(
+        round["input"],
+        format!("{}:0", hex_tx(&json!(cancel)).compute_txid())
+    );
+    assert_eq!(round["due"], true);
+    assert_eq!(round["refused"], false);
+    assert_eq!(round["urgent"], false);
+
+    let mut now = round["now"].clone();
+    now["rate"] = json!(2_500);
+    let last = json!({refund_txid.clone(): now});
+    let waiting = json!([[refund, false]]);
+    let same = bumps(view(121, 1), waiting.clone(), last.clone());
+    assert_eq!(same[0]["due"], false, "not again at the same tip");
+    assert_eq!(same[0]["now"]["rate"], 2_500, "the last bump's kept");
+    assert_eq!(
+        bumps(view(122, 2), waiting.clone(), last.clone())[0]["due"],
+        true
+    );
+    let refused = json!([[refund, true]]);
+    assert_eq!(
+        bumps(view(121, 1), refused, last)[0]["due"],
+        true,
+        "newly refused"
+    );
+    // Within `margin` blocks of `t2`: urgent, a clamp or failure logged again.
+    let near = bumps(view(137, 17), waiting, json!({}));
+    assert_eq!(near[0]["urgent"], true);
+    assert_eq!(near[0]["again"], true);
+    // Nothing waits before the lock is agreed.
+    let (_, fresh) = hellos();
+    let input =
+        json!({"state": fresh["state"], "view": view(121, 1), "waiting": [[refund, false]]});
+    assert_eq!(buyer_bumps(&input.to_string()).unwrap(), "[]");
+}
+
+/// The refund's target, floor, child and package rate, as the native
+/// driver and Esplora work them out.
+#[test]
+fn a_refund_below_the_estimate_gets_a_child_that_lifts_the_package() {
+    let key = json(&new_bitcoin_key("regtest").unwrap());
+    let wif = key["wif"].as_str().unwrap();
+    let (_, cancel, refund) = refunding(&key);
+    let parent = hex_tx(&json!(refund));
+    let vsize = parent.vsize();
+    let target = |estimate: Value, floor: Value, clamped: Value| {
+        let input = json!({"tx": refund, "vsize": vsize, "fee": 1_000, "estimate": estimate, "floor": floor,
+            "again": false, "clamped": clamped});
+        json(&bump_target(&input.to_string()).unwrap())
+    };
+    // 1,000 sat over its vsize pays a few sat/vB: 2 is enough, 50 is not.
+    assert!(1_000 / parent.vsize() > 2 && 1_000 / parent.vsize() < 50);
+    assert_eq!(
+        target(json!(2.0), Value::Null, Value::Null)["target"],
+        Value::Null
+    );
+    assert_eq!(
+        target(Value::Null, Value::Null, Value::Null)["target"],
+        Value::Null
+    );
+    assert_eq!(
+        target(json!(50.0), Value::Null, Value::Null)["target"],
+        50 * 250
+    );
+    // Refused: a package whatever it pays alone.
+    assert_eq!(target(json!(2.0), json!(250), Value::Null)["target"], 500);
+    // Clamped to 1,000 sat/vB, warned of once a target.
+    let clamped = target(json!(2_000.0), Value::Null, Value::Null);
+    assert_eq!(clamped["target"], 250_000);
+    assert_eq!(clamped["clamped"], 500_000);
+    assert!(clamped["warning"].as_str().unwrap().contains("clamped"));
+    let again = target(json!(2_000.0), Value::Null, json!(500_000));
+    assert_eq!(again["warning"], Value::Null);
+
+    let child = |rate: u64, last: Value| {
+        let input = json!({"wif": wif, "network": "regtest", "tx": refund, "vsize": vsize,
+            "fee": 1_000, "rate": rate, "last": last});
+        bump_child(&input.to_string()).map(|hex| hex_tx(&json!(hex)))
+    };
+    let first = child(50 * 250, Value::Null).unwrap();
+    assert_eq!(
+        first.input[0].previous_output,
+        OutPoint::new(parent.compute_txid(), 0)
+    );
+    assert_eq!(first.output.len(), 1);
+    assert_eq!(
+        first.output[0].script_pubkey.to_hex_string(),
+        key["script_pubkey"]
+    );
+    let payout = parent.output[0].value.to_sat();
+    assert!(signed_by(&first, wif, payout));
+    let fee = payout - first.output[0].value.to_sat();
+    let shown =
+        |fee: u64, tx: &bitcoin::Transaction| json!({"fee": fee, "weight": tx.weight().to_wu()});
+    let rate = |child: Value| {
+        let input = json!({"vsize": vsize, "parent": shown(1_000, &parent), "child": child});
+        json(&package_rate(&input.to_string()).unwrap())
+            .as_u64()
+            .unwrap()
+    };
+    assert!(
+        rate(shown(fee, &first)) >= 50 * 250,
+        "{}",
+        rate(shown(fee, &first))
+    );
+    assert!(rate(Value::Null) < 50 * 250);
+    // A second child pays enough to replace the first.
+    let second = child(50 * 250, shown(fee, &first)).unwrap();
+    assert!(payout - second.output[0].value.to_sat() > fee);
+    // Only a refund paying the wallet can be bumped.
+    let other = json(&new_bitcoin_key("regtest").unwrap());
+    let input = json!({"wif": other["wif"], "network": "regtest", "tx": refund, "vsize": vsize,
+        "fee": 1_000, "rate": 50 * 250, "last": null});
+    assert!(bump_child(&input.to_string())
+        .unwrap_err()
+        .contains("not this wallet's"));
+
+    // The floor: the relay's alone, else above a conflict spending cancel.
+    let floor = |other: Value, spent: Value| {
+        let input = json!({"wif": wif, "network": "regtest", "tx": refund, "vsize": vsize,
+            "other": other, "spent": spent});
+        bump_floor(&input.to_string()).map(|floor| json(&floor).as_u64().unwrap())
+    };
+    assert_eq!(floor(Value::Null, Value::Null), Ok(250));
+    let punish = json!({"fee": 5_000, "weight": 600});
+    assert!(floor(punish.clone(), json!(cancel)).unwrap() > 5_000 * 250 / 150 + 250 - 1);
+    assert!(
+        floor(punish, json!(refund)).is_err(),
+        "not the transaction it spends"
+    );
+
+    // A pooled child an Esplora shows paying a fortune is replaced at no
+    // more than 1,000 sat/vB over the package.
+    let fortune = child(50 * 250, json!({"fee": 500_000, "weight": 440})).unwrap();
+    let paid = payout - fortune.output[0].value.to_sat();
+    let package = vsize as u64 + fortune.vsize() as u64 + 1;
+    assert!(1_000 + paid <= 1_000 * package, "{paid} over {package} vB");
+    assert!(paid > fee, "still above an honest child's");
+}
+
+/// A witness padded under the refund's txid is not what the child pays
+/// for: the round is sized by the swap, and carries the machine's own copy,
+/// or waits for it.
+#[test]
+fn a_padded_refund_is_sized_as_the_swaps_own() {
+    let key = json(&new_bitcoin_key("regtest").unwrap());
+    let wif = key["wif"].as_str().unwrap();
+    let (state, cancel, refund) = refunding(&key);
+    let own = hex_tx(&json!(refund));
+    let mut padded = own.clone();
+    let mut witness: Vec<Vec<u8>> = padded.input[0].witness.iter().map(<[u8]>::to_vec).collect();
+    witness.insert(0, vec![0; 4_000]);
+    padded.input[0].witness = bitcoin::Witness::from_slice(&witness);
+    assert_eq!(padded.compute_txid(), own.compute_txid());
+    let padded = bitcoin::consensus::encode::serialize_hex(&padded);
+    let view = json!({"height": 121, "funding": 21, "stale": null, "cancel_spend": null,
+        "lock_spend": {"tx": cancel, "confirmations": 1}});
+    // The Esplora's padded copy first, then the machine's broadcast.
+    let input = json!({"state": json(&state), "view": view,
+        "waiting": [[padded, false], [refund, true]]});
+    let rounds = json(&buyer_bumps(&input.to_string()).unwrap());
+    assert_eq!(rounds[0]["vsize"], own.vsize());
+    assert_eq!(rounds[0]["tx"], refund, "the machine's own copy");
+    assert_eq!(rounds[0]["refused"], false, "as its first entry says");
+    // Given only the padded one, it waits for the machine's own: the
+    // child is sized by the swap, whatever the copy.
+    let input = json!({"state": json(&state), "view": view, "waiting": [[padded, false]]});
+    assert_eq!(buyer_bumps(&input.to_string()).unwrap(), "[]");
+    let child = |tx: &str| {
+        let input = json!({"wif": wif, "network": "regtest", "tx": tx, "vsize": own.vsize(),
+            "fee": 1_000, "rate": 50 * 250, "last": null});
+        hex_tx(&json!(bump_child(&input.to_string()).unwrap()))
+    };
+    assert_eq!(child(&padded), child(&refund));
 }

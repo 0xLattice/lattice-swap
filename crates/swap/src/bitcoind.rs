@@ -13,6 +13,8 @@ use bitcoin::{
 };
 use serde_json::{json, Value};
 
+use crate::bump::replacing;
+
 #[derive(Debug)]
 pub struct Error(pub String);
 
@@ -526,18 +528,4 @@ impl Bitcoin for Bitcoind {
         }
         Ok(signed.compute_txid())
     }
-}
-
-/// The least a child of `own` vbytes pays to replace one of `last_size`
-/// that paid `base`: Core takes a replacement that pays the old fee and its
-/// own relay at the incremental rate, at a feerate above the old one.
-pub(crate) fn replacing(
-    base: Amount,
-    last_size: u64,
-    own: u64,
-    incremental: FeeRate,
-) -> Option<Amount> {
-    let more = base.checked_add(incremental.fee_vb(own)?)?;
-    let above = (1000 * base.to_sat() / last_size.max(1) + 1).div_ceil(4);
-    Some(more.max(FeeRate::from_sat_per_kwu(above).fee_vb(own)?))
 }

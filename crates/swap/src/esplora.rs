@@ -21,11 +21,9 @@ use bitcoin::{Amount, BlockHash, FeeRate, Network, OutPoint, Script, Transaction
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::bitcoind::{replacing, Bitcoin, Error, Result, Tip};
+use crate::bitcoind::{Bitcoin, Error, Result, Tip};
+use crate::bump::{self, per_vb, MIN_RELAY};
 use crate::wallet::{self, Key, Utxo};
-
-/// Bitcoin Core's default relay floor, and incremental relay feerate.
-const MIN_RELAY: FeeRate = FeeRate::from_sat_per_vb_u32(1);
 
 /// The blocks a funding's or withdrawal's estimate aims to confirm in, as
 /// [`Bitcoin::fee_rate`] asks for a couple of blocks.
@@ -255,16 +253,6 @@ fn text(url: &str, response: ureq::Response) -> Result<String> {
     Ok(text)
 }
 
-/// A feerate of `rate` sat/vB, rounded up to a whole sat/kwu.
-fn per_vb(rate: f64) -> FeeRate {
-    FeeRate::from_sat_per_kwu((rate * 250.0).ceil() as u64)
-}
-
-/// `fee` over `vsize`, rounded up.
-fn over(fee: u64, vsize: u64) -> FeeRate {
-    FeeRate::from_sat_per_kwu((fee * 250).div_ceil(vsize.max(1)))
-}
-
 impl Bitcoin for Esplora {
     fn broadcast(&self, tx: &Transaction) -> Result<()> {
         self.post("/tx", "text/plain", &serialize_hex(tx)).map(drop)
@@ -356,19 +344,13 @@ impl Bitcoin for Esplora {
             Some((txid, shown)) if txid != parent.compute_txid() => shown,
             _ => return Ok(MIN_RELAY),
         };
-        let ours = self.package_vsize(parent)?;
+        let vsize = parent.vsize() as u64;
+        let ours = bump::package_vsize(&self.key, parent, vsize).map_err(Error)?;
         let (spent, _) = self
             .transaction(input.txid)?
             .ok_or_else(|| Error(format!("input {input} unseen")))?;
         let paid = spent.output[input.vout as usize].value.to_sat();
-        let fee = (parent.output.iter())
-            .try_fold(paid, |left, out| left.checked_sub(out.value.to_sat()))
-            .ok_or_else(|| Error("the parent pays out more than its input".into()))?;
-        let beat = over(other.fee, other.vsize())
-            .max(over(other.fee, ours))
-            .max(over(fee, parent.vsize() as u64));
-        let above = beat.to_sat_per_kwu() + MIN_RELAY.to_sat_per_kwu();
-        Ok(MIN_RELAY.max(FeeRate::from_sat_per_kwu(above)))
+        bump::floor(parent, vsize, paid, (other.fee, other.vsize()), ours).map_err(Error)
     }
 
     /// `parent`'s feerate with the unconfirmed child spending its payout,
@@ -381,40 +363,21 @@ impl Bitcoin for Esplora {
         if shown.status.confirmed {
             return Ok(None);
         }
-        let (mut fee, mut size) = (shown.fee, shown.vsize());
-        if let Some((_, child)) = self.pooled_spender(OutPoint::new(txid, 0))? {
-            fee += child.fee;
-            size += child.vsize();
-        }
-        // Rounded down: it is compared with a target the package must meet.
-        Ok(Some(FeeRate::from_sat_per_kwu(fee * 250 / size.max(1))))
+        let child = self.pooled_spender(OutPoint::new(txid, 0))?;
+        let child = child.map(|(_, child)| (child.fee, child.vsize()));
+        Ok(Some(bump::package_rate(shown.fee, shown.vsize(), child)))
     }
 
     /// As [`Bitcoind`]'s bump, the child signed by the wallet key, the
-    /// change back to it, the pair submitted to `POST /txs/package`.
+    /// change back to it ([`bump::child`]), the pair submitted to
+    /// `POST /txs/package`.
     ///
     /// [`Bitcoind`]: crate::bitcoind::Bitcoind
     fn bump(&self, parent: &Transaction, fee: Amount, rate: FeeRate, max: Amount) -> Result<Txid> {
-        let size = self.package_vsize(parent)?;
-        let mut fee = rate
-            .fee_vb(size + 1)
-            .and_then(|package| package.checked_sub(fee))
-            .ok_or_else(|| Error(format!("feerate {rate}")))?;
-        let txid = parent.compute_txid();
-        if let Some((last, shown)) = self.pooled_spender(OutPoint::new(txid, 0))? {
-            let own = size - parent.vsize() as u64 + 1;
-            let replace = replacing(Amount::from_sat(shown.fee), shown.vsize(), own, MIN_RELAY)
-                .ok_or_else(|| Error(format!("child {last}: fee {}", shown.fee)))?;
-            fee = fee.max(replace);
-        }
-        let change = self.key.script_pubkey.clone();
-        let spendable = parent.output[0]
-            .value
-            .checked_sub(change.minimal_non_dust())
-            .ok_or_else(|| Error("the payout is dust".into()))?;
-        let fee = fee.min(max).min(spendable);
-        let child = swap_bitcoin::cpfp(parent, change, fee).expect("change above dust");
-        let signed = self.sign_child(parent, child)?;
+        let last = self.pooled_spender(OutPoint::new(parent.compute_txid(), 0))?;
+        let last = last.map(|(_, shown)| (shown.fee, shown.vsize()));
+        let vsize = parent.vsize() as u64;
+        let signed = bump::child(&self.key, parent, vsize, fee, rate, max, last).map_err(Error)?;
         let package = serde_json::json!([serialize_hex(parent), serialize_hex(&signed)]);
         let answer = self.post("/txs/package", "application/json", &package.to_string())?;
         let answer: Value =
@@ -423,28 +386,5 @@ impl Bitcoin for Esplora {
             return Err(Error(format!("/txs/package: {answer}")));
         }
         Ok(signed.compute_txid())
-    }
-}
-
-impl Esplora {
-    /// `child`, spending `parent`'s payout, signed by the wallet key; only
-    /// a payout to the wallet can be bumped.
-    fn sign_child(&self, parent: &Transaction, child: Transaction) -> Result<Transaction> {
-        let payout = &parent.output[0];
-        if payout.script_pubkey != self.key.script_pubkey {
-            return Err(Error(format!(
-                "the payout of {} is not this wallet's",
-                parent.compute_txid()
-            )));
-        }
-        wallet::sign(&self.key.wif, child, &[payout.value.to_sat()]).map_err(Error)
-    }
-
-    /// `parent` and a signed child spending its payout, in vbytes.
-    fn package_vsize(&self, parent: &Transaction) -> Result<u64> {
-        let change = self.key.script_pubkey.clone();
-        let child = swap_bitcoin::cpfp(parent, change, Amount::ZERO)
-            .ok_or_else(|| Error("the payout is dust".into()))?;
-        Ok((parent.vsize() + self.sign_child(parent, child)?.vsize()) as u64)
     }
 }

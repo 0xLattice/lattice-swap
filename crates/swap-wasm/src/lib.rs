@@ -14,9 +14,10 @@
 //! an offer by [`decode_offer`] and judges it by [`check_offer`], talks to
 //! the seller over [`session::Ivy`], asking it for the terms at its amount
 //! ([`offer_terms`], [`check_answer`]), funds the lock from a key of its own
-//! ([`wallet`]), builds its Nexus view by [`nexus_view`], and shows where
-//! it is by [`buyer_status`].
+//! ([`wallet`]), builds its Nexus view by [`nexus_view`], shows where it
+//! is by [`buyer_status`], and bumps its refund by CPFP ([`bump`]).
 
+mod bump;
 mod session;
 mod wallet;
 

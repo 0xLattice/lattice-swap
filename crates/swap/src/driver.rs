@@ -13,6 +13,7 @@ use swap_bitcoin::{Spend, Swap};
 use swap_nexus_tx::rpc::Client;
 
 use crate::bitcoind::{self, Bitcoin};
+use crate::bump::{self, urgent, Waiting};
 use crate::transport::Transport;
 use crate::{view, SecretBytes, Spent};
 use crate::{Action, BitcoinView, Event, Machine, Message, NexusView, NexusWatch, Outcome, Rejoin};
@@ -351,8 +352,8 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
             message_timeout: Duration::from_secs(60),
             nex_key: None,
             fallback_fee_rate: FeeRate::from_sat_per_vb_u32(10),
-            max_fee_rate: FeeRate::from_sat_per_vb_u32(1_000),
-            max_fee_fraction: 1.0,
+            max_fee_rate: bump::MAX_FEE_RATE,
+            max_fee_fraction: bump::MAX_FEE_FRACTION,
             max_tip_age: Duration::from_secs(90 * 60),
             clock: SystemTime::now,
             waiting: HashMap::new(),
@@ -559,52 +560,22 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
         urgent: &[Spend],
         waiting: Vec<(Transaction, bool)>,
     ) {
-        let own: Vec<(Txid, Spend)> = self
-            .state
-            .own_spends()
-            .iter()
-            .map(|&spend| (swap.unsigned_tx(lock, spend).compute_txid(), spend))
-            .collect();
+        let own = self.state.own_spends();
         let mut still = HashMap::new();
-        for (tx, refused) in waiting {
+        for (tx, spend, refused) in bump::own_waiting(swap, lock, own, waiting) {
             let txid = tx.compute_txid();
-            let Some(&(_, spend)) = own.iter().find(|(own, _)| *own == txid) else {
-                continue;
-            };
-            if still.contains_key(&txid) {
-                continue;
-            }
             let last = self.waiting.get(&txid).copied();
             let urgent = urgent.contains(&spend);
-            // Near its deadline, a failure or a clamp is logged again at
-            // every block, not only once.
-            let again = urgent && last.is_none_or(|last| height > last.height);
-            // A failure is tried again at the next block, or, a few times, at
-            // the next poll once a deadline is near: a block may be all that
-            // is left.
-            let due = last.is_none_or(|last| {
-                height > last.height
-                    || refused && !last.refused
-                    || last.failed && urgent && last.retries < URGENT_RETRIES
-            });
-            let mut now = last.unwrap_or(Waiting {
-                height,
-                refused,
-                rate: FeeRate::ZERO,
-                failed: false,
-                retries: 0,
-                clamped: None,
-            });
-            now.refused = refused;
+            let bump::Round {
+                mut now,
+                due,
+                again,
+            } = bump::schedule(last, height, refused, urgent);
             if due {
-                now.retries = match last {
-                    Some(last) if last.height == height => last.retries.saturating_add(1),
-                    _ => 0,
-                };
-                now.height = height;
                 let fee = swap.fee(spend);
                 let clamped = &mut now.clamped;
-                let result = match self.target(&tx, fee, refused, urgent, again, clamped) {
+                let vsize = swap.vsize(spend);
+                let result = match self.target(&tx, vsize, fee, refused, urgent, again, clamped) {
                     Ok(Some(rate)) if rate > now.rate => match self.bitcoin.package_rate(&tx) {
                         Ok(Some(pooled)) if pooled >= rate => Ok(pooled),
                         Ok(_) => self.bump_one(&tx, fee, rate).map(|()| rate),
@@ -633,46 +604,48 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
         self.waiting = still;
     }
 
-    /// The feerate to raise `tx`, which pays `fee`, to, clamped to
+    /// The feerate to raise `tx`, of `vsize` vbytes, the swap's own size
+    /// of it, which pays `fee`, to, clamped to
     /// `max_fee_rate`; `None` if `tx` is in the mempool and already pays it
     /// alone. A refused `tx` needs a package whatever it pays. A clamp is
     /// logged once per target, the last kept in `clamped`, and `again`.
+    #[allow(clippy::too_many_arguments)]
     fn target(
         &self,
         tx: &Transaction,
+        vsize: u64,
         fee: Amount,
         refused: bool,
         urgent: bool,
         again: bool,
         clamped: &mut Option<FeeRate>,
     ) -> bitcoind::Result<Option<FeeRate>> {
-        let mut rate = self
-            .bitcoin
-            .fee_rate(urgent)?
-            .unwrap_or(self.fallback_fee_rate);
-        if refused {
-            rate = rate.max(self.bitcoin.floor(tx)?);
+        let estimate = self.bitcoin.fee_rate(urgent)?;
+        let floor = match refused {
+            true => Some(self.bitcoin.floor(tx)?),
+            false => None,
+        };
+        let (rate, warning) = bump::target(
+            tx,
+            vsize,
+            fee,
+            estimate,
+            self.fallback_fee_rate,
+            floor,
+            self.max_fee_rate,
+            again,
+            clamped,
+        );
+        if let Some(warning) = warning {
+            warn(&warning);
         }
-        if rate > self.max_fee_rate {
-            if *clamped != Some(rate) || again {
-                warn(&format!(
-                    "bump {}: target {rate} clamped to max_fee_rate {}",
-                    tx.compute_txid(),
-                    self.max_fee_rate
-                ));
-            }
-            *clamped = Some(rate);
-            rate = self.max_fee_rate;
-        }
-        let alone = rate.fee_vb(tx.vsize() as u64);
-        Ok((refused || alone.is_some_and(|alone| alone > fee)).then_some(rate))
+        Ok(rate)
     }
 
     /// Bumps `tx`, which pays `fee`, to `rate`, its child paying at most
     /// `max_fee_fraction` of the payout.
     fn bump_one(&self, tx: &Transaction, fee: Amount, rate: FeeRate) -> bitcoind::Result<()> {
-        let payout = tx.output[0].value.to_sat() as f64;
-        let max = Amount::from_sat((payout * self.max_fee_fraction) as u64);
+        let max = bump::max_fee(tx, self.max_fee_fraction);
         self.bitcoin.bump(tx, fee, rate, max).map(drop)
     }
 
@@ -828,10 +801,6 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
 /// budget is raised.
 pub const NEXUS_BUDGET: Duration = Duration::from_secs(10);
 
-/// How many times a failed bump near its deadline is tried again within one
-/// block, a poll apart.
-pub(crate) const URGENT_RETRIES: u8 = 8;
-
 /// How often a failure to read a Bitcoin view, or to submit a Nexus
 /// transaction, that lasts is logged again, and how long stale views last
 /// before they are logged.
@@ -852,45 +821,6 @@ fn warn_again(last: &mut Option<(String, SystemTime)>, e: String, now: SystemTim
 /// The time from `since` to `now`; none if the clock went back.
 fn elapsed(since: SystemTime, now: SystemTime) -> Duration {
     now.duration_since(since).unwrap_or_default()
-}
-
-/// A swap transaction of ours waiting unconfirmed.
-#[derive(Clone, Copy)]
-struct Waiting {
-    /// The tip when its target was last read.
-    height: u32,
-    /// Whether the mempool refused it at the last view.
-    refused: bool,
-    /// What the last bump that went through raised it to.
-    rate: FeeRate,
-    /// Whether the last attempt to bump it failed: it is tried again.
-    failed: bool,
-    /// Attempts since the first at `height`.
-    retries: u8,
-    /// The last target clamped to `max_fee_rate`, already logged.
-    clamped: Option<FeeRate>,
-}
-
-/// Our spends within `margin` blocks of their deadline: redeem once the
-/// lock is `t1 - margin` deep, refund once cancel is `t2 - margin` deep.
-fn urgent(swap: &Swap, lock: OutPoint, view: &BitcoinView, margin: u16) -> Vec<Spend> {
-    let near = |depth: Option<u32>, deadline: u16| {
-        depth.is_some_and(|depth| depth.saturating_add(margin.into()) >= u32::from(deadline))
-    };
-    let cancel = swap.unsigned_tx(lock, Spend::Cancel).compute_txid();
-    let cancel_depth = view
-        .lock_spend
-        .as_ref()
-        .filter(|spent| spent.tx.compute_txid() == cancel && spent.confirmations > 0)
-        .map(|spent| spent.confirmations);
-    let p = swap.params();
-    [
-        (Spend::Redeem, near(view.funding, p.t1)),
-        (Spend::Refund, near(cancel_depth, p.t2)),
-    ]
-    .into_iter()
-    .filter_map(|(spend, near)| near.then_some(spend))
-    .collect()
 }
 
 fn warn(what: &str) {
