@@ -83,7 +83,12 @@ impl Esplora {
     /// `timeout` bounds each request.
     pub fn new(url: &str, key: Key, timeout: Duration) -> Self {
         Self {
-            agent: ureq::AgentBuilder::new().timeout(timeout).build(),
+            // No redirects: one could move an https Esplora's reads to
+            // plain http, where anyone on the way can change them.
+            agent: ureq::AgentBuilder::new()
+                .timeout(timeout)
+                .redirects(0)
+                .build(),
             url: url.trim_end_matches('/').into(),
             key,
         }
@@ -234,6 +239,13 @@ impl Esplora {
 }
 
 fn text(url: &str, response: ureq::Response) -> Result<String> {
+    if (300..400).contains(&response.status()) {
+        let to = response.header("location").unwrap_or_default();
+        return Err(Error(format!(
+            "{url}: {} to {to}, not followed",
+            response.status()
+        )));
+    }
     let mut text = String::new();
     response
         .into_reader()

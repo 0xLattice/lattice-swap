@@ -137,7 +137,12 @@ impl Client {
     /// fails the call instead of blocking it.
     pub fn new(base: &str, cookie: &str, timeout: Duration) -> Self {
         Self {
-            agent: ureq::AgentBuilder::new().timeout(timeout).build(),
+            // No redirects: a node sends none, and one could move an https
+            // node's answers to plain http.
+            agent: ureq::AgentBuilder::new()
+                .timeout(timeout)
+                .redirects(0)
+                .build(),
             base: base.trim_end_matches('/').into(),
             timeout,
             deadline: Mutex::new(None),
@@ -187,7 +192,11 @@ impl Client {
     /// A client for a node's public read port, which takes no cookie.
     pub fn public(base: &str, timeout: Duration) -> Self {
         Self {
-            agent: ureq::AgentBuilder::new().timeout(timeout).build(),
+            // No redirects, as in `new`.
+            agent: ureq::AgentBuilder::new()
+                .timeout(timeout)
+                .redirects(0)
+                .build(),
             base: base.trim_end_matches('/').into(),
             timeout,
             deadline: Mutex::new(None),
