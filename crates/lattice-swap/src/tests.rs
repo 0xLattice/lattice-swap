@@ -92,7 +92,7 @@ fn the_defaults_are_the_agreed_settings_and_pass() {
     let args = offer_args(&[]);
     let terms = terms_of(&args);
     assert_eq!((terms.t1, terms.t2), (288, 144));
-    assert_eq!((terms.btc_confirmations, terms.nex_confirmations), (6, 24));
+    assert_eq!((terms.btc_confirmations, terms.nex_confirmations), (6, 12));
     assert_eq!(terms.btc_amount, Amount::from_sat(50_000_000));
     assert_eq!(terms.nex_amount, 1_000_000);
     assert_eq!(args.nodes.btc_network, Network::Bitcoin);
@@ -701,7 +701,7 @@ fn the_terms_are_fixed_before_the_machines_start() {
 fn take_refuses_terms_that_cannot_work() {
     let (policy, network) = policy(&["--max-t1", "1000"]);
     let mut offer = agreed();
-    offer.template.t1 = 100;
+    offer.template.t1 = 90;
     assert!(
         check_offer(&offer, &policy.policy(&agreed()), network, MAINNET, 0, 0).is_err(),
         "below the floor"

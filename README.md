@@ -252,7 +252,7 @@ the offer and the seller's session key, is kept beside the swap file in
 Both, like the driver, refuse a swap file of another state version: finish
 a swap with the build that started it.
 
-The defaults are `t1` 288 and `t2` 144 Bitcoin blocks, 6 Bitcoin and 24 Nexus
+The defaults are `t1` 288 and `t2` 144 Bitcoin blocks, 6 Bitcoin and 12 Nexus
 confirmations, and a margin of 12. A Nexus block is about 6 Bitcoin blocks, so
 the tool refuses any `t1` below `btc-confirmations + 6 × (nex-confirmations +
 1) + margin`. A buyer refuses an offer on another `--btc-network`, at another
@@ -260,7 +260,7 @@ price than its `--price`, or whose range does not hold its `--btc-amount`,
 and prints the offer before it dials. It also refuses one outside its bounds: `--max-btc-fee` 10000
 sat, `--max-nex-fee` 1000, `--max-t1` 288, `--min-t2` 144,
 `--min-btc-confirmations` 6, `--max-btc-confirmations` 12,
-`--min-refund-window` 72, `--min-nex-confirmations` 24 and `--min-margin` 6 by
+`--min-refund-window` 72, `--min-nex-confirmations` 12 and `--min-margin` 6 by
 default. The seller refuses to offer a range that is empty or whose terms do
 not work at either end: a `--min-btc-amount` below two `--btc-fee`, which
 redeem pays, plus 546 sat, the highest dust limit of a wallet's payout, or
