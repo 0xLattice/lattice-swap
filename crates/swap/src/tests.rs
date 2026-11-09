@@ -5185,6 +5185,10 @@ fn a_failed_take_warns_only_until_a_take_succeeds() {
     config.poll = Duration::from_millis(20);
     let wallet = app::Wallet::restore(config, &file).unwrap();
     let buy = wallet.resume(&hex::encode([2; 32])).unwrap();
+    // The amounts are the terms': the buyer receives `nex_amount - nex_fee`.
+    let shown = buy.status().unwrap();
+    assert_eq!(shown["nex_amount"], terms().nex_amount);
+    assert_eq!(shown["nex_fee"], terms().nex_fee);
     let warning = || buy.status().unwrap()["warning"].clone();
     let done = std::sync::atomic::AtomicBool::new(false);
     let until = |what: &str, holds: &dyn Fn() -> bool| {

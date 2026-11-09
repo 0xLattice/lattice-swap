@@ -207,7 +207,9 @@ export class Buyer extends EventTarget {
    *   {@link Wallet#running} judges it: while it does, no other swap is
    *   prepared and the wallet withdraws nothing;
    * - `btc_amount`, in sat, `price`, in sat a NEX of 1,000,000 base units,
-   *   and `nex_amount`, in base units: the swap's terms, read from its
+   *   `nex_amount`, in base units, what the seller locks, and `nex_fee`,
+   *   in base units, what the claim pays of it, so the buyer receives
+   *   `nex_amount - nex_fee`: the swap's terms, read from its
    *   state as the CLI reads them, and once it ends, from the offer at the
    *   policy's amount, the only terms `#request` accepts;
    *   `btc_confirmations` and `nex_confirmations`, how deep each lock must
@@ -240,6 +242,7 @@ export class Buyer extends EventTarget {
       btc_amount: terms.btc_amount,
       price: r.policy.price,
       nex_amount: terms.nex_amount,
+      nex_fee: terms.nex_fee,
       btc_confirmations: terms.btc_confirmations,
       nex_confirmations: terms.nex_confirmations,
       nexAddress: r.nex_address ?? null,
