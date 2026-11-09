@@ -1048,6 +1048,7 @@ impl Buy {
             "btc_amount": terms.btc_amount.to_sat(),
             "price": policy.price,
             "nex_amount": terms.nex_amount,
+            "nex_fee": terms.nex_fee,
             "btc_confirmations": terms.btc_confirmations,
             "nex_confirmations": terms.nex_confirmations,
             "nexAddress": record.nex_address,

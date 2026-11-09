@@ -2392,10 +2392,10 @@ fn a_replacing_child_pays_a_higher_feerate() {
     let incremental = FeeRate::from_sat_per_kwu(25);
     // A 109 vB child paying 1300 sat, replaced by one of 111 vB: the fee and
     // relay come to 1312, but 1312 / 111 is below 1300 / 109.
-    let fee = crate::bitcoind::replacing(Amount::from_sat(1300), 109, 111, incremental).unwrap();
+    let fee = crate::bump::replacing(Amount::from_sat(1300), 109, 111, incremental).unwrap();
     assert!(fee.to_sat() * 109 > 1300 * 111, "{fee}");
     // A larger old child leaves the relay rule binding.
-    let fee = crate::bitcoind::replacing(Amount::from_sat(1300), 400, 111, incremental).unwrap();
+    let fee = crate::bump::replacing(Amount::from_sat(1300), 400, 111, incremental).unwrap();
     assert_eq!(fee, Amount::from_sat(1312));
 }
 
@@ -2423,7 +2423,7 @@ fn a_failing_urgent_bump_is_tried_a_few_times_a_block() {
     node.0.borrow_mut().failing = 100;
     let polls = [117; 20];
     let tried = bumps(seller_watching(&locked, None), &node, &polls, |_| {}).len();
-    assert_eq!(tried, 1 + usize::from(crate::driver::URGENT_RETRIES));
+    assert_eq!(tried, 1 + usize::from(crate::bump::URGENT_RETRIES));
 }
 
 /// Redeem pays two fees: a target its feerate meets with both, though not
@@ -2432,8 +2432,9 @@ fn a_failing_urgent_bump_is_tried_a_few_times_a_block() {
 #[test]
 fn a_redeem_is_bumped_only_past_what_its_two_fees_pay() {
     let locked = locked();
-    let (swap, lock) = locked.swap();
-    let size = swap.unsigned_tx(lock, Spend::Redeem).vsize() as u64;
+    let (swap, _) = locked.swap();
+    // Sized as signed, whatever witness the node shows.
+    let size = swap.vsize(Spend::Redeem);
     let one = swap.params().fee;
     let rate = FeeRate::from_sat_per_kwu(one.to_sat() * 3 * 250 / (2 * size));
     let alone = rate.fee_vb(size).unwrap();
@@ -5203,6 +5204,10 @@ fn a_failed_take_warns_only_until_a_take_succeeds() {
     config.poll = Duration::from_millis(20);
     let wallet = app::Wallet::restore(config, &file).unwrap();
     let buy = wallet.resume(&hex::encode([2; 32])).unwrap();
+    // The amounts are the terms': the buyer receives `nex_amount - nex_fee`.
+    let shown = buy.status().unwrap();
+    assert_eq!(shown["nex_amount"], terms().nex_amount);
+    assert_eq!(shown["nex_fee"], terms().nex_fee);
     let warning = || buy.status().unwrap()["warning"].clone();
     let done = std::sync::atomic::AtomicBool::new(false);
     let until = |what: &str, holds: &dyn Fn() -> bool| {

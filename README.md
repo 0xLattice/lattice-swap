@@ -54,10 +54,15 @@ waits, holding nothing, until the first closes. Nothing watches a swap while
 the page is closed: `status()` names the cancel, refund and punish heights,
 and a buyer whose swap stalls must come back by the cancel height and keep
 the page open until the refund confirms, which must come before the punish.
-`backup()` gives a recovery file with the wallet key and every running swap;
-`status().backupCovers` says when a file taken now covers the lock. Build it
-with `web/driver/build.sh` (wasm-bindgen-cli 0.2.130) and test it with
-`npm test` there.
+While the refund waits unconfirmed, the page bumps it by CPFP from its own
+payout back to the wallet, submitting the pair to the Esplora's
+`POST /txs/package` (Bitcoin Core's `submitpackage`), which mempool.space
+serves: by the native driver's rules (`swap::bump`, through `swap-wasm`),
+toward the Esplora's estimate, at most 1000 sat/vB and all of the refund
+but dust. `backup()` gives a recovery file with the wallet key and every
+running swap; `status().backupCovers` says when a file taken now covers the
+lock. Build it with `web/driver/build.sh` (wasm-bindgen-cli 0.2.130) and
+test it with `npm test` there.
 
 `swap::app` is the same buyer for a native app: a wallet key of its own and
 each swap's record in one directory, Bitcoin from one Esplora
@@ -65,10 +70,8 @@ each swap's record in one directory, Bitcoin from one Esplora
 waits for the deposit, takes, cancels, shows the same status and withdraws
 as the browser does, runs the swap on the native driver, and carries on the
 one that runs at the next launch. Its recovery file is the browser's, so a
-wallet and its swaps move between the two either way. Unlike the browser,
-it bumps its refund by CPFP, submitting the pair to the Esplora's
-`POST /txs/package` (Bitcoin Core's `submitpackage`), which mempool.space
-serves.
+wallet and its swaps move between the two either way. As the browser does,
+it bumps its refund by CPFP through the Esplora's `POST /txs/package`.
 
 ## Install
 
@@ -124,6 +127,22 @@ nodes or keep amounts small. Each prints the note for each chain it reads
 through a public node. With either chain on a public node, the swap reads
 the chains at most once every 10 seconds, as the app does, however many
 messages the counterparty sends, within the node's rate limits.
+
+The Nexus this tool trades on is mainnet's, so on any `--btc-network` but
+`bitcoin` a swap trades real NEX for test coins worth nothing: `offer` and
+`take` refuse mainnet NEX (the default `--nexus-genesis`) for BTC on
+another network unless `--test-btc-for-mainnet-nex` is given, to test with
+tiny amounts, as on signet:
+
+```sh
+lattice-swap offer --btc-network signet --test-btc-for-mainnet-nex \
+  --nex-key-file ~/.lattice-swap/nex.key --price 50000000 \
+  --min-btc-amount 10000 --max-btc-amount 20000 \
+  --btc-fee 500 --nex-fee 10 --relay https://relay.example > offer
+```
+
+The browser driver and `swap::app` refuse such an offer the same way unless
+the buyer's policy sets `"test_btc_for_mainnet_nex": true`.
 
 On an Esplora, the BTC a seller receives, and a buyer's refund, go to a
 single-key wallet in `wallet.json` in `--dir`, the native app's

@@ -258,6 +258,144 @@ test('the refund lands in the wallet, and the deadlines show where it is', async
   assert.deepEqual(w.unsaved, []);
 });
 
+/** A swap run until it broadcasts its refund, the fee estimates then
+ * `fees`: `{w, run, refund}`, `refund` its hex. */
+async function refunding(fees) {
+  const { w, run, funding } = await funded();
+  const lookups = call('watchBuyer', (await w.store.get(`swap:${w.buyer.swapId}`)).state).bitcoin;
+  confirm(w, funding);
+  w.chain.mine(TERMS.t1 - 1);
+  const cancel = await broadcast(w, lookups.lock_spends[1]);
+  w.chain.fees = fees;
+  w.chain.paths = [];
+  confirm(w, cancel);
+  return { w, run, refund: await broadcast(w, lookups.cancel_spends[0]) };
+}
+
+test('a refund below the fee rate is bumped by CPFP from its own output, the pair submitted as a package', async () => {
+  // Fees rose after take: the refund's fixed fee pays well under 50 sat/vB.
+  const { w, run, refund } = await refunding({ 1: 50, 2: 50 });
+  const parent = parseTx(refund);
+  assert.ok((TERMS.btc_fee * 4) / parent.weight < 50, 'the refund alone pays less than the target');
+  await until(() => w.a.packages.length > 0).catch((e) => assert.fail(`${e.message}: ${JSON.stringify(w.buyer.status())}`));
+  const [[first, second]] = w.a.packages;
+  assert.equal(first, refund, 'the refund goes first, as its own parent');
+  const child = parseTx(second);
+  assert.deepEqual(child.inputs.map(({ txid, vout }) => ({ txid, vout })), [{ txid: parent.txid, vout: 0 }], 'the child spends the refund\'s payout');
+  assert.equal(child.outputs.length, 1);
+  assert.equal(child.outputs[0].script, w.wallet.key.script_pubkey, 'its change goes back to the wallet');
+  const childFee = parent.outputs[0].value - child.outputs[0].value;
+  const rate = ((TERMS.btc_fee + childFee) * 4) / (parent.weight + child.weight);
+  assert.ok(rate >= 50, `the package pays ${rate} sat/vB`);
+  // Bumped once a block: the next rounds at the same tip leave it be.
+  const polls = w.chain.paths.length;
+  await until(() => w.chain.paths.length > polls + 40);
+  assert.equal(w.a.packages.length, 1);
+  confirm(w, refund);
+  assert.equal(await run.done, 'refunded');
+  assert.deepEqual(w.unsaved, []);
+});
+
+test('a refund the mempool refuses alone goes out as a package with a child', async () => {
+  // Refused alone, as below a mempool's minimum that rose with fees: the
+  // refund goes out as a package, its target read at once.
+  const chain = new Chain();
+  const lookups = {};
+  chain.refuse = (hex) => (parseTx(hex).txid === lookups.refund ? 'min relay fee not met' : null);
+  const { w, run, funding } = await funded({ chain });
+  lookups.refund = call('watchBuyer', (await w.store.get(`swap:${w.buyer.swapId}`)).state).bitcoin.cancel_spends[0];
+  confirm(w, funding);
+  w.chain.mine(TERMS.t1 - 1);
+  const cancel = await broadcast(w, call('watchBuyer', (await w.store.get(`swap:${w.buyer.swapId}`)).state).bitcoin.lock_spends[1]);
+  w.chain.fees = { 1: 20, 2: 20 };
+  confirm(w, cancel);
+  await until(() => w.a.packages.length > 0).catch((e) => assert.fail(`${e.message}: ${JSON.stringify(w.buyer.status())}`));
+  assert.ok(!w.a.posted.some((tx) => parseTx(tx).txid === lookups.refund), 'never taken alone');
+  const [[parent, second]] = w.a.packages;
+  assert.equal(parseTx(parent).txid, lookups.refund);
+  const child = parseTx(second);
+  assert.equal(child.inputs[0].txid, lookups.refund);
+  assert.equal(child.outputs[0].script, w.wallet.key.script_pubkey);
+  confirm(w, parent);
+  assert.equal(await run.done, 'refunded');
+  assert.deepEqual(w.unsaved, []);
+});
+
+/** Runs `body` as a browser without `AbortSignal.any` would. */
+async function withoutAny(body) {
+  const any = AbortSignal.any;
+  delete AbortSignal.any;
+  try {
+    return await body();
+  } finally {
+    AbortSignal.any = any;
+  }
+}
+
+/** A fetch that answers `{"2": 3}` to every request, or never while
+ * `hang` holds, ending as its signal aborts: the signals asked with are
+ * logged in `signals`. */
+function signalled() {
+  const fetch = (_url, { signal }) =>
+    new Promise((resolve, reject) => {
+      fetch.signals.push(signal);
+      if (signal.aborted) return reject(signal.reason);
+      signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      if (!fetch.hang) resolve(new Response('{"2": 3}'));
+    });
+  fetch.signals = [];
+  fetch.hang = false;
+  return fetch;
+}
+
+for (const [name, run] of [['', (body) => body()], [' without AbortSignal.any', withoutAny]]) {
+  test(`a bump's deadline ends its own Esplora requests, never the wallet's${name}`, () =>
+    run(async () => {
+      const fetch = signalled();
+      const wallet = new Esplora('http://esplora.invalid', fetch);
+      const deadline = new AbortController();
+      const bumping = wallet.within(deadline.signal);
+      assert.equal(await bumping.feeRate(2), 3, 'answered within the deadline');
+      // Requests hanging on both while the bump's deadline passes.
+      fetch.hang = true;
+      const bump = bumping.feeRate(2);
+      const own = wallet.feeRate(2);
+      deadline.abort();
+      await assert.rejects(bump, /no answer within the round's bump budget/);
+      const ownSignal = fetch.signals.at(-1);
+      assert.equal(ownSignal.aborted, false, 'the wallet\'s request has no deadline');
+      assert.equal(wallet.deadline, null);
+      own.catch(() => {});
+      // Once passed, every request of the bump ends at once.
+      fetch.hang = false;
+      await assert.rejects(bumping.feeRate(2), /bump budget/);
+      assert.equal(await wallet.feeRate(2), 3);
+    }));
+}
+
+test('a refund is bumped where AbortSignal.any is missing', () =>
+  withoutAny(async () => {
+    const { w, run, refund } = await refunding({ 1: 50, 2: 50 });
+    await until(() => w.a.packages.length > 0).catch((e) => assert.fail(`${e.message}: ${JSON.stringify(w.buyer.status())}`));
+    assert.equal(w.a.packages[0][0], refund);
+    confirm(w, refund);
+    assert.equal(await run.done, 'refunded');
+  }));
+
+test('a refund that pays the fee rate is not bumped', async () => {
+  const { w, run, refund } = await refunding({ 1: 2, 2: 2 });
+  assert.ok((TERMS.btc_fee * 4) / parseTx(refund).weight > 2, 'the refund alone pays the target');
+  // The estimate is read for it, the only one read since the take, and
+  // nothing goes to /txs/package.
+  await until(() => w.chain.paths.includes('/fee-estimates'));
+  const polls = w.chain.paths.length;
+  await until(() => w.chain.paths.length > polls + 40);
+  assert.deepEqual(w.a.packages, []);
+  assert.ok(!w.chain.paths.includes('/txs/package'));
+  confirm(w, refund);
+  assert.equal(await run.done, 'refunded');
+});
+
 test('a failed cancel broadcast is the status’s warning until a round reads again', async () => {
   const poll = 300;
   const { w, run, funding } = await funded({ extra: { poll } });
@@ -853,6 +991,7 @@ test('status() carries the amounts, the confirmations asked for, the NEX address
     btc_amount: TERMS.btc_amount,
     price: POLICY.price,
     nex_amount: TERMS.nex_amount,
+    nex_fee: OFFER.template.nex_fee,
     btc_confirmations: OFFER.template.btc_confirmations,
     nex_confirmations: OFFER.template.nex_confirmations,
     nexAddress: w.nexAddress,
@@ -860,6 +999,7 @@ test('status() carries the amounts, the confirmations asked for, the NEX address
   const pick = (status) => Object.fromEntries(Object.keys(terms).map((key) => [key, status[key]]));
   assert.deepEqual(pick(w.buyer.status()), terms);
   assert.equal(TERMS.nex_amount, 500_000);
+  assert.equal(OFFER.template.nex_fee, 100);
   assert.equal(w.buyer.status().running, false, 'not taken');
   deposit(w, 1_100_000);
   const run = running(w.buyer);
