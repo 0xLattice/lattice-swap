@@ -307,7 +307,28 @@ fn raw_text(socket: &mut std::net::TcpStream) -> String {
 /// left unanswered meanwhile, is told the session is gone. Before, the
 /// relay waited on the write for good, past its own pings and silence.
 #[test]
-fn a_party_that_stops_reading_ends_the_pipe() {
+fn a_buyer_that_stops_reading_ends_the_pipe() {
+    one_stops_reading(Stops::Buyer);
+}
+
+/// As the buyer, so the seller: the buyer is told within
+/// [`swap_relay::SILENCE`], not after the relay's close to the seller, as
+/// stuck as its message was, has waited out its own.
+#[test]
+fn a_seller_that_stops_reading_ends_the_pipe() {
+    one_stops_reading(Stops::Seller);
+}
+
+enum Stops {
+    Buyer,
+    Seller,
+}
+
+/// Pairs a seller and a buyer; the one that `stops` reads nothing while
+/// the other writes until the relay, stuck writing to it, stops reading
+/// too. The writer must then be told, within SILENCE of the stuck write,
+/// by a close or the connection gone.
+fn one_stops_reading(stops: Stops) {
     use std::io::Write;
     let url = relay(10);
     let mut seller = raw_socket(&url, "sell");
@@ -315,22 +336,22 @@ fn a_party_that_stops_reading_ends_the_pipe() {
         .write_all(&frame(1, offer(&id(10)).as_bytes()))
         .unwrap();
     assert_eq!(raw_text(&mut seller), "listed");
-    let _buyer = raw_socket(&url, &format!("take/{}", id(10)));
+    let buyer = raw_socket(&url, &format!("take/{}", id(10)));
     assert_eq!(raw_text(&mut seller), "paired");
+    let (mut writer, _deaf) = match stops {
+        Stops::Buyer => (seller, buyer),
+        Stops::Seller => (buyer, seller),
+    };
 
-    // The buyer reads nothing: the seller writes until the relay, stuck
-    // writing to the buyer, stops reading from it too.
-    seller
+    writer
         .set_write_timeout(Some(Duration::from_secs(2)))
         .unwrap();
     let piece = frame(2, &vec![7; swap_relay::MAX_MESSAGE]);
-    while seller.write_all(&piece).is_ok() {}
+    while writer.write_all(&piece).is_ok() {}
 
-    // Ended within SILENCE of the stuck write: a close, or the connection
-    // gone.
     let deadline = swap_relay::SILENCE + TIMEOUT;
-    seller.set_read_timeout(Some(deadline)).unwrap();
-    match raw_message(&mut seller) {
+    writer.set_read_timeout(Some(deadline)).unwrap();
+    match raw_message(&mut writer) {
         Ok((8, _)) => {}
         Ok((opcode, _)) => panic!("not a close: {opcode}"),
         Err(e)

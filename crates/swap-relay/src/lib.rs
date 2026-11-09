@@ -249,8 +249,11 @@ async fn pipe(mut a: WebSocket, mut b: WebSocket) {
             _ => break,
         }
     }
-    sent(&mut a, Message::Close(None)).await;
-    sent(&mut b, Message::Close(None)).await;
+    // Side by side: one stuck closing does not keep the other waiting.
+    tokio::join!(
+        sent(&mut a, Message::Close(None)),
+        sent(&mut b, Message::Close(None))
+    );
 }
 
 /// Whether `message` went out on `socket` within [`SILENCE`]. A party that
