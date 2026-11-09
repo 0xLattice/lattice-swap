@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
+use axum::body::Bytes;
 use tokio::sync::oneshot;
 
 /// The most bytes an offer may hold; a real one holds about 1 KiB. With
@@ -34,6 +35,9 @@ struct Inner<T> {
     /// its first listing was taken holds a new ticket.
     next_ticket: u64,
     listed: HashMap<String, Listing<T>>,
+    /// The offers listed as one JSON array, made when first asked for
+    /// after the listings change, so each read of the board shares it.
+    json: Option<Bytes>,
 }
 
 struct Listing<T> {
@@ -93,6 +97,7 @@ impl<T> Drop for Ticket<T> {
             .is_some_and(|listing| listing.ticket == self.ticket)
         {
             inner.listed.remove(&self.id);
+            inner.json = None;
         }
     }
 }
@@ -133,6 +138,7 @@ impl<T> Board<T> {
                 held: 0,
                 next_ticket: 0,
                 listed: HashMap::new(),
+                json: None,
             }),
         })
     }
@@ -159,6 +165,7 @@ impl<T> Board<T> {
         }
         let mut inner = self.inner.lock().expect("the board's lock");
         if let Some(waiting) = inner.listed.remove(id) {
+            inner.json = None;
             return Ok(Meeting::Arrived(waiting.taker));
         }
         self.insert(&mut inner, id.to_string(), String::new())
@@ -186,6 +193,7 @@ impl<T> Board<T> {
                 taker,
             },
         );
+        inner.json = None;
         Ok(Ticket {
             board: self.clone(),
             id,
@@ -198,7 +206,9 @@ impl<T> Board<T> {
     /// seller its connection.
     pub fn take(&self, id: &str) -> Option<oneshot::Sender<T>> {
         let mut inner = self.inner.lock().expect("the board's lock");
-        inner.listed.remove(id).map(|listing| listing.taker)
+        let listing = inner.listed.remove(id)?;
+        inner.json = None;
+        Some(listing.taker)
     }
 
     pub fn contains(&self, id: &str) -> bool {
@@ -214,6 +224,33 @@ impl<T> Board<T> {
             .values()
             .map(|listing| listing.offer.clone())
             .collect()
+    }
+
+    /// The offers listed, as a JSON array of them as their sellers sent
+    /// them: made once per change to the listings, and shared after.
+    pub fn offers_json(&self) -> Bytes {
+        let mut inner = self.inner.lock().expect("the board's lock");
+        if let Some(json) = &inner.json {
+            return json.clone();
+        }
+        let mut json = Vec::with_capacity(
+            2 + inner
+                .listed
+                .values()
+                .map(|listing| listing.offer.len() + 1)
+                .sum::<usize>(),
+        );
+        json.push(b'[');
+        for (i, listing) in inner.listed.values().enumerate() {
+            if i > 0 {
+                json.push(b',');
+            }
+            json.extend_from_slice(listing.offer.as_bytes());
+        }
+        json.push(b']');
+        let json = Bytes::from(json);
+        inner.json = Some(json.clone());
+        json
     }
 }
 
@@ -248,6 +285,47 @@ mod tests {
         drop(ticket);
         assert!(board.offers().is_empty());
         assert!(board.take(&hex::encode([2; 32])).is_none());
+    }
+
+    /// The array is the offers joined as before, made anew only when the
+    /// listings change: reads between changes share one copy.
+    #[test]
+    fn offers_json_is_made_once_per_change() {
+        let board = Board::<u32>::new(10);
+        let joined = |board: &Board<u32>| format!("[{}]", board.offers().join(","));
+        let same = |a: &Bytes, b: &Bytes| a.as_ptr() == b.as_ptr();
+
+        let empty = board.offers_json();
+        assert_eq!(&empty[..], b"[]");
+        assert!(same(&empty, &board.offers_json()));
+
+        let a = board.list(offer(1)).unwrap();
+        let one = board.offers_json();
+        assert_eq!(&one[..], joined(&board).as_bytes());
+        assert!(same(&one, &board.offers_json()));
+
+        let b = board.list(offer(2)).unwrap();
+        let two = board.offers_json();
+        assert!(!same(&one, &two));
+        assert_eq!(&two[..], joined(&board).as_bytes());
+        assert!(same(&two, &board.offers_json()));
+
+        // A refused listing changes nothing.
+        assert_eq!(board.list(offer(2)).err(), Some(Refusal::Listed));
+        assert!(same(&two, &board.offers_json()));
+
+        // Taken.
+        board.take(b.id()).unwrap();
+        let taken = board.offers_json();
+        assert!(!same(&two, &taken));
+        assert_eq!(&taken[..], format!("[{}]", offer(1)).as_bytes());
+        // Its seller leaving after the take changes nothing.
+        drop(b);
+        assert!(same(&taken, &board.offers_json()));
+
+        // Withdrawn.
+        drop(a);
+        assert_eq!(&board.offers_json()[..], b"[]");
     }
 
     #[test]

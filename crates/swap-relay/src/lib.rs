@@ -91,7 +91,7 @@ async fn readable(mut response: Response) -> Response {
 }
 
 async fn offers(State(relay): State<Arc<Relay>>) -> Response {
-    let body = format!("[{}]", relay.board.offers().join(","));
+    let body = relay.board.offers_json();
     ([(header::CONTENT_TYPE, "application/json")], body).into_response()
 }
 
