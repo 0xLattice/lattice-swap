@@ -120,6 +120,22 @@ through a public node. With either chain on a public node, the swap reads
 the chains at most once every 10 seconds, as the app does, however many
 messages the counterparty sends, within the node's rate limits.
 
+The Nexus this tool trades on is mainnet's, so on any `--btc-network` but
+`bitcoin` a swap trades real NEX for test coins worth nothing: `offer` and
+`take` refuse mainnet NEX (the default `--nexus-genesis`) for BTC on
+another network unless `--test-btc-for-mainnet-nex` is given, to test with
+tiny amounts, as on signet:
+
+```sh
+lattice-swap offer --btc-network signet --test-btc-for-mainnet-nex \
+  --nex-key-file ~/.lattice-swap/nex.key --price 50000000 \
+  --min-btc-amount 10000 --max-btc-amount 20000 \
+  --btc-fee 500 --nex-fee 10 --relay https://relay.example > offer
+```
+
+The browser driver and `swap::app` refuse such an offer the same way unless
+the buyer's policy sets `"test_btc_for_mainnet_nex": true`.
+
 On an Esplora, the BTC a seller receives, and a buyer's refund, go to a
 single-key wallet in `wallet.json` in `--dir`, the native app's
 (`swap::app`), and a buyer's lock is funded from it: deposit to it first.

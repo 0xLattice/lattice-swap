@@ -362,3 +362,29 @@ fn one_stops_reading(stops: Stops) {
         Err(e) => panic!("the relay held the pipe past {deadline:?}: {e}"),
     }
 }
+
+/// A frame that announces more than a message may hold ends the connection
+/// at its header: the relay never sets aside room for it, which would let
+/// a few connections, each sending one such frame, hold the relay's memory.
+#[test]
+fn a_frame_past_the_message_bound_ends_the_connection_at_its_header() {
+    use std::io::{Read, Write};
+    let url = relay(10);
+    let mut socket = raw_socket(&url, &format!("rejoin/{}", id(9)));
+    socket
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+
+    // A binary frame, masked, of one byte more than a message may hold:
+    // its header only.
+    let mut header = vec![0x82, 0x80 | 127];
+    header.extend_from_slice(&(swap_relay::MAX_MESSAGE as u64 + 1).to_be_bytes());
+    header.extend_from_slice(&[0; 4]);
+    socket.write_all(&header).unwrap();
+    let mut rest = Vec::new();
+    match socket.read_to_end(&mut rest) {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
+        Err(e) => panic!("the relay held the connection open, waiting for the frame: {e}"),
+    }
+}

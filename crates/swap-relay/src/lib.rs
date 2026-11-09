@@ -50,6 +50,13 @@ use board::{Board, Meeting, Ticket};
 /// direction. An offer is held to [`board::MAX_OFFER`].
 pub const MAX_MESSAGE: usize = 64 * 1024;
 
+/// How much each connection reads at a time. The WebSocket fills its read
+/// buffer before each read, so this is what every connection holds, idle
+/// or not: at the library's default of 128 KiB, a thousand idle
+/// connections held 130 MB. A message larger than this still arrives
+/// whole, in more reads.
+pub const READ_BUFFER: usize = 8 * 1024;
+
 /// How long a seller has to send its offer once connected: a connection
 /// that lists nothing holds a socket, and no slot on the board.
 pub const OFFER_WAIT: Duration = Duration::from_secs(10);
@@ -81,6 +88,16 @@ pub fn router(relay: Arc<Relay>) -> Router {
         .with_state(relay)
 }
 
+/// `socket`, held to [`MAX_MESSAGE`] a message and a frame alike: a frame
+/// announcing more ends the connection at its header, before the relay
+/// sets aside room for it.
+fn bounded(socket: WebSocketUpgrade) -> WebSocketUpgrade {
+    socket
+        .max_message_size(MAX_MESSAGE)
+        .max_frame_size(MAX_MESSAGE)
+        .read_buffer_size(READ_BUFFER)
+}
+
 /// Lets any page read the answer: nothing here is private to a caller.
 async fn readable(mut response: Response) -> Response {
     response.headers_mut().insert(
@@ -96,9 +113,7 @@ async fn offers(State(relay): State<Arc<Relay>>) -> Response {
 }
 
 async fn sell(socket: WebSocketUpgrade, State(relay): State<Arc<Relay>>) -> Response {
-    socket
-        .max_message_size(MAX_MESSAGE)
-        .on_upgrade(move |socket| seller(relay, socket))
+    bounded(socket).on_upgrade(move |socket| seller(relay, socket))
 }
 
 /// Lists the seller's offer, waits for a buyer, then pipes the two.
@@ -159,9 +174,7 @@ async fn rejoin(
     socket: WebSocketUpgrade,
     State(relay): State<Arc<Relay>>,
 ) -> Response {
-    socket
-        .max_message_size(MAX_MESSAGE)
-        .on_upgrade(move |socket| meet(relay, id, socket))
+    bounded(socket).on_upgrade(move |socket| meet(relay, id, socket))
 }
 
 /// Meets the other party at rendezvous `id`, or waits for it there, then
@@ -201,15 +214,13 @@ async fn take(
     if !relay.board.contains(&id) {
         return (StatusCode::NOT_FOUND, "no such offer").into_response();
     }
-    socket
-        .max_message_size(MAX_MESSAGE)
-        .on_upgrade(move |socket| async move {
-            // Another buyer may have taken it since: then this socket is
-            // dropped, and closes.
-            if let Some(seller) = relay.board.take(&id) {
-                let _ = seller.send(socket);
-            }
-        })
+    bounded(socket).on_upgrade(move |socket| async move {
+        // Another buyer may have taken it since: then this socket is
+        // dropped, and closes.
+        if let Some(seller) = relay.board.take(&id) {
+            let _ = seller.send(socket);
+        }
+    })
 }
 
 /// Carries binary messages between `a` and `b` until either closes, says
