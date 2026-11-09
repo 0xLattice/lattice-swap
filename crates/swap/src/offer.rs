@@ -397,7 +397,7 @@ impl Bounds {
         max_btc_confirmations: 12,
         min_refund_window: 72,
         min_btc_fee_rate: None,
-        min_nex_confirmations: 24,
+        min_nex_confirmations: 12,
         min_margin: 6,
     };
 }

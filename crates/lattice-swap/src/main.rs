@@ -125,7 +125,7 @@ struct TermsArgs {
     #[arg(long, default_value_t = 6)]
     btc_confirmations: u32,
     /// How deep the NEX lock and the claims must be.
-    #[arg(long, default_value_t = 24)]
+    #[arg(long, default_value_t = 12)]
     nex_confirmations: u64,
     /// Bitcoin blocks of slack before a timelock.
     #[arg(long, default_value_t = 12)]
