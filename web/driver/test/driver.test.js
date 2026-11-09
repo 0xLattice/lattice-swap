@@ -6,8 +6,8 @@ import { Buyer, IndexedDBStore, MemoryStore, Wallet } from '../src/index.js';
 import { Esplora } from '../src/esplora.js';
 import { Nexus, nexusView } from '../src/views.js';
 import { call, wasm } from '../src/wasm.js';
-import { PINGS_MISSED, Session } from '../src/relay.js';
-import { Chain, esplora, kind, Locks, loadWasm, nexus, parseTx, POLICY, seller, testOffer, until } from './fakes.js';
+import { offers, PINGS_MISSED, Session } from '../src/relay.js';
+import { Chain, esplora, kind, Locks, loadWasm, nexus, parseTx, POLICY, redirecting, seller, serve, testOffer, until } from './fakes.js';
 
 before(loadWasm);
 
@@ -1371,4 +1371,51 @@ test('the chains are read once a poll, however many messages the seller sends', 
   // A Nexus view reads it three times; the balance and the views need it no more.
   assert.ok(infos <= 3 * rounds, `${infos} chain info reads in ${rounds} polls`);
   assert.equal(w.buyer.status().warning, null);
+});
+
+test('a Nexus node that never answers delays no cancel or refund, and the round warns', async () => {
+  const { w, run, funding } = await funded({ extra: { nexusBudget: 200 } });
+  const lookups = call('watchBuyer', (await w.store.get(`swap:${w.buyer.swapId}`)).state).bitcoin;
+  sellerLocksNex(w, funding);
+  await cidArrives(w);
+  // Each round's Nexus reads now wait on it, and are cut off at the budget.
+  w.node.hangs = true;
+  await until(() => /Nexus budget/.test(w.buyer.status().warning ?? '')).catch((e) =>
+    assert.fail(`${e.message}: ${JSON.stringify(w.buyer.status())}`),
+  );
+  w.chain.mine(TERMS.t1 - 1);
+  const cancel = await broadcast(w, lookups.lock_spends[1]);
+  confirm(w, cancel);
+  const refund = await broadcast(w, lookups.cancel_spends[0]);
+  confirm(w, refund);
+  assert.equal(await run.done, 'refunded');
+});
+
+test('a node moved to another Nexus sets no fee floor for the offer', async () => {
+  const w = await world();
+  // Checked at prepare; then on another Nexus, whose relay floor the
+  // offer's NEX fee is below.
+  w.node.genesis = 'another';
+  w.node.minRelayFee = '1000000000';
+  deposit(w, 1_100_000);
+  const run = running(w.buyer);
+  await until(() => w.buyer.status().warning !== null);
+  await run.stop();
+  assert.match(w.buyer.status().warning, /another/);
+  assert.doesNotMatch(w.buyer.status().warning, /minRelayFee/);
+  assert.equal(w.seller.log.length, 0, 'not taken');
+});
+
+test('no client follows a redirect', async () => {
+  const asked = [];
+  const target = await serve((_method, path) => (asked.push(path), [200, []]));
+  const redirect = await redirecting(target.url);
+  servers.push(target, redirect);
+  await assert.rejects(new Esplora(redirect.url).tip());
+  await assert.rejects(new Esplora(redirect.url).broadcast('00'));
+  await assert.rejects(new Nexus(redirect.url).get('/api/chain/info'));
+  await assert.rejects(new Nexus(redirect.url).submit('{}'));
+  await assert.rejects(offers(redirect.url));
+  assert.equal(redirect.paths.length, 5);
+  assert.deepEqual(asked, [], 'nothing reached where it pointed');
 });

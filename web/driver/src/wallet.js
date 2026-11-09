@@ -10,7 +10,7 @@
 
 import { call, wasm } from './wasm.js';
 import { Esplora } from './esplora.js';
-import { checkNexus, Nexus } from './views.js';
+import { checkNexus, Nexus, NEXUS_BUDGET } from './views.js';
 import { IndexedDBStore } from './store.js';
 
 /** The default Esplora for each network: mempool.space's. Regtest has
@@ -52,6 +52,10 @@ export const DEFAULTS = {
   /** The oldest a Bitcoin tip may be, in seconds, for a view not to be
    * stale: the CLI's `--max-tip-age`. */
   maxTipAge: 90 * 60,
+  /** How long a round's Nexus reads and the submits they lead to may take,
+   * in ms, and each Nexus request outside a round: the CLI's
+   * `--nexus-budget`. */
+  nexusBudget: NEXUS_BUDGET,
   fetch: undefined,
   WebSocket: undefined,
   /** Opens the session to the seller, as `Session.open`; tests stand a
@@ -171,7 +175,7 @@ export class Wallet {
     this.config = config;
     this.key = key;
     this.esplora = new Esplora(config.esplora, config.fetch);
-    this.nexus = new Nexus(config.nexus, config.fetch);
+    this.nexus = new Nexus(config.nexus, config.fetch, config.nexusBudget);
   }
 
   /** Where the buyer deposits.

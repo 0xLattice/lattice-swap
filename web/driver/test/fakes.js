@@ -32,6 +32,25 @@ export async function serve(route) {
   };
 }
 
+/** A server on loopback that redirects every request to the same path at
+ * `to`, logging each path asked in `paths`. */
+export async function redirecting(to, paths = []) {
+  const server = createServer((request, response) => {
+    paths.push(request.url);
+    response.writeHead(302, { Location: `${to}${request.url}` });
+    response.end();
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  return {
+    url: `http://127.0.0.1:${server.address().port}`,
+    paths,
+    close: () => {
+      server.close();
+      server.closeAllConnections();
+    },
+  };
+}
+
 /** A chain as an Esplora shows it: its block 0, by default regtest's, its
  * tip, transactions and outputs. */
 export class Chain {
@@ -162,16 +181,18 @@ export async function esplora(chain, onPost = () => {}) {
 
 /** A Nexus node's public read port at height 1 on the test offer's
  * genesis, or on `genesis`, that takes submits unless `acceptsSubmit` is
- * false; its `/api/chain/info` is at `height` and `tip`, if given, while
+ * false, its relay floor 1 or `minRelayFee`; its `/api/chain/info` is at `height` and `tip`, if given, while
  * its `/health`, a snapshot, stays at height 1, synced if `synced` holds.
  * It shows the accounts in `accounts`, by address, and logs what is
  * submitted to it in `submitted`, if given. It logs each path asked in
- * `paths`, if given, answers 503 to everything while `down` holds, and
- * otherwise calls `onRead(path)` before it answers. */
+ * `paths`, if given, answers 503 to everything while `down` holds, never
+ * answers while `hangs` holds, and otherwise calls `onRead(path)` before it
+ * answers. */
 export function nexus(node = {}) {
   return serve((method, path, body) => {
     node.paths?.push(path);
     if (node.down) return [503, 'down'];
+    if (node.hangs) return new Promise(() => {});
     node.onRead?.(path);
     if (method === 'POST' && path === '/transactions' && node.submitted) {
       node.submitted.push(body);
@@ -181,7 +202,7 @@ export function nexus(node = {}) {
     if (account && node.accounts?.[account[1]]) return [200, node.accounts[account[1]]];
     if (path === '/api/chain/info') {
       return [200, {
-        chain: ['Nexus'], genesisHash: node.genesis ?? 'genesis', minRelayFee: '1',
+        chain: ['Nexus'], genesisHash: node.genesis ?? 'genesis', minRelayFee: node.minRelayFee ?? '1',
         height: node.height ?? '1', tipCID: node.tip ?? 'tip', acceptsSubmit: node.acceptsSubmit ?? true,
       }];
     }
