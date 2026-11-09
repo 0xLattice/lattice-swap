@@ -1,16 +1,26 @@
 // A swap relay, as the CLI's buyer uses one: its board, and its pipe to
 // the seller, carrying an ivy session end to end.
 
+import { ESPLORA_TIMEOUT } from './esplora.js';
 import { wasm } from './wasm.js';
 
 /** The offers `relay` lists, each as its text, which `decodeOffer` reads:
  * its `quote` holds the `price`, in sat a NEX of 1,000,000 base units,
- * and the `min_btc_amount` and `max_btc_amount` a buyer picks between. */
-export async function offers(relay, fetchImpl = globalThis.fetch) {
-  // No redirects, as the native engine's clients follow none.
-  const response = await fetchImpl(`${relay.replace(/\/+$/, '')}/offers`, { cache: 'no-store', redirect: 'error' });
-  if (!response.ok) throw new Error(`${relay}/offers: ${response.status}`);
-  return (await response.json()).map((offer) => JSON.stringify(offer));
+ * and the `min_btc_amount` and `max_btc_amount` a buyer picks between.
+ * Read within `timeout` ms, as an Esplora's answers: a relay that hangs
+ * fails the list, not freezes it. */
+export async function offers(relay, fetchImpl = globalThis.fetch, timeout = ESPLORA_TIMEOUT) {
+  const url = `${relay.replace(/\/+$/, '')}/offers`;
+  const signal = AbortSignal.timeout(timeout);
+  try {
+    // No redirects, as the native engine's clients follow none.
+    const response = await fetchImpl(url, { cache: 'no-store', redirect: 'error', signal });
+    if (!response.ok) throw new Error(`${relay}/offers: ${response.status}`);
+    return (await response.json()).map((offer) => JSON.stringify(offer));
+  } catch (e) {
+    if (signal.aborted) throw new Error(`${url}: no answer within ${timeout} ms`);
+    throw e;
+  }
 }
 
 /** `path` at `relay`, an http:// or https:// URL, as a WebSocket URL. */

@@ -51,6 +51,23 @@ export async function redirecting(to, paths = []) {
   };
 }
 
+/** A server on loopback that answers every request's headers, then never
+ * its body. */
+export async function stalling() {
+  const server = createServer((_request, response) => {
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.write('[');
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  return {
+    url: `http://127.0.0.1:${server.address().port}`,
+    close: () => {
+      server.close();
+      server.closeAllConnections();
+    },
+  };
+}
+
 /** A chain as an Esplora shows it: its block 0, by default regtest's, its
  * tip, transactions and outputs. */
 export class Chain {

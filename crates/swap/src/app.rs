@@ -812,8 +812,14 @@ impl Buy {
                 }
             } else {
                 match self.take() {
-                    Ok(Some(driver)) => break driver,
-                    Ok(None) => {}
+                    // A round that took, or waits on the wallet, clears
+                    // an earlier round's error.
+                    Ok(taken) => {
+                        *self.warning.lock().unwrap() = None;
+                        if let Some(driver) = taken {
+                            break driver;
+                        }
+                    }
                     Err(e) => *self.warning.lock().unwrap() = Some(e.to_string()),
                 }
             }
