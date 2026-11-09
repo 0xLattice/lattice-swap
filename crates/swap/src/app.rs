@@ -692,9 +692,12 @@ pub struct Buy {
     cancelled: AtomicBool,
     /// Why the offer could not be taken, once it cannot.
     gone: Mutex<Option<String>>,
-    /// The last failure, if any; once the driver runs a resumed swap, why
-    /// its Nexus node will not do, as its `nexus_check` last found.
+    /// The last failure, if any; once the driver runs a resumed swap, that
+    /// its Nexus node takes no transactions, as its `nexus_check` found.
     warning: Arc<Mutex<Option<String>>>,
+    /// Why the driver's last Nexus read failed, while it fails: its
+    /// [`Driver::nexus_warning`].
+    nexus_warning: Arc<Mutex<Option<String>>>,
 }
 
 impl Buy {
@@ -705,6 +708,7 @@ impl Buy {
             cancelled: AtomicBool::new(false),
             gone: Mutex::new(None),
             warning: Arc::default(),
+            nexus_warning: Arc::default(),
         }
     }
 
@@ -759,6 +763,8 @@ impl Buy {
     /// stops the driver is returned: run it again, as the CLI's `resume`.
     pub fn run(&self, stop: impl Fn() -> bool) -> Result<Option<Outcome>> {
         let wallet = &self.wallet;
+        // A driver of its own reads Nexus anew.
+        *self.nexus_warning.lock().unwrap() = None;
         let mut driver = loop {
             let record = self.record().clone();
             if self.cancelled.load(Ordering::SeqCst) || self.gone.lock().unwrap().is_some() {
@@ -823,9 +829,11 @@ impl Buy {
         // As the browser funds and prices its own spends: the Esplora's
         // estimate, else the relay floor.
         driver.fallback_fee_rate = FeeRate::from_sat_per_vb_u32(1);
+        driver.nexus_warning = self.nexus_warning.clone();
         let outcome = driver.run_until(|_| stop())?;
         if outcome.is_some() {
             *self.warning.lock().unwrap() = None;
+            *self.nexus_warning.lock().unwrap() = None;
         }
         Ok(outcome)
     }
@@ -834,9 +842,9 @@ impl Buy {
     /// `resume` and the browser's `#checkNexus` check its node, but never
     /// refusing it: the swap's cancel, refund and the rest are Bitcoin's,
     /// and go on whatever the node does. Nexus is read only once the node
-    /// passes; until then the status's warning says why, and if a public
-    /// node takes no transactions, asked until it answers once, that the
-    /// swap's Nexus submits fail.
+    /// passes; until then the driver's `nexus_warning` says why, and the
+    /// status's warning, if a public node takes no transactions, asked
+    /// until it answers once, that the swap's Nexus submits fail.
     fn resumed_check(&self) -> NexusCheck {
         let wallet = self.wallet.clone();
         let warning = self.warning.clone();
@@ -845,18 +853,12 @@ impl Buy {
         let mut takes_none = None;
         Box::new(move |nexus| {
             let gated = chain(nexus);
-            let unread = gated
-                .as_ref()
-                .err()
-                .map(|e| format!("nexus: {e}: Nexus is not read until it passes; Bitcoin goes on"));
             if takes_none.is_none() {
                 takes_none = wallet.takes_no_transactions(nexus).ok();
             }
-            let no_submits = takes_none.clone().flatten().map(|why| {
+            *warning.lock().unwrap() = takes_none.clone().flatten().map(|why| {
                 format!("{why}: the swap's Bitcoin side goes on, its Nexus submits fail")
             });
-            let why: Vec<String> = unread.into_iter().chain(no_submits).collect();
-            *warning.lock().unwrap() = (!why.is_empty()).then(|| why.join("; "));
             gated
         })
     }
@@ -943,6 +945,17 @@ impl Buy {
         wallet.save(&record)?;
         *self.record() = record;
         Ok(Some(driver))
+    }
+
+    /// The driver's failing Nexus read, then the rest, as `resumed_check`
+    /// joined them.
+    fn warning(&self) -> Option<String> {
+        let nexus = self.nexus_warning.lock().unwrap().clone();
+        let why: Vec<String> = nexus
+            .into_iter()
+            .chain(self.warning.lock().unwrap().clone())
+            .collect();
+        (!why.is_empty()).then(|| why.join("; "))
     }
 
     /// Where the swap is, for an app to show, as the browser's
@@ -1041,7 +1054,7 @@ impl Buy {
             "nex_confirmations": terms.nex_confirmations,
             "nexAddress": record.nex_address,
             "tip": tip,
-            "warning": gone.or_else(|| self.warning.lock().unwrap().clone()),
+            "warning": gone.or_else(|| self.warning()),
         }))
     }
 }

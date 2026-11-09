@@ -5794,6 +5794,11 @@ fn a_node_that_hangs_on_submits_delays_a_round_by_the_budget_at_most() {
 fn a_resumed_refund_goes_on_whatever_its_nexus_node_does() {
     use bitcoin::consensus::encode::serialize_hex;
     let (_, buyer, _) = locked().nex_locked();
+    // Paid to a NEX address a node reads, so a good node's views pass: the
+    // fixtures' is no CID.
+    let paid_to = swap_nexus_tx::address(&[6; 32]);
+    let buyer = serde_json::to_string(&buyer).unwrap();
+    let buyer: Buyer = serde_json::from_str(&buyer.replace(BUYER_NEX, &paid_to)).unwrap();
     let (cancelling, actions) = buyer.clone().step(btc(20, None, None));
     assert!(matches!(cancelling, Buyer::Cancelling { .. }));
     let [cancel] = &broadcasts(&actions)[..] else {
@@ -5924,6 +5929,57 @@ fn a_resumed_refund_goes_on_whatever_its_nexus_node_does() {
         assert_eq!(stopped.map_err(|e| e.to_string()), Ok(None), "{failing:?}");
         assert_eq!(warning(&buy), serde_json::Value::Null, "{failing:?}");
     }
+
+    // Mid-swap, past its check, the node goes over to another Nexus: the
+    // running swap's status says so, and clears once the node is back. On
+    // another Nexus again, the swap still cancels when it is due.
+    *mode.lock().unwrap() = NexusNode::Good;
+    *at.lock().unwrap() = waiting.clone();
+    posted.lock().unwrap().clear();
+    let (buy, _dir) = resumed(&buyer);
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let stop = || done.store(true, std::sync::atomic::Ordering::SeqCst);
+    // A wait that fails stops the run first, so the test fails, not hangs.
+    let until = |what: &str, holds: &dyn Fn() -> bool| {
+        let start = std::time::Instant::now();
+        while !holds() {
+            if start.elapsed() > Duration::from_secs(10) {
+                stop();
+                panic!("{what}: {}", warning(&buy));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let elsewhere = || {
+        let warning = warning(&buy);
+        let warning = warning.as_str().unwrap_or_default();
+        warning.contains("follows the chain of genesis")
+            && warning.contains("Nexus is not read until it passes; Bitcoin goes on")
+    };
+    let cancelled = || {
+        posted.lock().unwrap().iter().any(|hex| {
+            let tx: Transaction = bitcoin::consensus::encode::deserialize_hex(hex).unwrap();
+            tx.compute_txid() == cancel.compute_txid()
+        })
+    };
+    std::thread::scope(|scope| {
+        let running = scope.spawn(|| {
+            let stopped = buy.run(|| done.load(std::sync::atomic::Ordering::SeqCst));
+            stopped.map_err(|e| e.to_string())
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        until("passed its check", &|| warning(&buy).is_null());
+        *mode.lock().unwrap() = NexusNode::Elsewhere;
+        until("the status names the other Nexus", &elsewhere);
+        *mode.lock().unwrap() = NexusNode::Good;
+        until("the warning clears", &|| warning(&buy).is_null());
+        *mode.lock().unwrap() = NexusNode::Elsewhere;
+        until("the status names the other Nexus again", &elsewhere);
+        *at.lock().unwrap() = chain(&[(&funding, 101)], 125);
+        until("cancel is broadcast", &cancelled);
+        stop();
+        assert_eq!(running.join().unwrap(), Ok(None));
+    });
 }
 
 /// bitcoind closes an idle RPC connection (`-rpcservertimeout`, 30s by
