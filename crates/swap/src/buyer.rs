@@ -46,12 +46,19 @@ pub enum Buyer {
         seen: bool,
         #[serde(default)]
         again: bool,
+        /// Stopped refunding on a spend of the cancel output that is no
+        /// punish it could check: while it asks, it watches the cancel
+        /// output, and goes back to refunding should it show none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unchecked: Option<Box<Unchecked>>,
     },
     /// Punished, and the seller gave no `s` this time: the swap has ended
     /// for this run, but keeps the secrets, so that a resume asks again.
     Punished {
         setup: Setup,
         seen: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unchecked: Option<Box<Unchecked>>,
     },
     Done(Outcome),
 }
@@ -62,6 +69,14 @@ pub struct BuyerStart {
     secrets: Secrets,
     refund_payout: ScriptBuf,
     nex_address: String,
+}
+
+/// The [`Buyer::Cancelling`] that stopped refunding on a spend of the
+/// cancel output that is no punish it could check.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Unchecked {
+    locked: BuyerLocked,
+    redeem: Option<EncryptedSignature>,
 }
 
 /// The BTC lock as agreed, with what the buyer needs to act on it.
@@ -268,14 +283,30 @@ impl Machine for Buyer {
                 match (claim.step(event), punished) {
                     (Claimed::Pending(claim, actions), _) => (ClaimingNex(claim), actions),
                     (Claimed::Done, _) => (Done(Outcome::Swapped), vec![]),
-                    (Claimed::Empty, Some(setup)) => (Punished { setup, seen: false }, vec![]),
+                    (Claimed::Empty, Some(setup)) => {
+                        let unchecked = None;
+                        let seen = false;
+                        (
+                            Punished {
+                                setup,
+                                seen,
+                                unchecked,
+                            },
+                            vec![],
+                        )
+                    }
                     (Claimed::Drained, Some(_)) => (Done(Outcome::Punished), vec![]),
                     (Claimed::Empty | Claimed::Drained, None) => (Done(Outcome::Drained), vec![]),
                 }
             }
             // Only `s` itself: the share the seller proved at the start.
             (
-                AskingShare { setup, seen, .. },
+                AskingShare {
+                    setup,
+                    seen,
+                    unchecked,
+                    ..
+                },
                 Event::Message(Message::ShareAnswer(ShareAnswer::Share(share))),
             ) => match KeyShare::from_bytes(share) {
                 Some(key)
@@ -287,13 +318,21 @@ impl Machine for Buyer {
                     claim.punished = true;
                     (ClaimingNex(claim), vec![])
                 }
-                _ => (Punished { setup, seen }, vec![]),
+                _ => (
+                    Punished {
+                        setup,
+                        seen,
+                        unchecked,
+                    },
+                    vec![],
+                ),
             },
             (
                 AskingShare {
                     setup,
                     seen,
                     again: false,
+                    unchecked,
                 },
                 Event::Message(Message::ShareAnswer(ShareAnswer::Refused(
                     ShareRefusal::NotPunished,
@@ -301,12 +340,56 @@ impl Machine for Buyer {
             ) => {
                 let again = true;
                 let ask = vec![Action::Send(Message::ShareRequest)];
-                (AskingShare { setup, seen, again }, ask)
+                let state = AskingShare {
+                    setup,
+                    seen,
+                    again,
+                    unchecked,
+                };
+                (state, ask)
             }
             (
-                AskingShare { setup, seen, .. },
+                AskingShare {
+                    setup,
+                    seen,
+                    unchecked,
+                    ..
+                },
                 Event::Message(Message::ShareAnswer(ShareAnswer::Refused(_))) | Event::Timeout,
-            ) => (Punished { setup, seen }, vec![]),
+            ) => (
+                Punished {
+                    setup,
+                    seen,
+                    unchecked,
+                },
+                vec![],
+            ),
+            // Our refund deep, or the cancel output shown unspent again:
+            // the spend we stopped on is gone, and refunding goes on.
+            (
+                AskingShare {
+                    setup,
+                    seen,
+                    again,
+                    unchecked: Some(unchecked),
+                },
+                Event::Bitcoin(view),
+            ) => {
+                let Unchecked { locked, redeem } = (*unchecked).clone();
+                match locked.cancelling(redeem, view) {
+                    (AskingShare { .. }, _) => {
+                        let unchecked = Some(unchecked);
+                        let state = AskingShare {
+                            setup,
+                            seen,
+                            again,
+                            unchecked,
+                        };
+                        (state, vec![])
+                    }
+                    next => next,
+                }
+            }
             (
                 AwaitSellerHello(_)
                 | AwaitFunded(_)
@@ -382,10 +465,15 @@ impl Machine for Buyer {
 
     fn resumed(self) -> Self {
         match self {
-            Buyer::Punished { setup, seen } => Buyer::AskingShare {
+            Buyer::Punished {
+                setup,
+                seen,
+                unchecked,
+            } => Buyer::AskingShare {
                 setup,
                 seen,
                 again: false,
+                unchecked,
             },
             state => state,
         }
@@ -408,6 +496,14 @@ impl Machine for Buyer {
                 margin: locked.setup.terms.margin,
             },
             ClaimingNex(claim) => claim.watch(),
+            AskingShare {
+                unchecked: Some(unchecked),
+                ..
+            } => Watch {
+                bitcoin: bitcoin(&unchecked.locked),
+                nexus: None,
+                margin: unchecked.locked.setup.terms.margin,
+            },
             AwaitSellerHello(_)
             | AwaitFunded(_)
             | AwaitSellerSignatures { .. }
@@ -566,21 +662,28 @@ impl BuyerLocked {
                     spent.confirmations >= terms.btc_confirmations
                         && setup.after_t2(self.lock, cancel_depth, spent)
                 });
-                let deep = gone || punished.is_some_and(|depth| depth >= terms.btc_confirmations);
+                let checked = punished.is_some_and(|depth| depth >= terms.btc_confirmations);
                 match (setup.spend(self.lock, &view.cancel_spend), punished) {
                     (Some((Spend::Refund, depth)), _) if depth >= terms.btc_confirmations => {
                         return (Buyer::Done(Outcome::Refunded), vec![]);
                     }
                     (Some((Spend::Refund, depth)), _) if depth > 0 => {}
                     // The BTC is the seller's: `s` can only give us the NEX.
-                    _ if deep => {
+                    _ if checked || gone => {
                         let seen = redeem.is_some();
-                        let setup = self.setup;
+                        let (setup, unchecked) = if checked {
+                            (self.setup, None)
+                        } else {
+                            let setup = self.setup.clone();
+                            let locked = self;
+                            (setup, Some(Box::new(Unchecked { locked, redeem })))
+                        };
                         let ask = vec![Action::Send(Message::ShareRequest)];
                         let state = Buyer::AskingShare {
                             setup,
                             seen,
                             again: false,
+                            unchecked,
                         };
                         return (state, ask);
                     }

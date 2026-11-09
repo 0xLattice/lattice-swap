@@ -116,8 +116,11 @@ and a public Nexus node for its claim of the NEX back on a refund, so keep
 `--max-btc-amount` small; a buyer trusts mempool.space to show Bitcoin in
 time to refund, and a public Nexus node for how deep the NEX lock is, so
 keep `--btc-amount` small. A seller also gives `s` to a buyer it punished
-once its Bitcoin node shows the punish deep: that trusts the node for where
-the punish is, so run your own or keep amounts small. Each prints the note for each chain it reads
+once its Bitcoin node shows the punish deep, trusting the node for where
+the punish is: a lying node can let the buyer take both the NEX and its
+refund. A buyer stops refunding once its Bitcoin node shows the cancel
+output spent deep after `t2`, until a resume shows otherwise. Run your own
+nodes or keep amounts small. Each prints the note for each chain it reads
 through a public node. With either chain on a public node, the swap reads
 the chains at most once every 10 seconds, as the app does, however many
 messages the counterparty sends, within the node's rate limits.

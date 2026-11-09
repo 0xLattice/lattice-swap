@@ -6277,3 +6277,54 @@ fn a_deep_unchecked_spend_after_t2_ends_the_refund() {
     let (buyer, _) = buyer.step(Event::Timeout);
     assert_eq!(buyer.outcome(), Some(Outcome::Punished));
 }
+
+/// A buyer that stopped refunding on a deep spend after `t2` it could not
+/// check goes back to refunding, resumed, when the cancel output shows no
+/// such spend, and ends refunded when its own refund shows deep.
+#[test]
+fn a_buyer_stopped_on_an_unchecked_spend_recovers_its_refund() {
+    let locked = locked();
+    let (swap, lock) = locked.swap();
+    let (_, buyer, _) = locked.nex_locked();
+    let (buyer, actions) = buyer.step(btc(20, None, None));
+    let [cancel] = &broadcasts(&actions)[..] else {
+        panic!("cancel");
+    };
+    // Neither the agreed punish nor signed: a lie, or a shape it cannot check.
+    let mut fake = swap.unsigned_tx(lock, Spend::Punish);
+    fake.output[0].script_pubkey = payout(9);
+    let (buyer, actions) = buyer.step(btc(31, Some((cancel, 11)), Some((&fake, 1))));
+    assert!(broadcasts(&actions).is_empty());
+    assert!(matches!(buyer, Buyer::AskingShare { .. }));
+    assert!(
+        buyer.watch().bitcoin.is_some(),
+        "the cancel output is watched"
+    );
+    // Still shown: it asks on, sending nothing.
+    let (buyer, actions) = buyer.step(btc(32, Some((cancel, 12)), Some((&fake, 2))));
+    assert!(actions.is_empty());
+    assert!(matches!(buyer, Buyer::AskingShare { .. }));
+    let (buyer, _) = buyer.step(Event::Timeout);
+    assert_eq!(buyer.outcome(), Some(Outcome::Punished));
+    let buyer = restart(&buyer);
+
+    // Resumed on a node that shows the cancel output unspent: it refunds.
+    let (resumed, actions) = buyer
+        .clone()
+        .resumed()
+        .step(btc(40, Some((cancel, 20)), None));
+    let [refund] = &broadcasts(&actions)[..] else {
+        panic!("refund");
+    };
+    assert_eq!(
+        refund.compute_txid(),
+        swap.unsigned_tx(lock, Spend::Refund).compute_txid()
+    );
+    assert!(matches!(resumed, Buyer::Cancelling { .. }));
+
+    // Resumed on a node that shows its refund deep: refunded.
+    let (resumed, _) = buyer
+        .resumed()
+        .step(btc(41, Some((cancel, 21)), Some((refund, 5))));
+    assert_eq!(resumed.outcome(), Some(Outcome::Refunded));
+}
