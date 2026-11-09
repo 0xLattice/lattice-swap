@@ -655,27 +655,34 @@ impl Setup {
     /// view puts it, with cancel `cancel_depth` deep. A backend is trusted
     /// for where a transaction is, never for what it is: it is the agreed
     /// punish, or, if `signed` is taken, any transaction the seller signed
-    /// through the punish leaf. And either waits `t2` blocks, as the leaf's
-    /// `OP_CHECKSEQUENCEVERIFY` makes it: its input says so, and in a block
-    /// it is that many blocks above cancel's.
+    /// through the punish leaf. And it is [`Setup::after_t2`].
     fn punish(&self, lock: OutPoint, cancel_depth: u32, spent: &Spent, signed: bool) -> bool {
         let swap = self.swap();
         let tx = &spent.tx;
         let agreed = tx.compute_txid() == swap.unsigned_tx(lock, Spend::Punish).compute_txid();
-        if !agreed && !(signed && swap.punish_signed(lock, tx)) {
-            return false;
-        }
+        (agreed || signed && swap.punish_signed(lock, tx))
+            && self.after_t2(lock, cancel_depth, spent)
+    }
+
+    /// Whether `spent`, a spend of the cancel output, waits `t2` blocks, as
+    /// the punish leaf's `OP_CHECKSEQUENCEVERIFY` makes any spend through it
+    /// (BIP68): its input says so, and in a block it is at least that many
+    /// blocks above cancel's, `cancel_depth` deep.
+    fn after_t2(&self, lock: OutPoint, cancel_depth: u32, spent: &Spent) -> bool {
+        let cancel_output = self.swap().unsigned_tx(lock, Spend::Punish).input[0].previous_output;
         let t2 = self.terms.t2;
+        let tx = &spent.tx;
         let waits = tx.version.0 >= 2
-            && tx.input.first().is_some_and(|input| {
-                matches!(
-                    input.sequence.to_relative_lock_time(),
-                    Some(relative::LockTime::Blocks(height)) if height.value() >= t2
-                )
+            && tx.input.iter().any(|input| {
+                input.previous_output == cancel_output
+                    && matches!(
+                        input.sequence.to_relative_lock_time(),
+                        Some(relative::LockTime::Blocks(height)) if height.value() >= t2
+                    )
             });
         waits
             && (spent.confirmations == 0
-                || cancel_depth + 1 >= spent.confirmations.saturating_add(t2.into()))
+                || cancel_depth >= spent.confirmations.saturating_add(t2.into()))
     }
 
     /// Cancel with both signatures; `other` is the counterparty's.

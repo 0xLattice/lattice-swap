@@ -6218,10 +6218,13 @@ fn a_punish_shown_before_t2_is_no_punish() {
     let (buyer, actions) = buyer.step(shown);
     assert_eq!(broadcasts(&actions).len(), 1, "still refunding");
     assert!(matches!(buyer, Buyer::Cancelling { .. }));
-    // Where it can be, it is.
+    // A block short of `t2` above cancel's (BIP68): no more.
     let (seller, _) = seller.step(btc(31, Some((cancel, 11)), Some((&punish, 2))));
+    assert!(matches!(seller, Seller::Cancelling { .. }), "not punished");
+    // Where it can be, it is.
+    let (seller, _) = seller.step(btc(32, Some((cancel, 12)), Some((&punish, 2))));
     assert!(matches!(seller, Seller::Punished { .. }));
-    let (buyer, actions) = buyer.step(btc(31, Some((cancel, 11)), Some((&punish, 2))));
+    let (buyer, actions) = buyer.step(btc(32, Some((cancel, 12)), Some((&punish, 2))));
     assert!(broadcasts(&actions).is_empty());
     assert!(matches!(buyer, Buyer::AskingShare { .. }));
 }
@@ -6240,4 +6243,37 @@ fn a_planted_wallet_temporary_is_never_followed() {
     assert_eq!(app::put_key(&config, &key).unwrap().wif, key.wif);
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "kept");
     assert!(!dir.path().join("wallet.json.tmp").exists());
+}
+
+/// A seller that punishes with a spend through the punish leaf in a shape
+/// the buyer cannot check, here with a second input for its fee, still
+/// ends the buyer's refund once it is deep after `t2`: the buyer asks for
+/// `s` and ends, never resending a refund whose input is spent.
+#[test]
+fn a_deep_unchecked_spend_after_t2_ends_the_refund() {
+    let locked = locked();
+    let (swap, lock) = locked.swap();
+    let (seller, buyer, _) = locked.nex_locked();
+    let (buyer, actions) = buyer.step(btc(20, None, None));
+    let [cancel] = &broadcasts(&actions)[..] else {
+        panic!("cancel");
+    };
+    let a = swap.sign(lock, Spend::Punish, &seller_key(&seller));
+    let mut punish = swap.finalize(lock, Spend::Punish, &a, None).unwrap();
+    punish.input.push(TxIn {
+        previous_output: OutPoint::new(Txid::from_byte_array([9; 32]), 0),
+        script_sig: ScriptBuf::new(),
+        sequence: bitcoin::Sequence::MAX,
+        witness: Witness::new(),
+    });
+    // Deep, but before `t2` above cancel's: the refund goes on.
+    let (buyer, actions) = buyer.step(btc(30, Some((cancel, 10)), Some((&punish, 1))));
+    assert_eq!(broadcasts(&actions).len(), 1, "still refunding");
+    assert!(matches!(buyer, Buyer::Cancelling { .. }));
+    let (buyer, actions) = buyer.step(btc(31, Some((cancel, 11)), Some((&punish, 1))));
+    assert!(broadcasts(&actions).is_empty(), "no refund");
+    assert!(matches!(sends(&actions)[..], [Message::ShareRequest]));
+    assert!(matches!(buyer, Buyer::AskingShare { .. }));
+    let (buyer, _) = buyer.step(Event::Timeout);
+    assert_eq!(buyer.outcome(), Some(Outcome::Punished));
 }

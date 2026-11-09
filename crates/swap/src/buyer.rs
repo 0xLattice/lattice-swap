@@ -554,13 +554,26 @@ impl BuyerLocked {
                             && setup.punish(self.lock, cancel_depth, spent, true)
                     })
                     .map(|spent| spent.confirmations);
+                // Deep, any other spend that waited `t2`, as the punish leaf
+                // makes it, ends the refund all the same: the seller may
+                // spend through that leaf in a shape we cannot check, and
+                // our refund would never confirm. It stops no refund that
+                // can still win safely: a spend shown before `t2` is
+                // refused, and from `t2` the seller's punish may beat the
+                // refund anyway. A backend that lies then can as well drop
+                // the refund we send through it.
+                let gone = view.cancel_spend.as_ref().is_some_and(|spent| {
+                    spent.confirmations >= terms.btc_confirmations
+                        && setup.after_t2(self.lock, cancel_depth, spent)
+                });
+                let deep = gone || punished.is_some_and(|depth| depth >= terms.btc_confirmations);
                 match (setup.spend(self.lock, &view.cancel_spend), punished) {
                     (Some((Spend::Refund, depth)), _) if depth >= terms.btc_confirmations => {
                         return (Buyer::Done(Outcome::Refunded), vec![]);
                     }
                     (Some((Spend::Refund, depth)), _) if depth > 0 => {}
                     // The BTC is the seller's: `s` can only give us the NEX.
-                    (_, Some(depth)) if depth >= terms.btc_confirmations => {
+                    _ if deep => {
                         let seen = redeem.is_some();
                         let setup = self.setup;
                         let ask = vec![Action::Send(Message::ShareRequest)];
