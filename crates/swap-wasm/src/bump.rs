@@ -55,8 +55,8 @@ fn tx(hex: &str) -> Result<Transaction> {
 /// keep for it, once due with `rate` and `failed` set from how its bump
 /// went. Those left out are forgotten. `vsize` is the swap's own size of
 /// it, which every step is sized by, and `tx` an entry of that size, the
-/// machine's own, if one is: an Esplora vouches for a txid, and its
-/// witness could be padded to make a child pay for more vbytes.
+/// machine's own, if one is; one whose entries are all larger is left out
+/// ([`bump::own_waiting`]).
 #[wasm_bindgen(js_name = buyerBumps)]
 pub fn buyer_bumps(input: &str) -> Result<String> {
     #[derive(Deserialize)]
@@ -73,26 +73,13 @@ pub fn buyer_bumps(input: &str) -> Result<String> {
         return text(&json!([]));
     };
     let urgent = bump::urgent(&swap, lock, &input.view, watch.margin);
-    let own: Vec<_> = (input.state.own_spends().iter())
-        .map(|&spend| (swap.unsigned_tx(lock, spend).compute_txid(), spend))
-        .collect();
-    // Each of our own once, in order: `(txid, spend, parent, refused)`.
-    let mut waiting: Vec<(Txid, _, Transaction, bool)> = vec![];
-    for (hex, refused) in input.waiting {
-        let parent = tx(&hex)?;
-        let txid = parent.compute_txid();
-        let Some(&(_, spend)) = own.iter().find(|(own, _)| *own == txid) else {
-            continue;
-        };
-        let sized = parent.vsize() as u64 == swap.vsize(spend);
-        match waiting.iter_mut().find(|(seen, ..)| *seen == txid) {
-            Some((.., kept, _)) if sized => *kept = parent,
-            Some(_) => {}
-            None => waiting.push((txid, spend, parent, refused)),
-        }
-    }
+    let waiting = (input.waiting.iter())
+        .map(|(hex, refused)| Ok((tx(hex)?, *refused)))
+        .collect::<Result<Vec<_>>>()?;
+    let own = input.state.own_spends();
     let mut rounds = vec![];
-    for (txid, spend, parent, refused) in waiting {
+    for (parent, spend, refused) in bump::own_waiting(&swap, lock, own, waiting) {
+        let txid = parent.compute_txid();
         let urgent = urgent.contains(&spend);
         let round = bump::schedule(
             input.last.get(&txid).copied(),

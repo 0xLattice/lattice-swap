@@ -91,10 +91,11 @@ export class Buyer extends EventTarget {
   #halt = new AbortController();
   /** The buyer's own transactions waiting unconfirmed, by txid, as the
    * last round kept them (`swap::bump::Waiting`), and what was broadcast
-   * since the last view, `[hex, refused]`: as the native driver's
+   * since the last view, `[hex, refused]` by txid, the latest of each:
+   * as the native driver's
    * `waiting` and `broadcast`, kept in memory only. */
   #waiting = {};
-  #broadcast = [];
+  #broadcast = new Map();
 
   constructor(wallet, record, checked) {
     super();
@@ -539,7 +540,7 @@ export class Buyer extends EventTarget {
         this.#raise(`broadcast: ${e.message}`);
         refused = true;
       }
-      this.#broadcast.push([action.Broadcast, refused]);
+      this.#broadcast.set(wasm.txidOf(action.Broadcast), [action.Broadcast, refused]);
     } else if (action.Submit) {
       try {
         await this.#checkNexus();
@@ -587,25 +588,25 @@ export class Buyer extends EventTarget {
    * `swap::bump::schedule`, and the rest is the native Esplora's bump over
    * this page's Esplora, each step through swap-wasm. A failure is the
    * round's warning, then tried again quietly at every block until the
-   * deadline nears. Every request of it ends within {@link BUMP_BUDGET},
-   * so a slow Esplora delays the round by that at most, and nothing here
-   * fails the round. */
+   * deadline nears. Every request of it, through an Esplora of its own
+   * ({@link Esplora#within}), ends within {@link BUMP_BUDGET}, so a slow
+   * Esplora delays the round by that at most, while the wallet's requests
+   * keep only their timeout; and nothing here fails the round. */
   async #bump(waiting) {
-    const { esplora } = this.#wallet;
-    esplora.deadline = AbortSignal.timeout(BUMP_BUDGET);
+    const esplora = this.#wallet.esplora.within(AbortSignal.timeout(BUMP_BUDGET));
     try {
       // The state as it is kept, not through a JavaScript number.
-      const all = [...waiting, ...this.#broadcast];
+      const all = [...waiting, ...this.#broadcast.values()];
       const rest = JSON.stringify({ view: this.#view, waiting: all, last: this.#waiting });
       const rounds = JSON.parse(wasm.buyerBumps(`{"state":${this.#r.state},${rest.slice(1)}`));
       // Taken only once read: a failure keeps them for the next view.
-      this.#broadcast = [];
+      this.#broadcast.clear();
       const still = {};
       for (const round of rounds) {
         const { now } = round;
         if (round.due) {
           try {
-            now.rate = await this.#bumpOne(round, now);
+            now.rate = await this.#bumpOne(esplora, round, now);
             now.failed = false;
           } catch (e) {
             if (!now.failed || round.again) this.#raise(`bump ${round.txid}: ${reason(e)}`);
@@ -617,19 +618,18 @@ export class Buyer extends EventTarget {
       this.#waiting = still;
     } catch (e) {
       this.#raise(`bump: ${reason(e)}`);
-    } finally {
-      esplora.deadline = null;
     }
   }
 
-  /** What `round`'s transaction is raised to: its target, from the
+  /** What `round`'s transaction is raised to, read through `esplora`,
+   * the bump's: its target, from the
    * estimate for 1 block near its deadline, else 2, at least the floor if
    * refused, once that is above `now.rate`, the last bump's; what its
    * package pays already, if that is enough; else the target, its child
    * submitted with it as a package. As the native driver's `target` and
    * `bump_one`. */
-  async #bumpOne(round, now) {
-    const { esplora, key } = this.#wallet;
+  async #bumpOne(esplora, round, now) {
+    const { key } = this.#wallet;
     const signer = { wif: key.wif, network: this.#c.network, tx: round.tx, vsize: round.vsize };
     const estimate = await esplora.feeRate(round.urgent ? 1 : 2);
     let floor = null;

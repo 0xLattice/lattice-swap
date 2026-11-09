@@ -57,6 +57,42 @@ pub struct Round {
     pub again: bool,
 }
 
+/// Each of the spends in `own` among `waiting`, `(tx, refused)` pairs,
+/// once, in order: `(tx, spend, refused)`, `refused` as its first entry
+/// says, and `tx` a copy of the swap's own size ([`Swap::vsize`]) if any
+/// is. A node vouches only for a txid: a witness padded under it would
+/// have a child pay for vbytes that are not there, so a spend whose only
+/// copies are larger than its own is left out, until the machine's own
+/// copy, which it sends again while the spend waits, comes along.
+pub fn own_waiting(
+    swap: &Swap,
+    lock: OutPoint,
+    own: &[Spend],
+    waiting: Vec<(Transaction, bool)>,
+) -> Vec<(Transaction, Spend, bool)> {
+    let own: Vec<_> = (own.iter())
+        .map(|&spend| (swap.unsigned_tx(lock, spend).compute_txid(), spend))
+        .collect();
+    let mut kept: Vec<(Transaction, Spend, bool)> = vec![];
+    for (tx, refused) in waiting {
+        let txid = tx.compute_txid();
+        let Some(&(_, spend)) = own.iter().find(|(own, _)| *own == txid) else {
+            continue;
+        };
+        let sized = tx.vsize() as u64 == swap.vsize(spend);
+        match kept
+            .iter_mut()
+            .find(|(seen, ..)| seen.compute_txid() == txid)
+        {
+            Some((seen, ..)) if sized => *seen = tx,
+            Some(_) => {}
+            None => kept.push((tx, spend, refused)),
+        }
+    }
+    kept.retain(|(tx, spend, _)| tx.vsize() as u64 <= swap.vsize(*spend));
+    kept
+}
+
 /// The round for a transaction waiting at `height`, last kept as `last`,
 /// `refused` by the mempool, near its deadline if `urgent`. A failure is
 /// tried again at the next block, or, a few times, at the next poll once a

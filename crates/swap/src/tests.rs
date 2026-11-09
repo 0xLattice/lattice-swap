@@ -2414,8 +2414,9 @@ fn a_failing_urgent_bump_is_tried_a_few_times_a_block() {
 #[test]
 fn a_redeem_is_bumped_only_past_what_its_two_fees_pay() {
     let locked = locked();
-    let (swap, lock) = locked.swap();
-    let size = swap.unsigned_tx(lock, Spend::Redeem).vsize() as u64;
+    let (swap, _) = locked.swap();
+    // Sized as signed, whatever witness the node shows.
+    let size = swap.vsize(Spend::Redeem);
     let one = swap.params().fee;
     let rate = FeeRate::from_sat_per_kwu(one.to_sat() * 3 * 250 / (2 * size));
     let alone = rate.fee_vb(size).unwrap();

@@ -14,15 +14,37 @@ export const ESPLORA_TIMEOUT = 30_000;
  * delays the next round by this at most. */
 export const BUMP_BUDGET = 10_000;
 
+/** A signal that aborts once `a` or `b` does: `AbortSignal.any`, and by
+ * hand where a browser lacks it (before Chrome 116, Firefox 124, Safari
+ * 17.4). */
+export function either(a, b) {
+  if (typeof AbortSignal.any === 'function') return AbortSignal.any([a, b]);
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  if (a.aborted || b.aborted) abort();
+  a.addEventListener('abort', abort, { once: true });
+  b.addEventListener('abort', abort, { once: true });
+  return controller.signal;
+}
+
 /** One Esplora API at `url`, e.g. `https://mempool.space/api`. */
 export class Esplora {
   constructor(url, fetchImpl = globalThis.fetch, timeout = ESPLORA_TIMEOUT) {
     this.url = url.replace(/\/+$/, '');
     this.fetch = fetchImpl;
     this.timeout = timeout;
-    /** What also ends each request, while a round's bump reads it: its
-     * share of {@link BUMP_BUDGET}. */
+    /** What also ends each of this instance's requests, if set: a
+     * bump's, by {@link Esplora#within}. */
     this.deadline = null;
+  }
+
+  /** This Esplora for one round's bump: every request it makes also ends
+   * at `deadline`, while the wallet's own, which others share, keep only
+   * their timeout. */
+  within(deadline) {
+    const esplora = new Esplora(this.url, this.fetch, this.timeout);
+    esplora.deadline = deadline;
+    return esplora;
   }
 
   /** `path` fetched, its answer read within `timeout` ms, and before the
@@ -32,7 +54,7 @@ export class Esplora {
   async #fetch(path, init, read) {
     const timeout = AbortSignal.timeout(this.timeout);
     const deadline = this.deadline;
-    const signal = deadline === null ? timeout : AbortSignal.any([timeout, deadline]);
+    const signal = deadline === null ? timeout : either(timeout, deadline);
     try {
       return await read(await this.fetch(`${this.url}${path}`, { ...init, redirect: 'error', signal }));
     } catch (e) {

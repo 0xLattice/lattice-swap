@@ -560,21 +560,10 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
         urgent: &[Spend],
         waiting: Vec<(Transaction, bool)>,
     ) {
-        let own: Vec<(Txid, Spend)> = self
-            .state
-            .own_spends()
-            .iter()
-            .map(|&spend| (swap.unsigned_tx(lock, spend).compute_txid(), spend))
-            .collect();
+        let own = self.state.own_spends();
         let mut still = HashMap::new();
-        for (tx, refused) in waiting {
+        for (tx, spend, refused) in bump::own_waiting(swap, lock, own, waiting) {
             let txid = tx.compute_txid();
-            let Some(&(_, spend)) = own.iter().find(|(own, _)| *own == txid) else {
-                continue;
-            };
-            if still.contains_key(&txid) {
-                continue;
-            }
             let last = self.waiting.get(&txid).copied();
             let urgent = urgent.contains(&spend);
             let bump::Round {
@@ -585,7 +574,8 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
             if due {
                 let fee = swap.fee(spend);
                 let clamped = &mut now.clamped;
-                let result = match self.target(&tx, fee, refused, urgent, again, clamped) {
+                let vsize = swap.vsize(spend);
+                let result = match self.target(&tx, vsize, fee, refused, urgent, again, clamped) {
                     Ok(Some(rate)) if rate > now.rate => match self.bitcoin.package_rate(&tx) {
                         Ok(Some(pooled)) if pooled >= rate => Ok(pooled),
                         Ok(_) => self.bump_one(&tx, fee, rate).map(|()| rate),
@@ -614,13 +604,16 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
         self.waiting = still;
     }
 
-    /// The feerate to raise `tx`, which pays `fee`, to, clamped to
+    /// The feerate to raise `tx`, of `vsize` vbytes, the swap's own size
+    /// of it, which pays `fee`, to, clamped to
     /// `max_fee_rate`; `None` if `tx` is in the mempool and already pays it
     /// alone. A refused `tx` needs a package whatever it pays. A clamp is
     /// logged once per target, the last kept in `clamped`, and `again`.
+    #[allow(clippy::too_many_arguments)]
     fn target(
         &self,
         tx: &Transaction,
+        vsize: u64,
         fee: Amount,
         refused: bool,
         urgent: bool,
@@ -634,7 +627,7 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
         };
         let (rate, warning) = bump::target(
             tx,
-            tx.vsize() as u64,
+            vsize,
             fee,
             estimate,
             self.fallback_fee_rate,

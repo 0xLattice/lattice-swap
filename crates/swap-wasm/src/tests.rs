@@ -1172,7 +1172,8 @@ fn a_refund_below_the_estimate_gets_a_child_that_lifts_the_package() {
 }
 
 /// A witness padded under the refund's txid is not what the child pays
-/// for: the round is sized by the swap, and carries the machine's own copy.
+/// for: the round is sized by the swap, and carries the machine's own copy,
+/// or waits for it.
 #[test]
 fn a_padded_refund_is_sized_as_the_swaps_own() {
     let key = json(&new_bitcoin_key("regtest").unwrap());
@@ -1194,14 +1195,14 @@ fn a_padded_refund_is_sized_as_the_swaps_own() {
     assert_eq!(rounds[0]["vsize"], own.vsize());
     assert_eq!(rounds[0]["tx"], refund, "the machine's own copy");
     assert_eq!(rounds[0]["refused"], false, "as its first entry says");
-    // Given only the padded one, the child is still sized by the swap.
+    // Given only the padded one, it waits for the machine's own: the
+    // child is sized by the swap, whatever the copy.
     let input = json!({"state": json(&state), "view": view, "waiting": [[padded, false]]});
-    let rounds = json(&buyer_bumps(&input.to_string()).unwrap());
-    assert_eq!(rounds[0]["vsize"], own.vsize());
-    let child = |tx: &Value| {
+    assert_eq!(buyer_bumps(&input.to_string()).unwrap(), "[]");
+    let child = |tx: &str| {
         let input = json!({"wif": wif, "network": "regtest", "tx": tx, "vsize": own.vsize(),
             "fee": 1_000, "rate": 50 * 250, "last": null});
         hex_tx(&json!(bump_child(&input.to_string()).unwrap()))
     };
-    assert_eq!(child(&rounds[0]["tx"]), child(&json!(refund)));
+    assert_eq!(child(&padded), child(&refund));
 }

@@ -321,6 +321,67 @@ test('a refund the mempool refuses alone goes out as a package with a child', as
   assert.deepEqual(w.unsaved, []);
 });
 
+/** Runs `body` as a browser without `AbortSignal.any` would. */
+async function withoutAny(body) {
+  const any = AbortSignal.any;
+  delete AbortSignal.any;
+  try {
+    return await body();
+  } finally {
+    AbortSignal.any = any;
+  }
+}
+
+/** A fetch that answers `{"2": 3}` to every request, or never while
+ * `hang` holds, ending as its signal aborts: the signals asked with are
+ * logged in `signals`. */
+function signalled() {
+  const fetch = (_url, { signal }) =>
+    new Promise((resolve, reject) => {
+      fetch.signals.push(signal);
+      if (signal.aborted) return reject(signal.reason);
+      signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      if (!fetch.hang) resolve(new Response('{"2": 3}'));
+    });
+  fetch.signals = [];
+  fetch.hang = false;
+  return fetch;
+}
+
+for (const [name, run] of [['', (body) => body()], [' without AbortSignal.any', withoutAny]]) {
+  test(`a bump's deadline ends its own Esplora requests, never the wallet's${name}`, () =>
+    run(async () => {
+      const fetch = signalled();
+      const wallet = new Esplora('http://esplora.invalid', fetch);
+      const deadline = new AbortController();
+      const bumping = wallet.within(deadline.signal);
+      assert.equal(await bumping.feeRate(2), 3, 'answered within the deadline');
+      // Requests hanging on both while the bump's deadline passes.
+      fetch.hang = true;
+      const bump = bumping.feeRate(2);
+      const own = wallet.feeRate(2);
+      deadline.abort();
+      await assert.rejects(bump, /no answer within the round's bump budget/);
+      const ownSignal = fetch.signals.at(-1);
+      assert.equal(ownSignal.aborted, false, 'the wallet\'s request has no deadline');
+      assert.equal(wallet.deadline, null);
+      own.catch(() => {});
+      // Once passed, every request of the bump ends at once.
+      fetch.hang = false;
+      await assert.rejects(bumping.feeRate(2), /bump budget/);
+      assert.equal(await wallet.feeRate(2), 3);
+    }));
+}
+
+test('a refund is bumped where AbortSignal.any is missing', () =>
+  withoutAny(async () => {
+    const { w, run, refund } = await refunding({ 1: 50, 2: 50 });
+    await until(() => w.a.packages.length > 0).catch((e) => assert.fail(`${e.message}: ${JSON.stringify(w.buyer.status())}`));
+    assert.equal(w.a.packages[0][0], refund);
+    confirm(w, refund);
+    assert.equal(await run.done, 'refunded');
+  }));
+
 test('a refund that pays the fee rate is not bumped', async () => {
   const { w, run, refund } = await refunding({ 1: 2, 2: 2 });
   assert.ok((TERMS.btc_fee * 4) / parseTx(refund).weight > 2, 'the refund alone pays the target');
