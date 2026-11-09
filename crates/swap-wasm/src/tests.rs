@@ -498,6 +498,51 @@ fn an_offer_is_judged_by_the_clis_policy() {
     assert_eq!(check(floored, Value::Null), None);
 }
 
+/// The browser refuses mainnet NEX for BTC on another network than
+/// Bitcoin's, unless its policy opts in with `test_btc_for_mainnet_nex`.
+#[test]
+fn mainnet_nex_for_test_btc_is_refused_unless_the_policy_opts_in() {
+    let mut offer = signed_offer("http://relay.example");
+    offer.template.nexus_genesis = swap_nexus_tx::MAINNET_GENESIS.into();
+    let key = SigningKey::from_bytes(&[4; 32]);
+    let place = swap::offer::Place::Relay("http://relay.example".into());
+    let offer = Offer::new(
+        offer.quote,
+        offer.template,
+        Network::Signet,
+        place,
+        &key,
+        [7; 32],
+    );
+    let check = |opt_in: Option<bool>| {
+        let mut policy = json!({
+            "btc_amount": 1_000_000, "price": 2_000_000, "max_t1": 20, "min_t2": 20,
+            "min_btc_confirmations": 1, "min_nex_confirmations": 1, "min_margin": 3,
+            "min_refund_window": 19,
+        });
+        if let Some(opt_in) = opt_in {
+            policy["test_btc_for_mainnet_nex"] = json!(opt_in);
+        }
+        let input = json!({
+            "offer": offer,
+            "policy": policy,
+            "network": "signet",
+            "nexus_genesis": swap_nexus_tx::MAINNET_GENESIS,
+            "fee_estimate": 1_000,
+            "min_relay_fee": 1,
+        });
+        check_offer(&input.to_string()).unwrap()
+    };
+    for refused in [check(None), check(Some(false))] {
+        let refused = refused.unwrap();
+        assert!(
+            refused.starts_with("refused: mainnet NEX for signet BTC"),
+            "{refused}"
+        );
+    }
+    assert_eq!(check(Some(true)), None);
+}
+
 /// The terms the buyer starts on, and its check of the seller's answer, as
 /// the CLI's `take` makes them.
 #[test]

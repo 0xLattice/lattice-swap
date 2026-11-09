@@ -485,6 +485,8 @@ impl World {
                 .args(NO_BUMP)
                 .args(["--min-btc-confirmations", "1"])
                 .args(["--min-nex-confirmations", "1"])
+                // The node may follow mainnet's genesis, on regtest.
+                .arg("--test-btc-for-mainnet-nex")
                 .arg("--dir")
                 .arg(self.dir("buyer"))
                 .args(self.node_args("buyer"))
@@ -539,6 +541,8 @@ impl World {
                 .args(["--btc-confirmations", &btc_confirmations])
                 .args(["--nex-confirmations", &nex_confirmations])
                 .args(NO_BUMP)
+                // The node may follow mainnet's genesis, on regtest.
+                .arg("--test-btc-for-mainnet-nex")
                 .arg("--dir")
                 .arg(self.dir("seller"))
                 .arg("--nex-key-file")
@@ -1082,6 +1086,8 @@ impl World {
             "max_btc_fee": BTC_FEE.to_sat(), "max_nex_fee": self.nex_fee,
             "max_t1": t1, "min_t2": 10, "min_refund_window": 9, "min_margin": 3,
             "min_btc_fee_rate": 1, "min_btc_confirmations": 1, "min_nex_confirmations": 1,
+            // The node may follow mainnet's genesis, on regtest.
+            "test_btc_for_mainnet_nex": true,
         })
     }
 
@@ -1924,10 +1930,16 @@ fn an_esplora_on_another_network_is_refused() {
         assert_eq!(out.status.code(), Some(1));
         String::from_utf8(out.stderr).unwrap()
     };
-    let refused = offer(&["--esplora", &shim, "--btc-network", "signet"]);
+    let refused = offer(&[
+        "--esplora",
+        &shim,
+        "--btc-network",
+        "signet",
+        "--test-btc-for-mainnet-nex",
+    ]);
     assert!(refused.contains("the Esplora's genesis is"), "{refused}");
     assert!(refused.contains("not signet's"), "{refused}");
-    let refused = offer(&["--btc-network", "regtest"]);
+    let refused = offer(&["--btc-network", "regtest", "--test-btc-for-mainnet-nex"]);
     assert!(
         refused.contains("regtest has no public Esplora"),
         "{refused}"
