@@ -7,11 +7,14 @@
 //! the node holds, and the cancel output's spender only when
 //! [`Lookups::search_from`] says so. A Nexus view reads the health, the own
 //! account, the lock account, then the watched transaction, and the health
-//! again: it is one view only if [`one_tip`] holds for the two.
+//! again: it is one view only if [`one_tip`] holds for the two. Before
+//! any of it, the node's `/api/chain/info` must pass [`nexus_genesis`].
 
 use bitcoin::{BlockHash, OutPoint, Transaction, Txid};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use swap_bitcoin::{Spend, Swap};
+use swap_nexus_tx::rpc::parse::{self, NodeRefusal};
 use swap_nexus_tx::rpc::Health;
 
 use crate::Spent;
@@ -137,4 +140,18 @@ pub fn spends(tx: &Transaction, outpoint: OutPoint) -> bool {
 /// tips.
 pub fn one_tip(before: &Health, after: &Health) -> bool {
     (after.height, &after.tip) == (before.height, &before.tip)
+}
+
+/// Refuses a node whose `/api/chain/info` is not on the Nexus of
+/// `expected`, where a NEX lock is worthless: checked every round, first,
+/// so nothing a node on another Nexus shows is read.
+pub fn nexus_genesis(chain_info: &Value, expected: &str) -> Result<(), NodeRefusal> {
+    match parse::genesis(chain_info) {
+        Ok(genesis) if genesis == expected => Ok(()),
+        Ok(genesis) => Err(NodeRefusal::OtherNexus {
+            genesis,
+            expected: expected.into(),
+        }),
+        Err(e) => Err(NodeRefusal::Malformed(e)),
+    }
 }

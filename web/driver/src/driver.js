@@ -12,7 +12,7 @@
 // eigenwallet asks its user to resume a swap before its timelocks.
 
 import { call, safe, wasm } from './wasm.js';
-import { bitcoinView, checkNexus, nexusView } from './views.js';
+import { bitcoinView, checkNexus, nexusGenesis, nexusView } from './views.js';
 import { Session } from './relay.js';
 import { ended, isRunning, swapKey } from './wallet.js';
 
@@ -530,6 +530,9 @@ export class Buyer extends EventTarget {
     } else if (action.Submit) {
       try {
         await this.#checkNexus();
+        // Again just before it goes: the node may have moved to another
+        // Nexus since the view that asked for it.
+        await nexusGenesis(this.#wallet.nexus, this.#c.nexusGenesis);
         await this.#wallet.nexus.submit(wasm.nexusSubmitBody(JSON.stringify(action.Submit)));
       } catch (e) {
         this.#raise(`nexus submit: ${e.message}`);
@@ -564,7 +567,9 @@ export class Buyer extends EventTarget {
     const watch = call('watchBuyer', this.#r.state).nexus;
     if (!watch) return;
     await this.#checkNexus();
-    const view = await nexusView(this.#wallet.nexus, watch);
+    // The page's genesis: the swap's, as `#checkNexus` refuses a swap on
+    // another.
+    const view = await nexusView(this.#wallet.nexus, watch, this.#c.nexusGenesis);
     // The tip moved while the view was read: read again next round.
     if (view === null) return;
     this.#nexusDepth = view.watched?.[1] ?? null;
@@ -572,7 +577,9 @@ export class Buyer extends EventTarget {
   }
 
   /** Refuses a node on another Nexus, once per Buyer: a resumed swap's
-   * first use of it, as `prepare` checks it before anything else. A swap
+   * first use of it, as `prepare` checks it before anything else; its
+   * genesis alone is checked again every round and before every submit
+   * ({@link nexusGenesis}), as a node may move to another. A swap
    * whose terms name another Nexus than the page's is refused first, as
    * the CLI's `resume` refuses one: the node is checked against the
    * page's. Throws into the round, as any failed read does. */

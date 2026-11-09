@@ -984,19 +984,12 @@ fn nexus_view(
     watch: &NexusWatch,
     genesis: Option<&str>,
 ) -> swap_nexus_tx::rpc::Result<Result<Option<NexusView>, String>> {
-    use swap_nexus_tx::rpc::parse::{self, NodeRefusal};
+    use swap_nexus_tx::rpc::parse;
     use swap_nexus_tx::rpc::Error;
     let chain_info = client.chain_info()?;
     if let Some(expected) = genesis {
-        match parse::genesis(&chain_info) {
-            Ok(genesis) if genesis == expected => {}
-            Ok(genesis) => {
-                let expected = expected.into();
-                return Ok(Err(
-                    NodeRefusal::OtherNexus { genesis, expected }.to_string()
-                ));
-            }
-            Err(e) => return Ok(Err(NodeRefusal::Malformed(e).to_string())),
+        if let Err(refusal) = view::nexus_genesis(&chain_info, expected) {
+            return Ok(Err(refusal.to_string()));
         }
     }
     let min_relay_fee = parse::min_relay_fee(&chain_info).map_err(Error::Malformed)?;

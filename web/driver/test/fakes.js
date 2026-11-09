@@ -163,20 +163,29 @@ export async function esplora(chain, onPost = () => {}) {
 /** A Nexus node's public read port at height 1 on the test offer's
  * genesis, or on `genesis`, that takes submits unless `acceptsSubmit` is
  * false; its `/api/chain/info` is at `height` and `tip`, if given, while
- * its `/health`, a snapshot, stays at height 1. It answers 503 to
- * everything while `down` holds, and logs each path asked in `paths`, if
- * given. */
+ * its `/health`, a snapshot, stays at height 1, synced if `synced` holds.
+ * It shows the accounts in `accounts`, by address, and logs what is
+ * submitted to it in `submitted`, if given. It logs each path asked in
+ * `paths`, if given, answers 503 to everything while `down` holds, and
+ * otherwise calls `onRead(path)` before it answers. */
 export function nexus(node = {}) {
-  return serve((method, path) => {
+  return serve((method, path, body) => {
     node.paths?.push(path);
     if (node.down) return [503, 'down'];
+    node.onRead?.(path);
+    if (method === 'POST' && path === '/transactions' && node.submitted) {
+      node.submitted.push(body);
+      return [200, {}];
+    }
+    const account = path.match(/^\/api\/state\/account\/(\w+)$/);
+    if (account && node.accounts?.[account[1]]) return [200, node.accounts[account[1]]];
     if (path === '/api/chain/info') {
       return [200, {
         chain: ['Nexus'], genesisHash: node.genesis ?? 'genesis', minRelayFee: '1',
         height: node.height ?? '1', tipCID: node.tip ?? 'tip', acceptsSubmit: node.acceptsSubmit ?? true,
       }];
     }
-    if (path === '/health') return [200, { phase: 'active', height: '1', tipCID: 'tip' }];
+    if (path === '/health') return [200, { phase: 'active', height: '1', tipCID: 'tip', ...(node.synced ? { bestHeaderHeight: '1' } : {}) }];
     // The block halfway up, and the state after it, if it keeps them.
     if (path.startsWith('/api/block/') && node.keepsState) return [200, { hash: 'half' }];
     if (path.startsWith('/accounts/') && node.keepsState) return [200, { balance: '0', nonce: '0' }];

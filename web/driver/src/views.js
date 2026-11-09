@@ -96,15 +96,32 @@ export class Nexus {
   }
 }
 
+/** The node's `/api/chain/info`, once it shows the Nexus of `genesis`:
+ * swap-wasm's `checkGenesis`, as the native driver checks it first every
+ * round. Throws its refusal otherwise. */
+export async function nexusGenesis(nexus, genesis) {
+  const chainInfo = await nexus.get('/api/chain/info');
+  const refused = wasm.checkGenesis(JSON.stringify({ genesis, chain_info: chainInfo }));
+  if (refused !== undefined && refused !== null) throw new Error(refused);
+  return chainInfo;
+}
+
 /** The view for `watch`, a watch's `nexus`, in the native driver's
- * order, or null if the tip moved under it. */
-export async function nexusView(nexus, watch) {
+ * order, or null if the tip moved under it. A node on another Nexus than
+ * `genesis` is refused before anything else is read of it, in the native
+ * driver's words. */
+export async function nexusView(nexus, watch, genesis) {
   const account = (address) => nexus.get(`/api/state/account/${encodeURIComponent(address)}`);
   const transaction = (cid) => nexus.get(`/api/transaction/${encodeURIComponent(cid)}`, true);
+  let chainInfo;
+  try {
+    chainInfo = await nexusGenesis(nexus, genesis);
+  } catch (e) {
+    throw new Error(`nexus: ${e.message}: Nexus is not read until it passes; Bitcoin goes on`);
+  }
   const health = await nexus.health();
   const own = await account(watch.own_address);
   const lock = await account(watch.lock_address);
-  const chainInfo = await nexus.get('/api/chain/info');
   let watched = null;
   if (watch.cid !== null) {
     const before = await transaction(watch.cid);

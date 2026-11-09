@@ -1096,6 +1096,55 @@ test('a resumed swap reads Nexus once its node passes the check', async () => {
   await again.stop();
 });
 
+test('a node that moves to another Nexus mid-swap is read no further, and the refund goes on', async () => {
+  const { w, run, record, funding } = await funded();
+  await run.stop();
+  const [watching] = watchingNexus(record);
+  await w.store.put(`swap:${record.swap_id}`, watching);
+  const { bitcoin: lookups, nexus: watch } = call('watchBuyer', watching.state);
+  w.node.accounts = { [watch.own_address]: { balance: '0', nonce: '0' }, [watch.lock_address]: { balance: '0', nonce: '0' } };
+  w.node.paths = [];
+  const buyer = await Buyer.resume(w.wallet, record.swap_id);
+  const again = running(buyer);
+  confirm(w, funding);
+  // Read from the swap's Nexus first, then the node follows another.
+  await until(() => w.node.paths.includes(`/api/state/account/${watch.lock_address}`));
+  w.node.genesis = 'another';
+  await until(() => /refused: the Nexus node follows the chain of genesis another, not genesis: Nexus is not read until it passes; Bitcoin goes on/.test(buyer.status().warning ?? ''));
+  w.node.paths = [];
+  w.chain.mine(TERMS.t1 - 1);
+  confirm(w, await broadcast(w, lookups.lock_spends[1]));
+  await broadcast(w, lookups.cancel_spends[0]);
+  await again.stop();
+  assert.deepEqual(w.node.paths.filter((path) => path !== '/api/chain/info'), [], 'nothing read past its genesis');
+});
+
+test('a claim is not submitted to a node that moved to another Nexus since its view', async () => {
+  const { w, run, record } = await funded();
+  await run.stop();
+  const [, claiming] = watchingNexus(record);
+  await w.store.put(`swap:${record.swap_id}`, claiming);
+  const watch = call('watchBuyer', claiming.state).nexus;
+  w.node.synced = true;
+  w.node.accounts = { [watch.own_address]: { balance: '0', nonce: '0' }, [watch.lock_address]: { balance: String(TERMS.nex_amount), nonce: '0' } };
+  w.node.submitted = [];
+  // The view that leads to the claim reads the swap's Nexus up to the lock;
+  // the node follows another before the claim goes.
+  w.node.onRead = (path) => path === `/api/state/account/${watch.lock_address}` && (w.node.genesis = 'another');
+  const buyer = await Buyer.resume(w.wallet, record.swap_id);
+  const warnings = [];
+  buyer.addEventListener('status', (event) => warnings.push(event.detail.warning));
+  const again = running(buyer);
+  await until(() => warnings.some((warning) => /nexus submit: refused: the Nexus node follows the chain of genesis another/.test(warning ?? '')));
+  await until(() => /Nexus is not read until it passes/.test(buyer.status().warning ?? ''));
+  assert.deepEqual(w.node.submitted, [], 'nothing submitted to another Nexus');
+  // Back on the swap's Nexus, the claim goes.
+  w.node.onRead = null;
+  w.node.genesis = 'genesis';
+  await until(() => w.node.submitted.length > 0);
+  await again.stop();
+});
+
 test('a resumed swap whose terms name another Nexus than the page’s is refused', async () => {
   const { w, run, record } = await funded();
   await run.stop();
@@ -1229,7 +1278,7 @@ test('a Nexus view counts a depth against the live tip, not the /health snapshot
   // 9, where the watched claim is mined.
   const routes = {
     '/health': { phase: 'active', height: '5', bestHeaderHeight: '5', tipCID: 'tip5' },
-    '/api/chain/info': { minRelayFee: '1', height: '9', tipCID: 'tip9' },
+    '/api/chain/info': { chain: ['Nexus'], genesisHash: 'genesis', minRelayFee: '1', height: '9', tipCID: 'tip9' },
     '/api/state/account/own': { balance: '0', nonce: '0' },
     '/api/state/account/lock': { balance: '500000', nonce: '0' },
     '/api/transaction/claim': {
@@ -1243,7 +1292,7 @@ test('a Nexus view counts a depth against the live tip, not the /health snapshot
     return { ok: body !== undefined, status: body === undefined ? 404 : 200, json: async () => body, text: async () => '' };
   };
   const nexus = new Nexus('http://node.invalid', fetchImpl);
-  const view = await nexusView(nexus, { own_address: 'own', lock_address: 'lock', cid: 'claim', block_at: null });
+  const view = await nexusView(nexus, { own_address: 'own', lock_address: 'lock', cid: 'claim', block_at: null }, 'genesis');
   assert.deepEqual([view.health.height, view.health.tip], [9, 'tip9']);
   assert.equal(view.watched[1], 1, 'mined in the live tip: one deep');
 });

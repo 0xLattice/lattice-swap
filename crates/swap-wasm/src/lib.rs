@@ -342,6 +342,18 @@ pub fn check_nexus(input: &str) -> Result<Option<String>> {
     )
 }
 
+/// Why a Nexus node is not on the Nexus of `genesis`, as the native
+/// driver refuses one every round before reading anything else, or null:
+/// `{"genesis", "chain_info"}` in, `chain_info` its `/api/chain/info`.
+#[wasm_bindgen(js_name = checkGenesis)]
+pub fn check_genesis(input: &str) -> Result<Option<String>> {
+    let input: Value = parse(input)?;
+    let genesis = input["genesis"].as_str().ok_or("no genesis")?;
+    Ok(view::nexus_genesis(&input["chain_info"], genesis)
+        .err()
+        .map(|refusal| refusal.to_string()))
+}
+
 /// An address nobody holds, whose account after a past block shows
 /// whether a Nexus node keeps the state of past blocks, as the CLI asks.
 #[wasm_bindgen(js_name = nexusProbeAddress)]
