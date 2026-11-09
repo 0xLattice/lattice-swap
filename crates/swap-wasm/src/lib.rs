@@ -428,7 +428,8 @@ pub fn decode_offer(text: &str) -> Result<String> {
 /// Why a buyer refuses an offer, as the CLI's `take` refuses it, or null.
 /// `{"offer", "policy", "network", "nexus_genesis", "fee_estimate",
 /// "min_relay_fee"}` in: the policy as [`Policy`], its bounds defaulting to
-/// the CLI's; `fee_estimate` the estimate for 6 blocks in sat/kvB, or null
+/// the CLI's, so mainnet NEX for BTC on another network than Bitcoin's is
+/// refused unless it sets `test_btc_for_mainnet_nex`; `fee_estimate` the estimate for 6 blocks in sat/kvB, or null
 /// where there is none; `min_relay_fee` the Nexus node's.
 #[wasm_bindgen(js_name = checkOffer)]
 pub fn check_offer(input: &str) -> Result<Option<String>> {

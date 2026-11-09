@@ -384,6 +384,9 @@ pub struct Bounds {
     pub min_nex_confirmations: u64,
     /// The fewest Bitcoin blocks of slack before a timelock.
     pub min_margin: u16,
+    /// Takes an offer of mainnet NEX for BTC on another network than
+    /// Bitcoin's: see [`check_networks`]. Only to test with tiny amounts.
+    pub test_btc_for_mainnet_nex: bool,
 }
 
 impl Bounds {
@@ -399,6 +402,7 @@ impl Bounds {
         min_btc_fee_rate: None,
         min_nex_confirmations: 12,
         min_margin: 6,
+        test_btc_for_mainnet_nex: false,
     };
 }
 
@@ -429,11 +433,35 @@ pub fn nex_fee_floor(least: u64, min_relay_fee: u64) -> u64 {
     least.max(min_relay_fee)
 }
 
+/// Refuses a swap of mainnet NEX, the Nexus of
+/// [`swap_nexus_tx::MAINNET_GENESIS`], for BTC on another network than
+/// Bitcoin's, whose coins are worth nothing: real NEX for test coins.
+/// `test_btc_for_mainnet_nex` lets it, to test with tiny amounts. Both the
+/// seller's `offer` and the buyer's [`check_offer`] ask it.
+pub fn check_networks(
+    network: Network,
+    nexus_genesis: &str,
+    test_btc_for_mainnet_nex: bool,
+) -> std::result::Result<(), String> {
+    if nexus_genesis == swap_nexus_tx::MAINNET_GENESIS
+        && network != Network::Bitcoin
+        && !test_btc_for_mainnet_nex
+    {
+        return Err(format!(
+            "refused: mainnet NEX for {network} BTC, which is worth nothing: trade it for \
+             Bitcoin's, or opt in with test_btc_for_mainnet_nex \
+             (--test-btc-for-mainnet-nex) to test with tiny amounts"
+        ));
+    }
+    Ok(())
+}
+
 /// An offer the buyer takes: a quote at the price it agreed to, whose range
 /// holds the amount it asks for, terms at that amount that work, on its
 /// Bitcoin network and its Nexus, a Bitcoin fee of at least
 /// `btc_fee_floor`, a Nexus fee of at least `nex_fee_floor`, and every
-/// other term within its bounds.
+/// other term within its bounds; never mainnet NEX for BTC on another
+/// network than Bitcoin's, unless the bounds opt in: see [`check_networks`].
 pub fn check_offer(
     offer: &Offer,
     policy: &Policy,
@@ -455,6 +483,11 @@ pub fn check_offer(
             terms.nexus_genesis
         ));
     }
+    check_networks(
+        network,
+        nexus_genesis,
+        policy.bounds.test_btc_for_mainnet_nex,
+    )?;
     if quote.price != policy.price {
         return refused(format!(
             "asks {} sat a NEX, not {}",

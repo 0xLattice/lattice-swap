@@ -202,6 +202,11 @@ struct NodeArgs {
     /// lattice-node must follow that chain. Mainnet's by default.
     #[arg(long, default_value = swap_nexus_tx::MAINNET_GENESIS)]
     nexus_genesis: String,
+    /// Lets `offer` and `take` trade mainnet NEX for BTC on another
+    /// --btc-network than bitcoin, whose coins are worth nothing: only to
+    /// test with tiny amounts. Refused without it.
+    #[arg(long)]
+    test_btc_for_mainnet_nex: bool,
 }
 
 impl NodeArgs {
@@ -781,6 +786,7 @@ impl PolicyArgs {
                 min_btc_fee_rate: self.min_btc_fee_rate,
                 min_nex_confirmations: self.min_nex_confirmations,
                 min_margin: self.min_margin,
+                ..Bounds::DEFAULT
             },
         }
     }
@@ -852,6 +858,11 @@ fn offer(args: OfferArgs) -> Result<Outcome> {
     if let Some(listen) = args.listen {
         check_listen(listen, args.advertise)?;
     }
+    offer::check_networks(
+        args.nodes.btc_network,
+        &args.nodes.nexus_genesis,
+        args.nodes.test_btc_for_mainnet_nex,
+    )?;
     let template = args
         .terms
         .template(random32(), args.nodes.nexus_genesis.clone());
@@ -1056,7 +1067,8 @@ fn take(args: TakeArgs) -> Result<Outcome> {
     args.nodes.check_nexus(&nexus)?;
     let nex_floor = nex_fee_floor(&nexus, args.policy.min_nex_fee)?;
     let (network, genesis) = (args.nodes.btc_network, &args.nodes.nexus_genesis);
-    let policy = args.policy.policy(&offer);
+    let mut policy = args.policy.policy(&offer);
+    policy.bounds.test_btc_for_mainnet_nex = args.nodes.test_btc_for_mainnet_nex;
     check_offer(&offer, &policy, network, genesis, floor, nex_floor)?;
     if let Btc::Esplora(_, wallet) = &bitcoin {
         // As the app's, before the offer is taken, at the rate the driver

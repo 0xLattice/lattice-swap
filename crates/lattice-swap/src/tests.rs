@@ -2754,3 +2754,89 @@ fn take_on_an_esplora_waits_for_the_last_swap_to_end() {
         "{refused}"
     );
 }
+
+/// `offer` refuses mainnet NEX for BTC on another network than Bitcoin's,
+/// before it asks any node, unless --test-btc-for-mainnet-nex opts in.
+#[test]
+fn offer_refuses_mainnet_nex_for_test_btc_unless_opted_in() {
+    let refused = offer(offer_args(&["--btc-network", "signet"]))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refused.contains("refused: mainnet NEX for signet BTC"),
+        "{refused}"
+    );
+    // Opted in, it goes on to the next check, here a range below the
+    // floor, before any node.
+    let mut args = offer_args(&["--btc-network", "signet", "--test-btc-for-mainnet-nex"]);
+    args.terms.min_btc_amount = 2_545;
+    let refused = offer(args).unwrap_err().to_string();
+    assert!(refused.contains("at 2545 sat, btc_amount"), "{refused}");
+    // On another Nexus, or on Bitcoin, there is nothing to opt in to.
+    let mut args = offer_args(&["--btc-network", "signet"]);
+    args.nodes.nexus_genesis = swap_nexus_tx::cid(b"dev");
+    args.terms.min_btc_amount = 2_545;
+    let refused = offer(args).unwrap_err().to_string();
+    assert!(refused.contains("at 2545 sat, btc_amount"), "{refused}");
+}
+
+/// `take`, and the library's, refuse an offer of mainnet NEX for BTC on
+/// another network than Bitcoin's, unless the policy opts in, as
+/// --test-btc-for-mainnet-nex does.
+#[test]
+fn take_refuses_mainnet_nex_for_test_btc_unless_opted_in() {
+    let mut args = offer_args(&[]);
+    args.terms.btc_fee = 10_000;
+    args.terms.nex_fee = 1_000;
+    let key = SigningKey::from_bytes(&[1; 32]);
+    let offer = offer_of(&args, Network::Signet, address(), &key);
+    let take = |extra: &[&str]| {
+        let mut extra = extra.to_vec();
+        extra.extend(["--btc-network", "signet"]);
+        let mut args = vec!["take", "offer", "--nex-address", "b", "--price", "50000000"];
+        args.extend(extra);
+        let Command::Take(args) = parse(&args).unwrap().command else {
+            panic!("a take")
+        };
+        let mut policy = args.policy.policy(&offer);
+        policy.bounds.test_btc_for_mainnet_nex = args.nodes.test_btc_for_mainnet_nex;
+        check_offer(
+            &offer,
+            &policy,
+            args.nodes.btc_network,
+            MAINNET,
+            FLOOR,
+            NEX_FLOOR,
+        )
+    };
+    let refused = take(&[]).unwrap_err();
+    assert!(
+        refused.starts_with("refused: mainnet NEX for signet BTC"),
+        "{refused}"
+    );
+    assert_eq!(take(&["--test-btc-for-mainnet-nex"]), Ok(()));
+
+    let (policy, _) = policy(&[]);
+    let directory = tempfile::tempdir().unwrap();
+    let unreachable = "http://127.0.0.1:1";
+    let refused = swap::session::take(
+        offer,
+        &policy.policy(&agreed()),
+        Network::Signet,
+        MAINNET,
+        FLOOR,
+        NEX_FLOOR,
+        ScriptBuf::new(),
+        swap_nexus_tx::cid(b"buyer"),
+        Bitcoind::new(unreachable, "u:p", Network::Signet, TIMEOUT),
+        Client::new(unreachable, "c", TIMEOUT),
+        Store::new(directory.path(), [7; 32]),
+    )
+    .err()
+    .unwrap()
+    .to_string();
+    assert!(
+        refused.contains("refused: mainnet NEX for signet BTC"),
+        "{refused}"
+    );
+}
