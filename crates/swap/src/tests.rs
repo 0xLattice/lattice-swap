@@ -1633,14 +1633,30 @@ fn a_buyer_whose_funding_does_not_show_keeps_its_secrets() {
     assert_eq!(buyer.outcome(), None);
 }
 
+/// The seller's signing key, from its saved state.
+fn seller_key(seller: &Seller) -> KeyPair<EvenY> {
+    fn secrets(value: &serde_json::Value) -> Option<&serde_json::Value> {
+        match value {
+            serde_json::Value::Object(map) => map
+                .get("secrets")
+                .or_else(|| map.values().find_map(secrets)),
+            _ => None,
+        }
+    }
+    let state = serde_json::to_value(seller).unwrap();
+    let secrets: Secrets = serde_json::from_value(secrets(&state).unwrap().clone()).unwrap();
+    secrets.key()
+}
+
 /// A buyer whose cancel output the seller spent through the punish leaf with
 /// a transaction of its own, not the agreed punish, is punished all the
-/// same, and stops refunding once it sees that spend.
+/// same, and stops refunding once it sees that spend in a block: the
+/// seller's signature on it shows the seller made it.
 #[test]
 fn a_punish_of_the_sellers_own_making_ends_punished() {
     let locked = locked();
     let (swap, lock) = locked.swap();
-    let (_, buyer, _) = locked.nex_locked();
+    let (seller, buyer, _) = locked.nex_locked();
     let (buyer, actions) = buyer.step(btc(20, None, None));
     let [cancel] = &broadcasts(&actions)[..] else {
         panic!("cancel");
@@ -1650,6 +1666,7 @@ fn a_punish_of_the_sellers_own_making_ends_punished() {
         value: Amount::from_sat(990_000),
         script_pubkey: payout(9),
     };
+    let punish = swap.sign_punish_leaf(punish, &seller_key(&seller));
     // In the mempool, a refund may still replace it.
     let (buyer, actions) = buyer.step(btc(31, Some((cancel, 11)), Some((&punish, 0))));
     let [refund] = &broadcasts(&actions)[..] else {
@@ -1669,20 +1686,21 @@ fn a_punish_of_the_sellers_own_making_ends_punished() {
     assert!(matches!(buyer, Buyer::AskingShare { .. }));
 }
 
-/// The same from the seller's side: a punish of its own making ends it
-/// punished, and while that punish is in the mempool it broadcasts nothing
-/// that would conflict with it.
+/// The same from the seller's side: its punish, the only one it signs, ends
+/// it punished, and while that punish is in the mempool it broadcasts
+/// nothing that would conflict with it.
 #[test]
 fn the_seller_ends_on_a_punish_of_its_own_making() {
-    let locked = locked();
-    let (swap, lock) = locked.swap();
-    let (seller, _, _) = locked.nex_locked();
+    let (seller, _, _) = locked().nex_locked();
     let (seller, actions) = seller.step(btc(20, None, None));
     let [cancel] = &broadcasts(&actions)[..] else {
         panic!("cancel");
     };
-    let mut punish = swap.unsigned_tx(lock, Spend::Punish);
-    punish.output[0].script_pubkey = payout(9);
+    let (seller, actions) = seller.step(btc(31, Some((cancel, 11)), None));
+    let [punish] = &broadcasts(&actions)[..] else {
+        panic!("punish");
+    };
+    let punish = punish.clone();
     let (seller, actions) = seller.step(btc(31, Some((cancel, 11)), Some((&punish, 0))));
     assert!(actions.is_empty(), "no punish against its own");
     assert_eq!(seller.outcome(), None);
@@ -3174,10 +3192,10 @@ fn the_buyer_ends_only_on_a_deep_refund_or_punish() {
     for spend in [refund, punish] {
         let (buyer, actions) = buyer
             .clone()
-            .step(btc(22, Some((cancel, 2)), Some((&spend, 2))));
+            .step(btc(32, Some((cancel, 12)), Some((&spend, 2))));
         assert!(actions.is_empty(), "a spend in a block is waited for");
         assert_eq!(buyer.outcome(), None);
-        let (buyer, _) = buyer.step(btc(23, Some((cancel, 3)), Some((&spend, 3))));
+        let (buyer, _) = buyer.step(btc(33, Some((cancel, 13)), Some((&spend, 3))));
         let punished = matches!(buyer, Buyer::AskingShare { .. });
         assert!(buyer.outcome() == Some(Outcome::Refunded) || punished);
     }
@@ -6091,4 +6109,227 @@ fn bitcoind_calls_as_it_closes_an_idle_connection() {
         let call = bitcoind.call("getblockcount", json!([]));
         assert_eq!(call.map_err(|e| e.to_string()), Ok(json!(7)));
     }
+}
+
+/// A spend of the cancel output a backend names is the seller's punish only
+/// if it is the agreed one: a transaction nobody signed, named as spending
+/// it deep while cancel is still short of `t2`, ends nothing, and `s` stays.
+#[test]
+fn a_fabricated_punish_never_releases_s() {
+    let locked = locked();
+    let (swap, lock) = locked.swap();
+    let (seller, _buyer, _) = locked.nex_locked();
+    let (seller, actions) = seller.step(btc(20, None, None));
+    let [cancel] = &broadcasts(&actions)[..] else {
+        panic!("cancel");
+    };
+    // Anything naming the cancel outpoint, no witness, other txid.
+    let mut fake = swap.unsigned_tx(lock, Spend::Punish);
+    fake.output[0].script_pubkey = payout(9);
+    fake.output[0].value = Amount::from_sat(990_000);
+    assert_ne!(
+        fake.compute_txid(),
+        swap.unsigned_tx(lock, Spend::Punish).compute_txid()
+    );
+    // Cancel only 2 deep: no real punish could be in a block (t2 = 10).
+    let (seller, _) = seller.step(btc(22, Some((cancel, 2)), Some((&fake, 1))));
+    assert!(matches!(seller, Seller::Cancelling { .. }), "not punished");
+    let (_, actions) = seller.step(message(Message::ShareRequest));
+    assert!(matches!(
+        sent(&actions),
+        Message::ShareAnswer(ShareAnswer::Refused(ShareRefusal::NotPunished))
+    ));
+}
+
+/// The same with a garbage witness, and from `t2` on: the seller takes the
+/// spend for no punish, and sends its own.
+#[test]
+fn a_fabricated_punish_with_a_garbage_witness_is_no_punish() {
+    let locked = locked();
+    let (swap, lock) = locked.swap();
+    let (seller, _, _) = locked.nex_locked();
+    let (seller, actions) = seller.step(btc(20, None, None));
+    let [cancel] = &broadcasts(&actions)[..] else {
+        panic!("cancel");
+    };
+    let fake = Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::new(cancel.compute_txid(), 0),
+            script_sig: ScriptBuf::new(),
+            sequence: bitcoin::Sequence::MAX,
+            witness: Witness::from_slice(&[[0xAAu8; 64].as_slice()]),
+        }],
+        output: vec![TxOut {
+            value: cancel.output[0].value - Amount::from_sat(1_000),
+            script_pubkey: payout(42),
+        }],
+    };
+    let (seller, _) = seller.step(btc(22, Some((cancel, 2)), Some((&fake, 1))));
+    assert!(matches!(seller, Seller::Cancelling { .. }), "not punished");
+    let (seller, actions) = seller.step(btc(40, Some((cancel, 20)), Some((&fake, 15))));
+    assert!(matches!(seller, Seller::Cancelling { .. }), "not punished");
+    let [punish] = &broadcasts(&actions)[..] else {
+        panic!("its own punish");
+    };
+    assert_eq!(
+        punish.compute_txid(),
+        swap.unsigned_tx(lock, Spend::Punish).compute_txid()
+    );
+}
+
+/// The buyer reads the same fabricated spend as no punish: it keeps
+/// sending its refund.
+#[test]
+fn a_fabricated_punish_never_stops_the_buyers_refund() {
+    let locked = locked();
+    let (swap, lock) = locked.swap();
+    let (_, buyer, _) = locked.nex_locked();
+    let (buyer, actions) = buyer.step(btc(20, None, None));
+    let [cancel] = &broadcasts(&actions)[..] else {
+        panic!("cancel");
+    };
+    let mut fake = swap.unsigned_tx(lock, Spend::Punish);
+    fake.output[0].script_pubkey = payout(9);
+    let (buyer, actions) = buyer.step(btc(22, Some((cancel, 2)), Some((&fake, 1))));
+    let [refund] = &broadcasts(&actions)[..] else {
+        panic!("refund");
+    };
+    assert_eq!(
+        refund.input[0].previous_output,
+        fake.input[0].previous_output
+    );
+    assert!(matches!(buyer, Buyer::Cancelling { .. }));
+}
+
+/// The agreed punish, named in a block before its `t2` could have passed,
+/// is where it cannot be: neither side takes it for a punish.
+#[test]
+fn a_punish_shown_before_t2_is_no_punish() {
+    let locked = locked();
+    let (swap, lock) = locked.swap();
+    let (seller, buyer, _) = locked.nex_locked();
+    let (seller, actions) = seller.step(btc(20, None, None));
+    let [cancel] = &broadcasts(&actions)[..] else {
+        panic!("cancel");
+    };
+    let punish = swap.unsigned_tx(lock, Spend::Punish);
+    // t2 = 10: a punish 2 deep needs cancel at least 11 deep.
+    let shown = btc(29, Some((cancel, 9)), Some((&punish, 2)));
+    let (seller, _) = seller.step(shown.clone());
+    assert!(matches!(seller, Seller::Cancelling { .. }), "not punished");
+    let (buyer, _) = buyer.step(btc(20, None, None));
+    let (buyer, actions) = buyer.step(shown);
+    assert_eq!(broadcasts(&actions).len(), 1, "still refunding");
+    assert!(matches!(buyer, Buyer::Cancelling { .. }));
+    // A block short of `t2` above cancel's (BIP68): no more.
+    let (seller, _) = seller.step(btc(31, Some((cancel, 11)), Some((&punish, 2))));
+    assert!(matches!(seller, Seller::Cancelling { .. }), "not punished");
+    // Where it can be, it is.
+    let (seller, _) = seller.step(btc(32, Some((cancel, 12)), Some((&punish, 2))));
+    assert!(matches!(seller, Seller::Punished { .. }));
+    let (buyer, actions) = buyer.step(btc(32, Some((cancel, 12)), Some((&punish, 2))));
+    assert!(broadcasts(&actions).is_empty());
+    assert!(matches!(buyer, Buyer::AskingShare { .. }));
+}
+
+/// The wallet's temporary file, planted as a link, is never written
+/// through: it is removed and made anew, the owner's alone.
+#[cfg(all(unix, feature = "native"))]
+#[test]
+fn a_planted_wallet_temporary_is_never_followed() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = app_config(dir.path());
+    let target = dir.path().join("target");
+    std::fs::write(&target, "kept").unwrap();
+    std::os::unix::fs::symlink(&target, dir.path().join("wallet.json.tmp")).unwrap();
+    let key = wallet::Key::new("regtest").unwrap();
+    assert_eq!(app::put_key(&config, &key).unwrap().wif, key.wif);
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "kept");
+    assert!(!dir.path().join("wallet.json.tmp").exists());
+}
+
+/// A seller that punishes with a spend through the punish leaf in a shape
+/// the buyer cannot check, here with a second input for its fee, still
+/// ends the buyer's refund once it is deep after `t2`: the buyer asks for
+/// `s` and ends, never resending a refund whose input is spent.
+#[test]
+fn a_deep_unchecked_spend_after_t2_ends_the_refund() {
+    let locked = locked();
+    let (swap, lock) = locked.swap();
+    let (seller, buyer, _) = locked.nex_locked();
+    let (buyer, actions) = buyer.step(btc(20, None, None));
+    let [cancel] = &broadcasts(&actions)[..] else {
+        panic!("cancel");
+    };
+    let a = swap.sign(lock, Spend::Punish, &seller_key(&seller));
+    let mut punish = swap.finalize(lock, Spend::Punish, &a, None).unwrap();
+    punish.input.push(TxIn {
+        previous_output: OutPoint::new(Txid::from_byte_array([9; 32]), 0),
+        script_sig: ScriptBuf::new(),
+        sequence: bitcoin::Sequence::MAX,
+        witness: Witness::new(),
+    });
+    // Deep, but before `t2` above cancel's: the refund goes on.
+    let (buyer, actions) = buyer.step(btc(30, Some((cancel, 10)), Some((&punish, 1))));
+    assert_eq!(broadcasts(&actions).len(), 1, "still refunding");
+    assert!(matches!(buyer, Buyer::Cancelling { .. }));
+    let (buyer, actions) = buyer.step(btc(31, Some((cancel, 11)), Some((&punish, 1))));
+    assert!(broadcasts(&actions).is_empty(), "no refund");
+    assert!(matches!(sends(&actions)[..], [Message::ShareRequest]));
+    assert!(matches!(buyer, Buyer::AskingShare { .. }));
+    let (buyer, _) = buyer.step(Event::Timeout);
+    assert_eq!(buyer.outcome(), Some(Outcome::Punished));
+}
+
+/// A buyer that stopped refunding on a deep spend after `t2` it could not
+/// check goes back to refunding, resumed, when the cancel output shows no
+/// such spend, and ends refunded when its own refund shows deep.
+#[test]
+fn a_buyer_stopped_on_an_unchecked_spend_recovers_its_refund() {
+    let locked = locked();
+    let (swap, lock) = locked.swap();
+    let (_, buyer, _) = locked.nex_locked();
+    let (buyer, actions) = buyer.step(btc(20, None, None));
+    let [cancel] = &broadcasts(&actions)[..] else {
+        panic!("cancel");
+    };
+    // Neither the agreed punish nor signed: a lie, or a shape it cannot check.
+    let mut fake = swap.unsigned_tx(lock, Spend::Punish);
+    fake.output[0].script_pubkey = payout(9);
+    let (buyer, actions) = buyer.step(btc(31, Some((cancel, 11)), Some((&fake, 1))));
+    assert!(broadcasts(&actions).is_empty());
+    assert!(matches!(buyer, Buyer::AskingShare { .. }));
+    assert!(
+        buyer.watch().bitcoin.is_some(),
+        "the cancel output is watched"
+    );
+    // Still shown: it asks on, sending nothing.
+    let (buyer, actions) = buyer.step(btc(32, Some((cancel, 12)), Some((&fake, 2))));
+    assert!(actions.is_empty());
+    assert!(matches!(buyer, Buyer::AskingShare { .. }));
+    let (buyer, _) = buyer.step(Event::Timeout);
+    assert_eq!(buyer.outcome(), Some(Outcome::Punished));
+    let buyer = restart(&buyer);
+
+    // Resumed on a node that shows the cancel output unspent: it refunds.
+    let (resumed, actions) = buyer
+        .clone()
+        .resumed()
+        .step(btc(40, Some((cancel, 20)), None));
+    let [refund] = &broadcasts(&actions)[..] else {
+        panic!("refund");
+    };
+    assert_eq!(
+        refund.compute_txid(),
+        swap.unsigned_tx(lock, Spend::Refund).compute_txid()
+    );
+    assert!(matches!(resumed, Buyer::Cancelling { .. }));
+
+    // Resumed on a node that shows its refund deep: refunded.
+    let (resumed, _) = buyer
+        .resumed()
+        .step(btc(41, Some((cancel, 21)), Some((refund, 5))));
+    assert_eq!(resumed.outcome(), Some(Outcome::Refunded));
 }

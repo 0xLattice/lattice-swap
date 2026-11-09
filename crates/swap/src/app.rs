@@ -37,7 +37,7 @@ use serde_json::{json, Value};
 use swap_nexus_tx::rpc::Client;
 
 use crate::bitcoind::Bitcoin;
-use crate::driver::{bitcoin_view, Driver, NexusCheck, Store};
+use crate::driver::{bitcoin_view, create_temporary, Driver, NexusCheck, Store};
 use crate::esplora::Esplora;
 use crate::offer::{self, check_offer, Offer, Place, Policy};
 use crate::session::{self, check_nex_address, Result, Session, SessionFile, TIMEOUT};
@@ -212,11 +212,7 @@ fn read_key(config: &Config) -> Result<Option<Key>> {
 /// taken, the directory synced. The key the directory then holds.
 pub(crate) fn put_key(config: &Config, key: &Key) -> Result<Key> {
     let temporary = config.dir.join(format!("{WALLET}.tmp"));
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let mut file = options.open(&temporary)?;
+    let mut file = create_temporary(&temporary)?;
     file.write_all(&serde_json::to_vec(&Recovery {
         format: FORMAT.into(),
         network: config.network,
@@ -249,11 +245,7 @@ fn buyer_state(state: Value) -> Result<Buyer> {
 /// a temporary file, synced, then renamed over it.
 fn write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let temporary = path.with_extension("tmp");
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let mut file = options.open(&temporary)?;
+    let mut file = create_temporary(&temporary)?;
     file.write_all(bytes)?;
     file.sync_all()?;
     fs::rename(&temporary, path)
