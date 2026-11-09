@@ -5,6 +5,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::mem::discriminant;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bitcoin::{Amount, BlockHash, FeeRate, OutPoint, Transaction, Txid};
@@ -207,6 +208,10 @@ pub struct Driver<M, B, T> {
     /// a failed [`Driver::nexus_check`] is. Read from the `/api/chain/info`
     /// the view reads anyway.
     pub nexus_genesis: Option<String>,
+    /// Why the last Nexus read failed, worded as it is logged, while it
+    /// fails; cleared once a read passes, or while Nexus is not watched.
+    /// For an app's status to show, as the browser's driver shows it.
+    pub nexus_warning: Arc<Mutex<Option<String>>>,
     /// How long a round's Nexus check, view and the submits it leads to
     /// may take: every request ends by then, and one past it is not asked,
     /// so a slow or silent Nexus node delays the next Bitcoin round by this
@@ -338,6 +343,7 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
             reconnect: None,
             nexus_check: None,
             nexus_genesis: None,
+            nexus_warning: Arc::default(),
             nexus_budget: NEXUS_BUDGET,
             nexus_round: None,
             store,
@@ -672,6 +678,7 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
 
     fn observe_nexus(&mut self) -> io::Result<()> {
         let Some(watch) = self.state.watch().nexus else {
+            self.warn_nexus(None);
             return Ok(());
         };
         self.nexus_round = Some(Instant::now() + self.nexus_budget);
@@ -693,14 +700,18 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
         match read {
             Err(e) | Ok(Ok(Err(e))) => {
                 let e = format!("nexus: {e}: Nexus is not read until it passes; Bitcoin goes on");
+                self.warn_nexus(Some(e.clone()));
                 warn_again(&mut self.check_failed, e, (self.clock)());
                 Ok(())
             }
             Ok(Err(e)) => {
-                warn(&format!("nexus: {e}"));
+                let e = format!("nexus: {e}");
+                warn(&e);
+                self.warn_nexus(Some(e));
                 Ok(())
             }
             Ok(Ok(Ok(view))) => {
+                self.warn_nexus(None);
                 if self.check_failed.take().is_some() {
                     warn("nexus: the node passes its check: Nexus is read again");
                 }
@@ -712,6 +723,11 @@ impl<M: Machine, B: Bitcoin, T: Transport> Driver<M, B, T> {
                 }
             }
         }
+    }
+
+    fn warn_nexus(&self, warning: Option<String>) {
+        // Poisoned or not, the swap goes on.
+        *self.nexus_warning.lock().unwrap_or_else(|p| p.into_inner()) = warning;
     }
 
     fn apply(&mut self, event: Event) -> io::Result<()> {
