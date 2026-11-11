@@ -660,7 +660,7 @@ struct OfferArgs {
     #[command(flatten)]
     terms: TermsArgs,
     /// Where to listen for the buyer.
-    #[arg(long, required_unless_present = "relay")]
+    #[arg(long, required_unless_present_any = ["relay", "serve_relay"])]
     listen: Option<SocketAddr>,
     /// The address the buyer dials, if not the one listened on. Required
     /// when listening on an unspecified address, such as 0.0.0.0.
@@ -673,6 +673,22 @@ struct OfferArgs {
     /// the offer printed names the first.
     #[arg(long, conflicts_with_all = ["listen", "advertise"])]
     relay: Vec<String>,
+    /// Where to run a relay of this seller's own, in this process, for as
+    /// long as it runs, and list the offer on it beside any --relay: a
+    /// seller with a reachable address then depends on no one else's relay
+    /// for buyers to find it. Anyone can list offers on it too. Needs
+    /// --serve-relay-url.
+    #[arg(
+        long,
+        requires = "serve_relay_url",
+        conflicts_with_all = ["listen", "advertise"]
+    )]
+    serve_relay: Option<SocketAddr>,
+    /// The http:// or https:// URL buyers reach --serve-relay at, as
+    /// --advertise is the address they dial: the offer listed there names
+    /// it. Put TLS in front of the relay for https://.
+    #[arg(long, requires = "serve_relay")]
+    serve_relay_url: Option<String>,
     /// Seconds to wait for the buyer to dial.
     #[arg(long, default_value_t = 600)]
     wait: u64,
@@ -900,7 +916,16 @@ fn offer(args: OfferArgs) -> Result<Outcome> {
     let store = Store::new(&args.dir, swap_id);
 
     let listener = args.listen.map(TcpListener::bind).transpose()?;
-    let place = match (&listener, args.relay.first()) {
+    // Each relay as the seller dials it, and as its offer names it: the
+    // one it serves itself, it dials on its own machine.
+    let mut relays: Vec<(String, String)> = (args.relay.iter())
+        .map(|relay| (relay.clone(), relay.clone()))
+        .collect();
+    if let (Some(listen), Some(url)) = (args.serve_relay, &args.serve_relay_url) {
+        relays.push((serve_relay(listen)?, url.clone()));
+    }
+    let named: Vec<String> = relays.iter().map(|(_, named)| named.clone()).collect();
+    let place = match (&listener, named.first()) {
         (_, Some(relay)) => Place::Relay(relay.clone()),
         (Some(listener), None) => Place::Address(args.advertise.unwrap_or(listener.local_addr()?)),
         (None, None) => return Err("give --listen or --relay".into()),
@@ -940,15 +965,15 @@ fn offer(args: OfferArgs) -> Result<Outcome> {
         offer: offer.clone(),
         key: Some(hex::encode(session.to_bytes())),
     };
-    match (listener, args.relay.is_empty()) {
+    match (listener, relays.is_empty()) {
         (_, false) => {
             log(&format!(
                 "listing the offer on {}, waiting for the buyer",
-                args.relay.join(", ")
+                named.join(", ")
             ));
-            let offers = listed_on(&offer, &args.relay);
+            let offers = listed_on(&offer, &named);
             let encoded: Vec<String> = offers.iter().map(Offer::encode).collect();
-            let listings: Vec<(&str, &str)> = (args.relay.iter().map(String::as_str))
+            let listings: Vec<(&str, &str)> = (relays.iter().map(|(dialed, _)| &dialed[..]))
                 .zip(encoded.iter().map(String::as_str))
                 .collect();
             let (taken, mut transport) =
@@ -974,6 +999,42 @@ fn offer(args: OfferArgs) -> Result<Outcome> {
         }
         (None, true) => unreachable!("a place was found"),
     }
+}
+
+/// How many sellers the relay `offer --serve-relay` runs holds at once,
+/// listed or swapping, as `swap-relay` holds by default.
+const SERVED_RELAY_OFFERS: usize = 10_000;
+
+/// Runs a swap-relay on `listen`, on a thread of its own, until this
+/// process ends: the relay's own router, as `swap-relay` serves it. Binds
+/// before it returns, so an address in use fails the offer at once.
+/// Returns the URL this process reaches it at, on its own machine.
+fn serve_relay(listen: SocketAddr) -> Result<String> {
+    let listener = TcpListener::bind(listen)?;
+    listener.set_nonblocking(true)?;
+    let mut local = listener.local_addr()?;
+    if local.ip().is_unspecified() {
+        local.set_ip(match local {
+            SocketAddr::V4(_) => std::net::Ipv4Addr::LOCALHOST.into(),
+            SocketAddr::V6(_) => std::net::Ipv6Addr::LOCALHOST.into(),
+        });
+    }
+    let relay = Arc::new(swap_relay::Relay {
+        board: swap_relay::board::Board::new(SERVED_RELAY_OFFERS),
+        rejoins: swap_relay::board::Board::new(SERVED_RELAY_OFFERS),
+    });
+    let runtime = tokio::runtime::Runtime::new()?;
+    std::thread::Builder::new().spawn(move || {
+        let served = runtime.block_on(async {
+            let listener = tokio::net::TcpListener::from_std(listener)?;
+            swap_relay::serve(listener, relay).await
+        });
+        if let Err(e) = served {
+            log(&format!("the relay on {listen} stopped: {e}"));
+        }
+    })?;
+    log(&format!("serving a relay on {listen}"));
+    Ok(format!("http://{local}"))
 }
 
 /// `offer` as listed on each of `relays`, naming it: one swap, one swap id

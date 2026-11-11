@@ -257,6 +257,123 @@ fn an_offer_listed_on_several_relays_names_each() {
 }
 
 #[test]
+fn offer_serves_a_relay_at_its_public_url() {
+    let base = [
+        "offer",
+        "--price",
+        "1",
+        "--min-btc-amount",
+        "1",
+        "--max-btc-amount",
+        "2",
+        "--btc-fee",
+        "1",
+        "--nex-fee",
+        "1",
+    ];
+    let with = |extra: &[&str]| parse(&[&base[..], extra].concat());
+    let serve = ["--serve-relay", "0.0.0.0:7500"];
+    let url = ["--serve-relay-url", "https://seller.example"];
+    let Command::Offer(args) = with(&[&serve[..], &url[..]].concat()).unwrap().command else {
+        panic!("an offer");
+    };
+    assert_eq!(args.serve_relay, Some("0.0.0.0:7500".parse().unwrap()));
+    assert_eq!(
+        args.serve_relay_url.as_deref(),
+        Some("https://seller.example")
+    );
+    assert!(args.listen.is_none() && args.relay.is_empty());
+    let both = [&serve[..], &url[..], &["--relay", "http://r"]].concat();
+    assert!(with(&both).is_ok());
+    assert!(with(&serve).is_err(), "no URL");
+    assert!(with(&url).is_err(), "no relay to name");
+    let listening = [&serve[..], &url[..], &["--listen", "127.0.0.1:0"]].concat();
+    assert!(with(&listening).is_err());
+}
+
+/// A relay on loopback, as `swap-relay` runs one: its URL.
+fn other_relay() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    listener.set_nonblocking(true).unwrap();
+    std::thread::spawn(move || {
+        let relay = Arc::new(swap_relay::Relay {
+            board: swap_relay::board::Board::new(10),
+            rejoins: swap_relay::board::Board::new(10),
+        });
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            swap_relay::serve(listener, relay).await.unwrap();
+        });
+    });
+    url
+}
+
+fn listed(url: &str) -> Vec<Value> {
+    ureq::get(&format!("{url}/offers"))
+        .call()
+        .unwrap()
+        .into_json()
+        .unwrap()
+}
+
+fn wait_listed(url: &str, count: usize) {
+    for _ in 0..200 {
+        if listed(url).len() == count {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!("{count} offers never listed on {url}");
+}
+
+/// The relay the seller serves itself lists its offer naming the public
+/// URL, beside another relay; a buyer that takes it there withdraws it from
+/// the other, and the seller is not taken twice.
+#[test]
+fn a_seller_lists_on_the_relay_it_serves_and_another() {
+    let served = serve_relay("0.0.0.0:0".parse().unwrap()).unwrap();
+    assert!(served.starts_with("http://127.0.0.1:"), "{served}");
+    let other = other_relay();
+    let key = SigningKey::from_bytes(&[1; 32]);
+    let public = "https://seller.example".to_string();
+    let offer = offer_of(
+        &small_args(16),
+        Network::Bitcoin,
+        Place::Relay(other.clone()),
+        &key,
+    );
+    let copies = listed_on(&offer, &[other.clone(), public.clone()]);
+    let encoded: Vec<String> = copies.iter().map(Offer::encode).collect();
+    let buyer_key = SigningKey::from_bytes(&offer.buyer_session);
+    let buyer = ivy::Config::new(buyer_key.clone()).peer_key();
+    let (at, served_at) = (other.clone(), served.clone());
+    let seller = std::thread::spawn(move || {
+        let listings = [
+            (&at[..], &encoded[0][..]),
+            (&served_at[..], &encoded[1][..]),
+        ];
+        let config = ivy::Config::new(key);
+        Ivy::accept_relayed_on(&listings, &config, buyer, TIMEOUT, TIMEOUT)
+    });
+    wait_listed(&served, 1);
+    wait_listed(&other, 1);
+    assert_eq!(listed(&served)[0]["relay"], public.as_str());
+
+    let id = hex::encode(offer.template.swap_id);
+    let config = ivy::Config::new(buyer_key);
+    let seller_key = offer.seller_key().unwrap();
+    let mut buyer = Ivy::connect_relayed(&served, &id, &config, seller_key, TIMEOUT).unwrap();
+    let (taken, mut seller) = seller.join().unwrap().unwrap();
+    assert_eq!(taken, 1, "through the relay it serves");
+    wait_listed(&other, 0);
+    let again = Ivy::connect_relayed(&other, &id, &config, seller_key, TIMEOUT).err();
+    assert_eq!(again.map(|e| e.kind()), Some(io::ErrorKind::NotFound));
+    buyer.send(b"request").unwrap();
+    assert_eq!(seller.recv(TIMEOUT).unwrap().unwrap(), b"request");
+}
+
+#[test]
 fn an_offer_names_an_address_or_a_relay() {
     let key = SigningKey::from_bytes(&[1; 32]);
     let mut offer = offer_of(&small_args(16), Network::Bitcoin, address(), &key);
