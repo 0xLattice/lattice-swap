@@ -21,6 +21,31 @@ fn relay(max_offers: usize) -> String {
     )
 }
 
+/// A relay on loopback until the sender is dropped, when it stops and
+/// every connection it holds closes: its URL.
+fn relay_until_stopped() -> (String, tokio::sync::oneshot::Sender<()>) {
+    let relay = Arc::new(Relay {
+        board: Board::new(10),
+        rejoins: Board::new(10),
+    });
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    listener.set_nonblocking(true).unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    thread::spawn(move || {
+        // Dropped on return, the runtime ends the connections' tasks too.
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            tokio::select! {
+                _ = swap_relay::serve(listener, relay) => {}
+                _ = stopped => {}
+            }
+        });
+    });
+    (url, stop)
+}
+
 /// A relay on `listener`, holding at most `max_offers` sellers: its URL.
 fn relay_on(listener: std::net::TcpListener, max_offers: usize) -> String {
     let relay = Arc::new(Relay {
@@ -218,7 +243,8 @@ fn a_seller_lists_on_every_relay_again_past_a_stranger() {
 
 /// A relay that is down, or that refuses the offer, is passed over: the
 /// seller stays listed on the one that takes it, and its buyer gets
-/// through. Only when every relay fails does the seller.
+/// through. With every relay failing, it tries them again until its wait
+/// runs out.
 #[test]
 fn a_relay_down_or_refusing_leaves_the_others_listed() {
     // Nothing listens there.
@@ -243,10 +269,9 @@ fn a_relay_down_or_refusing_leaves_the_others_listed() {
         (&down[..], &offer(&id(15))[..]),
         (&full[..], &offer(&id(15))[..]),
     ];
-    // Neither lists it, so neither is tried again: the error is the one
-    // that failed last, whichever that was.
-    let failed = Ivy::accept_relayed_on(&listings, &config(1), key(2), TIMEOUT, TIMEOUT);
-    assert!(failed.is_err());
+    let wait = Duration::from_millis(500);
+    let failed = Ivy::accept_relayed_on(&listings, &config(1), key(2), wait, TIMEOUT);
+    assert_eq!(failed.err().unwrap().kind(), io::ErrorKind::TimedOut);
 }
 
 /// A relay down when the seller lists is tried again every
@@ -280,6 +305,38 @@ fn a_relay_down_at_the_start_lists_the_offer_once_it_is_up() {
     let (taken, mut seller) = seller.join().unwrap().unwrap();
     assert_eq!(taken, 0);
     wait_listed(&up, 0);
+    seller.send(b"terms").unwrap();
+    assert_eq!(buyer.recv(TIMEOUT).unwrap().unwrap(), b"terms");
+}
+
+/// With the only relay that listed it gone and the other still down, the
+/// seller goes on trying both until its wait runs out: once the other is
+/// back, the offer is listed there.
+#[test]
+fn a_seller_retries_while_every_relay_is_down() {
+    let address = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap()
+    };
+    let late = format!("http://{address}");
+    let (first, stop) = relay_until_stopped();
+    let seller = seller_on(&[&first, &late], offer(&id(17)));
+    wait_listed(&first, 1);
+    drop(stop);
+    thread::sleep(Duration::from_millis(500));
+    assert!(!seller.is_finished(), "gave up with a relay still to retry");
+    relay_on(std::net::TcpListener::bind(address).unwrap(), 10);
+    let deadline = std::time::Instant::now() + 3 * swap::transport::RETRY;
+    while offers(&late).is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never listed on {late}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    let mut buyer = Ivy::connect_relayed(&late, &id(17), &config(2), key(1), TIMEOUT).unwrap();
+    let (taken, mut seller) = seller.join().unwrap().unwrap();
+    assert_eq!(taken, 1);
     seller.send(b"terms").unwrap();
     assert_eq!(buyer.recv(TIMEOUT).unwrap().unwrap(), b"terms");
 }

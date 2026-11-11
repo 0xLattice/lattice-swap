@@ -377,10 +377,11 @@ impl Ivy<Relayed> {
     /// so it locks nothing. A pairing that fails the handshake lists the
     /// offer on every relay again. A relay that is down, refuses the offer
     /// or drops its connection is logged and tried again every [`RETRY`]
-    /// while another is listed, so one down at the start gets the offer
-    /// once it is back; fails once none is listed, as a lone relay's
-    /// refusal fails [`Ivy::accept_relayed`]. Returns which of `listings`
-    /// the buyer came through, where the two meet again.
+    /// until `wait` runs out, so one down at the start, or all of them for
+    /// a while, gets the offer once it is back. A lone relay is not: its
+    /// refusal fails [`Ivy::accept_relayed`] at once, as it always has.
+    /// Returns which of `listings` the buyer came through, where the two
+    /// meet again.
     pub fn accept_relayed_on(
         listings: &[(&str, &str)],
         config: &Config,
@@ -421,9 +422,7 @@ impl Ivy<Relayed> {
                                     Poll::Ready(Err(e)) => e,
                                 },
                             };
-                            let others = (slots.iter().enumerate())
-                                .any(|(j, slot)| j != i && matches!(slot, Slot::Listing(_)));
-                            if !others {
+                            if listings.len() == 1 {
                                 return Poll::Ready(Err(failed));
                             }
                             let relay = listings[i].0;
