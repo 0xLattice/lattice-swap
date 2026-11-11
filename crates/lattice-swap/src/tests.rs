@@ -2185,7 +2185,7 @@ fn the_nexus_genesis_defaults_to_mainnets() {
             Command::Offer(args) => args.nodes,
             Command::Take(args) => args.nodes,
             Command::Resume(args) => args.nodes,
-            Command::Wallet(_) | Command::Status { .. } => unreachable!(),
+            Command::Wallet(_) | Command::Status { .. } | Command::RelayDir(_) => unreachable!(),
         };
         assert_eq!(nodes.nexus_genesis, MAINNET, "{args:?}");
     }
@@ -3349,5 +3349,333 @@ fn take_refuses_mainnet_nex_for_test_btc_unless_opted_in() {
     assert!(
         refused.contains("refused: mainnet NEX for signet BTC"),
         "{refused}"
+    );
+}
+
+/// A node hosting the relay directory at `RELAY_DIR_CHAIN`, whose tip lists
+/// `listed` for `account`, pooling no fee below `floor`: it serves the
+/// chain's info, the Volumes of the tip's block and state, and the account,
+/// at balance 100 and nonce 6 (any other a 404), only when asked for that
+/// chain, and records each transaction submitted.
+fn relay_dir_node(
+    floor: u64,
+    account: &str,
+    listed: Option<&str>,
+) -> (String, Arc<std::sync::Mutex<Vec<Value>>>) {
+    use ciborium::Value as Cbor;
+    use std::io::BufRead;
+    use std::sync::Mutex;
+    let text = |text: &str| Cbor::Text(text.into());
+    let map = |entries: Vec<(&str, Cbor)>| {
+        Cbor::Map(entries.into_iter().map(|(k, v)| (text(k), v)).collect())
+    };
+    let mut nodes = Vec::new();
+    let mut put = |node: Cbor| {
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&node, &mut bytes).unwrap();
+        let cid = swap_nexus_tx::cid(&bytes);
+        nodes.push((cid.clone(), bytes));
+        cid
+    };
+    let link = |cid: &str| map(vec![("rawCID", text(cid))]);
+    let children = match listed {
+        Some(url) => {
+            let entry = put(map(vec![
+                ("prefix", text(&format!("relay/{account}"))),
+                ("value", text(url)),
+                ("children", Cbor::Array(vec![])),
+            ]));
+            vec![map(vec![("key", text("r")), ("value", link(&entry))])]
+        }
+        None => vec![],
+    };
+    let count = Cbor::Integer(0.into());
+    let root = put(map(vec![
+        ("count", count),
+        ("children", Cbor::Array(children)),
+    ]));
+    let state = put(map(vec![("generalState", link(&root))]));
+    let block = put(map(vec![("postState", link(&state))]));
+    // The block a Volume of its own, the state's nodes one under the state.
+    let archive = |nodes: &[(String, Vec<u8>)]| {
+        let mut archive = (nodes.len() as u16).to_be_bytes().to_vec();
+        for (cid, bytes) in nodes {
+            archive.extend((cid.len() as u16).to_be_bytes());
+            archive.extend(cid.as_bytes());
+            archive.extend((bytes.len() as u32).to_be_bytes());
+            archive.extend(bytes);
+        }
+        archive
+    };
+    let (block_node, state_nodes) = nodes.split_last().unwrap();
+    let volumes = [
+        (block.clone(), archive(std::slice::from_ref(block_node))),
+        (state.clone(), archive(state_nodes)),
+    ];
+    let chain: Vec<&str> = RELAY_DIR_CHAIN.split('/').collect();
+    let info = json!({
+        "chain": chain, "tipCID": block, "height": "5",
+        "acceptsSubmit": true, "minRelayFee": floor.to_string(),
+    });
+    let account = account.to_string();
+    let submitted = Arc::new(Mutex::new(Vec::new()));
+    let recorded = submitted.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = io::BufReader::new(stream.unwrap());
+            let mut line = String::new();
+            stream.read_line(&mut line).unwrap();
+            let mut length = 0;
+            loop {
+                let mut header = String::new();
+                stream.read_line(&mut header).unwrap();
+                if let Some(n) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = n.trim().parse().unwrap();
+                }
+                if header == "\r\n" {
+                    break;
+                }
+            }
+            let mut body = vec![0; length];
+            stream.read_exact(&mut body).unwrap();
+            let target = line.split(' ').nth(1).unwrap();
+            let (path, query) = target.split_once('?').unwrap_or((target, ""));
+            let chained = query == "chainPath=Nexus%2Ftestnet%2Fswap-relays";
+            let found: Option<Vec<u8>> = match path.strip_prefix("/volumes/") {
+                _ if path == "/transactions" => {
+                    recorded
+                        .lock()
+                        .unwrap()
+                        .push(serde_json::from_slice(&body).unwrap());
+                    Some(json!({"transactionCID": "bafy"}).to_string().into())
+                }
+                _ if !chained => None,
+                Some(cid) => volumes
+                    .iter()
+                    .find(|(root, _)| root == cid)
+                    .map(|(_, archive)| archive.clone()),
+                None if path == "/api/chain/info" => Some(info.to_string().into()),
+                None if path == format!("/api/state/account/{account}") => {
+                    Some(json!({"balance": "100", "nonce": "6"}).to_string().into())
+                }
+                None => None,
+            };
+            let (status, body) = match found {
+                Some(body) => ("200 OK", body),
+                None => ("404 Not Found", Vec::new()),
+            };
+            let head = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let stream = stream.get_mut();
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.write_all(&body).unwrap();
+        }
+    });
+    (url, submitted)
+}
+
+/// `relay-dir add` and `remove` read the account's entry, then write it from
+/// that value, paying --fee from the account at its nonce; a fee below the
+/// node's floor, a write that changes nothing, or a URL readers skip, sends
+/// none.
+#[test]
+fn relay_dir_writes_from_the_value_listed() {
+    use std::os::unix::fs::PermissionsExt;
+    let seed = [5; 32];
+    let account = SecretBytes(seed).nex_address();
+    let key = tempfile::NamedTempFile::new().unwrap();
+    fs::write(key.path(), hex::encode(seed)).unwrap();
+    fs::set_permissions(key.path(), fs::Permissions::from_mode(0o600)).unwrap();
+    let old = "https://old.example";
+    let run = |listed: Option<&str>, args: &[&str]| {
+        let (url, submitted) = relay_dir_node(4, &account, listed);
+        let key = key.path().to_str().unwrap();
+        let flags = ["--key", key, "--nexus-url", &url];
+        let cli = Cli::try_parse_from(
+            ["lattice-swap", "relay-dir"]
+                .iter()
+                .chain(args)
+                .chain(&flags),
+        )
+        .unwrap();
+        let Command::RelayDir(command) = cli.command else {
+            unreachable!()
+        };
+        let result = relay_dir_write(command).map_err(|e| e.to_string());
+        let submitted = submitted.lock().unwrap().clone();
+        (result, submitted)
+    };
+    let written = |submitted: &[Value]| {
+        assert_eq!(submitted.len(), 1);
+        submitted[0]["transaction"]["body"].clone()
+    };
+
+    let (result, submitted) = run(Some(old), &["add", "--url", "https://new.example/x"]);
+    let refused = result.unwrap_err();
+    assert!(refused.ends_with("pass --fee 4 to pay it"), "{refused}");
+    assert!(submitted.is_empty());
+    let (result, submitted) = run(
+        Some(old),
+        &["add", "--url", "https://new.example/x", "--fee", "4"],
+    );
+    result.unwrap();
+    let body = written(&submitted);
+    assert_eq!(
+        body["actions"],
+        json!([{"key": format!("relay/{account}"), "oldValue": old, "newValue": "https://new.example/x"}])
+    );
+    assert_eq!(
+        body["accountActions"],
+        json!([{"owner": account, "delta": "-4"}])
+    );
+    assert_eq!(body["nonce"], "6");
+    assert_eq!(body["signers"], json!([account]));
+    assert_eq!(
+        body["chainPath"],
+        json!(["Nexus", "testnet", "swap-relays"])
+    );
+
+    let (result, submitted) = run(None, &["add", "--url", old, "--fee", "10"]);
+    result.unwrap();
+    let body = written(&submitted);
+    assert_eq!(
+        body["actions"],
+        json!([{"key": format!("relay/{account}"), "newValue": old}])
+    );
+    assert_eq!(body["accountActions"][0]["delta"], "-10");
+
+    let (result, submitted) = run(Some(old), &["remove", "--fee", "4"]);
+    result.unwrap();
+    assert_eq!(
+        written(&submitted)["actions"],
+        json!([{"key": format!("relay/{account}"), "oldValue": old}])
+    );
+
+    for (listed, args) in [
+        (Some(old), &["add", "--url", old, "--fee", "4"][..]),
+        (None, &["remove", "--fee", "4"]),
+    ] {
+        let (result, submitted) = run(listed, args);
+        result.unwrap();
+        assert!(submitted.is_empty(), "{args:?}");
+    }
+
+    let (result, submitted) = run(Some(old), &["add", "--url", "https://user@relay.example"]);
+    assert!(result.unwrap_err().starts_with("refused: "));
+    assert!(submitted.is_empty());
+    for url in [
+        "http://relay.example",
+        "https://127.0.0.1",
+        "https://localhost",
+    ] {
+        let (result, _) = run(None, &["add", "--url", url]);
+        assert!(result.unwrap_err().starts_with("refused: "), "{url}");
+    }
+
+    let (result, submitted) = run(None, &["remove", "--chain", "Nexus/other"]);
+    assert!(result.unwrap_err().contains("404"));
+    assert!(submitted.is_empty());
+}
+
+/// `relay-dir --key` reads a seed in hex or a key file `lattice key
+/// generate` writes, `{address, privateKey, publicKey}`, refusing one whose
+/// public key is not its private key's; `--nexus-url` has no default.
+#[test]
+fn relay_dir_reads_either_key_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let seed = [5; 32];
+    let public = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+    let multikey = swap_nexus_tx::multikey_hex(&public);
+    let key_file = |text: String| {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(file.path(), text).unwrap();
+        fs::set_permissions(file.path(), fs::Permissions::from_mode(0o600)).unwrap();
+        file
+    };
+    let lattice = |public_key: &str| {
+        json!({
+            "address": swap_nexus_tx::address(&public),
+            "privateKey": hex::encode(seed),
+            "publicKey": public_key,
+        })
+        .to_string()
+    };
+    for text in [
+        hex::encode(seed),
+        format!("{}\n", hex::encode(seed)),
+        lattice(&multikey),
+    ] {
+        let file = key_file(text.clone());
+        assert_eq!(relay_dir_key(file.path()).unwrap().0, seed, "{text}");
+    }
+    let other = swap_nexus_tx::multikey_hex(&[9; 32]);
+    let refused = relay_dir_key(key_file(lattice(&other)).path());
+    let refused = refused.err().unwrap().to_string();
+    assert!(refused.contains("not its privateKey's"), "{refused}");
+    assert!(relay_dir_key(key_file("{}".into()).path()).is_err());
+
+    // A lattice key file writes as the seed does.
+    let file = key_file(lattice(&multikey));
+    let account = SecretBytes(seed).nex_address();
+    let (url, submitted) = relay_dir_node(0, &account, None);
+    let path = file.path().to_str().unwrap();
+    let args = ["relay-dir", "remove", "--key", path, "--nexus-url", &url];
+    let cli = Cli::try_parse_from(["lattice-swap"].iter().chain(&args)).unwrap();
+    let Command::RelayDir(command) = cli.command else {
+        unreachable!()
+    };
+    relay_dir_write(command).unwrap();
+    assert!(submitted.lock().unwrap().is_empty(), "nothing listed");
+    let (url, submitted) = relay_dir_node(0, &account, None);
+    let args = [
+        "relay-dir",
+        "add",
+        "--url",
+        "https://r.example",
+        "--key",
+        path,
+        "--nexus-url",
+        &url,
+    ];
+    let cli = Cli::try_parse_from(["lattice-swap"].iter().chain(&args)).unwrap();
+    let Command::RelayDir(command) = cli.command else {
+        unreachable!()
+    };
+    relay_dir_write(command).unwrap();
+    assert_eq!(
+        submitted.lock().unwrap()[0]["transaction"]["body"]["signers"],
+        json!([account])
+    );
+
+    // An account the node has never seen is at nonce 0, with no balance:
+    // enough for a write that pays no fee.
+    let (url, submitted) = relay_dir_node(0, "another", None);
+    let args = [
+        "relay-dir",
+        "add",
+        "--url",
+        "https://r.example",
+        "--key",
+        path,
+        "--nexus-url",
+        &url,
+    ];
+    let cli = Cli::try_parse_from(["lattice-swap"].iter().chain(&args)).unwrap();
+    let Command::RelayDir(command) = cli.command else {
+        unreachable!()
+    };
+    relay_dir_write(command).unwrap();
+    let body = submitted.lock().unwrap()[0]["transaction"]["body"].clone();
+    assert_eq!(body["nonce"], "0");
+    assert_eq!(body["accountActions"], json!([]));
+
+    let args = ["lattice-swap", "relay-dir", "remove", "--key", path];
+    assert!(
+        Cli::try_parse_from(args).is_err(),
+        "--nexus-url is required"
     );
 }

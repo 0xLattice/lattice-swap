@@ -104,8 +104,13 @@ fn verdict(context: &[u8]) -> bool {
 }
 
 fn accepts_with(actions: Vec<Value>, signers: &[String], account_actions: Vec<Value>) -> bool {
+    accepts_body(&body(actions, signers, account_actions))
+}
+
+/// The verdict on an encoded body, recorded as [`accepts_with`] says.
+fn accepts_body(body: &[u8]) -> bool {
     static RECORDED: AtomicUsize = AtomicUsize::new(0);
-    let context = context(Some(&body(actions, signers, account_actions)));
+    let context = context(Some(body));
     let accepted = verdict(&context);
     if let Some(directory) = std::env::var_os("CONTEXT_DIR") {
         let directory = std::path::Path::new(&directory);
@@ -214,6 +219,31 @@ fn coin_actions_pass_untouched() {
         &[alice()],
         vec![coin(alice(), -5), coin(bob(), 5)]
     ));
+}
+
+/// The writes `lattice-swap relay-dir` sends, built as it builds them:
+/// each passes signed by the account it writes for, and none by another.
+#[test]
+fn the_cli_writes_pass_for_their_own_account_only() {
+    use swap_nexus_tx::{address, relay_dir_action, TransactionBody};
+    let (alice, bob) = (address(&[1; 32]), address(&[2; 32]));
+    let url = || Some(URL.to_string());
+    let other = || Some("https://other.example/swap".to_string());
+    let writes = [(None, url()), (url(), other()), (other(), None)];
+    for (current, new) in writes {
+        let action = relay_dir_action(&alice, current, new).unwrap();
+        for fee in [0, 10] {
+            let path = PATH.map(String::from).to_vec();
+            let write = |signer: &str| {
+                TransactionBody::write(signer, vec![action.clone()], fee, 3, path.clone())
+                    .unwrap()
+                    .to_dag_cbor()
+            };
+            assert!(accepts_body(&write(&alice)), "{action:?}");
+            assert!(!accepts_body(&write(&bob)), "{action:?}");
+        }
+    }
+    assert!(relay_dir_action(&alice, url(), url()).is_none());
 }
 
 #[test]

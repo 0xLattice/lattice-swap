@@ -1,7 +1,9 @@
 //! A blocking client for the few routes of a Lattice node's operator RPC
 //! (lattice-node 3.2.0) the swap needs: check which Nexus the node follows
 //! and that it is synced, read an account, submit a transaction, and read
-//! back a transaction and whether it is mined.
+//! back a transaction and whether it is mined; and, for the relay directory,
+//! read a chain the node hosts, by its path: its info, an account and the
+//! Volumes of its state.
 //!
 //! The operator port listens on loopback only and takes the node's cookie
 //! (`<data-directory>/.cookie`, `__cookie__:<token>`) as HTTP basic auth. It
@@ -24,6 +26,8 @@ use std::{fmt, fs};
 
 #[cfg(feature = "native")]
 use base64::Engine;
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "native")]
 use serde_json::Value;
@@ -112,6 +116,10 @@ pub struct Inclusion {
 /// than buffered.
 #[cfg(feature = "native")]
 const MAX_RESPONSE_BYTES: u64 = 1 << 20;
+
+/// The most bytes of a Volume archive read: the node's own bound on one.
+#[cfg(feature = "native")]
+const MAX_VOLUME_BYTES: u64 = 64 << 20;
 
 #[cfg(feature = "native")]
 pub struct Client {
@@ -334,17 +342,48 @@ impl Client {
         ))
     }
 
+    /// `GET /api/chain/info` of the chain at `chain_path`, which the node
+    /// must host, as the node answered it.
+    pub fn chain_info_of(&self, chain_path: &[String]) -> Result<Value> {
+        json(&self.get_bytes("/api/chain/info", Some(chain_path), MAX_RESPONSE_BYTES)?)
+    }
+
+    /// [`Client::account`] on the chain at `chain_path`.
+    pub fn account_of(&self, address: &str, chain_path: &[String]) -> Result<Account> {
+        let path = format!("/api/state/account/{}", cid_path(address)?);
+        let json = json(&self.get_bytes(&path, Some(chain_path), MAX_RESPONSE_BYTES)?)?;
+        parse::account(&json).map_err(Error::Malformed)
+    }
+
+    /// The nodes of the Volume `cid` roots, held by the node for the chain
+    /// at `chain_path`, by CID: [`parse::volume`]. Not checked against
+    /// their CIDs.
+    pub fn volume(&self, cid: &str, chain_path: &[String]) -> Result<BTreeMap<String, Vec<u8>>> {
+        let path = format!("/volumes/{}", cid_path(cid)?);
+        let bytes = self.get_bytes(&path, Some(chain_path), MAX_VOLUME_BYTES)?;
+        parse::volume(&bytes).map_err(Error::Malformed)
+    }
+
     fn get(&self, path: &str) -> Result<Value> {
+        json(&self.get_bytes(path, None, MAX_RESPONSE_BYTES)?)
+    }
+
+    /// The answer to `GET path`, of the chain at `chain_path` if given; one
+    /// over `limit` bytes is refused.
+    fn get_bytes(&self, path: &str, chain_path: Option<&[String]>, limit: u64) -> Result<Vec<u8>> {
         self.authorized(|authorization| {
-            let request = self.bounded(self.agent.get(&format!("{}{path}", self.base)))?;
-            read(authorize(request, authorization).call())
+            let mut request = self.bounded(self.agent.get(&format!("{}{path}", self.base)))?;
+            if let Some(chain_path) = chain_path {
+                request = request.query("chainPath", &chain_path.join("/"));
+            }
+            read_bytes(authorize(request, authorization).call(), limit)
         })
     }
 
     /// `request`'s answer under the cookie held, the cookie file's read
     /// first if it holds none; on a 401, under the cookie file's, read
     /// again, if this client has one.
-    fn authorized(&self, request: impl Fn(&str) -> Result<Value>) -> Result<Value> {
+    fn authorized<T>(&self, request: impl Fn(&str) -> Result<T>) -> Result<T> {
         let mut held = self.authorization.lock().expect("not poisoned").clone();
         if held.is_empty() && self.cookie.is_some() {
             held = self.read_cookie()?;
@@ -394,6 +433,21 @@ fn cid_path(text: &str) -> Result<&str> {
 
 #[cfg(feature = "native")]
 fn read(response: std::result::Result<ureq::Response, ureq::Error>) -> Result<Value> {
+    json(&read_bytes(response, MAX_RESPONSE_BYTES)?)
+}
+
+#[cfg(feature = "native")]
+fn json(bytes: &[u8]) -> Result<Value> {
+    serde_json::from_slice(bytes).map_err(|e| Error::Malformed(e.to_string()))
+}
+
+/// A 2xx answer's bytes, at most `limit` of them; any other status is an
+/// error naming the answer.
+#[cfg(feature = "native")]
+fn read_bytes(
+    response: std::result::Result<ureq::Response, ureq::Error>,
+    limit: u64,
+) -> Result<Vec<u8>> {
     let (status, response) = match response {
         Ok(response) => (None, response),
         Err(ureq::Error::Status(status, response)) => (Some(status), response),
@@ -402,18 +456,18 @@ fn read(response: std::result::Result<ureq::Response, ureq::Error>) -> Result<Va
     let mut bytes = Vec::new();
     response
         .into_reader()
-        .take(MAX_RESPONSE_BYTES + 1)
+        .take(limit + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| Error::Transport(e.to_string()))?;
-    if bytes.len() as u64 > MAX_RESPONSE_BYTES {
-        return Err(Error::Malformed("answer over 1 MiB".into()));
+    if bytes.len() as u64 > limit {
+        return Err(Error::Malformed(format!("answer over {limit} bytes")));
     }
     match status {
         Some(status) => Err(Error::Status {
             status,
             body: String::from_utf8_lossy(&bytes).into(),
         }),
-        None => serde_json::from_slice(&bytes).map_err(|e| Error::Malformed(e.to_string())),
+        None => Ok(bytes),
     }
 }
 
@@ -422,7 +476,9 @@ fn read(response: std::result::Result<ureq::Response, ureq::Error>) -> Result<Va
 /// Each takes a route's JSON and fails, naming what is wrong, on one that
 /// is not as the node writes it.
 pub mod parse {
-    use super::{Account, AccountAction, Health, Inclusion, TransactionBody, TransactionStatus};
+    use super::{
+        Account, AccountAction, BTreeMap, Health, Inclusion, TransactionBody, TransactionStatus,
+    };
     use serde_json::Value;
 
     /// `GET /health`.
@@ -534,6 +590,35 @@ pub mod parse {
         decimal(json, "minRelayFee")
     }
 
+    /// `GET /volumes/:cid`: a complete Volume archive as lattice-node frames
+    /// it, big-endian: a `u16` count of nodes, then each node's `u16` CID
+    /// length, CID, `u32` length and bytes.
+    pub fn volume(archive: &[u8]) -> Result<BTreeMap<String, Vec<u8>>, String> {
+        fn take<'a>(rest: &mut &'a [u8], n: usize) -> Result<&'a [u8], String> {
+            if rest.len() < n {
+                return Err("a Volume archive cut short".into());
+            }
+            let (head, tail) = rest.split_at(n);
+            *rest = tail;
+            Ok(head)
+        }
+        let rest = &mut &archive[..];
+        let count = u16::from_be_bytes(take(rest, 2)?.try_into().unwrap());
+        let mut nodes = BTreeMap::new();
+        for _ in 0..count {
+            let length = u16::from_be_bytes(take(rest, 2)?.try_into().unwrap());
+            let cid = std::str::from_utf8(take(rest, length.into())?)
+                .map_err(|_| "a Volume archive's CID is not UTF-8".to_string())?;
+            let length = u32::from_be_bytes(take(rest, 4)?.try_into().unwrap());
+            let bytes = take(rest, length as usize)?;
+            nodes.insert(cid.to_string(), bytes.to_vec());
+        }
+        if !rest.is_empty() {
+            return Err("bytes after a Volume archive".into());
+        }
+        Ok(nodes)
+    }
+
     /// `GET /api/state/account/:address`, or `/accounts/:address?block=`.
     pub fn account(json: &Value) -> Result<Account, String> {
         Ok(Account {
@@ -582,6 +667,7 @@ pub mod parse {
         Ok(TransactionStatus {
             body: TransactionBody {
                 account_actions,
+                actions: Vec::new(),
                 signers: strings("signers")?,
                 nonce: decimal(json, "nonce")?,
                 chain_path: strings("chainPath")?,
@@ -677,6 +763,27 @@ mod tests {
             }
         });
         (url, counts)
+    }
+
+    #[test]
+    fn a_volume_archive_is_read_whole() {
+        let archive = [
+            &[0, 2][..],
+            &[0, 2],
+            b"ba",
+            &[0, 0, 0, 2, 7, 8],
+            &[0, 2],
+            b"bc",
+            &[0, 0, 0, 0],
+        ]
+        .concat();
+        let nodes = parse::volume(&archive).unwrap();
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes["ba"], [7, 8]);
+        assert_eq!(nodes["bc"], [] as [u8; 0]);
+        assert!(parse::volume(&archive[..archive.len() - 1]).is_err());
+        assert!(parse::volume(&[archive.as_slice(), &[0]].concat()).is_err());
+        assert!(parse::volume(&[]).is_err());
     }
 
     /// A public read port's `/health` is a snapshot that may lag: a public

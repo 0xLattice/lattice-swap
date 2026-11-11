@@ -1,0 +1,167 @@
+{
+  "version": 1,
+  "vectors": [
+    {
+      "name": "relay-dir/list",
+      "privateKey": "f8c32905a7f69b9fe7fb4e477fec229fea61b4e09a99cdbc71cde16862e5497d",
+      "fee": 0,
+      "nonce": 0,
+      "chainPath": [
+        "Nexus",
+        "testnet",
+        "swap-relays"
+      ],
+      "actions": [
+        {
+          "key": "relay/bafyreifrbp6x4ncfbqakwfcwfqkl7qhbsdeygsakjxixekwkdprbomyut4",
+          "newValue": "https://relay.example"
+        }
+      ],
+      "dagCborHex": "a8656e6f6e63650067616374696f6e7381a2636b6579784172656c61792f62616679726569667262703678346e63666271616b7766637766716b6c37716862736465796773616b6a786978656b776b647072626f6d79757434686e657756616c75657568747470733a2f2f72656c61792e6578616d706c65677369676e65727381783b62616679726569667262703678346e63666271616b7766637766716b6c37716862736465796773616b6a786978656b776b647072626f6d7975743469636861696e5061746883654e6578757367746573746e65746b737761702d72656c6179736e6163636f756e74416374696f6e73806e6465706f736974416374696f6e73806e72656365697074416374696f6e7380717769746864726177616c416374696f6e7380",
+      "cid": "bafyreihnwxkhvgvrmq7coc4ghwha4xbq3b5ehztz6am4mkfvnoj7cuzldm",
+      "publicKey": "ed015004e0740735ce0a343d5b374b5f2d833534aa3363722c56d8ec38965f70515b",
+      "signature": "dced6d00647a51b1a0ff33724b5279a0cc483f223a7bdc47911eda8f80fb1c691ab80a3d575e7c166c10260fa87f3e2ef6103156b2c60ddb1dad67ab8b955d09",
+      "transactionCID": "bafyreiefsokx4izmzpd33jlog6ey2fhfh2xbe3r5fz4u4cuw43xddak75e",
+      "payload": {
+        "transaction": {
+          "signatures": {
+            "ed015004e0740735ce0a343d5b374b5f2d833534aa3363722c56d8ec38965f70515b": "dced6d00647a51b1a0ff33724b5279a0cc483f223a7bdc47911eda8f80fb1c691ab80a3d575e7c166c10260fa87f3e2ef6103156b2c60ddb1dad67ab8b955d09"
+          },
+          "body": {
+            "accountActions": [],
+            "actions": [
+              {
+                "key": "relay/bafyreifrbp6x4ncfbqakwfcwfqkl7qhbsdeygsakjxixekwkdprbomyut4",
+                "newValue": "https://relay.example"
+              }
+            ],
+            "depositActions": [],
+            "receiptActions": [],
+            "withdrawalActions": [],
+            "signers": [
+              "bafyreifrbp6x4ncfbqakwfcwfqkl7qhbsdeygsakjxixekwkdprbomyut4"
+            ],
+            "nonce": "0",
+            "chainPath": [
+              "Nexus",
+              "testnet",
+              "swap-relays"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "relay-dir/replace",
+      "privateKey": "f8c32905a7f69b9fe7fb4e477fec229fea61b4e09a99cdbc71cde16862e5497d",
+      "fee": 10,
+      "nonce": 7,
+      "chainPath": [
+        "Nexus",
+        "testnet",
+        "swap-relays"
+      ],
+      "actions": [
+        {
+          "key": "relay/bafyreifrbp6x4ncfbqakwfcwfqkl7qhbsdeygsakjxixekwkdprbomyut4",
+          "oldValue": "https://relay.example",
+          "newValue": "https://other.example/swap"
+        }
+      ],
+      "dagCborHex": "a8656e6f6e63650767616374696f6e7381a3636b6579784172656c61792f62616679726569667262703678346e63666271616b7766637766716b6c37716862736465796773616b6a786978656b776b647072626f6d79757434686e657756616c7565781a68747470733a2f2f6f746865722e6578616d706c652f73776170686f6c6456616c75657568747470733a2f2f72656c61792e6578616d706c65677369676e65727381783b62616679726569667262703678346e63666271616b7766637766716b6c37716862736465796773616b6a786978656b776b647072626f6d7975743469636861696e5061746883654e6578757367746573746e65746b737761702d72656c6179736e6163636f756e74416374696f6e7381a26564656c746129656f776e6572783b62616679726569667262703678346e63666271616b7766637766716b6c37716862736465796773616b6a786978656b776b647072626f6d797574346e6465706f736974416374696f6e73806e72656365697074416374696f6e7380717769746864726177616c416374696f6e7380",
+      "cid": "bafyreichyweawjsoerlekp2a4enibch52yowwaqtpplvt4rhzrqmp63vf4",
+      "publicKey": "ed015004e0740735ce0a343d5b374b5f2d833534aa3363722c56d8ec38965f70515b",
+      "signature": "9510049e7a41128a3ac6e61f9ea67a37526cd1e545931be69e9567c7921ad929c583e9a8c61400840445327d95c2cdca22ff05b47c16885c2752135fb7774601",
+      "transactionCID": "bafyreihc65lib3gj223xtmkrg55qmjnf5mmfqf534zmro2own5k3czrd6q",
+      "payload": {
+        "transaction": {
+          "signatures": {
+            "ed015004e0740735ce0a343d5b374b5f2d833534aa3363722c56d8ec38965f70515b": "9510049e7a41128a3ac6e61f9ea67a37526cd1e545931be69e9567c7921ad929c583e9a8c61400840445327d95c2cdca22ff05b47c16885c2752135fb7774601"
+          },
+          "body": {
+            "accountActions": [
+              {
+                "owner": "bafyreifrbp6x4ncfbqakwfcwfqkl7qhbsdeygsakjxixekwkdprbomyut4",
+                "delta": "-10"
+              }
+            ],
+            "actions": [
+              {
+                "key": "relay/bafyreifrbp6x4ncfbqakwfcwfqkl7qhbsdeygsakjxixekwkdprbomyut4",
+                "oldValue": "https://relay.example",
+                "newValue": "https://other.example/swap"
+              }
+            ],
+            "depositActions": [],
+            "receiptActions": [],
+            "withdrawalActions": [],
+            "signers": [
+              "bafyreifrbp6x4ncfbqakwfcwfqkl7qhbsdeygsakjxixekwkdprbomyut4"
+            ],
+            "nonce": "7",
+            "chainPath": [
+              "Nexus",
+              "testnet",
+              "swap-relays"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "relay-dir/remove",
+      "privateKey": "f8c32905a7f69b9fe7fb4e477fec229fea61b4e09a99cdbc71cde16862e5497d",
+      "fee": 300,
+      "nonce": 1000,
+      "chainPath": [
+        "Nexus",
+        "testnet",
+        "swap-relays"
+      ],
+      "actions": [
+        {
+          "key": "relay/bafyreifrbp6x4ncfbqakwfcwfqkl7qhbsdeygsakjxixekwkdprbomyut4",
+          "oldValue": "https://other.example/swap"
+        }
+      ],
+      "dagCborHex": "a8656e6f6e63651903e867616374696f6e7381a2636b6579784172656c61792f62616679726569667262703678346e63666271616b7766637766716b6c37716862736465796773616b6a786978656b776b647072626f6d79757434686f6c6456616c7565781a68747470733a2f2f6f746865722e6578616d706c652f73776170677369676e65727381783b62616679726569667262703678346e63666271616b7766637766716b6c37716862736465796773616b6a786978656b776b647072626f6d7975743469636861696e5061746883654e6578757367746573746e65746b737761702d72656c6179736e6163636f756e74416374696f6e7381a26564656c746139012b656f776e6572783b62616679726569667262703678346e63666271616b7766637766716b6c37716862736465796773616b6a786978656b776b647072626f6d797574346e6465706f736974416374696f6e73806e72656365697074416374696f6e7380717769746864726177616c416374696f6e7380",
+      "cid": "bafyreifxtm2rmeqmc2p4qpk4blrmrpoecfahcvjr7kzrl2mfyl6z6rg42a",
+      "publicKey": "ed015004e0740735ce0a343d5b374b5f2d833534aa3363722c56d8ec38965f70515b",
+      "signature": "c5856f515b88d8b366d277dc45aa7c57cbe17dc464a00129a4c791f74bfde2e366177acdaa5fd81b34c423e3cd05638bfb1400168c824b2b5a6eda529ef28e09",
+      "transactionCID": "bafyreifdzt3cjhcv4ty6c74afvf4txzspvpa2dl4wqeqq7dy4nifp5rmua",
+      "payload": {
+        "transaction": {
+          "signatures": {
+            "ed015004e0740735ce0a343d5b374b5f2d833534aa3363722c56d8ec38965f70515b": "c5856f515b88d8b366d277dc45aa7c57cbe17dc464a00129a4c791f74bfde2e366177acdaa5fd81b34c423e3cd05638bfb1400168c824b2b5a6eda529ef28e09"
+          },
+          "body": {
+            "accountActions": [
+              {
+                "owner": "bafyreifrbp6x4ncfbqakwfcwfqkl7qhbsdeygsakjxixekwkdprbomyut4",
+                "delta": "-300"
+              }
+            ],
+            "actions": [
+              {
+                "key": "relay/bafyreifrbp6x4ncfbqakwfcwfqkl7qhbsdeygsakjxixekwkdprbomyut4",
+                "oldValue": "https://other.example/swap"
+              }
+            ],
+            "depositActions": [],
+            "receiptActions": [],
+            "withdrawalActions": [],
+            "signers": [
+              "bafyreifrbp6x4ncfbqakwfcwfqkl7qhbsdeygsakjxixekwkdprbomyut4"
+            ],
+            "nonce": "1000",
+            "chainPath": [
+              "Nexus",
+              "testnet",
+              "swap-relays"
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

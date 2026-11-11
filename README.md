@@ -22,8 +22,9 @@ no Nexus consensus change is required.
   through the punish leaf in a shape no refund can replace, and contesting
   it is best effort.
 - `swap-nexus`: the joint key, `(s + b)·G`, and Ed25519 signing with it.
-- `swap-nexus-tx`: Nexus transfers encoded and signed exactly as Lattice
-  54.2.1 does, checked against Lattice's conformance vectors, and a small
+- `swap-nexus-tx`: Nexus transfers, and general-state writes on any chain
+  of the tree, encoded and signed exactly as Lattice 54.2.1 does, checked
+  against Lattice's conformance vectors, and a small
   client for a lattice-node's RPC. Its node test is ignored by default; run
   it with `NEXUS_NODE_IMAGE` naming a lattice-node image and `-- --ignored`,
   where Docker can share the host's network.
@@ -416,6 +417,44 @@ both meet there again whenever their session is lost: on the relay the
 buyer took it on. The relay holds
 nothing of the swap: a buyer that gives up must itself be online, with
 `resume`, to refund between cancel and `t2`.
+
+### Listing a relay on the relay directory
+
+The relay directory is a child chain, `Nexus/testnet/swap-relays` for now,
+where each relay's operator lists its URL under `relay/<account>`, for
+takers to find. Its policy lets only `<account>` write that key, so one
+account lists one relay. An operator lists, or moves, its relay with
+`relay-dir add` and unlists it with `relay-dir remove`:
+
+```sh
+lattice-swap relay-dir add --url https://relay.example --key relay.key \
+  --nexus-cookie ~/.lattice/.cookie --nexus-url http://127.0.0.1:8080
+lattice-swap relay-dir remove --key relay.key \
+  --nexus-cookie ~/.lattice/.cookie --nexus-url http://127.0.0.1:8080
+```
+
+`--key` is a file readable by its owner alone holding the account's
+Ed25519 seed in hex, as `--nex-key-file` does, or a key file
+`lattice key generate` writes. `--nexus-url` is required: the node, your own
+lattice-node with `--nexus-cookie` or a public read port that takes
+submits, must host the directory's chain (`--chain`,
+`Nexus/testnet/swap-relays` by default), and no default node is known to.
+Each command reads the account's entry at the chain's tip, as the node
+says it is, and writes it from that value, so `add` replaces a URL listed
+before; it sends nothing if the entry already holds what was asked. `add`
+refuses a URL readers skip: not `https://`, with user info, or to a literal
+name or address of this machine or a private network. The write pays
+`--fee`, 0 by default, from the account's balance on the directory's chain,
+at its nonce there (an account the chain has never seen has nonce 0 and no
+balance). A node whose relay floor (`minRelayFee`) is above `--fee` is
+refused, naming its floor: pass that as `--fee` to pay it. An account
+holding less than the fee there is refused too. So the account needs coins
+on the directory's chain, unless the node's relay floor is 0: this tool
+does not pay fees in work through a sponsor.
+It prints the transaction's CID and the fee paid once the node takes it.
+The entry changes only once a block holds the write, and the chain refuses
+it if the entry changed since it was read: a stale or false tip from the
+node makes the write fail, not land wrong.
 
 ## License
 

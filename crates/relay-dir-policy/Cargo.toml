@@ -14,6 +14,8 @@ lattice-policy-rules = { git = "https://github.com/adalinxx/moniker", rev = "b5f
 [dev-dependencies]
 # Encodes the transaction bodies the tests feed the policy.
 ciborium = "0.2"
+# Builds the writes `lattice-swap relay-dir` sends.
+swap-nexus-tx = { path = "../swap-nexus-tx", default-features = false }
 
 # Its own workspace, out of the swap's: the module is built small, and these
 # settings would otherwise apply to every crate's release build.

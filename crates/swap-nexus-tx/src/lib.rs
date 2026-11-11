@@ -3,8 +3,8 @@
 //!
 //! Encoding, addresses and signing match Lattice 54.2.1 (cashew 5.0.3 DAG-CBOR)
 //! byte for byte; `tests/vectors` holds Lattice's own conformance vectors.
-//! Only account actions (transfers) are built here: the body's other action
-//! lists are always empty.
+//! Only account actions (transfers) and general-state actions (writes) are
+//! built here: the body's other action lists are always empty.
 
 mod cbor;
 pub mod rpc;
@@ -77,10 +77,41 @@ pub struct AccountAction {
     pub delta: i64,
 }
 
-/// A `TransactionBody` whose only actions are account actions.
+/// One general-state change: `key` from `old_value` to `new_value`, `None`
+/// meaning absent. Lattice refuses it unless `old_value` is the key's value
+/// where it executes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Action {
+    pub key: String,
+    pub old_value: Option<String>,
+    pub new_value: Option<String>,
+}
+
+/// The key family of the relay directory, a child chain relays list
+/// themselves on: `relay/<account>`, which only `<account>` writes.
+pub const RELAY_DIR_PREFIX: &str = "relay/";
+
+/// The write that takes `account`'s entry on the relay directory from
+/// `current` to `url`, `None` meaning none; `None` if it holds that already.
+pub fn relay_dir_action(
+    account: &str,
+    current: Option<String>,
+    url: Option<String>,
+) -> Option<Action> {
+    (current != url).then(|| Action {
+        key: format!("{RELAY_DIR_PREFIX}{account}"),
+        old_value: current,
+        new_value: url,
+    })
+}
+
+/// A `TransactionBody` whose only actions are account and general-state
+/// actions.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransactionBody {
     pub account_actions: Vec<AccountAction>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<Action>,
     /// Addresses whose keys sign; every debited owner must be one.
     pub signers: Vec<String>,
     /// The first signer's next nonce.
@@ -109,9 +140,39 @@ impl TransactionBody {
                     delta: debit - fee as i64,
                 },
             ],
+            actions: Vec::new(),
             signers: vec![from.into()],
             nonce,
             chain_path: vec!["Nexus".into()],
+        })
+    }
+
+    /// Writes `actions` on the chain at `chain_path`, signed by `signer`,
+    /// who leaves `fee` to the miner as a debit nothing credits, or no
+    /// account action at all if it is 0: the body Lattice's `lattice tx`
+    /// and Selfhold's `recordsBody` build. `None` if the fee does not fit an
+    /// `i64`.
+    pub fn write(
+        signer: &str,
+        actions: Vec<Action>,
+        fee: u64,
+        nonce: u64,
+        chain_path: Vec<String>,
+    ) -> Option<Self> {
+        let debit = i64::try_from(fee).ok()?;
+        let account_actions = (fee > 0)
+            .then(|| AccountAction {
+                owner: signer.into(),
+                delta: -debit,
+            })
+            .into_iter()
+            .collect();
+        Some(Self {
+            account_actions,
+            actions,
+            signers: vec![signer.into()],
+            nonce,
+            chain_path,
         })
     }
 
@@ -129,9 +190,24 @@ impl TransactionBody {
                 ])
             })
             .collect();
+        // An absent value is left out, as Swift's `Codable` leaves out a nil.
+        let actions = self
+            .actions
+            .iter()
+            .map(|action| {
+                let mut entries = vec![("key", Value::Text(action.key.clone()))];
+                for (name, value) in [
+                    ("oldValue", &action.old_value),
+                    ("newValue", &action.new_value),
+                ] {
+                    entries.extend(value.clone().map(|value| (name, Value::Text(value))));
+                }
+                Value::Map(entries)
+            })
+            .collect();
         Value::Map(vec![
             ("accountActions", Value::Array(account_actions)),
-            ("actions", empty()),
+            ("actions", Value::Array(actions)),
             ("depositActions", empty()),
             ("receiptActions", empty()),
             ("withdrawalActions", empty()),
@@ -178,9 +254,23 @@ impl TransactionBody {
             .iter()
             .map(|a| serde_json::json!({"owner": a.owner, "delta": a.delta.to_string()}))
             .collect();
+        let actions: Vec<_> = self
+            .actions
+            .iter()
+            .map(|a| {
+                let mut action = serde_json::json!({"key": a.key});
+                if let Some(old) = &a.old_value {
+                    action["oldValue"] = old.as_str().into();
+                }
+                if let Some(new) = &a.new_value {
+                    action["newValue"] = new.as_str().into();
+                }
+                action
+            })
+            .collect();
         serde_json::json!({
             "accountActions": account_actions,
-            "actions": [],
+            "actions": actions,
             "depositActions": [],
             "receiptActions": [],
             "withdrawalActions": [],
@@ -415,6 +505,30 @@ mod tests {
         let mut transaction = Transaction::new(body);
         transaction.sign_joint(&joint);
         assert!(transaction.verify());
+    }
+
+    #[test]
+    fn a_write_pays_its_fee_as_a_debit_and_leaves_absent_values_out() {
+        let action = |old: Option<&str>, new: Option<&str>| Action {
+            key: "k".into(),
+            old_value: old.map(String::from),
+            new_value: new.map(String::from),
+        };
+        let path = vec!["Nexus".into(), "child".into()];
+        let body =
+            TransactionBody::write("a", vec![action(None, Some("v"))], 0, 2, path.clone()).unwrap();
+        assert!(body.account_actions.is_empty(), "no fee, no account action");
+        let body = TransactionBody::write("a", vec![action(Some("v"), None)], 9, 2, path).unwrap();
+        let deltas: Vec<i64> = body.account_actions.iter().map(|a| a.delta).collect();
+        assert_eq!(deltas, [-9]);
+        assert_eq!(body.signers, ["a"]);
+        let wire = body.to_wire_json();
+        assert_eq!(
+            wire["actions"],
+            serde_json::json!([{"key": "k", "oldValue": "v"}])
+        );
+        assert_eq!(wire["chainPath"], serde_json::json!(["Nexus", "child"]));
+        assert!(TransactionBody::write("a", vec![], u64::MAX, 0, vec![]).is_none());
     }
 
     #[test]
