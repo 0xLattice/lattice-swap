@@ -668,9 +668,11 @@ struct OfferArgs {
     advertise: Option<SocketAddr>,
     /// A relay, by its http:// or https:// URL, to list the offer on and
     /// meet the buyer through, instead of listening. Anyone can list the
-    /// relay's offers and take one.
+    /// relay's offers and take one. Give it again to list on several: the
+    /// buyer that takes the offer on one withdraws it from the others, and
+    /// the offer printed names the first.
     #[arg(long, conflicts_with_all = ["listen", "advertise"])]
-    relay: Option<String>,
+    relay: Vec<String>,
     /// Seconds to wait for the buyer to dial.
     #[arg(long, default_value_t = 600)]
     wait: u64,
@@ -898,7 +900,7 @@ fn offer(args: OfferArgs) -> Result<Outcome> {
     let store = Store::new(&args.dir, swap_id);
 
     let listener = args.listen.map(TcpListener::bind).transpose()?;
-    let place = match (&listener, &args.relay) {
+    let place = match (&listener, args.relay.first()) {
         (_, Some(relay)) => Place::Relay(relay.clone()),
         (Some(listener), None) => Place::Address(args.advertise.unwrap_or(listener.local_addr()?)),
         (None, None) => return Err("give --listen or --relay".into()),
@@ -933,22 +935,31 @@ fn offer(args: OfferArgs) -> Result<Outcome> {
         Seller::new(terms, key.nex_address(), redeem, punish)
             .map_err(|refusal| format!("refused: {refusal:?}"))
     };
-    let rejoin = SessionFile {
+    let mut rejoin = SessionFile {
         listen: listener.as_ref().map(TcpListener::local_addr).transpose()?,
         offer: offer.clone(),
         key: Some(hex::encode(session.to_bytes())),
     };
-    match (listener, &args.relay) {
-        (_, Some(relay)) => {
+    match (listener, args.relay.is_empty()) {
+        (_, false) => {
             log(&format!(
-                "listing the offer on {relay}, waiting for the buyer"
+                "listing the offer on {}, waiting for the buyer",
+                args.relay.join(", ")
             ));
-            let mut transport =
-                Ivy::accept_relayed(relay, &offer.encode(), &config, buyer, wait, TIMEOUT)?;
+            let offers = listed_on(&offer, &args.relay);
+            let encoded: Vec<String> = offers.iter().map(Offer::encode).collect();
+            let listings: Vec<(&str, &str)> = (args.relay.iter().map(String::as_str))
+                .zip(encoded.iter().map(String::as_str))
+                .collect();
+            let (taken, mut transport) =
+                Ivy::accept_relayed_on(&listings, &config, buyer, wait, TIMEOUT)?;
+            // The two meet again on the relay the buyer took it on, the
+            // only one its offer names.
+            rejoin.offer = offers[taken].clone();
             let terms = answer_request(&mut transport, &offer)?;
             start.run(seller(terms)?, vec![], Box::new(transport), rejoin, None)
         }
-        (Some(listener), None) => {
+        (Some(listener), true) => {
             log("waiting for the buyer");
             let kept = listener.try_clone()?;
             let mut transport = Ivy::accept(listener, &config, buyer, wait, TIMEOUT)?;
@@ -961,8 +972,22 @@ fn offer(args: OfferArgs) -> Result<Outcome> {
                 Some(kept),
             )
         }
-        (None, None) => unreachable!("a place was found"),
+        (None, true) => unreachable!("a place was found"),
     }
+}
+
+/// `offer` as listed on each of `relays`, naming it: one swap, one swap id
+/// and one set of keys, and only the relay differs, which the seller does
+/// not sign, so each copy verifies. A buyer takes the copy on the relay it
+/// reads, and reaches the seller, and meets it again, there.
+fn listed_on(offer: &Offer, relays: &[String]) -> Vec<Offer> {
+    relays
+        .iter()
+        .map(|relay| Offer {
+            relay: Some(relay.clone()),
+            ..offer.clone()
+        })
+        .collect()
 }
 
 /// The terms the seller of `offer` fixes at the buyer's request, which

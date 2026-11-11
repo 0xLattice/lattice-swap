@@ -155,6 +155,92 @@ fn a_seller_that_goes_frees_its_slot() {
     }
 }
 
+/// A seller, key 1, listing `offer` on every relay of `urls` and waiting
+/// for the buyer of key 2: which relay it came through, and the session.
+fn seller_on(
+    urls: &[&str],
+    offer: String,
+) -> thread::JoinHandle<io::Result<(usize, Ivy<Relayed>)>> {
+    let urls: Vec<String> = urls.iter().map(|url| url.to_string()).collect();
+    thread::spawn(move || {
+        let listings: Vec<(&str, &str)> = urls.iter().map(|url| (&url[..], &offer[..])).collect();
+        Ivy::accept_relayed_on(&listings, &config(1), key(2), TIMEOUT, TIMEOUT)
+    })
+}
+
+/// A seller listed on two relays is taken on one, and its offer leaves the
+/// other at once: a second buyer finds nothing there, so the seller is
+/// never taken twice for its one swap.
+#[test]
+fn a_seller_taken_on_one_relay_leaves_the_other() {
+    let (a, b) = (relay(10), relay(10));
+    let seller = seller_on(&[&a, &b], offer(&id(11)));
+    wait_listed(&a, 1);
+    wait_listed(&b, 1);
+
+    let mut buyer = Ivy::connect_relayed(&b, &id(11), &config(2), key(1), TIMEOUT).unwrap();
+    let (taken, mut seller) = seller.join().unwrap().unwrap();
+    assert_eq!(taken, 1, "through the second relay");
+    wait_listed(&a, 0);
+    let again = Ivy::connect_relayed(&a, &id(11), &config(2), key(1), TIMEOUT).err();
+    assert_eq!(again.map(|e| e.kind()), Some(io::ErrorKind::NotFound));
+
+    buyer.send(b"request").unwrap();
+    assert_eq!(seller.recv(TIMEOUT).unwrap().unwrap(), b"request");
+}
+
+/// A stranger that takes the offer on one relay fails the handshake: the
+/// seller lists it on both again, and the buyer gets through either.
+#[test]
+fn a_seller_lists_on_every_relay_again_past_a_stranger() {
+    let (a, b) = (relay(10), relay(10));
+    let seller = seller_on(&[&a, &b], offer(&id(12)));
+    wait_listed(&a, 1);
+    wait_listed(&b, 1);
+    let stranger = Ivy::connect_relayed(&a, &id(12), &config(3), key(1), TIMEOUT);
+    assert!(stranger.is_err());
+    wait_listed(&a, 1);
+    wait_listed(&b, 1);
+    let mut buyer = Ivy::connect_relayed(&a, &id(12), &config(2), key(1), TIMEOUT).unwrap();
+    let (taken, mut seller) = seller.join().unwrap().unwrap();
+    assert_eq!(taken, 0);
+    wait_listed(&b, 0);
+    seller.send(b"terms").unwrap();
+    assert_eq!(buyer.recv(TIMEOUT).unwrap().unwrap(), b"terms");
+}
+
+/// A relay that is down, or that refuses the offer, is passed over: the
+/// seller stays listed on the one that takes it, and its buyer gets
+/// through. Only when every relay fails does the seller.
+#[test]
+fn a_relay_down_or_refusing_leaves_the_others_listed() {
+    // Nothing listens there.
+    let down = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}", listener.local_addr().unwrap())
+    };
+    let (full, up) = (relay(1), relay(10));
+    let _holder = seller(&full, offer(&id(13)));
+    wait_listed(&full, 1);
+
+    let seller = seller_on(&[&down, &full, &up], offer(&id(14)));
+    wait_listed(&up, 1);
+    assert_eq!(offers(&full).len(), 1, "refused: the board is full");
+    let mut buyer = Ivy::connect_relayed(&up, &id(14), &config(2), key(1), TIMEOUT).unwrap();
+    let (taken, mut seller) = seller.join().unwrap().unwrap();
+    assert_eq!(taken, 2);
+    seller.send(b"terms").unwrap();
+    assert_eq!(buyer.recv(TIMEOUT).unwrap().unwrap(), b"terms");
+
+    let listings = [
+        (&down[..], &offer(&id(15))[..]),
+        (&full[..], &offer(&id(15))[..]),
+    ];
+    let failed = Ivy::accept_relayed_on(&listings, &config(1), key(2), TIMEOUT, TIMEOUT);
+    let failed = failed.err().unwrap().to_string();
+    assert!(failed.contains("full"), "the last to fail: {failed}");
+}
+
 /// The seller, key 1, waiting at rendezvous `id` for the buyer of key 2.
 fn rejoining_seller(url: &str, id: [u8; 32]) -> thread::JoinHandle<io::Result<Ivy<Relayed>>> {
     let url = url.to_string();

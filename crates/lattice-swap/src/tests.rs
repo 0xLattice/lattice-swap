@@ -231,6 +231,31 @@ fn an_offer_whose_terms_are_changed_is_refused() {
     Offer::decode(&offer.encode()).unwrap();
 }
 
+/// One offer listed on several relays: each copy names its own relay and
+/// still verifies, on the one swap id and keys, so whichever a buyer takes
+/// reaches the same seller, through the relay it read it on.
+#[test]
+fn an_offer_listed_on_several_relays_names_each() {
+    let key = SigningKey::from_bytes(&[1; 32]);
+    let relays = ["http://a.example".to_string(), "http://b.example".into()];
+    let offer = offer_of(
+        &small_args(16),
+        Network::Bitcoin,
+        Place::Relay(relays[0].clone()),
+        &key,
+    );
+    let copies = listed_on(&offer, &relays);
+    assert_eq!(copies.len(), 2);
+    for (copy, relay) in copies.iter().zip(&relays) {
+        let decoded = Offer::decode(&copy.encode()).unwrap();
+        assert!(matches!(decoded.place(), Ok(Place::Relay(at)) if at == *relay));
+        assert_eq!(decoded.template, offer.template);
+        assert_eq!(decoded.seller, offer.seller);
+        assert_eq!(decoded.buyer_session, offer.buyer_session);
+    }
+    assert_eq!(listed_on(&offer, &relays[..1]), [offer]);
+}
+
 #[test]
 fn an_offer_names_an_address_or_a_relay() {
     let key = SigningKey::from_bytes(&[1; 32]);
@@ -246,7 +271,7 @@ fn an_offer_names_an_address_or_a_relay() {
 fn offer_listens_or_uses_a_relay() {
     let relay = ["--relay", "http://127.0.0.1:1"];
     let args = offer_args(&[]);
-    assert!(args.listen.is_some() && args.relay.is_none());
+    assert!(args.listen.is_some() && args.relay.is_empty());
     let base: Vec<&str> = [
         "offer",
         "--price",
@@ -265,7 +290,14 @@ fn offer_listens_or_uses_a_relay() {
     let Command::Offer(args) = with(&relay).unwrap().command else {
         panic!("an offer");
     };
-    assert_eq!(args.relay.as_deref(), Some("http://127.0.0.1:1"));
+    assert_eq!(args.relay, ["http://127.0.0.1:1"]);
+    let Command::Offer(args) = with(&[&relay[..], &["--relay", "http://127.0.0.1:2"]].concat())
+        .unwrap()
+        .command
+    else {
+        panic!("an offer");
+    };
+    assert_eq!(args.relay, ["http://127.0.0.1:1", "http://127.0.0.1:2"]);
     assert!(with(&[]).is_err(), "neither");
     assert!(with(&[&relay[..], &["--listen", "127.0.0.1:0"]].concat()).is_err());
     assert!(with(&[&relay[..], &["--advertise", "192.0.2.1:7000"]].concat()).is_err());
