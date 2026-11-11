@@ -33,8 +33,11 @@
 //! is skipped unless its account is an address and its value an `https://`
 //! URL with no user info, whose host is not a literal name or address of
 //! this machine or a private network (a name may still resolve to one).
-//! Under [`PREFIX`], a malformed entry or child is skipped, not refused, so
-//! one cannot blank the list.
+//! Under [`PREFIX`], a malformed entry or child is skipped, not refused. A
+//! linked node no host serves, bytes that are not DAG-CBOR or a node over the
+//! caps still fail the whole listing: no honest directory chain holds one,
+//! and the block's author decides its content anyway, so a caller that gets
+//! no list falls back to relays of its own.
 
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr};
@@ -65,18 +68,20 @@ pub const MAX_NODE_BYTES: usize = 32 * 1024;
 /// character that follows it, and an address is base32: 32 at most.
 pub const MAX_CHILDREN: usize = 64;
 
-/// The most nodes a listing reads. In cashew's trie every node but the root
-/// has a nonempty prefix, so no path is deeper than the longest key, and a
-/// node with no value has at least two children, so a subtree read whole
-/// has fewer such nodes than entries. Read in the order [`Listing::wants`]
-/// names them, by the time a listing stops, every node it read is an entry,
-/// a valueless node of a subtree read whole, or on the path to the node it
-/// reads next; the block and its state are two more. A trie of another
-/// shape, which only a hostile block holds, is cut off here.
-pub const MAX_NODES: usize = 2 * MAX_ENTRIES + MAX_KEY_BYTES + 2;
-
 /// The longest key a listing descends to: below it, a branch is not read.
 const MAX_PATH_BYTES: usize = PREFIX.len() + MAX_KEY_BYTES;
+
+/// The most nodes a listing reads. In cashew's trie every node but the root
+/// has a nonempty prefix, so a path below the root holds at most
+/// [`MAX_PATH_BYTES`] nodes the listing descends from, and one past them it
+/// reads but does not descend; and a node with no value has at least two
+/// children, so a subtree read whole has fewer such nodes than entries.
+/// Read in the order [`Listing::wants`] names them, depth-first, by the time
+/// a listing stops every node it read is an entry, a valueless node of a
+/// subtree read whole, or on the path to the node it reads next; the block,
+/// its state and the trie's root are three more. A trie of another shape,
+/// which only a hostile block holds, is cut off here.
+pub const MAX_NODES: usize = 2 * MAX_ENTRIES + MAX_PATH_BYTES + 1 + 3;
 
 /// A relay as its account lists it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -330,7 +335,8 @@ pub fn list(
     mut fetch: impl FnMut(&str) -> Result<Vec<u8>, String>,
 ) -> Result<Vec<Relay>, String> {
     let mut listing = Listing::new(commitment)?;
-    while let Some(cid) = listing.wants().into_iter().next() {
+    while let Some((cid, _)) = listing.pending.last() {
+        let cid = cid.clone();
         let bytes = fetch(&cid)?;
         listing.give(&cid, &bytes)?;
     }
