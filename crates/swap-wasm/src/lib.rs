@@ -15,7 +15,8 @@
 //! the seller over [`session::Ivy`], asking it for the terms at its amount
 //! ([`offer_terms`], [`check_answer`]), funds the lock from a key of its own
 //! ([`wallet`]), builds its Nexus view by [`nexus_view`], shows where it
-//! is by [`buyer_status`], and bumps its refund by CPFP ([`bump`]).
+//! is by [`buyer_status`], and bumps its refund by CPFP ([`bump`]). It
+//! finds relays on the relay directory chain by [`list_relays`].
 
 mod bump;
 mod session;
@@ -28,6 +29,7 @@ use ed25519_dalek::SigningKey;
 use rand_core::{OsRng, RngCore};
 use serde_json::{json, Value};
 use swap::offer::{self, Offer, Policy};
+use swap::relay_dir;
 use swap::view::{self, Lookups, Tip};
 use swap::wallet::Key;
 use swap::STATE_VERSION;
@@ -414,6 +416,34 @@ pub fn sign_nex(seed: &str, body: &str) -> Result<String> {
     let mut transaction = Transaction::new(body);
     transaction.sign(&SigningKey::from_bytes(&bytes));
     text(&transaction)
+}
+
+/// The relays the relay directory lists in the block `commitment` names:
+/// `child/<directory>`'s value on Nexus, `<block CID>@<parent state CID>`.
+/// A listing step, `{"state", "wants", "relays"}`: the page fetches the
+/// nodes `wants` names, by CID from any host, and hands each to
+/// [`give_relay_node`] with `state`; once `wants` is empty, `relays`
+/// (`[{"account", "url"}]`) is the list ([`swap::relay_dir`]).
+#[wasm_bindgen(js_name = listRelays)]
+pub fn list_relays(commitment: &str) -> Result<String> {
+    listed(&relay_dir::Listing::new(commitment)?)
+}
+
+/// Gives a listing's `state` the node `cid` names: a listing step, as
+/// [`list_relays`]. Refuses `bytes` that are not the ones `cid` names.
+#[wasm_bindgen(js_name = giveRelayNode)]
+pub fn give_relay_node(state: &str, cid: &str, bytes: &[u8]) -> Result<String> {
+    let mut listing: relay_dir::Listing = parse(state)?;
+    listing.give(cid, bytes)?;
+    listed(&listing)
+}
+
+fn listed(listing: &relay_dir::Listing) -> Result<String> {
+    text(&json!({
+        "state": listing,
+        "wants": listing.wants(),
+        "relays": listing.relays(),
+    }))
 }
 
 /// The offer in `text`, as the CLI's `take` reads one: it names where to

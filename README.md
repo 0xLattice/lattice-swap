@@ -36,6 +36,9 @@ no Nexus consensus change is required.
   Its end-to-end tests run whole swaps on regtest and a Nexus node; like the
   node test, they are ignored by default and need `NEXUS_NODE_IMAGE` and
   `-- --ignored`.
+  `swap::relay_dir` lists the relays on the relay directory chain from a
+  block Nexus commits, each node fetched by CID from any host and checked
+  against it.
 - `swap-wasm`: the machines built for a browser, with JSON in and out: no
   I/O, which the page does. `swap` and `swap-nexus-tx` keep their native I/O
   behind the default `native` feature, so without it they build for
