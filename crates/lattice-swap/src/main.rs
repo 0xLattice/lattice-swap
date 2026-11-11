@@ -655,16 +655,37 @@ fn owner_only(_: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A relay of the seller's own, run in this process for as long as it
+/// runs: `offer` lists on it beside any --relay, so a seller with a
+/// reachable address depends on no one else's relay for buyers to find it,
+/// and `resume` serves it again, so a buyer that took the offer there can
+/// meet the seller again there. Anyone can list offers on it too.
+#[derive(Args)]
+struct ServeRelayArgs {
+    /// Where to run the relay. Needs --serve-relay-url.
+    #[arg(long, requires = "serve_relay_url")]
+    serve_relay: Option<SocketAddr>,
+    /// The http:// or https:// URL buyers reach --serve-relay at, as
+    /// --advertise is the address they dial: the offer listed there names
+    /// it. Put TLS in front of the relay for https://.
+    #[arg(long, requires = "serve_relay")]
+    serve_relay_url: Option<String>,
+}
+
 #[derive(Args)]
 struct OfferArgs {
     #[command(flatten)]
     terms: TermsArgs,
     /// Where to listen for the buyer.
-    #[arg(long, required_unless_present_any = ["relay", "serve_relay"])]
+    #[arg(
+        long,
+        required_unless_present_any = ["relay", "serve_relay"],
+        conflicts_with = "serve_relay"
+    )]
     listen: Option<SocketAddr>,
     /// The address the buyer dials, if not the one listened on. Required
     /// when listening on an unspecified address, such as 0.0.0.0.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "serve_relay")]
     advertise: Option<SocketAddr>,
     /// A relay, by its http:// or https:// URL, to list the offer on and
     /// meet the buyer through, instead of listening. Anyone can list the
@@ -673,22 +694,8 @@ struct OfferArgs {
     /// the offer printed names the first.
     #[arg(long, conflicts_with_all = ["listen", "advertise"])]
     relay: Vec<String>,
-    /// Where to run a relay of this seller's own, in this process, for as
-    /// long as it runs, and list the offer on it beside any --relay: a
-    /// seller with a reachable address then depends on no one else's relay
-    /// for buyers to find it. Anyone can list offers on it too. Needs
-    /// --serve-relay-url.
-    #[arg(
-        long,
-        requires = "serve_relay_url",
-        conflicts_with_all = ["listen", "advertise"]
-    )]
-    serve_relay: Option<SocketAddr>,
-    /// The http:// or https:// URL buyers reach --serve-relay at, as
-    /// --advertise is the address they dial: the offer listed there names
-    /// it. Put TLS in front of the relay for https://.
-    #[arg(long, requires = "serve_relay")]
-    serve_relay_url: Option<String>,
+    #[command(flatten)]
+    serve: ServeRelayArgs,
     /// Seconds to wait for the buyer to dial.
     #[arg(long, default_value_t = 600)]
     wait: u64,
@@ -815,6 +822,8 @@ struct SwapFileArgs {
     /// The swap file, `<swap id>.json`.
     swap_file: PathBuf,
     #[command(flatten)]
+    serve: ServeRelayArgs,
+    #[command(flatten)]
     nodes: NodeArgs,
     #[command(flatten)]
     key: NexKeyArgs,
@@ -921,7 +930,7 @@ fn offer(args: OfferArgs) -> Result<Outcome> {
     let mut relays: Vec<(String, String)> = (args.relay.iter())
         .map(|relay| (relay.clone(), relay.clone()))
         .collect();
-    if let (Some(listen), Some(url)) = (args.serve_relay, &args.serve_relay_url) {
+    if let (Some(listen), Some(url)) = (args.serve.serve_relay, &args.serve.serve_relay_url) {
         relays.push((serve_relay(listen)?, url.clone()));
     }
     let named: Vec<String> = relays.iter().map(|(_, named)| named.clone()).collect();
@@ -1217,6 +1226,20 @@ fn resume(args: SwapFileArgs) -> Result<Outcome> {
             swap_file.display()
         )
         .into());
+    }
+    if let (Some(listen), Some(url)) = (args.serve.serve_relay, &args.serve.serve_relay_url) {
+        // A relay the two would not meet at would serve no one this swap.
+        let session = SessionFile::load(&store)?;
+        let relay = session.and_then(|session| session.offer.relay);
+        if relay.as_deref() != Some(url) {
+            return Err(format!(
+                "refused: {} meets the other party at {}, not {url}",
+                swap_file.display(),
+                relay.as_deref().unwrap_or("no relay")
+            )
+            .into());
+        }
+        serve_relay(listen)?;
     }
     match saved {
         Saved::Seller(seller) => {

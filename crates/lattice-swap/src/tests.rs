@@ -277,9 +277,12 @@ fn offer_serves_a_relay_at_its_public_url() {
     let Command::Offer(args) = with(&[&serve[..], &url[..]].concat()).unwrap().command else {
         panic!("an offer");
     };
-    assert_eq!(args.serve_relay, Some("0.0.0.0:7500".parse().unwrap()));
     assert_eq!(
-        args.serve_relay_url.as_deref(),
+        args.serve.serve_relay,
+        Some("0.0.0.0:7500".parse().unwrap())
+    );
+    assert_eq!(
+        args.serve.serve_relay_url.as_deref(),
         Some("https://seller.example")
     );
     assert!(args.listen.is_none() && args.relay.is_empty());
@@ -1656,6 +1659,59 @@ fn resume_exits_with_the_outcome_and_needs_no_key_once_signed() {
         3,
         "a done swap names no address"
     );
+}
+
+/// `resume --serve-relay` serves the seller's relay again, where a buyer
+/// that took the offer there meets it again; one the swap does not meet at
+/// is refused before anything is served.
+#[cfg(unix)]
+#[test]
+fn resume_serves_the_relay_the_swap_meets_at() {
+    let (_directory, path) = swap_file(Seller::Done(Outcome::Refunded));
+    let public = "https://seller.example";
+    let mut offer = takeable();
+    offer.address = None;
+    offer.relay = Some(public.into());
+    let session = SessionFile {
+        offer,
+        key: None,
+        listen: None,
+    };
+    session
+        .save(&swap_store(Path::new(&path)).unwrap())
+        .unwrap();
+    let listen = {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().to_string()
+    };
+    let cookie = tempfile::NamedTempFile::new().unwrap();
+    let cookie = cookie.path().to_str().unwrap();
+    let url = bitcoind(Value::Null);
+    let run = |served_at: &str| {
+        let mut args = vec!["lattice-swap", "resume", &path, "--btc-url", &url];
+        args.extend(["--btc-wallet", "w", "--btc-cookie", cookie]);
+        args.extend(["--nexus-url", "http://127.0.0.1:1"]);
+        args.extend(["--nexus-cookie", cookie, "--serve-relay", &listen]);
+        args.extend(["--serve-relay-url", served_at]);
+        exit_status(Cli::try_parse_from(&args).unwrap().command)
+    };
+
+    let refused = run("https://other.example").unwrap_err().to_string();
+    assert!(
+        refused.contains("meets the other party at https://seller.example"),
+        "{refused}"
+    );
+    assert!(ureq::get(&format!("http://{listen}/offers"))
+        .call()
+        .is_err());
+
+    assert_eq!(run(public).unwrap(), 3);
+    let offers: Vec<Value> = ureq::get(&format!("http://{listen}/offers"))
+        .call()
+        .unwrap()
+        .into_json()
+        .unwrap();
+    assert!(offers.is_empty());
 }
 
 /// lattice-node removes its cookie file when it stops: a swap resumed
