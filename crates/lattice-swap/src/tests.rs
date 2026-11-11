@@ -2423,6 +2423,79 @@ fn a_resumed_seller_takes_the_buyer_back_over_tcp_and_no_one_else() {
     );
 }
 
+/// A seller resumed with `--serve-relay` meets the buyer again on the
+/// relay it serves, dialling it on its own machine, though its session file
+/// names the public URL, which need not reach it from there; the buyer
+/// comes to that relay from outside, here on loopback in its place.
+#[test]
+fn a_resumed_seller_rejoins_through_the_relay_it_serves() {
+    let served = serve_relay("127.0.0.1:0".parse().unwrap()).unwrap();
+    let key = SigningKey::from_bytes(&random32());
+    // Nothing answers here.
+    let public = "http://127.0.0.1:1".to_string();
+    let offer = offer_of(
+        &small_args(40),
+        Network::Regtest,
+        Place::Relay(public.clone()),
+        &key,
+    );
+    let session = SessionFile {
+        offer: offer.clone(),
+        key: Some(hex::encode(key.to_bytes())),
+        listen: None,
+    };
+    let session = session.through(Some(served.clone()));
+    assert_eq!(session.offer.relay.as_deref(), Some(&served[..]));
+    let mut seller = session.reconnect(None).unwrap();
+    let mut buyer = SessionFile {
+        offer: Offer {
+            relay: Some(served),
+            ..offer
+        },
+        key: None,
+        listen: None,
+    }
+    .reconnect(None)
+    .unwrap();
+    let rejoin = swap::Rejoin {
+        id: [3; 32],
+        key: [4; 32],
+    };
+    let mut seller_session = None;
+    let mut buyer_session = None;
+    for _ in 0..1_000 {
+        if seller_session.is_none() {
+            seller_session = seller(&rejoin).and_then(|opened| opened.ok());
+        }
+        if buyer_session.is_none() {
+            buyer_session = buyer(&rejoin).and_then(|opened| opened.ok());
+        }
+        if seller_session.is_some() && buyer_session.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let (mut seller, mut buyer) = (seller_session.unwrap(), buyer_session.unwrap());
+    buyer.send(b"again").unwrap();
+    assert_eq!(
+        seller.recv(TIMEOUT).unwrap().as_deref(),
+        Some(&b"again"[..])
+    );
+    // Not given a relay, the session goes where its offer says.
+    let unchanged = SessionFile {
+        offer: offer_of(
+            &small_args(40),
+            Network::Regtest,
+            Place::Relay(public.clone()),
+            &key,
+        ),
+        key: None,
+        listen: None,
+    }
+    .through(None);
+    assert_eq!(unchanged.offer.relay, Some(public));
+}
+
 /// The lattice-node writes a new cookie at every restart: the client
 /// offer, take and resume build reads the cookie file again on a 401
 /// instead of staying refused.

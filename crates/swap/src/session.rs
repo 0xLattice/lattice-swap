@@ -70,6 +70,18 @@ impl SessionFile {
         }
     }
 
+    /// The same session, meeting the counterparty on the relay at `relay`,
+    /// if given, rather than at the URL its offer names: a seller's own
+    /// relay, which it reaches on its own machine, where that URL, routed
+    /// out and back in, may not reach it. The relay is only where to go;
+    /// the session's keys and rendezvous are the same anywhere.
+    pub fn through(mut self, relay: Option<String>) -> Self {
+        if relay.is_some() {
+            self.offer.relay = relay;
+        }
+        self
+    }
+
     /// Opens sessions to the counterparty for [`Driver::reconnect`]: the
     /// seller's on `listener` if it listens, else on the one it listened
     /// on. The buyer comes back under the rejoin key ([`crate::Rejoin`]),
@@ -249,7 +261,18 @@ pub fn resume<M: Machine, B: Bitcoin>(
     nexus: Client,
     store: Store,
 ) -> io::Result<Driver<M, B, Session>> {
-    let rejoin = SessionFile::load(&store);
+    resume_through(bitcoin, nexus, store, None)
+}
+
+/// [`resume`], meeting the counterparty again on the relay at `relay`, if
+/// given ([`SessionFile::through`]).
+pub fn resume_through<M: Machine, B: Bitcoin>(
+    bitcoin: B,
+    nexus: Client,
+    store: Store,
+    relay: Option<String>,
+) -> io::Result<Driver<M, B, Session>> {
+    let rejoin = SessionFile::load(&store).map(|rejoin| rejoin.map(|rejoin| rejoin.through(relay)));
     let mut driver = Driver::<M, B, Session>::resume(bitcoin, nexus, None, store)?;
     if driver.state().rejoin().is_some() {
         driver.reconnect = reconnect(rejoin);

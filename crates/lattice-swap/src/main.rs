@@ -1227,6 +1227,8 @@ fn resume(args: SwapFileArgs) -> Result<Outcome> {
         )
         .into());
     }
+    // The relay the seller serves, as it reaches it on its own machine.
+    let mut served = None;
     if let (Some(listen), Some(url)) = (args.serve.serve_relay, &args.serve.serve_relay_url) {
         // A relay the two would not meet at would serve no one this swap.
         let session = SessionFile::load(&store)?;
@@ -1239,7 +1241,7 @@ fn resume(args: SwapFileArgs) -> Result<Outcome> {
             )
             .into());
         }
-        serve_relay(listen)?;
+        served = Some(serve_relay(listen)?);
     }
     match saved {
         Saved::Seller(seller) => {
@@ -1251,7 +1253,7 @@ fn resume(args: SwapFileArgs) -> Result<Outcome> {
                 args.nodes.trust(SELLER_TRUSTS);
                 args.nodes.resumed_check()
             });
-            let driver = swap::session::resume::<Seller, _>(bitcoin, nexus, store);
+            let driver = swap::session::resume_through::<Seller, _>(bitcoin, nexus, store, served);
             run(
                 &swap_file,
                 driver.map(|mut driver| {
