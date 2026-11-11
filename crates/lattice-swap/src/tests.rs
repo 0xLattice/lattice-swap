@@ -3353,10 +3353,12 @@ fn take_refuses_mainnet_nex_for_test_btc_unless_opted_in() {
 }
 
 /// A node hosting the relay directory at `RELAY_DIR_CHAIN`, whose tip lists
-/// `listed` for `account`: it serves the chain's info, the Volumes of the
-/// tip's block and state, and the account, at balance 100 and nonce 6, only
-/// when asked for that chain, and records each transaction submitted.
+/// `listed` for `account`, pooling no fee below `floor`: it serves the
+/// chain's info, the Volumes of the tip's block and state, and the account,
+/// at balance 100 and nonce 6 (any other a 404), only when asked for that
+/// chain, and records each transaction submitted.
 fn relay_dir_node(
+    floor: u64,
     account: &str,
     listed: Option<&str>,
 ) -> (String, Arc<std::sync::Mutex<Vec<Value>>>) {
@@ -3413,7 +3415,7 @@ fn relay_dir_node(
     let chain: Vec<&str> = RELAY_DIR_CHAIN.split('/').collect();
     let info = json!({
         "chain": chain, "tipCID": block, "height": "5",
-        "acceptsSubmit": true, "minRelayFee": "4",
+        "acceptsSubmit": true, "minRelayFee": floor.to_string(),
     });
     let account = account.to_string();
     let submitted = Arc::new(Mutex::new(Vec::new()));
@@ -3477,8 +3479,9 @@ fn relay_dir_node(
 }
 
 /// `relay-dir add` and `remove` read the account's entry, then write it from
-/// that value, paying at least the node's floor from the account at its
-/// nonce; a write that changes nothing, or a URL readers skip, sends none.
+/// that value, paying --fee from the account at its nonce; a fee below the
+/// node's floor, a write that changes nothing, or a URL readers skip, sends
+/// none.
 #[test]
 fn relay_dir_writes_from_the_value_listed() {
     use std::os::unix::fs::PermissionsExt;
@@ -3489,7 +3492,7 @@ fn relay_dir_writes_from_the_value_listed() {
     fs::set_permissions(key.path(), fs::Permissions::from_mode(0o600)).unwrap();
     let old = "https://old.example";
     let run = |listed: Option<&str>, args: &[&str]| {
-        let (url, submitted) = relay_dir_node(&account, listed);
+        let (url, submitted) = relay_dir_node(4, &account, listed);
         let key = key.path().to_str().unwrap();
         let flags = ["--key", key, "--nexus-url", &url];
         let cli = Cli::try_parse_from(
@@ -3512,6 +3515,13 @@ fn relay_dir_writes_from_the_value_listed() {
     };
 
     let (result, submitted) = run(Some(old), &["add", "--url", "https://new.example/x"]);
+    let refused = result.unwrap_err();
+    assert!(refused.ends_with("pass --fee 4 to pay it"), "{refused}");
+    assert!(submitted.is_empty());
+    let (result, submitted) = run(
+        Some(old),
+        &["add", "--url", "https://new.example/x", "--fee", "4"],
+    );
     result.unwrap();
     let body = written(&submitted);
     assert_eq!(
@@ -3538,14 +3548,17 @@ fn relay_dir_writes_from_the_value_listed() {
     );
     assert_eq!(body["accountActions"][0]["delta"], "-10");
 
-    let (result, submitted) = run(Some(old), &["remove"]);
+    let (result, submitted) = run(Some(old), &["remove", "--fee", "4"]);
     result.unwrap();
     assert_eq!(
         written(&submitted)["actions"],
         json!([{"key": format!("relay/{account}"), "oldValue": old}])
     );
 
-    for (listed, args) in [(Some(old), &["add", "--url", old][..]), (None, &["remove"])] {
+    for (listed, args) in [
+        (Some(old), &["add", "--url", old, "--fee", "4"][..]),
+        (None, &["remove", "--fee", "4"]),
+    ] {
         let (result, submitted) = run(listed, args);
         result.unwrap();
         assert!(submitted.is_empty(), "{args:?}");
@@ -3608,7 +3621,7 @@ fn relay_dir_reads_either_key_file() {
     // A lattice key file writes as the seed does.
     let file = key_file(lattice(&multikey));
     let account = SecretBytes(seed).nex_address();
-    let (url, submitted) = relay_dir_node(&account, None);
+    let (url, submitted) = relay_dir_node(0, &account, None);
     let path = file.path().to_str().unwrap();
     let args = ["relay-dir", "remove", "--key", path, "--nexus-url", &url];
     let cli = Cli::try_parse_from(["lattice-swap"].iter().chain(&args)).unwrap();
@@ -3617,7 +3630,7 @@ fn relay_dir_reads_either_key_file() {
     };
     relay_dir_write(command).unwrap();
     assert!(submitted.lock().unwrap().is_empty(), "nothing listed");
-    let (url, submitted) = relay_dir_node(&account, None);
+    let (url, submitted) = relay_dir_node(0, &account, None);
     let args = [
         "relay-dir",
         "add",
@@ -3637,6 +3650,28 @@ fn relay_dir_reads_either_key_file() {
         submitted.lock().unwrap()[0]["transaction"]["body"]["signers"],
         json!([account])
     );
+
+    // An account the node has never seen is at nonce 0, with no balance:
+    // enough for a write that pays no fee.
+    let (url, submitted) = relay_dir_node(0, "another", None);
+    let args = [
+        "relay-dir",
+        "add",
+        "--url",
+        "https://r.example",
+        "--key",
+        path,
+        "--nexus-url",
+        &url,
+    ];
+    let cli = Cli::try_parse_from(["lattice-swap"].iter().chain(&args)).unwrap();
+    let Command::RelayDir(command) = cli.command else {
+        unreachable!()
+    };
+    relay_dir_write(command).unwrap();
+    let body = submitted.lock().unwrap()[0]["transaction"]["body"].clone();
+    assert_eq!(body["nonce"], "0");
+    assert_eq!(body["accountActions"], json!([]));
 
     let args = ["lattice-swap", "relay-dir", "remove", "--key", path];
     assert!(

@@ -133,8 +133,8 @@ struct RelayDirArgs {
     /// The relay directory's chain path.
     #[arg(long, default_value = RELAY_DIR_CHAIN)]
     chain: String,
-    /// The fee paid on that chain, from the account's balance there; the
-    /// node's relay floor if higher.
+    /// The fee paid on that chain, from the account's balance there. A
+    /// node whose relay floor is higher refuses it, and so does this tool.
     #[arg(long, default_value_t = 0)]
     fee: u64,
     /// The URL of a node that hosts --chain, required as no default node
@@ -1632,7 +1632,16 @@ fn relay_dir_write(command: RelayDirCommand) -> Result<()> {
         return Err(format!("refused: {} takes no transactions", args.nexus_url).into());
     }
     let tip = parse::tip(&info)?.1.ok_or("the chain has no tip yet")?;
-    let fee = args.fee.max(parse::min_relay_fee(&info)?);
+    let fee = args.fee;
+    let floor = parse::min_relay_fee(&info)?;
+    if floor > fee {
+        return Err(format!(
+            "refused: {} pools no fee below {floor}, above the fee of {fee}: \
+             pass --fee {floor} to pay it",
+            args.nexus_url
+        )
+        .into());
+    }
     // A Volume holds many nodes: one already read is not asked for again.
     let mut held = BTreeMap::new();
     let key_name = format!("{}{account}", relay_dir::PREFIX);
@@ -1651,7 +1660,15 @@ fn relay_dir_write(command: RelayDirCommand) -> Result<()> {
         );
         return Ok(());
     };
-    let funds = nexus.account_of(&account, &chain)?;
+    // A node with a tip answers 404 for an account it has never seen, as
+    // `lattice tx` takes it: nonce 0, no balance.
+    let funds = match nexus.account_of(&account, &chain) {
+        Err(swap_nexus_tx::rpc::Error::Status { status: 404, .. }) => swap_nexus_tx::rpc::Account {
+            balance: 0,
+            nonce: 0,
+        },
+        funds => funds?,
+    };
     if funds.balance < fee {
         return Err(format!(
             "{account} holds {} on {}, less than the fee of {fee}",
@@ -1663,7 +1680,11 @@ fn relay_dir_write(command: RelayDirCommand) -> Result<()> {
         .ok_or("the fee does not fit")?;
     let mut transaction = swap_nexus_tx::Transaction::new(body);
     transaction.sign(&SigningKey::from_bytes(&key.0));
-    println!("submitted: {}", nexus.submit(&transaction)?);
+    let cid = nexus.submit(&transaction)?;
+    println!(
+        "submitted: {cid}, fee {fee}; unconfirmed until a block holds it, and refused \
+         there if the entry changed since it was read"
+    );
     Ok(())
 }
 

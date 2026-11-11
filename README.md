@@ -439,18 +439,22 @@ Ed25519 seed in hex, as `--nex-key-file` does, or a key file
 lattice-node with `--nexus-cookie` or a public read port that takes
 submits, must host the directory's chain (`--chain`,
 `Nexus/testnet/swap-relays` by default), and no default node is known to.
-Each command reads the account's entry at the chain's tip and writes it
-from that value, so `add` replaces a URL listed before; it sends nothing if
-the entry already holds what was asked. `add` refuses a URL readers skip:
-not `https://`, with user info, or to a literal name or address of this
-machine or a private network. The write pays `--fee`, or the node's relay
-floor if higher, from the account's balance on the directory's chain, at
-its nonce there; an account holding less than the fee there is refused.
-So the account needs coins on the directory's chain, unless the node's
-relay floor is 0 and no `--fee` is given: this tool does not pay fees in
-work through a sponsor.
-It prints the transaction's CID once the node takes it; the entry changes
-once a block holds it.
+Each command reads the account's entry at the chain's tip, as the node
+says it is, and writes it from that value, so `add` replaces a URL listed
+before; it sends nothing if the entry already holds what was asked. `add`
+refuses a URL readers skip: not `https://`, with user info, or to a literal
+name or address of this machine or a private network. The write pays
+`--fee`, 0 by default, from the account's balance on the directory's chain,
+at its nonce there (an account the chain has never seen has nonce 0 and no
+balance). A node whose relay floor (`minRelayFee`) is above `--fee` is
+refused, naming its floor: pass that as `--fee` to pay it. An account
+holding less than the fee there is refused too. So the account needs coins
+on the directory's chain, unless the node's relay floor is 0: this tool
+does not pay fees in work through a sponsor.
+It prints the transaction's CID and the fee paid once the node takes it.
+The entry changes only once a block holds the write, and the chain refuses
+it if the entry changed since it was read: a stale or false tip from the
+node makes the write fail, not land wrong.
 
 ## License
 

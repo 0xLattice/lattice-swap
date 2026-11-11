@@ -83,6 +83,11 @@ const MAX_PATH_BYTES: usize = PREFIX.len() + MAX_KEY_BYTES;
 /// which only a hostile block holds, is cut off here.
 pub const MAX_NODES: usize = 2 * MAX_ENTRIES + MAX_PATH_BYTES + 1 + 3;
 
+/// The most nodes [`value`] reads: the block, its state, the trie's root,
+/// and one node for each byte of the longest key, as in cashew's trie every
+/// node below the root has a nonempty prefix.
+pub const MAX_VALUE_NODES: usize = MAX_PATH_BYTES + 3;
+
 /// A relay as its account lists it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Relay {
@@ -348,13 +353,29 @@ pub fn list(
 /// fetched by `fetch` from its CID and refused unless its bytes are the ones
 /// it names. A node it cannot read as a trie node ends the walk at no value:
 /// a write whose old value is wrong is refused by the chain anyway.
+///
+/// It reads at most [`MAX_VALUE_NODES`] nodes of at most [`MAX_NODE_BYTES`]
+/// bytes each, as a [`Listing`] does, and fails beyond them.
 pub fn value(
     block: &str,
     key: &str,
     mut fetch: impl FnMut(&str) -> Result<Vec<u8>, String>,
 ) -> Result<Option<String>, String> {
+    let mut read = 0;
     let mut node = |cid: &str| -> Result<Value, String> {
+        read += 1;
+        if read > MAX_VALUE_NODES {
+            return Err(format!(
+                "the walk to {key} reads more than {MAX_VALUE_NODES} nodes"
+            ));
+        }
         let bytes = fetch(cid)?;
+        if bytes.len() > MAX_NODE_BYTES {
+            return Err(format!(
+                "{cid} is {} bytes, more than a node of the directory's",
+                bytes.len()
+            ));
+        }
         if self::cid(&bytes) != cid {
             return Err(format!(
                 "the bytes given for {cid} are not the ones it names"
@@ -614,6 +635,51 @@ mod tests {
         // Bytes that are not the node's are refused.
         let refused = super::value(block, "relay/", |_| Ok(b"\xa0".to_vec()));
         assert!(refused.unwrap_err().contains("not the ones it names"));
+    }
+
+    /// A chain of nodes with empty prefixes, which only a hostile block
+    /// holds, is read up to [`MAX_VALUE_NODES`]; a node over
+    /// [`MAX_NODE_BYTES`] is refused.
+    #[test]
+    fn value_reads_a_bounded_walk() {
+        let key = format!("relay/{}", account(1));
+        let mut store = Store::default();
+        let chain = |store: &mut Store, empty: usize, value: &str| {
+            let mut at = store.put(map(vec![
+                ("prefix", text(&key)),
+                ("value", text(value)),
+                ("children", Value::Array(vec![])),
+            ]));
+            for _ in 0..empty {
+                let child = map(vec![("key", text("r")), ("value", to_link(&at))]);
+                at = store.put(map(vec![
+                    ("prefix", text("")),
+                    ("children", Value::Array(vec![child])),
+                ]));
+            }
+            let child = map(vec![("key", text("r")), ("value", to_link(&at))]);
+            let commitment = store.commit(Value::Array(vec![child]));
+            commitment.split('@').next().unwrap().to_string()
+        };
+        let read = |store: &Store, block: &str| {
+            super::value(block, &key, |cid| {
+                store.0.get(cid).cloned().ok_or(format!("no {cid}"))
+            })
+        };
+        // Block, state, root, the empty nodes and the entry.
+        let most = chain(&mut store, MAX_VALUE_NODES - 4, "https://r.example");
+        assert_eq!(
+            read(&store, &most).unwrap().as_deref(),
+            Some("https://r.example")
+        );
+        let over = chain(&mut store, MAX_VALUE_NODES - 3, "https://r.example");
+        assert!(read(&store, &over).unwrap_err().contains("more than"));
+
+        let big = "x".repeat(MAX_NODE_BYTES);
+        let block = chain(&mut store, 0, &big);
+        assert!(read(&store, &block)
+            .unwrap_err()
+            .contains("bytes, more than"));
     }
 
     #[test]
