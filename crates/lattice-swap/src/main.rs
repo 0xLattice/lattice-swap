@@ -881,7 +881,37 @@ fn seller_key(
     }
 }
 
-fn offer(args: OfferArgs) -> Result<Outcome> {
+/// The server `relay` names, to tell two spellings of one relay apart:
+/// its scheme and host in lowercase, its port unless the scheme's default,
+/// and its path without trailing slashes, as a URL parser compares them.
+fn relay_server(relay: &str) -> String {
+    let (scheme, rest) = relay.split_once("://").unwrap_or(("", relay));
+    let scheme = scheme.to_ascii_lowercase();
+    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let host = host.to_ascii_lowercase();
+    let host = match scheme.as_str() {
+        "http" => host.strip_suffix(":80"),
+        "https" => host.strip_suffix(":443"),
+        _ => None,
+    }
+    .unwrap_or(&host);
+    format!("{scheme}://{host}/{}", path.trim_end_matches('/'))
+}
+
+/// `relays` with each server once, first spelling first: a relay given
+/// twice would list the offer once, and refuse it again every [`RETRY`]
+/// for good as listed already.
+///
+/// [`RETRY`]: swap::transport::RETRY
+fn distinct_relays(relays: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    (relays.into_iter())
+        .filter(|relay| seen.insert(relay_server(relay)))
+        .collect()
+}
+
+fn offer(mut args: OfferArgs) -> Result<Outcome> {
+    args.relay = distinct_relays(args.relay);
     if let Some(listen) = args.listen {
         check_listen(listen, args.advertise)?;
     }

@@ -256,6 +256,35 @@ fn an_offer_listed_on_several_relays_names_each() {
     assert_eq!(listed_on(&offer, &relays[..1]), [offer]);
 }
 
+/// A relay given twice, in any spelling of the same server, is listed on
+/// once: the second listing would be refused as listed already, and tried
+/// again for good.
+#[test]
+fn a_relay_given_twice_is_listed_on_once() {
+    let relays = [
+        "https://relay.example",
+        "HTTPS://Relay.Example:443/",
+        "https://relay.example//",
+        "https://relay.example:8443",
+        "http://relay.example:80",
+        "http://relay.example",
+        "https://relay.example/path/",
+        "https://relay.example/path",
+        "https://other.example",
+    ];
+    let distinct = distinct_relays(relays.iter().map(|relay| relay.to_string()).collect());
+    assert_eq!(
+        distinct,
+        [
+            "https://relay.example",
+            "https://relay.example:8443",
+            "http://relay.example:80",
+            "https://relay.example/path/",
+            "https://other.example",
+        ]
+    );
+}
+
 #[test]
 fn offer_serves_a_relay_at_its_public_url() {
     let base = [
