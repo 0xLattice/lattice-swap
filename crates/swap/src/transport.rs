@@ -371,12 +371,16 @@ impl Ivy<Relayed> {
     /// names each relay and the offer listed there. The first relay to pair
     /// a buyer wins, and the others' connections are closed at once, which
     /// withdraws the offer from their boards: the seller has one swap to
-    /// run, so a second buyer must not take it elsewhere meanwhile. A
-    /// pairing that fails the handshake lists the offer on every relay
-    /// again, those that failed before among them. A relay that is down,
-    /// refuses the offer or drops its connection is logged and left out
-    /// until then; fails only once every relay has. Returns which of
-    /// `listings` the buyer came through, where the two meet again.
+    /// run, so a second buyer must not take it elsewhere meanwhile. Two
+    /// buyers taking it on two relays in the same instant cannot be
+    /// prevented, but the second's session is closed before its handshake,
+    /// so it locks nothing. A pairing that fails the handshake lists the
+    /// offer on every relay again. A relay that is down, refuses the offer
+    /// or drops its connection is logged and tried again every [`RETRY`]
+    /// while another is listed, so one down at the start gets the offer
+    /// once it is back; fails once none is listed, as a lone relay's
+    /// refusal fails [`Ivy::accept_relayed`]. Returns which of `listings`
+    /// the buyer came through, where the two meet again.
     pub fn accept_relayed_on(
         listings: &[(&str, &str)],
         config: &Config,
@@ -389,28 +393,44 @@ impl Ivy<Relayed> {
             .iter()
             .map(|(relay, _)| relay_url(relay, "sell"))
             .collect::<io::Result<Vec<_>>>()?;
+        /// A relay's listing until it pairs, or the wait before the next.
+        enum Slot<L> {
+            Listing(Pin<Box<L>>),
+            Retrying(Pin<Box<tokio::time::Sleep>>),
+        }
+        let listing =
+            |i: usize| Slot::Listing(Box::pin(list(&urls[i], listings[i].1, send_timeout)));
         let (taken, connection) = runtime.block_on(async {
             let deadline = tokio::time::Instant::now() + wait;
             loop {
-                // Each relay's listing, with its index, until it pairs.
-                let mut listed: Vec<(usize, Pin<Box<_>>)> = (urls.iter().zip(listings))
-                    .map(|(url, (_, offer))| Box::pin(list(url, offer, send_timeout)))
-                    .enumerate()
-                    .collect();
+                let mut slots: Vec<_> = (0..listings.len()).map(listing).collect();
                 let paired = poll_fn(|cx| {
-                    let mut i = 0;
-                    while i < listed.len() {
-                        match listed[i].1.as_mut().poll(cx) {
-                            Poll::Pending => i += 1,
-                            Poll::Ready(Ok(socket)) => {
-                                return Poll::Ready(Ok((listed[i].0, socket)))
+                    for i in 0..slots.len() {
+                        loop {
+                            let failed = match &mut slots[i] {
+                                Slot::Retrying(retry) => {
+                                    if retry.as_mut().poll(cx).is_pending() {
+                                        break;
+                                    }
+                                    slots[i] = listing(i);
+                                    continue;
+                                }
+                                Slot::Listing(listed) => match listed.as_mut().poll(cx) {
+                                    Poll::Pending => break,
+                                    Poll::Ready(Ok(socket)) => return Poll::Ready(Ok((i, socket))),
+                                    Poll::Ready(Err(e)) => e,
+                                },
+                            };
+                            let others = (slots.iter().enumerate())
+                                .any(|(j, slot)| j != i && matches!(slot, Slot::Listing(_)));
+                            if !others {
+                                return Poll::Ready(Err(failed));
                             }
-                            Poll::Ready(Err(e)) if listed.len() == 1 => return Poll::Ready(Err(e)),
-                            Poll::Ready(Err(e)) => {
-                                let relay = listings[listed[i].0].0;
-                                eprintln!("lattice-swap: not listed on {relay}: {e}");
-                                drop(listed.remove(i));
-                            }
+                            let relay = listings[i].0;
+                            eprintln!(
+                                "lattice-swap: not listed on {relay}, trying again: {failed}"
+                            );
+                            slots[i] = Slot::Retrying(Box::pin(sleep(RETRY)));
                         }
                     }
                     Poll::Pending
@@ -419,7 +439,7 @@ impl Ivy<Relayed> {
                     .await
                     .map_err(|_| timed_out("no peer dialed"))??;
                 // Withdrawn from the other boards for the handshake.
-                drop(listed);
+                drop(slots);
                 let accept = ivy::accept(Relayed::new(socket), config, |key| *key == peer);
                 match timeout(send_timeout, accept).await {
                     Ok(Ok(connection)) => return io::Result::Ok((taken, connection)),
