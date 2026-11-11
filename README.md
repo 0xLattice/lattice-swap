@@ -372,8 +372,24 @@ lattice-swap offer --relay https://relay.example ... > offer
 curl -s https://relay.example/offers
 ```
 
+Give `--relay` again to list on several relays at once, so one that is
+down does not hide the offer. Each lists the same offer, naming itself; the
+printed one names the first. A relay that is down or refuses the offer is
+logged and tried again every 5 seconds until `--wait` runs out, so one
+down at the start gets the offer once it is back. One server given twice,
+in any spelling, is listed on once. The
+first relay to pair a buyer wins, and the seller closes its connections to
+the others, which withdraws the offer from their boards: it has one swap to
+run. If that buyer fails the handshake, the offer is listed on all of them
+again.
+
+```sh
+lattice-swap offer --relay https://relay.example --relay https://other.example ... > offer
+```
+
 `take` on an offer that names a relay reaches the seller through it, and
-both meet there again whenever their session is lost. The relay holds
+both meet there again whenever their session is lost: on the relay the
+buyer took it on. The relay holds
 nothing of the swap: a buyer that gives up must itself be online, with
 `resume`, to refund between cancel and `t2`.
 

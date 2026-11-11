@@ -363,37 +363,91 @@ impl Ivy<Relayed> {
         wait: Duration,
         send_timeout: Duration,
     ) -> io::Result<Self> {
+        Self::accept_relayed_on(&[(relay, offer)], config, peer, wait, send_timeout)
+            .map(|(_, session)| session)
+    }
+
+    /// As [`Ivy::accept_relayed`], on several relays at once: `listings`
+    /// names each relay and the offer listed there. The first relay to pair
+    /// a buyer wins, and the others' connections are closed at once, which
+    /// withdraws the offer from their boards: the seller has one swap to
+    /// run, so a second buyer must not take it elsewhere meanwhile. Two
+    /// buyers taking it on two relays in the same instant cannot be
+    /// prevented, but the second's session is closed before its handshake,
+    /// so it locks nothing. A pairing that fails the handshake lists the
+    /// offer on every relay again. A relay that is down, refuses the offer
+    /// or drops its connection is logged and tried again every [`RETRY`]
+    /// until `wait` runs out, so one down at the start, or all of them for
+    /// a while, gets the offer once it is back. A lone relay is not: its
+    /// refusal fails [`Ivy::accept_relayed`] at once, as it always has.
+    /// Returns which of `listings` the buyer came through, where the two
+    /// meet again.
+    pub fn accept_relayed_on(
+        listings: &[(&str, &str)],
+        config: &Config,
+        peer: PeerKey,
+        wait: Duration,
+        send_timeout: Duration,
+    ) -> io::Result<(usize, Self)> {
         let runtime = runtime()?;
-        let url = relay_url(relay, "sell")?;
-        let connection = runtime.block_on(async {
+        let urls = listings
+            .iter()
+            .map(|(relay, _)| relay_url(relay, "sell"))
+            .collect::<io::Result<Vec<_>>>()?;
+        /// A relay's listing until it pairs, or the wait before the next.
+        enum Slot<L> {
+            Listing(Pin<Box<L>>),
+            Retrying(Pin<Box<tokio::time::Sleep>>),
+        }
+        let listing =
+            |i: usize| Slot::Listing(Box::pin(list(&urls[i], listings[i].1, send_timeout)));
+        let (taken, connection) = runtime.block_on(async {
             let deadline = tokio::time::Instant::now() + wait;
             loop {
-                let paired = async {
-                    let mut socket = dial(&url, send_timeout).await?;
-                    send_text(&mut socket, offer).await?;
-                    match timeout(send_timeout, text(&mut socket)).await {
-                        Err(_) => Err(timed_out("the relay did not answer")),
-                        Ok(Ok(reply)) if reply == "listed" => Ok(()),
-                        Ok(Ok(reply)) => Err(io::Error::other(format!("the relay: {reply}"))),
-                        Ok(Err(e)) => Err(e),
-                    }?;
-                    match text(&mut socket).await? {
-                        reply if reply == "paired" => Ok(socket),
-                        reply => Err(io::Error::other(format!("the relay: {reply}"))),
+                let mut slots: Vec<_> = (0..listings.len()).map(listing).collect();
+                let paired = poll_fn(|cx| {
+                    for i in 0..slots.len() {
+                        loop {
+                            let failed = match &mut slots[i] {
+                                Slot::Retrying(retry) => {
+                                    if retry.as_mut().poll(cx).is_pending() {
+                                        break;
+                                    }
+                                    slots[i] = listing(i);
+                                    continue;
+                                }
+                                Slot::Listing(listed) => match listed.as_mut().poll(cx) {
+                                    Poll::Pending => break,
+                                    Poll::Ready(Ok(socket)) => return Poll::Ready(Ok((i, socket))),
+                                    Poll::Ready(Err(e)) => e,
+                                },
+                            };
+                            if listings.len() == 1 {
+                                return Poll::Ready(Err(failed));
+                            }
+                            let relay = listings[i].0;
+                            eprintln!(
+                                "lattice-swap: not listed on {relay}, trying again: {failed}"
+                            );
+                            slots[i] = Slot::Retrying(Box::pin(sleep(RETRY)));
+                        }
                     }
-                };
-                let socket = tokio::time::timeout_at(deadline, paired)
+                    Poll::Pending
+                });
+                let (taken, socket) = tokio::time::timeout_at(deadline, paired)
                     .await
                     .map_err(|_| timed_out("no peer dialed"))??;
+                // Withdrawn from the other boards for the handshake.
+                drop(slots);
                 let accept = ivy::accept(Relayed::new(socket), config, |key| *key == peer);
                 match timeout(send_timeout, accept).await {
-                    Ok(Ok(connection)) => return io::Result::Ok(connection),
+                    Ok(Ok(connection)) => return io::Result::Ok((taken, connection)),
                     Ok(Err(e)) => eprintln!("lattice-swap: a relayed handshake failed: {e}"),
                     Err(_) => eprintln!("lattice-swap: a relayed handshake timed out"),
                 }
             }
         })?;
-        Self::new(runtime, connection, send_timeout)
+        Ok((taken, Self::new(runtime, connection, send_timeout)?))
     }
 
     /// Asks the relay at `relay` to pair this party with the seller that
@@ -457,6 +511,27 @@ impl Ivy<Relayed> {
                 .map_err(|_| timed_out("the handshake timed out"))?
         })?;
         Self::new(runtime, connection, send_timeout)
+    }
+}
+
+/// The relay's socket at `url`, its `/sell`, once it has listed `offer`
+/// and paired a buyer with it.
+async fn list(
+    url: &str,
+    offer: &str,
+    send_timeout: Duration,
+) -> io::Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
+    let mut socket = dial(url, send_timeout).await?;
+    send_text(&mut socket, offer).await?;
+    match timeout(send_timeout, text(&mut socket)).await {
+        Err(_) => Err(timed_out("the relay did not answer")),
+        Ok(Ok(reply)) if reply == "listed" => Ok(()),
+        Ok(Ok(reply)) => Err(io::Error::other(format!("the relay: {reply}"))),
+        Ok(Err(e)) => Err(e),
+    }?;
+    match text(&mut socket).await? {
+        reply if reply == "paired" => Ok(socket),
+        reply => Err(io::Error::other(format!("the relay: {reply}"))),
     }
 }
 
