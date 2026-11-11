@@ -1251,3 +1251,34 @@ fn a_padded_refund_is_sized_as_the_swaps_own() {
     };
     assert_eq!(child(&padded), child(&refund));
 }
+
+/// `{<field>: {"rawCID": <cid>}}` in DAG-CBOR.
+fn link_node(field: &str, cid: &str) -> Vec<u8> {
+    let mut bytes = vec![0xa1, 0x60 + field.len() as u8];
+    bytes.extend(field.as_bytes());
+    bytes.extend([0xa1, 0x66]);
+    bytes.extend(b"rawCID");
+    bytes.extend([0x78, cid.len() as u8]);
+    bytes.extend(cid.as_bytes());
+    bytes
+}
+
+#[test]
+fn a_relay_listing_crosses_as_json() {
+    // An empty general state, in a block's post state.
+    let root = b"\xa2\x65count\x00\x68children\x80".to_vec();
+    let state = link_node("generalState", &swap_nexus_tx::cid(&root));
+    let block = link_node("postState", &swap_nexus_tx::cid(&state));
+    let block_cid = swap_nexus_tx::cid(&block);
+    assert!(list_relays("not a commitment").is_err());
+    let mut step = json(&list_relays(&format!("{block_cid}@x")).unwrap());
+    assert_eq!(step["wants"], json!([block_cid]));
+    assert!(give_relay_node(&text(&step["state"]).unwrap(), &block_cid, &state).is_err());
+    for node in [block, state, root] {
+        let cid = step["wants"][0].as_str().unwrap().to_string();
+        assert_eq!(cid, swap_nexus_tx::cid(&node));
+        step = json(&give_relay_node(&text(&step["state"]).unwrap(), &cid, &node).unwrap());
+    }
+    assert_eq!(step["wants"], json!([]));
+    assert_eq!(step["relays"], json!([]));
+}

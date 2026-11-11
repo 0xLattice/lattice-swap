@@ -1690,6 +1690,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "bitcoin",
+ "ciborium",
  "corepc-node",
  "curve25519-dalek",
  "ed25519-dalek",
@@ -1712,6 +1713,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "ureq",
+ "url",
  "wasm-bindgen-test",
 ]
 

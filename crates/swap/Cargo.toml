@@ -28,6 +28,8 @@ swap-nexus = { path = "../swap-nexus" }
 swap-nexus-tx = { path = "../swap-nexus-tx", default-features = false }
 base64 = { version = "0.22", optional = true }
 bitcoin = { version = "0.32", features = ["serde"] }
+# The relay directory's trie nodes.
+ciborium = "0.2"
 curve25519-dalek = "4"
 # The relay's WebSocket, as a byte stream for the ivy session.
 futures-util = { version = "0.3", default-features = false, features = ["sink"], optional = true }
@@ -47,6 +49,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring"], opti
 # The version axum's WebSocket uses, so the relay and this share one.
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"], optional = true }
 ureq = { version = "2", default-features = false, features = ["json", "tls"], optional = true }
+# Whether a listed relay is an https:// URL.
+url = "2"
 
 # Drive real nodes.
 [[test]]

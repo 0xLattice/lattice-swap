@@ -64,6 +64,7 @@ pub mod driver;
 #[cfg(feature = "native")]
 pub mod esplora;
 pub mod offer;
+pub mod relay_dir;
 mod seller;
 #[cfg(feature = "native")]
 pub mod session;
