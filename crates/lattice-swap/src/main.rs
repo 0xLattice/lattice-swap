@@ -126,8 +126,8 @@ enum RelayDirCommand {
 /// sent to a node that hosts the directory's chain.
 #[derive(Args)]
 struct RelayDirArgs {
-    /// A file holding the account's key, its Ed25519 seed in hex, readable
-    /// by its owner alone.
+    /// A file holding the account's key, readable by its owner alone: its
+    /// Ed25519 seed in hex, or a key file `lattice key generate` writes.
     #[arg(long)]
     key: PathBuf,
     /// The relay directory's chain path.
@@ -137,10 +137,10 @@ struct RelayDirArgs {
     /// node's relay floor if higher.
     #[arg(long, default_value_t = 0)]
     fee: u64,
-    /// The node's URL, which must host --chain: a public read port, which
-    /// must take submits, or with --nexus-cookie your own lattice-node's
-    /// RPC.
-    #[arg(long, default_value = PUBLIC_NEXUS)]
+    /// The URL of a node that hosts --chain, required as no default node
+    /// does: a public read port, which must take submits, or with
+    /// --nexus-cookie your own lattice-node's RPC.
+    #[arg(long)]
     nexus_url: String,
     /// Your own lattice-node's RPC cookie file, with its --nexus-url.
     #[arg(long, requires = "nexus_url")]
@@ -618,6 +618,32 @@ impl NexKeyArgs {
 fn key_file(path: &Path) -> Result<SecretBytes> {
     owner_only(path)?;
     nex_key(&read(path)?)
+}
+
+/// The key in `path`, which only its owner may read: its seed in hex, as
+/// [`key_file`] reads it, or a key file `lattice key generate` writes,
+/// `{"privateKey", "publicKey", ...}`, the seed in hex beside its Multikey,
+/// which must be the seed's.
+fn relay_dir_key(path: &Path) -> Result<SecretBytes> {
+    owner_only(path)?;
+    let text = read(path)?;
+    if !text.trim_start().starts_with('{') {
+        return nex_key(&text);
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct KeyFile {
+        private_key: String,
+        public_key: String,
+    }
+    let file: KeyFile = serde_json::from_str(&text)
+        .map_err(|e| format!("{}: not a lattice key file: {e}", path.display()))?;
+    let key = nex_key(&file.private_key)?;
+    let public = SigningKey::from_bytes(&key.0).verifying_key().to_bytes();
+    if swap_nexus_tx::multikey_hex(&public) != file.public_key.to_ascii_lowercase() {
+        return Err(format!("{}: its publicKey is not its privateKey's", path.display()).into());
+    }
+    Ok(key)
 }
 
 /// A Nexus key: its Ed25519 seed in hex.
@@ -1591,7 +1617,7 @@ fn relay_dir_write(command: RelayDirCommand) -> Result<()> {
         }
         RelayDirCommand::Remove(write) => (write, None),
     };
-    let key = key_file(&args.key)?;
+    let key = relay_dir_key(&args.key)?;
     let account = key.nex_address();
     let chain: Vec<String> = args.chain.split('/').map(String::from).collect();
     let nexus = match &args.nexus_cookie {

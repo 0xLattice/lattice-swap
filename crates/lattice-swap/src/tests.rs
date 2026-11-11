@@ -3567,3 +3567,80 @@ fn relay_dir_writes_from_the_value_listed() {
     assert!(result.unwrap_err().contains("404"));
     assert!(submitted.is_empty());
 }
+
+/// `relay-dir --key` reads a seed in hex or a key file `lattice key
+/// generate` writes, `{address, privateKey, publicKey}`, refusing one whose
+/// public key is not its private key's; `--nexus-url` has no default.
+#[test]
+fn relay_dir_reads_either_key_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let seed = [5; 32];
+    let public = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+    let multikey = swap_nexus_tx::multikey_hex(&public);
+    let key_file = |text: String| {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(file.path(), text).unwrap();
+        fs::set_permissions(file.path(), fs::Permissions::from_mode(0o600)).unwrap();
+        file
+    };
+    let lattice = |public_key: &str| {
+        json!({
+            "address": swap_nexus_tx::address(&public),
+            "privateKey": hex::encode(seed),
+            "publicKey": public_key,
+        })
+        .to_string()
+    };
+    for text in [
+        hex::encode(seed),
+        format!("{}\n", hex::encode(seed)),
+        lattice(&multikey),
+    ] {
+        let file = key_file(text.clone());
+        assert_eq!(relay_dir_key(file.path()).unwrap().0, seed, "{text}");
+    }
+    let other = swap_nexus_tx::multikey_hex(&[9; 32]);
+    let refused = relay_dir_key(key_file(lattice(&other)).path());
+    let refused = refused.err().unwrap().to_string();
+    assert!(refused.contains("not its privateKey's"), "{refused}");
+    assert!(relay_dir_key(key_file("{}".into()).path()).is_err());
+
+    // A lattice key file writes as the seed does.
+    let file = key_file(lattice(&multikey));
+    let account = SecretBytes(seed).nex_address();
+    let (url, submitted) = relay_dir_node(&account, None);
+    let path = file.path().to_str().unwrap();
+    let args = ["relay-dir", "remove", "--key", path, "--nexus-url", &url];
+    let cli = Cli::try_parse_from(["lattice-swap"].iter().chain(&args)).unwrap();
+    let Command::RelayDir(command) = cli.command else {
+        unreachable!()
+    };
+    relay_dir_write(command).unwrap();
+    assert!(submitted.lock().unwrap().is_empty(), "nothing listed");
+    let (url, submitted) = relay_dir_node(&account, None);
+    let args = [
+        "relay-dir",
+        "add",
+        "--url",
+        "https://r.example",
+        "--key",
+        path,
+        "--nexus-url",
+        &url,
+    ];
+    let cli = Cli::try_parse_from(["lattice-swap"].iter().chain(&args)).unwrap();
+    let Command::RelayDir(command) = cli.command else {
+        unreachable!()
+    };
+    relay_dir_write(command).unwrap();
+    assert_eq!(
+        submitted.lock().unwrap()[0]["transaction"]["body"]["signers"],
+        json!([account])
+    );
+
+    let args = ["lattice-swap", "relay-dir", "remove", "--key", path];
+    assert!(
+        Cli::try_parse_from(args).is_err(),
+        "--nexus-url is required"
+    );
+}

@@ -433,10 +433,12 @@ lattice-swap relay-dir remove --key relay.key \
   --nexus-cookie ~/.lattice/.cookie --nexus-url http://127.0.0.1:8080
 ```
 
-`--key` is a file holding the account's Ed25519 seed in hex, readable by
-its owner alone, as `--nex-key-file` is. The node, your own lattice-node
-with `--nexus-cookie` or a public read port that takes submits, must host
-the directory's chain (`--chain`, `Nexus/testnet/swap-relays` by default).
+`--key` is a file readable by its owner alone holding the account's
+Ed25519 seed in hex, as `--nex-key-file` does, or a key file
+`lattice key generate` writes. `--nexus-url` is required: the node, your own
+lattice-node with `--nexus-cookie` or a public read port that takes
+submits, must host the directory's chain (`--chain`,
+`Nexus/testnet/swap-relays` by default), and no default node is known to.
 Each command reads the account's entry at the chain's tip and writes it
 from that value, so `add` replaces a URL listed before; it sends nothing if
 the entry already holds what was asked. `add` refuses a URL readers skip:
@@ -444,6 +446,9 @@ not `https://`, with user info, or to a literal name or address of this
 machine or a private network. The write pays `--fee`, or the node's relay
 floor if higher, from the account's balance on the directory's chain, at
 its nonce there; an account holding less than the fee there is refused.
+So the account needs coins on the directory's chain, unless the node's
+relay floor is 0 and no `--fee` is given: this tool does not pay fees in
+work through a sponsor.
 It prints the transaction's CID once the node takes it; the entry changes
 once a block holds it.
 
