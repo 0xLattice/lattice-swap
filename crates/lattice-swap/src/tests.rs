@@ -972,7 +972,7 @@ fn only_a_swap_exits_zero() {
 #[test]
 fn a_failure_after_the_swap_file_exists_says_how_to_resume() {
     let file = tempfile::NamedTempFile::new().unwrap();
-    let hinted = resume_hint(file.path(), "lost".into()).to_string();
+    let hinted = resume_hint(file.path(), "", "lost".into()).to_string();
     let hint = format!(
         "lost\nto carry on, run with the same flags, the node and key flags and \
          --max-fee-rate, --fallback-fee-rate, --max-fee-fraction, --max-tip-age and \
@@ -981,8 +981,18 @@ fn a_failure_after_the_swap_file_exists_says_how_to_resume() {
         file.path().display()
     );
     assert_eq!(hinted, hint);
+    // A seller that serves its relay is told to serve it again.
+    let serve = ServeRelayArgs {
+        serve_relay: Some("0.0.0.0:7500".parse().unwrap()),
+        serve_relay_url: Some("https://seller.example".into()),
+    };
+    let hinted = resume_hint(file.path(), &serve.flags(), "lost".into()).to_string();
+    assert_eq!(
+        hinted,
+        format!("{hint} --serve-relay 0.0.0.0:7500 --serve-relay-url https://seller.example")
+    );
     let missing = file.path().with_extension("gone");
-    assert_eq!(resume_hint(&missing, "lost".into()).to_string(), "lost");
+    assert_eq!(resume_hint(&missing, "", "lost".into()).to_string(), "lost");
 }
 
 #[test]
@@ -1565,7 +1575,7 @@ fn the_bump_settings_default_to_the_drivers() {
     let mut bump = offer_args(&[]).bump;
     bump.max_fee_fraction = f64::NAN;
     let driver = Driver::<Seller, _, Ivy>::resume(bitcoin(), nexus(), None, store());
-    let refused = run(Path::new(&path), driver, &bump, None)
+    let refused = run(Path::new(&path), "", driver, &bump, None)
         .unwrap_err()
         .to_string();
     assert!(refused.contains("max_fee_fraction NaN"), "{refused}");
@@ -2523,6 +2533,122 @@ fn a_resumed_seller_rejoins_through_the_relay_it_serves() {
     }
     .through(None);
     assert_eq!(unchanged.offer.relay, Some(public));
+}
+
+/// While `offer` runs, a seller whose buyer took the offer on the relay it
+/// serves meets the buyer again there through its own machine, though the
+/// session file it saves names the public URL, as the buyer's does.
+#[test]
+fn a_started_seller_rejoins_through_the_relay_it_serves() {
+    struct Quiet;
+    impl Transport for Quiet {
+        fn send(&mut self, _: &[u8]) -> io::Result<()> {
+            Ok(())
+        }
+        fn recv(&mut self, _: Duration) -> io::Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+    }
+    let served = serve_relay("127.0.0.1:0".parse().unwrap()).unwrap();
+    let key = SigningKey::from_bytes(&random32());
+    // Nothing answers here.
+    let public = "http://127.0.0.1:1".to_string();
+    let offer = offer_of(
+        &small_args(40),
+        Network::Regtest,
+        Place::Relay(public.clone()),
+        &key,
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::new(directory.path(), [7; 32]);
+    let unreachable = "http://127.0.0.1:1";
+    let driver = swap::session::start_through(
+        Seller::Done(Outcome::Refunded),
+        vec![],
+        Bitcoind::new(unreachable, "u:p", Network::Regtest, TIMEOUT),
+        Client::new(unreachable, "c", TIMEOUT),
+        MAINNET,
+        Box::new(Quiet),
+        Store::new(directory.path(), [7; 32]),
+        SessionFile {
+            offer: offer.clone(),
+            key: Some(hex::encode(key.to_bytes())),
+            listen: None,
+        },
+        None,
+        Some(served.clone()),
+    )
+    .unwrap();
+    let saved = SessionFile::load(&store).unwrap().unwrap();
+    assert_eq!(
+        saved.offer.relay,
+        Some(public),
+        "saved as the offer names it"
+    );
+
+    let mut seller = driver.reconnect.unwrap();
+    let mut buyer = SessionFile {
+        offer: Offer {
+            relay: Some(served),
+            ..offer
+        },
+        key: None,
+        listen: None,
+    }
+    .reconnect(None)
+    .unwrap();
+    let rejoin = swap::Rejoin {
+        id: [5; 32],
+        key: [6; 32],
+    };
+    let (mut seller_session, mut buyer_session) = (None, None);
+    for _ in 0..1_000 {
+        if seller_session.is_none() {
+            seller_session = seller(&rejoin).and_then(|opened| opened.ok());
+        }
+        if buyer_session.is_none() {
+            buyer_session = buyer(&rejoin).and_then(|opened| opened.ok());
+        }
+        if seller_session.is_some() && buyer_session.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let (mut seller, mut buyer) = (seller_session.unwrap(), buyer_session.unwrap());
+    buyer.send(b"again").unwrap();
+    assert_eq!(
+        seller.recv(TIMEOUT).unwrap().as_deref(),
+        Some(&b"again"[..])
+    );
+}
+
+/// A buyer serves no relay: `resume --serve-relay` on a buyer's swap is
+/// refused before anything is served.
+#[cfg(unix)]
+#[test]
+fn resume_refuses_to_serve_a_relay_for_a_buyer() {
+    let (buyer, _) = Buyer::start(small(16), ScriptBuf::new(), "b".into()).unwrap();
+    let (_directory, path) = swap_file(buyer);
+    let listen = {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().to_string()
+    };
+    let args = [
+        "lattice-swap",
+        "resume",
+        &path,
+        "--serve-relay",
+        &listen,
+        "--serve-relay-url",
+        "https://seller.example",
+    ];
+    let refused = exit_status(Cli::try_parse_from(args).unwrap().command)
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("a buyer's swap"), "{refused}");
+    assert!(ureq::get(&format!("http://{listen}/offers"))
+        .call()
+        .is_err());
 }
 
 /// The lattice-node writes a new cookie at every restart: the client

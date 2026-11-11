@@ -39,7 +39,7 @@ const REJOIN_WAIT: Duration = Duration::from_secs(60);
 /// address it listened on, if not on a relay. The seller dials no one: it
 /// listens again, or waits at the relay; the buyer dials the seller, or
 /// comes to the relay. Readable by its owner alone.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SessionFile {
     pub offer: Offer,
     pub key: Option<String>,
@@ -181,8 +181,38 @@ pub fn start<M: Machine, B: Bitcoin>(
     rejoin: SessionFile,
     listener: Option<TcpListener>,
 ) -> Result<Driver<M, B, Session>> {
+    start_through(
+        machine,
+        actions,
+        bitcoin,
+        nexus,
+        nexus_genesis,
+        transport,
+        store,
+        rejoin,
+        listener,
+        None,
+    )
+}
+
+/// [`start`], meeting the counterparty again on the relay at `relay`, if
+/// given ([`SessionFile::through`]); `rejoin` is saved as it is, naming
+/// the relay the offer does.
+#[allow(clippy::too_many_arguments)]
+pub fn start_through<M: Machine, B: Bitcoin>(
+    machine: M,
+    actions: Vec<Action>,
+    bitcoin: B,
+    nexus: Client,
+    nexus_genesis: &str,
+    transport: Session,
+    store: Store,
+    rejoin: SessionFile,
+    listener: Option<TcpListener>,
+    relay: Option<String>,
+) -> Result<Driver<M, B, Session>> {
     log(&format!("swap file {}", store.path().display()));
-    let reconnect = rejoin.reconnect(listener)?;
+    let reconnect = rejoin.clone().through(relay).reconnect(listener)?;
     rejoin.save(&store)?;
     let mut driver = Driver::start(machine, actions, bitcoin, nexus, Some(transport), store)?;
     driver.reconnect = Some(reconnect);
