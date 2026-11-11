@@ -42,6 +42,11 @@ no Nexus consensus change is required.
   `wasm32-unknown-unknown`, with a clang that has the WebAssembly target.
 - `swap-relay`: a relay the parties can meet through: an offer board and a
   pipe between the two.
+- `relay-dir-policy`: the validity policy of the relay directory, a child
+  chain where each relay's account lists its `https://` URL under
+  `relay/<account>`. A wasm module, in a workspace of its own:
+  `build.sh` builds it, `chain/relay_dir_policy.wasm` is that build, and
+  `chain/spec.json` is the chain's spec, naming it by CID.
 - `lattice-swap`: the command line tool that runs one side of a swap.
 
 `web/driver` is the buyer's side in a browser, over `swap-wasm`. It funds the
