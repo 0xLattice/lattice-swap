@@ -10,8 +10,12 @@
 //! their session is lost, and
 //! saving its state to a swap file that `resume` carries on from after a
 //! restart and `status` reads.
+//!
+//! A relay's operator runs `relay-dir add` to list the relay on the relay
+//! directory, where takers find relays, and `relay-dir remove` to unlist it.
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener};
@@ -35,8 +39,9 @@ use swap::session::{
     check_nex_address, state_name, swap_store, Result, Saved, Session, SessionFile, TIMEOUT,
 };
 use swap::transport::{Ivy, Transport};
-use swap::{Buyer, Machine, Message, Outcome, SecretBytes, Seller, Terms};
-use swap_nexus_tx::rpc::Client;
+use swap::{relay_dir, Buyer, Machine, Message, Outcome, SecretBytes, Seller, Terms};
+use swap_nexus_tx::rpc::{parse, Client};
+use swap_nexus_tx::{relay_dir_action, TransactionBody};
 /// Holds the seller's Nexus wallet key when no key file is given.
 const NEX_KEY_ENV: &str = "LATTICE_SWAP_NEX_KEY";
 /// Holds the password for `--btc-user`.
@@ -45,6 +50,8 @@ const BTC_PASSWORD_ENV: &str = "LATTICE_SWAP_BTC_PASSWORD";
 const FEE_TARGET: u16 = 6;
 /// The public Nexus node read by default: a read port that takes submits.
 const PUBLIC_NEXUS: &str = "https://lattice-mainnet-read.fly.dev";
+/// The relay directory's chain, by default: testnet's.
+const RELAY_DIR_CHAIN: &str = "Nexus/testnet/swap-relays";
 /// What a seller is told without its Nexus key.
 const NO_KEY: &str = "the seller needs its Nexus key: --nex-key-file or LATTICE_SWAP_NEX_KEY";
 
@@ -94,6 +101,50 @@ enum Command {
         /// The swap file, `<swap id>.json`.
         swap_file: PathBuf,
     },
+    /// Lists a relay on the relay directory, the chain takers find relays
+    /// on, under the key's account, or unlists it. Each account lists one
+    /// relay, and only the account's key writes it.
+    #[command(subcommand)]
+    RelayDir(RelayDirCommand),
+}
+
+#[derive(Subcommand)]
+enum RelayDirCommand {
+    /// Lists the relay at --url, in place of the one the account lists now.
+    Add {
+        /// The relay's base URL: `https://`, to a public host.
+        #[arg(long)]
+        url: String,
+        #[command(flatten)]
+        write: RelayDirArgs,
+    },
+    /// Unlists the account's relay.
+    Remove(RelayDirArgs),
+}
+
+/// A write to the relay directory, paid for by the account that makes it,
+/// sent to a node that hosts the directory's chain.
+#[derive(Args)]
+struct RelayDirArgs {
+    /// A file holding the account's key, its Ed25519 seed in hex, readable
+    /// by its owner alone.
+    #[arg(long)]
+    key: PathBuf,
+    /// The relay directory's chain path.
+    #[arg(long, default_value = RELAY_DIR_CHAIN)]
+    chain: String,
+    /// The fee paid on that chain, from the account's balance there; the
+    /// node's relay floor if higher.
+    #[arg(long, default_value_t = 0)]
+    fee: u64,
+    /// The node's URL, which must host --chain: a public read port, which
+    /// must take submits, or with --nexus-cookie your own lattice-node's
+    /// RPC.
+    #[arg(long, default_value = PUBLIC_NEXUS)]
+    nexus_url: String,
+    /// Your own lattice-node's RPC cookie file, with its --nexus-url.
+    #[arg(long, requires = "nexus_url")]
+    nexus_cookie: Option<PathBuf>,
 }
 
 /// Defaults are this tool's settings, not protocol rules.
@@ -553,20 +604,28 @@ impl NexKeyArgs {
     /// The key, if one is given.
     fn given(&self) -> Result<Option<SecretBytes>> {
         let hex = match &self.nex_key_file {
-            Some(path) => {
-                owner_only(path)?;
-                read(path)?
-            }
+            Some(path) => return key_file(path).map(Some),
             None => match std::env::var(NEX_KEY_ENV) {
                 Ok(hex) => hex,
                 Err(_) => return Ok(None),
             },
         };
-        let mut seed = [0u8; 32];
-        hex::decode_to_slice(hex.trim(), &mut seed)
-            .map_err(|_| "the Nexus key is not 32 bytes of hex")?;
-        Ok(Some(SecretBytes(seed)))
+        nex_key(&hex).map(Some)
     }
+}
+
+/// The Nexus key in `path`, which only its owner may read.
+fn key_file(path: &Path) -> Result<SecretBytes> {
+    owner_only(path)?;
+    nex_key(&read(path)?)
+}
+
+/// A Nexus key: its Ed25519 seed in hex.
+fn nex_key(hex: &str) -> Result<SecretBytes> {
+    let mut seed = [0u8; 32];
+    hex::decode_to_slice(hex.trim(), &mut seed)
+        .map_err(|_| "the Nexus key is not 32 bytes of hex")?;
+    Ok(SecretBytes(seed))
 }
 
 /// How the driver bumps, by CPFP from their payout, the swap transactions
@@ -1513,6 +1572,75 @@ fn wallet(args: WalletArgs) -> Result<()> {
     Ok(())
 }
 
+/// Takes the key's account's entry on the relay directory to --url, or
+/// none for `remove`: reads what the entry holds at the chain's tip, the
+/// write's old value, then signs and submits the write, paying the fee
+/// from the account's balance on that chain. Does nothing if the entry
+/// already holds it. A URL that is not one the directory's readers list,
+/// `https://` to a public host, is refused.
+fn relay_dir_write(command: RelayDirCommand) -> Result<()> {
+    let (args, url) = match command {
+        RelayDirCommand::Add { url, write } => {
+            if relay_dir::relay_url(&url).is_none() {
+                return Err(format!(
+                    "refused: {url} is not an https:// URL to a public host, which readers skip"
+                )
+                .into());
+            }
+            (write, Some(url))
+        }
+        RelayDirCommand::Remove(write) => (write, None),
+    };
+    let key = key_file(&args.key)?;
+    let account = key.nex_address();
+    let chain: Vec<String> = args.chain.split('/').map(String::from).collect();
+    let nexus = match &args.nexus_cookie {
+        Some(cookie) => Client::from_cookie_file(&args.nexus_url, cookie, TIMEOUT),
+        None => Client::public(&args.nexus_url, TIMEOUT),
+    };
+    let info = nexus.chain_info_of(&chain)?;
+    if info["chain"] != json!(chain) {
+        return Err(format!("{} answered for another chain: {info}", args.nexus_url).into());
+    }
+    if args.nexus_cookie.is_none() && info["acceptsSubmit"] != true {
+        return Err(format!("refused: {} takes no transactions", args.nexus_url).into());
+    }
+    let tip = parse::tip(&info)?.1.ok_or("the chain has no tip yet")?;
+    let fee = args.fee.max(parse::min_relay_fee(&info)?);
+    // A Volume holds many nodes: one already read is not asked for again.
+    let mut held = BTreeMap::new();
+    let key_name = format!("{}{account}", relay_dir::PREFIX);
+    let current = relay_dir::value(&tip, &key_name, |cid| {
+        if !held.contains_key(cid) {
+            held.extend(nexus.volume(cid, &chain).map_err(|e| e.to_string())?);
+        }
+        held.get(cid)
+            .cloned()
+            .ok_or(format!("the node's Volume {cid} lacks its root"))
+    })?;
+    let Some(action) = relay_dir_action(&account, current, url) else {
+        println!(
+            "unchanged: {account}'s entry on {} already holds that",
+            args.chain
+        );
+        return Ok(());
+    };
+    let funds = nexus.account_of(&account, &chain)?;
+    if funds.balance < fee {
+        return Err(format!(
+            "{account} holds {} on {}, less than the fee of {fee}",
+            funds.balance, args.chain
+        )
+        .into());
+    }
+    let body = TransactionBody::write(&account, vec![action], fee, funds.nonce, chain)
+        .ok_or("the fee does not fit")?;
+    let mut transaction = swap_nexus_tx::Transaction::new(body);
+    transaction.sign(&SigningKey::from_bytes(&key.0));
+    println!("submitted: {}", nexus.submit(&transaction)?);
+    Ok(())
+}
+
 /// A swap in `dir` that has not ended, as the app judges it, if any.
 fn unended(dir: &Path) -> Result<Option<String>> {
     for entry in fs::read_dir(dir)? {
@@ -1627,6 +1755,7 @@ fn exit_status(command: Command) -> Result<u8> {
         Command::Resume(args) => resume(args).map(exit_code),
         Command::Wallet(args) => wallet(args).map(|()| 0),
         Command::Status { swap_file } => status(&swap_file).map(|()| 0),
+        Command::RelayDir(command) => relay_dir_write(command).map(|()| 0),
     }
 }
 
