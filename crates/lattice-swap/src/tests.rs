@@ -2622,6 +2622,65 @@ fn a_started_seller_rejoins_through_the_relay_it_serves() {
     );
 }
 
+/// The relay served is listed on once, as served, though a --relay names
+/// its server too: listed on as given, the seller would dial its own
+/// relay out and back in, and be refused the second listing.
+#[test]
+fn the_relay_served_is_listed_on_once() {
+    let relays = [
+        "https://relay.example".to_string(),
+        "HTTPS://Seller.Example/".into(),
+    ];
+    let local = "http://127.0.0.1:7500".to_string();
+    assert_eq!(
+        relays_dialled(&relays, Some((local.clone(), "https://seller.example"))),
+        [
+            (
+                "https://relay.example".to_string(),
+                "https://relay.example".to_string()
+            ),
+            (local, "https://seller.example".to_string()),
+        ]
+    );
+    assert_eq!(
+        relays_dialled(&relays, None),
+        [
+            (
+                "https://relay.example".to_string(),
+                "https://relay.example".to_string()
+            ),
+            (
+                "HTTPS://Seller.Example/".to_string(),
+                "HTTPS://Seller.Example/".to_string()
+            ),
+        ]
+    );
+}
+
+/// What `offer` runs the swap with once a buyer takes it: on the relay it
+/// serves, the rejoin through its own machine and the --serve-relay flags
+/// in the resume hint; on another, neither, as `resume` refuses to serve a
+/// relay the swap does not meet at.
+#[test]
+fn only_a_swap_taken_on_the_relay_served_resumes_serving_it() {
+    let serve = ServeRelayArgs {
+        serve_relay: Some("0.0.0.0:7500".parse().unwrap()),
+        serve_relay_url: Some("https://seller.example".into()),
+    };
+    let local = "http://127.0.0.1:7500".to_string();
+    let relays = relays_dialled(
+        &["https://relay.example".to_string()],
+        Some((local.clone(), "https://seller.example")),
+    );
+    assert_eq!(rejoin_through(&relays, 0, &serve), (None, String::new()));
+    let (through, flags) = rejoin_through(&relays, 1, &serve);
+    assert_eq!(through, Some(local));
+    assert_eq!(
+        flags,
+        " --serve-relay 0.0.0.0:7500 --serve-relay-url https://seller.example"
+    );
+}
+
 /// A buyer serves no relay: `resume --serve-relay` on a buyer's swap is
 /// refused before anything is served.
 #[cfg(unix)]

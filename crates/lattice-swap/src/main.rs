@@ -966,14 +966,11 @@ fn offer(mut args: OfferArgs) -> Result<Outcome> {
     let store = Store::new(&args.dir, swap_id);
 
     let listener = args.listen.map(TcpListener::bind).transpose()?;
-    // Each relay as the seller dials it, and as its offer names it: the
-    // one it serves itself, it dials on its own machine.
-    let mut relays: Vec<(String, String)> = (args.relay.iter())
-        .map(|relay| (relay.clone(), relay.clone()))
-        .collect();
-    if let (Some(listen), Some(url)) = (args.serve.serve_relay, &args.serve.serve_relay_url) {
-        relays.push((serve_relay(listen)?, url.clone()));
-    }
+    let served = match (args.serve.serve_relay, &args.serve.serve_relay_url) {
+        (Some(listen), Some(url)) => Some((serve_relay(listen)?, &url[..])),
+        _ => None,
+    };
+    let relays = relays_dialled(&args.relay, served);
     let named: Vec<String> = relays.iter().map(|(_, named)| named.clone()).collect();
     let place = match (&listener, named.first()) {
         (_, Some(relay)) => Place::Relay(relay.clone()),
@@ -995,7 +992,7 @@ fn offer(mut args: OfferArgs) -> Result<Outcome> {
     println!("{}", offer.encode());
     io::stdout().flush()?;
     let wait = Duration::from_secs(args.wait);
-    let start = Start {
+    let mut start = Start {
         bitcoin,
         nexus,
         nexus_genesis: args.nodes.nexus_genesis.clone(),
@@ -1003,7 +1000,7 @@ fn offer(mut args: OfferArgs) -> Result<Outcome> {
         nex_key: Some(key.clone()),
         bump: &args.bump,
         poll: args.nodes.poll(),
-        serve: args.serve.flags(),
+        serve: String::new(),
     };
     // The seller fixes the terms at the amount the buyer asks for, then
     // starts its machine on them.
@@ -1032,10 +1029,8 @@ fn offer(mut args: OfferArgs) -> Result<Outcome> {
             // The two meet again on the relay the buyer took it on, the
             // only one its offer names.
             rejoin.offer = offers[taken].clone();
-            // The relay it serves, it reaches on its own machine: the URL
-            // the offer names may not lead back to it from there.
-            let (dialed, named) = (&relays[taken].0, &named[taken]);
-            let through = (dialed != named).then(|| dialed.clone());
+            let (through, serve) = rejoin_through(&relays, taken, &args.serve);
+            start.serve = serve;
             let terms = answer_request(&mut transport, &offer)?;
             let transport = Box::new(transport);
             start.run(seller(terms)?, vec![], transport, rejoin, None, through)
@@ -1056,6 +1051,39 @@ fn offer(mut args: OfferArgs) -> Result<Outcome> {
         }
         (None, true) => unreachable!("a place was found"),
     }
+}
+
+/// The relays to list on, each as the seller dials it and as its offer
+/// names it: every one of `relays`, and the relay it serves, if any, which
+/// it dials at the first and its offer names by the second. A relay of the
+/// served one's server is listed on once, as the served one, whose dialling
+/// does not leave the machine.
+fn relays_dialled(relays: &[String], served: Option<(String, &str)>) -> Vec<(String, String)> {
+    let serves = served.as_ref().map(|(_, url)| relay_server(url));
+    let mut dialled: Vec<(String, String)> = (relays.iter())
+        .filter(|relay| Some(relay_server(relay)) != serves)
+        .map(|relay| (relay.clone(), relay.clone()))
+        .collect();
+    dialled.extend(served.map(|(local, url)| (local, url.to_string())));
+    dialled
+}
+
+/// How the seller meets the buyer again once it took the offer on
+/// `relays[taken]` ([`relays_dialled`]), and what `resume` needs given
+/// again to: on the relay it serves, through its own machine, as the URL
+/// the offer names may not lead back to it, and the --serve-relay flags;
+/// on any other, as its offer names it, and no flags, as `resume` refuses
+/// to serve a relay the swap does not meet at.
+fn rejoin_through(
+    relays: &[(String, String)],
+    taken: usize,
+    serve: &ServeRelayArgs,
+) -> (Option<String>, String) {
+    let (dialled, named) = &relays[taken];
+    if dialled == named {
+        return (None, String::new());
+    }
+    (Some(dialled.clone()), serve.flags())
 }
 
 /// How many sellers the relay `offer --serve-relay` runs holds at once,
@@ -1144,7 +1172,8 @@ struct Start<'a> {
     nex_key: Option<SecretBytes>,
     bump: &'a BumpArgs,
     poll: Option<Duration>,
-    /// The --serve-relay flags given, for the resume hint.
+    /// The --serve-relay flags `resume` needs given again, for its hint:
+    /// none unless the buyer took the offer on the relay served.
     serve: String,
 }
 
