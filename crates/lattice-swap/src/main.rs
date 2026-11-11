@@ -1079,11 +1079,12 @@ fn rejoin_through(
     taken: usize,
     serve: &ServeRelayArgs,
 ) -> (Option<String>, String) {
-    let (dialled, named) = &relays[taken];
-    if dialled == named {
+    // The served relay is the one [`relays_dialled`] puts last: told
+    // apart by place, as its URL may be the very address it is dialled at.
+    if serve.serve_relay.is_none() || taken + 1 != relays.len() {
         return (None, String::new());
     }
-    (Some(dialled.clone()), serve.flags())
+    (Some(relays[taken].0.clone()), serve.flags())
 }
 
 /// How many sellers the relay `offer --serve-relay` runs holds at once,

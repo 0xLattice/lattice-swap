@@ -2679,6 +2679,25 @@ fn only_a_swap_taken_on_the_relay_served_resumes_serving_it() {
         flags,
         " --serve-relay 0.0.0.0:7500 --serve-relay-url https://seller.example"
     );
+    // A URL that is the very address it is dialled at is the relay served
+    // all the same.
+    let loopback = "http://127.0.0.1:7500".to_string();
+    let serve = ServeRelayArgs {
+        serve_relay: Some("127.0.0.1:7500".parse().unwrap()),
+        serve_relay_url: Some(loopback.clone()),
+    };
+    let relays = relays_dialled(
+        &["https://relay.example".to_string()],
+        Some((loopback.clone(), &loopback)),
+    );
+    assert_eq!(rejoin_through(&relays, 0, &serve), (None, String::new()));
+    assert_eq!(
+        rejoin_through(&relays, 1, &serve),
+        (
+            Some(loopback),
+            " --serve-relay 127.0.0.1:7500 --serve-relay-url http://127.0.0.1:7500".into()
+        )
+    );
 }
 
 /// A buyer serves no relay: `resume --serve-relay` on a buyer's swap is
