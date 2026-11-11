@@ -375,7 +375,9 @@ curl -s https://relay.example/offers
 Give `--relay` again to list on several relays at once, so one that is
 down does not hide the offer. Each lists the same offer, naming itself; the
 printed one names the first. A relay that is down or refuses the offer is
-logged and passed over, and the seller fails only once every relay has. The
+logged and tried again every 5 seconds while another holds the offer, so
+one down at the start gets it once it is back; the seller fails only once
+no relay holds it. The
 first relay to pair a buyer wins, and the seller closes its connections to
 the others, which withdraws the offer from their boards: it has one swap to
 run. If that buyer fails the handshake, the offer is listed on all of them

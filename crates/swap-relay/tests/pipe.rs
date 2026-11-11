@@ -15,11 +15,18 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A relay on loopback, holding at most `max_offers` sellers: its URL.
 fn relay(max_offers: usize) -> String {
+    relay_on(
+        std::net::TcpListener::bind("127.0.0.1:0").unwrap(),
+        max_offers,
+    )
+}
+
+/// A relay on `listener`, holding at most `max_offers` sellers: its URL.
+fn relay_on(listener: std::net::TcpListener, max_offers: usize) -> String {
     let relay = Arc::new(Relay {
         board: Board::new(max_offers),
         rejoins: Board::new(max_offers),
     });
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     listener.set_nonblocking(true).unwrap();
     thread::spawn(move || {
@@ -236,9 +243,45 @@ fn a_relay_down_or_refusing_leaves_the_others_listed() {
         (&down[..], &offer(&id(15))[..]),
         (&full[..], &offer(&id(15))[..]),
     ];
+    // Neither lists it, so neither is tried again: the error is the one
+    // that failed last, whichever that was.
     let failed = Ivy::accept_relayed_on(&listings, &config(1), key(2), TIMEOUT, TIMEOUT);
-    let failed = failed.err().unwrap().to_string();
-    assert!(failed.contains("full"), "the last to fail: {failed}");
+    assert!(failed.is_err());
+}
+
+/// A relay down when the seller lists is tried again every
+/// [`swap::transport::RETRY`] while another holds the offer: once it is
+/// up, the offer is listed there too, and a buyer can take it there.
+#[test]
+fn a_relay_down_at_the_start_lists_the_offer_once_it_is_up() {
+    let address = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap()
+    };
+    let late = format!("http://{address}");
+    let up = relay(10);
+    let seller = seller_on(&[&late, &up], offer(&id(16)));
+    wait_listed(&up, 1);
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        relay_on(std::net::TcpListener::bind(address).unwrap(), 10),
+        late
+    );
+    let deadline = std::time::Instant::now() + 3 * swap::transport::RETRY;
+    while offers(&late).is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never listed on {late}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    let mut buyer = Ivy::connect_relayed(&late, &id(16), &config(2), key(1), TIMEOUT).unwrap();
+    let (taken, mut seller) = seller.join().unwrap().unwrap();
+    assert_eq!(taken, 0);
+    wait_listed(&up, 0);
+    seller.send(b"terms").unwrap();
+    assert_eq!(buyer.recv(TIMEOUT).unwrap().unwrap(), b"terms");
 }
 
 /// The seller, key 1, waiting at rendezvous `id` for the buyer of key 2.
