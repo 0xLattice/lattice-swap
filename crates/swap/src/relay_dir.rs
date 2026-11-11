@@ -25,12 +25,16 @@
 //! a stored key is the prefixes on its path joined. The walk is
 //! moniker-sdk's `list` (`src/records/state.mjs`).
 //!
-//! A listing reads at most [`MAX_ENTRIES`] entries and [`MAX_NODES`] nodes,
-//! and each CID once, so a directory of any size or shape costs a bounded
-//! read. It reads each node's children in random order, so where it stops
-//! does not depend on key order. An entry is skipped unless its account is
-//! an address and its value an `https://` URL with no user info, whose host
-//! is not this machine or a private network's.
+//! A listing reads at most [`MAX_ENTRIES`] entries and [`MAX_NODES`] nodes
+//! of at most [`MAX_NODE_BYTES`] bytes and [`MAX_CHILDREN`] children each,
+//! each CID once, and no key longer than the policy allows, so a directory
+//! of any size or shape costs a bounded read. It reads each node's children
+//! in random order, so where it stops does not depend on key order. An entry
+//! is skipped unless its account is an address and its value an `https://`
+//! URL with no user info, whose host is not a literal name or address of
+//! this machine or a private network (a name may still resolve to one).
+//! Under [`PREFIX`], a malformed entry or child is skipped, not refused, so
+//! one cannot blank the list.
 
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr};
@@ -50,6 +54,17 @@ pub const MAX_ENTRIES: usize = 512;
 /// The longest key the directory's policy allows.
 const MAX_KEY_BYTES: usize = 512;
 
+/// The most bytes a node may have. The directory's policy caps a value at
+/// 16 KiB and a key at 512 bytes, and a node holds one value, one prefix and
+/// at most [`MAX_CHILDREN`] short links, so an honest node is well under
+/// this.
+pub const MAX_NODE_BYTES: usize = 32 * 1024;
+
+/// The most children a node may have. Cashew files a node's children by the
+/// first character of their prefixes, so an honest node has one per
+/// character that follows it, and an address is base32: 32 at most.
+pub const MAX_CHILDREN: usize = 64;
+
 /// The most nodes a listing reads. In cashew's trie every node but the root
 /// has a nonempty prefix, so no path is deeper than the longest key, and a
 /// node with no value has at least two children, so a subtree read whole
@@ -59,6 +74,9 @@ const MAX_KEY_BYTES: usize = 512;
 /// reads next; the block and its state are two more. A trie of another
 /// shape, which only a hostile block holds, is cut off here.
 pub const MAX_NODES: usize = 2 * MAX_ENTRIES + MAX_KEY_BYTES + 2;
+
+/// The longest key a listing descends to: below it, a branch is not read.
+const MAX_PATH_BYTES: usize = PREFIX.len() + MAX_KEY_BYTES;
 
 /// A relay as its account lists it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,7 +133,9 @@ impl Listing {
     }
 
     /// The CIDs of the nodes still to read, the next first; none once the
-    /// listing is done. Any may be fetched and given in any order.
+    /// listing is done. Any may be fetched and given in any order, but
+    /// [`MAX_NODES`] is reached before [`MAX_ENTRIES`] on an honest trie
+    /// only out of this order, which is depth-first.
     pub fn wants(&self) -> Vec<String> {
         self.pending
             .iter()
@@ -131,12 +151,19 @@ impl Listing {
     }
 
     /// Reads `bytes` as the node `cid` names. Refuses bytes that are not the
-    /// ones it names, and a node that is not what the walk expects there; a
-    /// node not wanted is ignored.
+    /// ones it names, more than [`MAX_NODE_BYTES`] of them, a node with more
+    /// than [`MAX_CHILDREN`] children, and a node above [`PREFIX`] that is
+    /// not what the walk expects there; a node not wanted is ignored.
     pub fn give(&mut self, cid: &str, bytes: &[u8]) -> Result<(), String> {
         let Some(at) = self.pending.iter().position(|(wanted, _)| wanted == cid) else {
             return Ok(());
         };
+        if bytes.len() > MAX_NODE_BYTES {
+            return Err(format!(
+                "{cid} is {} bytes, more than a node of the directory's",
+                bytes.len()
+            ));
+        }
         if self::cid(bytes) != cid {
             return Err(format!(
                 "the bytes given for {cid} are not the ones it names"
@@ -187,7 +214,11 @@ impl Listing {
                 }
             }
             Node::Under { mut path } => {
-                path.push_str(prefix(node)?);
+                // A malformed node is skipped, as an entry would be.
+                let Some(prefix) = prefix(node) else {
+                    return Some(());
+                };
+                path.push_str(prefix);
                 self.under(path, node)?;
             }
         }
@@ -195,11 +226,16 @@ impl Listing {
     }
 
     /// Takes the entry at `node`, under the key `path`, then queues its
-    /// children in random order, or stops at [`MAX_ENTRIES`].
+    /// children in random order, or stops at [`MAX_ENTRIES`]. Below
+    /// [`MAX_PATH_BYTES`] nothing is read. None only for a node with more
+    /// than [`MAX_CHILDREN`] children.
     fn under(&mut self, path: String, node: &Value) -> Option<()> {
+        if path.len() > MAX_PATH_BYTES {
+            return Some(());
+        }
         if let Some(value) = field(node, "value") {
-            let value = value.as_text()?;
             self.entries += 1;
+            let value = value.as_text().unwrap_or_default();
             let account = path.strip_prefix(PREFIX).filter(|account| is_cid(account));
             if let (Some(account), Some(url)) = (account, relay_url(value)) {
                 self.relays.push(Relay {
@@ -212,7 +248,12 @@ impl Listing {
                 return Some(());
             }
         }
-        let mut children = children(node)?;
+        // A child that is not `{key, value: {rawCID}}` is skipped.
+        let mut children: Vec<_> = match field(node, "children").and_then(Value::as_array) {
+            Some(children) if children.len() > MAX_CHILDREN => return None,
+            Some(children) => children.iter().filter_map(child).collect(),
+            None => Vec::new(),
+        };
         // Fisher-Yates.
         for i in (1..children.len()).rev() {
             let j = (OsRng.next_u64() % (i as u64 + 1)) as usize;
@@ -237,23 +278,29 @@ impl Listing {
 }
 
 /// `value` as a relay's base URL: `https://`, no user info, and a host that
-/// is not this machine or a private network's.
+/// is not literally this machine or a private network: `localhost`, or an
+/// address outside the public unicast ranges. A name is not resolved.
 fn relay_url(value: &str) -> Option<Url> {
     let url = Url::parse(value).ok()?;
     let local_ip = |ip: IpAddr| match ip {
         IpAddr::V4(ip) => !public_v4(ip),
-        IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
+        // IPv4-mapped and IPv4-compatible (`::a.b.c.d`, `::1` among them).
+        IpAddr::V6(ip) => match ip.to_ipv4() {
             Some(ip) => !public_v4(ip),
             None => {
                 ip.is_loopback()
                     || ip.is_unspecified()
                     || ip.is_unique_local()
                     || ip.is_unicast_link_local()
+                    || ip.is_multicast()
             }
         },
     };
     let local = match url.host()? {
-        Host::Domain(domain) => domain == "localhost" || domain.ends_with(".localhost"),
+        Host::Domain(domain) => {
+            let domain = domain.trim_end_matches('.');
+            domain == "localhost" || domain.ends_with(".localhost")
+        }
         Host::Ipv4(ip) => local_ip(IpAddr::V4(ip)),
         Host::Ipv6(ip) => local_ip(IpAddr::V6(ip)),
     };
@@ -261,9 +308,19 @@ fn relay_url(value: &str) -> Option<Url> {
     (url.scheme() == "https" && plain && !local).then_some(url)
 }
 
-/// Whether `ip` is reachable beyond this machine and its private network.
+/// Whether `ip` is a unicast address beyond this machine and its private
+/// network: not `0.0.0.0/8`, loopback, private, carrier-grade NAT
+/// (`100.64.0.0/10`), link-local, broadcast or multicast.
 fn public_v4(ip: Ipv4Addr) -> bool {
-    !(ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified())
+    let [a, b, ..] = ip.octets();
+    let shared = a == 100 && b & 0xc0 == 64;
+    !(a == 0
+        || ip.is_loopback()
+        || ip.is_private()
+        || shared
+        || ip.is_link_local()
+        || ip.is_broadcast()
+        || ip.is_multicast())
 }
 
 /// The relays listed in the block `commitment` names, each node fetched by
@@ -297,18 +354,20 @@ fn prefix(node: &Value) -> Option<&str> {
     field(node, "prefix").map_or(Some(""), Value::as_text)
 }
 
-/// A trie node's children: each one's key and CID.
+/// A trie node's children, each one's key and CID: at most
+/// [`MAX_CHILDREN`], each well formed.
 fn children(node: &Value) -> Option<Vec<(String, String)>> {
-    field(node, "children")?
-        .as_array()?
-        .iter()
-        .map(|child| {
-            Some((
-                field(child, "key")?.as_text()?.into(),
-                link(child, "value")?,
-            ))
-        })
-        .collect()
+    let children = field(node, "children")?.as_array()?;
+    (children.len() <= MAX_CHILDREN).then_some(())?;
+    children.iter().map(child).collect()
+}
+
+/// A child: `{key, value: {rawCID}}`.
+fn child(child: &Value) -> Option<(String, String)> {
+    Some((
+        field(child, "key")?.as_text()?.into(),
+        link(child, "value")?,
+    ))
 }
 
 #[cfg(test)]
@@ -472,6 +531,8 @@ mod tests {
             "https://relay.example:8443/base",
             "https://8.8.8.8",
             "https://[2606:4700::1111]",
+            "https://100.128.0.1",
+            "https://relay.example.",
         ] {
             assert!(relay_url(url).is_some(), "{url}");
         }
@@ -494,6 +555,17 @@ mod tests {
             "https://[fe80::1]",
             "https://[::ffff:127.0.0.1]",
             "https://[::ffff:10.0.0.1]",
+            "https://localhost.",
+            "https://localhost..",
+            "https://relay.localhost.",
+            "https://[::127.0.0.1]",
+            "https://[::10.0.0.1]",
+            "https://100.64.0.1",
+            "https://100.127.255.255",
+            "https://0.1.2.3",
+            "https://255.255.255.255",
+            "https://224.0.0.1",
+            "https://[ff02::1]",
         ] {
             assert!(relay_url(url).is_none(), "{url}");
         }
@@ -536,7 +608,7 @@ mod tests {
     }
 
     #[test]
-    fn a_trie_deeper_than_any_key_is_cut_off() {
+    fn a_valueless_chain_stops_at_the_longest_key() {
         let mut store = Store::default();
         let mut below = store.put(map(vec![
             ("prefix", text("q")),
@@ -551,7 +623,116 @@ mod tests {
         let commitment = under_prefix(&mut store, vec![child("q", &below)]);
         let (relays, fetched) = store.counted(&commitment).unwrap();
         assert_eq!(relays, []);
+        // The block, its state, the root, `relay/`, and one node a byte down
+        // to the first key longer than the longest.
+        assert_eq!(fetched, 4 + MAX_PATH_BYTES - PREFIX.len() + 1);
+    }
+
+    #[test]
+    fn a_trie_of_more_nodes_than_its_entries_need_is_cut_off() {
+        // 40 valueless nodes of 40 valueless nodes each.
+        let mut store = Store::default();
+        let middles = (0..40)
+            .map(|i| {
+                let leaves = (0..40)
+                    .map(|j| {
+                        let key = format!("l{i}-{j}");
+                        child(&key[..1], &trie_node(&mut store, &key, None, vec![]))
+                    })
+                    .collect::<Vec<_>>();
+                let key = format!("m{i}");
+                let middle = trie_node(&mut store, &key, None, leaves);
+                child(&key[..1], &middle)
+            })
+            .collect();
+        let commitment = under_prefix(&mut store, middles);
+        let (relays, fetched) = store.counted(&commitment).unwrap();
+        assert_eq!(relays, []);
         assert_eq!(fetched, MAX_NODES);
+    }
+
+    /// A node under `relay/`: `prefix`, `value` if any, and `children`.
+    fn trie_node(
+        store: &mut Store,
+        prefix: &str,
+        value: Option<Value>,
+        children: Vec<Value>,
+    ) -> String {
+        let mut fields = vec![("prefix", text(prefix))];
+        fields.extend(value.map(|value| ("value", value)));
+        fields.push(("children", Value::Array(children)));
+        store.put(map(fields))
+    }
+
+    #[test]
+    fn a_node_over_the_caps_is_refused() {
+        let mut store = Store::default();
+        let big = store.put(map(vec![("padding", text(&"x".repeat(MAX_NODE_BYTES)))]));
+        let mut listing = Listing::new(&format!("{big}@x")).unwrap();
+        assert!(listing.give(&big, &store.0[&big]).is_err());
+
+        let leaf = trie_node(&mut store, "q", None, vec![]);
+        let fan = |n| {
+            (0..n)
+                .map(|i| child(&format!("{i}"), &leaf))
+                .collect::<Vec<_>>()
+        };
+        let at_most = under_prefix(&mut store, fan(MAX_CHILDREN));
+        assert!(store.list(&at_most).is_ok());
+        let over = under_prefix(&mut store, fan(MAX_CHILDREN + 1));
+        assert!(store.list(&over).is_err());
+    }
+
+    #[test]
+    fn a_branch_below_the_longest_key_is_not_read() {
+        let mut store = Store::default();
+        let step = "q".repeat(100);
+        let mut below = trie_node(
+            &mut store,
+            &step,
+            Some(text("https://deep.example")),
+            vec![],
+        );
+        for _ in 0..20 {
+            below = trie_node(&mut store, &step, None, vec![child("q", &below)]);
+        }
+        let commitment = under_prefix(&mut store, vec![child("q", &below)]);
+        let (relays, fetched) = store.counted(&commitment).unwrap();
+        assert_eq!(relays, []);
+        // The block, its state, the root, `relay/`, and the chain down to
+        // the first node whose key is longer than the longest.
+        assert_eq!(fetched, 4 + MAX_PATH_BYTES.div_ceil(100));
+    }
+
+    #[test]
+    fn a_malformed_entry_under_the_prefix_is_skipped() {
+        let mut store = Store::default();
+        let good = account(1);
+        let leaf = trie_node(
+            &mut store,
+            &good,
+            Some(text("https://good.example")),
+            vec![],
+        );
+        let number = trie_node(&mut store, "d", Some(Value::Integer(1.into())), vec![]);
+        let shapeless = store.put(text("not a node"));
+        let commitment = under_prefix(
+            &mut store,
+            vec![
+                child(&good[..1], &leaf),
+                map(vec![("key", text("c"))]),
+                child("d", &number),
+                child("e", &shapeless),
+            ],
+        );
+        let relays = store.list(&commitment).unwrap();
+        assert_eq!(relays.len(), 1);
+        assert_eq!(relays[0].account, good);
+
+        // Above it, a node of the wrong shape is still refused.
+        let wrong = store.put(map(vec![("prefix", Value::Integer(1.into()))]));
+        let commitment = store.commit(Value::Array(vec![child("r", &wrong)]));
+        assert!(store.list(&commitment).is_err());
     }
 
     #[test]
