@@ -5,10 +5,19 @@
 //! `<block CID>@<parent state CID>`. Given that value, as read from a Nexus
 //! state the caller trusts, a [`Listing`] asks for the block, then its post
 //! state, then the general-state trie down to [`PREFIX`] and every node under
-//! it, and takes a node only if its bytes are the ones its CID names: so
-//! whoever served them, the list is the chain's. It does no I/O: the caller
+//! it, and takes a node only if its bytes are the ones its CID names, so
+//! whoever served them cannot change the list. It does no I/O: the caller
 //! fetches what [`Listing::wants`] names and hands it over by
 //! [`Listing::give`], or [`list`] does both with a fetch it is given.
+//!
+//! What it checks is that the block is the one Nexus commits, not that the
+//! block follows the directory's rules: Nexus checks only that the block
+//! carrying the commitment holds that child block and enters that parent
+//! state. So the list is what the committed block says, trusted to Nexus's
+//! proof of work, and the directory's policy holds for it only when the
+//! reader's own node hosts the directory chain. A false list can hide relays
+//! or name useless ones, which is a matter of finding offers, not of funds:
+//! every offer is signed by its seller.
 //!
 //! The trie is cashew's Merkle dictionary: the root is `{count, children}`
 //! and every other node `{prefix, value?, children}`, a child
@@ -16,21 +25,40 @@
 //! a stored key is the prefixes on its path joined. The walk is
 //! moniker-sdk's `list` (`src/records/state.mjs`).
 //!
-//! A listing reads at most [`MAX_ENTRIES`] entries, so a directory of any
-//! size costs a bounded read. It reads each node's children in random
-//! order, so where it stops does not depend on key order. An entry whose
-//! value is not an `https://` URL is skipped.
+//! A listing reads at most [`MAX_ENTRIES`] entries and [`MAX_NODES`] nodes,
+//! and each CID once, so a directory of any size or shape costs a bounded
+//! read. It reads each node's children in random order, so where it stops
+//! does not depend on key order. An entry is skipped unless its account is
+//! an address and its value an `https://` URL with no user info, whose host
+//! is not this machine or a private network's.
+
+use std::collections::BTreeSet;
+use std::net::{IpAddr, Ipv4Addr};
 
 use ciborium::Value;
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use swap_nexus_tx::{cid, is_cid};
+use url::{Host, Url};
 
 /// The key family the directory's policy allows: `relay/<account>`.
 pub const PREFIX: &str = "relay/";
 
 /// The most entries a listing reads.
 pub const MAX_ENTRIES: usize = 512;
+
+/// The longest key the directory's policy allows.
+const MAX_KEY_BYTES: usize = 512;
+
+/// The most nodes a listing reads. In cashew's trie every node but the root
+/// has a nonempty prefix, so no path is deeper than the longest key, and a
+/// node with no value has at least two children, so a subtree read whole
+/// has fewer such nodes than entries. Read in the order [`Listing::wants`]
+/// names them, by the time a listing stops, every node it read is an entry,
+/// a valueless node of a subtree read whole, or on the path to the node it
+/// reads next; the block and its state are two more. A trie of another
+/// shape, which only a hostile block holds, is cut off here.
+pub const MAX_NODES: usize = 2 * MAX_ENTRIES + MAX_KEY_BYTES + 2;
 
 /// A relay as its account lists it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,6 +72,9 @@ pub struct Relay {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Listing {
     pending: Vec<(String, Node)>,
+    /// Every CID ever queued: each is read once.
+    queued: BTreeSet<String>,
+    nodes: usize,
     entries: usize,
     relays: Vec<Relay>,
 }
@@ -72,6 +103,8 @@ impl Listing {
         match parts[..] {
             [block, parent] if is_cid(block) && !parent.is_empty() => Ok(Self {
                 pending: vec![(block.into(), Node::Block)],
+                queued: BTreeSet::from([block.into()]),
+                nodes: 0,
                 entries: 0,
                 relays: Vec::new(),
             }),
@@ -84,17 +117,15 @@ impl Listing {
     /// The CIDs of the nodes still to read, the next first; none once the
     /// listing is done. Any may be fetched and given in any order.
     pub fn wants(&self) -> Vec<String> {
-        let mut wants: Vec<String> = Vec::new();
-        for (cid, _) in self.pending.iter().rev() {
-            if !wants.contains(cid) {
-                wants.push(cid.clone());
-            }
-        }
-        wants
+        self.pending
+            .iter()
+            .rev()
+            .map(|(cid, _)| cid.clone())
+            .collect()
     }
 
-    /// The relays read so far: all of them, up to [`MAX_ENTRIES`] entries,
-    /// once [`Listing::wants`] is empty.
+    /// The relays read so far: all of them, up to [`MAX_ENTRIES`] entries
+    /// and [`MAX_NODES`] nodes, once [`Listing::wants`] is empty.
     pub fn relays(&self) -> &[Relay] {
         &self.relays
     }
@@ -103,9 +134,9 @@ impl Listing {
     /// ones it names, and a node that is not what the walk expects there; a
     /// node not wanted is ignored.
     pub fn give(&mut self, cid: &str, bytes: &[u8]) -> Result<(), String> {
-        if !self.pending.iter().any(|(wanted, _)| wanted == cid) {
+        let Some(at) = self.pending.iter().position(|(wanted, _)| wanted == cid) else {
             return Ok(());
-        }
+        };
         if self::cid(bytes) != cid {
             return Err(format!(
                 "the bytes given for {cid} are not the ones it names"
@@ -113,27 +144,26 @@ impl Listing {
         }
         let node: Value =
             ciborium::from_reader(bytes).map_err(|e| format!("{cid} is not DAG-CBOR: {e}"))?;
-        let (reads, pending) = std::mem::take(&mut self.pending)
-            .into_iter()
-            .partition(|(wanted, _)| wanted == cid);
-        self.pending = pending;
-        for (_, at) in reads {
-            self.read(at, &node)
-                .ok_or_else(|| format!("{cid} is not the node the directory has there"))?;
+        let (_, at) = self.pending.remove(at);
+        self.read(at, &node)
+            .ok_or_else(|| format!("{cid} is not the node the directory has there"))?;
+        self.nodes += 1;
+        if self.nodes == MAX_NODES {
+            self.pending.clear();
         }
         Ok(())
     }
 
     fn read(&mut self, at: Node, node: &Value) -> Option<()> {
         match at {
-            Node::Block => self.pending.push((link(node, "postState")?, Node::State)),
-            Node::State => self.pending.push((
+            Node::Block => self.queue(link(node, "postState")?, Node::State),
+            Node::State => self.queue(
                 link(node, "generalState")?,
                 Node::Toward {
                     path: String::new(),
                     rest: PREFIX.into(),
                 },
-            )),
+            ),
             Node::Toward { mut path, rest } => {
                 let prefix = prefix(node)?;
                 let rest = if let Some(rest) = rest.strip_prefix(prefix) {
@@ -153,7 +183,7 @@ impl Listing {
                     .find(|(key, _)| key.chars().eq([first]));
                 if let Some((_, cid)) = child {
                     let rest = rest.into();
-                    self.pending.push((cid, Node::Toward { path, rest }));
+                    self.queue(cid, Node::Toward { path, rest });
                 }
             }
             Node::Under { mut path } => {
@@ -167,17 +197,11 @@ impl Listing {
     /// Takes the entry at `node`, under the key `path`, then queues its
     /// children in random order, or stops at [`MAX_ENTRIES`].
     fn under(&mut self, path: String, node: &Value) -> Option<()> {
-        // Stopped already, by another read of the same node.
-        if self.entries == MAX_ENTRIES {
-            return Some(());
-        }
         if let Some(value) = field(node, "value") {
             let value = value.as_text()?;
             self.entries += 1;
-            let url = url::Url::parse(value)
-                .ok()
-                .filter(|url| url.scheme() == "https");
-            if let (Some(account), Some(url)) = (path.strip_prefix(PREFIX), url) {
+            let account = path.strip_prefix(PREFIX).filter(|account| is_cid(account));
+            if let (Some(account), Some(url)) = (account, relay_url(value)) {
                 self.relays.push(Relay {
                     account: account.into(),
                     url: url.into(),
@@ -196,10 +220,50 @@ impl Listing {
         }
         for (_, cid) in children {
             let path = path.clone();
-            self.pending.push((cid, Node::Under { path }));
+            self.queue(cid, Node::Under { path });
         }
         Some(())
     }
+
+    /// Queues the node `cid` names, unless it was queued before. A node is
+    /// read once: in cashew's trie two places hold one node only if their
+    /// subtrees are the same below them, the same key ends with the same
+    /// values, and the entries of the place read second go unlisted.
+    fn queue(&mut self, cid: String, at: Node) {
+        if self.queued.insert(cid.clone()) {
+            self.pending.push((cid, at));
+        }
+    }
+}
+
+/// `value` as a relay's base URL: `https://`, no user info, and a host that
+/// is not this machine or a private network's.
+fn relay_url(value: &str) -> Option<Url> {
+    let url = Url::parse(value).ok()?;
+    let local_ip = |ip: IpAddr| match ip {
+        IpAddr::V4(ip) => !public_v4(ip),
+        IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
+            Some(ip) => !public_v4(ip),
+            None => {
+                ip.is_loopback()
+                    || ip.is_unspecified()
+                    || ip.is_unique_local()
+                    || ip.is_unicast_link_local()
+            }
+        },
+    };
+    let local = match url.host()? {
+        Host::Domain(domain) => domain == "localhost" || domain.ends_with(".localhost"),
+        Host::Ipv4(ip) => local_ip(IpAddr::V4(ip)),
+        Host::Ipv6(ip) => local_ip(IpAddr::V6(ip)),
+    };
+    let plain = url.username().is_empty() && url.password().is_none();
+    (url.scheme() == "https" && plain && !local).then_some(url)
+}
+
+/// Whether `ip` is reachable beyond this machine and its private network.
+fn public_v4(ip: Ipv4Addr) -> bool {
+    !(ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified())
 }
 
 /// The relays listed in the block `commitment` names, each node fetched by
@@ -322,7 +386,13 @@ mod tests {
         /// A block whose general state holds `entries`, and its commitment.
         fn block(&mut self, entries: &[(String, String)]) -> String {
             let children = self.children(entries);
-            let count = Value::Integer(entries.len().into());
+            self.commit(children)
+        }
+
+        /// A block whose general state's root has `children`, and its
+        /// commitment.
+        fn commit(&mut self, children: Value) -> String {
+            let count = Value::Integer(0.into());
             let root = self.put(map(vec![("count", count), ("children", children)]));
             let state = self.put(map(vec![("generalState", to_link(&root))]));
             let block = self.put(map(vec![
@@ -333,9 +403,17 @@ mod tests {
         }
 
         fn list(&self, commitment: &str) -> Result<Vec<Relay>, String> {
-            list(commitment, |cid| {
+            self.counted(commitment).map(|(relays, _)| relays)
+        }
+
+        /// The relays listed, and how many nodes were fetched.
+        fn counted(&self, commitment: &str) -> Result<(Vec<Relay>, usize), String> {
+            let mut fetched = 0;
+            let relays = list(commitment, |cid| {
+                fetched += 1;
                 self.0.get(cid).cloned().ok_or(format!("no {cid}"))
-            })
+            })?;
+            Ok((relays, fetched))
         }
     }
 
@@ -358,6 +436,9 @@ mod tests {
             entry(format!("relay/{plain}"), "http://plain.example"),
             entry(format!("relay/{junk}"), "not a url"),
             entry("relay", "https://no-account.example"),
+            entry("relay/alice", "https://not-an-address.example"),
+            entry(format!("relay/{one}/x"), "https://run-on.example"),
+            entry(format!("relay/{}", account(5)), "https://127.0.0.1"),
             entry("relax/x", "https://other.example"),
             entry(format!("user/{one}/name"), "https://user.example"),
             entry("child/x", "https://child.example"),
@@ -382,6 +463,95 @@ mod tests {
         // An empty directory lists nothing.
         let commitment = store.block(&[entry("child/x", "1")]);
         assert_eq!(store.list(&commitment).unwrap(), []);
+    }
+
+    #[test]
+    fn a_relay_url_is_https_to_a_public_host() {
+        for url in [
+            "https://relay.example",
+            "https://relay.example:8443/base",
+            "https://8.8.8.8",
+            "https://[2606:4700::1111]",
+        ] {
+            assert!(relay_url(url).is_some(), "{url}");
+        }
+        for url in [
+            "http://relay.example",
+            "wss://relay.example",
+            "https://user@relay.example",
+            "https://user:pass@relay.example",
+            "https://localhost",
+            "https://relay.localhost",
+            "https://127.0.0.1",
+            "https://0.0.0.0",
+            "https://10.0.0.1",
+            "https://172.16.0.1",
+            "https://192.168.1.1",
+            "https://169.254.169.254",
+            "https://[::1]",
+            "https://[::]",
+            "https://[fd00::1]",
+            "https://[fe80::1]",
+            "https://[::ffff:127.0.0.1]",
+            "https://[::ffff:10.0.0.1]",
+        ] {
+            assert!(relay_url(url).is_none(), "{url}");
+        }
+    }
+
+    /// `{key, value: {rawCID}}`, a child under `key`.
+    fn child(key: &str, cid: &str) -> Value {
+        map(vec![("key", text(key)), ("value", to_link(cid))])
+    }
+
+    /// The root's one child: the node `relay/`, over `children`.
+    fn under_prefix(store: &mut Store, children: Vec<Value>) -> String {
+        let prefix = store.put(map(vec![
+            ("prefix", text(PREFIX)),
+            ("children", Value::Array(children)),
+        ]));
+        store.commit(Value::Array(vec![child("r", &prefix)]))
+    }
+
+    #[test]
+    fn a_node_named_many_times_is_read_once() {
+        // Each level's node has every child the next level's one node.
+        let mut store = Store::default();
+        let mut below = store.put(map(vec![
+            ("prefix", text("z")),
+            ("children", Value::Array(vec![])),
+        ]));
+        for _ in 0..20 {
+            let children = (0..16).map(|_| child("z", &below)).collect();
+            below = store.put(map(vec![
+                ("prefix", text("z")),
+                ("children", Value::Array(children)),
+            ]));
+        }
+        let commitment = under_prefix(&mut store, vec![child("z", &below)]);
+        let (relays, fetched) = store.counted(&commitment).unwrap();
+        assert_eq!(relays, []);
+        // The block, its state, the root, `relay/` and the 21 levels.
+        assert_eq!(fetched, 25);
+    }
+
+    #[test]
+    fn a_trie_deeper_than_any_key_is_cut_off() {
+        let mut store = Store::default();
+        let mut below = store.put(map(vec![
+            ("prefix", text("q")),
+            ("children", Value::Array(vec![])),
+        ]));
+        for _ in 0..2 * MAX_NODES {
+            below = store.put(map(vec![
+                ("prefix", text("q")),
+                ("children", Value::Array(vec![child("q", &below)])),
+            ]));
+        }
+        let commitment = under_prefix(&mut store, vec![child("q", &below)]);
+        let (relays, fetched) = store.counted(&commitment).unwrap();
+        assert_eq!(relays, []);
+        assert_eq!(fetched, MAX_NODES);
     }
 
     #[test]
