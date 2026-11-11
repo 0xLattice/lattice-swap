@@ -655,16 +655,48 @@ fn owner_only(_: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A relay of the seller's own, run in this process for as long as it
+/// runs: `offer` lists on it beside any --relay, so a seller with a
+/// reachable address depends on no one else's relay for buyers to find it,
+/// and `resume` serves it again, so a buyer that took the offer there can
+/// meet the seller again there. Anyone can list offers on it too.
+#[derive(Args)]
+struct ServeRelayArgs {
+    /// Where to run the relay. Needs --serve-relay-url.
+    #[arg(long, requires = "serve_relay_url")]
+    serve_relay: Option<SocketAddr>,
+    /// The http:// or https:// URL buyers reach --serve-relay at, as
+    /// --advertise is the address they dial: the offer listed there names
+    /// it. Put TLS in front of the relay for https://.
+    #[arg(long, requires = "serve_relay")]
+    serve_relay_url: Option<String>,
+}
+
+impl ServeRelayArgs {
+    /// The flags as given, for `resume` to be given them again: none if
+    /// no relay is served.
+    fn flags(&self) -> String {
+        match (self.serve_relay, &self.serve_relay_url) {
+            (Some(listen), Some(url)) => format!(" --serve-relay {listen} --serve-relay-url {url}"),
+            _ => String::new(),
+        }
+    }
+}
+
 #[derive(Args)]
 struct OfferArgs {
     #[command(flatten)]
     terms: TermsArgs,
     /// Where to listen for the buyer.
-    #[arg(long, required_unless_present = "relay")]
+    #[arg(
+        long,
+        required_unless_present_any = ["relay", "serve_relay"],
+        conflicts_with = "serve_relay"
+    )]
     listen: Option<SocketAddr>,
     /// The address the buyer dials, if not the one listened on. Required
     /// when listening on an unspecified address, such as 0.0.0.0.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "serve_relay")]
     advertise: Option<SocketAddr>,
     /// A relay, by its http:// or https:// URL, to list the offer on and
     /// meet the buyer through, instead of listening. Anyone can list the
@@ -673,6 +705,8 @@ struct OfferArgs {
     /// the offer printed names the first.
     #[arg(long, conflicts_with_all = ["listen", "advertise"])]
     relay: Vec<String>,
+    #[command(flatten)]
+    serve: ServeRelayArgs,
     /// Seconds to wait for the buyer to dial.
     #[arg(long, default_value_t = 600)]
     wait: u64,
@@ -798,6 +832,8 @@ impl PolicyArgs {
 struct SwapFileArgs {
     /// The swap file, `<swap id>.json`.
     swap_file: PathBuf,
+    #[command(flatten)]
+    serve: ServeRelayArgs,
     #[command(flatten)]
     nodes: NodeArgs,
     #[command(flatten)]
@@ -930,7 +966,13 @@ fn offer(mut args: OfferArgs) -> Result<Outcome> {
     let store = Store::new(&args.dir, swap_id);
 
     let listener = args.listen.map(TcpListener::bind).transpose()?;
-    let place = match (&listener, args.relay.first()) {
+    let served = match (args.serve.serve_relay, &args.serve.serve_relay_url) {
+        (Some(listen), Some(url)) => Some((serve_relay(listen)?, &url[..])),
+        _ => None,
+    };
+    let relays = relays_dialled(&args.relay, served);
+    let named: Vec<String> = relays.iter().map(|(_, named)| named.clone()).collect();
+    let place = match (&listener, named.first()) {
         (_, Some(relay)) => Place::Relay(relay.clone()),
         (Some(listener), None) => Place::Address(args.advertise.unwrap_or(listener.local_addr()?)),
         (None, None) => return Err("give --listen or --relay".into()),
@@ -950,7 +992,7 @@ fn offer(mut args: OfferArgs) -> Result<Outcome> {
     println!("{}", offer.encode());
     io::stdout().flush()?;
     let wait = Duration::from_secs(args.wait);
-    let start = Start {
+    let mut start = Start {
         bitcoin,
         nexus,
         nexus_genesis: args.nodes.nexus_genesis.clone(),
@@ -958,6 +1000,7 @@ fn offer(mut args: OfferArgs) -> Result<Outcome> {
         nex_key: Some(key.clone()),
         bump: &args.bump,
         poll: args.nodes.poll(),
+        serve: String::new(),
     };
     // The seller fixes the terms at the amount the buyer asks for, then
     // starts its machine on them.
@@ -970,15 +1013,15 @@ fn offer(mut args: OfferArgs) -> Result<Outcome> {
         offer: offer.clone(),
         key: Some(hex::encode(session.to_bytes())),
     };
-    match (listener, args.relay.is_empty()) {
+    match (listener, relays.is_empty()) {
         (_, false) => {
             log(&format!(
                 "listing the offer on {}, waiting for the buyer",
-                args.relay.join(", ")
+                named.join(", ")
             ));
-            let offers = listed_on(&offer, &args.relay);
+            let offers = listed_on(&offer, &named);
             let encoded: Vec<String> = offers.iter().map(Offer::encode).collect();
-            let listings: Vec<(&str, &str)> = (args.relay.iter().map(String::as_str))
+            let listings: Vec<(&str, &str)> = (relays.iter().map(|(dialed, _)| &dialed[..]))
                 .zip(encoded.iter().map(String::as_str))
                 .collect();
             let (taken, mut transport) =
@@ -986,8 +1029,11 @@ fn offer(mut args: OfferArgs) -> Result<Outcome> {
             // The two meet again on the relay the buyer took it on, the
             // only one its offer names.
             rejoin.offer = offers[taken].clone();
+            let (through, serve) = rejoin_through(&relays, taken, &args.serve);
+            start.serve = serve;
             let terms = answer_request(&mut transport, &offer)?;
-            start.run(seller(terms)?, vec![], Box::new(transport), rejoin, None)
+            let transport = Box::new(transport);
+            start.run(seller(terms)?, vec![], transport, rejoin, None, through)
         }
         (Some(listener), true) => {
             log("waiting for the buyer");
@@ -1000,10 +1046,81 @@ fn offer(mut args: OfferArgs) -> Result<Outcome> {
                 Box::new(transport),
                 rejoin,
                 Some(kept),
+                None,
             )
         }
         (None, true) => unreachable!("a place was found"),
     }
+}
+
+/// The relays to list on, each as the seller dials it and as its offer
+/// names it: every one of `relays`, and the relay it serves, if any, which
+/// it dials at the first and its offer names by the second. A relay of the
+/// served one's server is listed on once, as the served one, whose dialling
+/// does not leave the machine.
+fn relays_dialled(relays: &[String], served: Option<(String, &str)>) -> Vec<(String, String)> {
+    let serves = served.as_ref().map(|(_, url)| relay_server(url));
+    let mut dialled: Vec<(String, String)> = (relays.iter())
+        .filter(|relay| Some(relay_server(relay)) != serves)
+        .map(|relay| (relay.clone(), relay.clone()))
+        .collect();
+    dialled.extend(served.map(|(local, url)| (local, url.to_string())));
+    dialled
+}
+
+/// How the seller meets the buyer again once it took the offer on
+/// `relays[taken]` ([`relays_dialled`]), and what `resume` needs given
+/// again to: on the relay it serves, through its own machine, as the URL
+/// the offer names may not lead back to it, and the --serve-relay flags;
+/// on any other, as its offer names it, and no flags, as `resume` refuses
+/// to serve a relay the swap does not meet at.
+fn rejoin_through(
+    relays: &[(String, String)],
+    taken: usize,
+    serve: &ServeRelayArgs,
+) -> (Option<String>, String) {
+    // The served relay is the one [`relays_dialled`] puts last: told
+    // apart by place, as its URL may be the very address it is dialled at.
+    if serve.serve_relay.is_none() || taken + 1 != relays.len() {
+        return (None, String::new());
+    }
+    (Some(relays[taken].0.clone()), serve.flags())
+}
+
+/// How many sellers the relay `offer --serve-relay` runs holds at once,
+/// listed or swapping, as `swap-relay` holds by default.
+const SERVED_RELAY_OFFERS: usize = 10_000;
+
+/// Runs a swap-relay on `listen`, on a thread of its own, until this
+/// process ends: the relay's own router, as `swap-relay` serves it. Binds
+/// before it returns, so an address in use fails the offer at once.
+/// Returns the URL this process reaches it at, on its own machine.
+fn serve_relay(listen: SocketAddr) -> Result<String> {
+    let listener = TcpListener::bind(listen)?;
+    listener.set_nonblocking(true)?;
+    let mut local = listener.local_addr()?;
+    if local.ip().is_unspecified() {
+        local.set_ip(match local {
+            SocketAddr::V4(_) => std::net::Ipv4Addr::LOCALHOST.into(),
+            SocketAddr::V6(_) => std::net::Ipv6Addr::LOCALHOST.into(),
+        });
+    }
+    let relay = Arc::new(swap_relay::Relay {
+        board: swap_relay::board::Board::new(SERVED_RELAY_OFFERS),
+        rejoins: swap_relay::board::Board::new(SERVED_RELAY_OFFERS),
+    });
+    let runtime = tokio::runtime::Runtime::new()?;
+    std::thread::Builder::new().spawn(move || {
+        let served = runtime.block_on(async {
+            let listener = tokio::net::TcpListener::from_std(listener)?;
+            swap_relay::serve(listener, relay).await
+        });
+        if let Err(e) = served {
+            log(&format!("the relay on {listen} stopped: {e}"));
+        }
+    })?;
+    log(&format!("serving a relay on {listen}"));
+    Ok(format!("http://{local}"))
 }
 
 /// `offer` as listed on each of `relays`, naming it: one swap, one swap id
@@ -1056,12 +1173,16 @@ struct Start<'a> {
     nex_key: Option<SecretBytes>,
     bump: &'a BumpArgs,
     poll: Option<Duration>,
+    /// The --serve-relay flags `resume` needs given again, for its hint:
+    /// none unless the buyer took the offer on the relay served.
+    serve: String,
 }
 
 impl Start<'_> {
     /// Runs `machine`, which asks for `actions` first, over `transport` to
     /// the swap's end, meeting the counterparty again by `rejoin` whenever
-    /// the session is lost: the seller on `listener`, if it listens.
+    /// the session is lost: the seller on `listener`, if it listens, or on
+    /// the relay at `through`, if given ([`SessionFile::through`]).
     fn run<M: Machine>(
         self,
         machine: M,
@@ -1069,9 +1190,10 @@ impl Start<'_> {
         transport: Session,
         rejoin: SessionFile,
         listener: Option<TcpListener>,
+        through: Option<String>,
     ) -> Result<Outcome> {
         let swap_file = self.store.path().to_path_buf();
-        let driver = swap::session::start(
+        let driver = swap::session::start_through(
             machine,
             actions,
             self.bitcoin,
@@ -1081,10 +1203,11 @@ impl Start<'_> {
             self.store,
             rejoin,
             listener,
+            through,
         );
-        let mut driver = driver.map_err(|e| resume_hint(&swap_file, e))?;
+        let mut driver = driver.map_err(|e| resume_hint(&swap_file, &self.serve, e))?;
         driver.nex_key = self.nex_key;
-        run(&swap_file, Ok(driver), self.bump, self.poll)
+        run(&swap_file, &self.serve, Ok(driver), self.bump, self.poll)
     }
 }
 
@@ -1102,6 +1225,7 @@ fn take(args: TakeArgs) -> Result<Outcome> {
     if store.path().exists() {
         return Err(resume_hint(
             store.path(),
+            "",
             "this offer was taken already: its swap file exists".into(),
         ));
     }
@@ -1169,8 +1293,8 @@ fn take(args: TakeArgs) -> Result<Outcome> {
         nexus,
         store,
     )
-    .map_err(|e| resume_hint(&swap_file, e))?;
-    run(&swap_file, Ok(driver), &args.bump, args.nodes.poll())
+    .map_err(|e| resume_hint(&swap_file, "", e))?;
+    run(&swap_file, "", Ok(driver), &args.bump, args.nodes.poll())
 }
 
 fn resume(args: SwapFileArgs) -> Result<Outcome> {
@@ -1187,6 +1311,30 @@ fn resume(args: SwapFileArgs) -> Result<Outcome> {
         )
         .into());
     }
+    // The relay the seller serves, as it reaches it on its own machine.
+    let mut served = None;
+    if args.serve.serve_relay.is_some() && matches!(saved, Saved::Buyer(_)) {
+        return Err(format!(
+            "refused: {} is a buyer's swap, and only the seller serves its relay: \
+             leave out --serve-relay",
+            swap_file.display()
+        )
+        .into());
+    }
+    if let (Some(listen), Some(url)) = (args.serve.serve_relay, &args.serve.serve_relay_url) {
+        // A relay the two would not meet at would serve no one this swap.
+        let session = SessionFile::load(&store)?;
+        let relay = session.and_then(|session| session.offer.relay);
+        if relay.as_deref() != Some(url) {
+            return Err(format!(
+                "refused: {} meets the other party at {}, not {url}",
+                swap_file.display(),
+                relay.as_deref().unwrap_or("no relay")
+            )
+            .into());
+        }
+        served = Some(serve_relay(listen)?);
+    }
     match saved {
         Saved::Seller(seller) => {
             let given = args.key.given()?;
@@ -1197,9 +1345,10 @@ fn resume(args: SwapFileArgs) -> Result<Outcome> {
                 args.nodes.trust(SELLER_TRUSTS);
                 args.nodes.resumed_check()
             });
-            let driver = swap::session::resume::<Seller, _>(bitcoin, nexus, store);
+            let driver = swap::session::resume_through::<Seller, _>(bitcoin, nexus, store, served);
             run(
                 &swap_file,
+                &args.serve.flags(),
                 driver.map(|mut driver| {
                     driver.nex_key = key;
                     driver.nexus_check = check;
@@ -1225,7 +1374,7 @@ fn resume(args: SwapFileArgs) -> Result<Outcome> {
                 driver.nexus_genesis = Some(flag.clone());
                 driver
             });
-            run(&swap_file, driver, &args.bump, args.nodes.poll())
+            run(&swap_file, "", driver, &args.bump, args.nodes.poll())
         }
     }
 }
@@ -1397,6 +1546,7 @@ fn status(swap_file: &Path) -> Result<()> {
 /// file exists, says how to carry on.
 fn run<M: Machine, B: Bitcoin, T: Transport>(
     swap_file: &Path,
+    serve: &str,
     driver: io::Result<Driver<M, B, T>>,
     bump: &BumpArgs,
     poll: Option<Duration>,
@@ -1417,14 +1567,20 @@ fn run<M: Machine, B: Bitcoin, T: Transport>(
                 false
             })
         })
-        .map_err(|e| resume_hint(swap_file, e.into()))?;
+        .map_err(|e| resume_hint(swap_file, serve, e.into()))?;
     let outcome = outcome.expect("only an outcome ends a run that never stops");
     println!("outcome: {outcome:?}");
     Ok(outcome)
 }
 
 /// The error, and how to carry on if the swap file exists.
-fn resume_hint(swap_file: &Path, error: Box<dyn std::error::Error>) -> Box<dyn std::error::Error> {
+/// `serve` is the --serve-relay flags given, if any, which `resume` needs
+/// again to meet a buyer that took the offer on the relay they serve.
+fn resume_hint(
+    swap_file: &Path,
+    serve: &str,
+    error: Box<dyn std::error::Error>,
+) -> Box<dyn std::error::Error> {
     if !swap_file.exists() {
         return error;
     }
@@ -1432,7 +1588,7 @@ fn resume_hint(swap_file: &Path, error: Box<dyn std::error::Error>) -> Box<dyn s
         "{error}\nto carry on, run with the same flags, the node and key flags and \
          --max-fee-rate, --fallback-fee-rate, --max-fee-fraction, --max-tip-age and \
          --nexus-budget: \
-         lattice-swap resume {}",
+         lattice-swap resume {}{serve}",
         swap_file.display()
     )
     .into()

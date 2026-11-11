@@ -286,6 +286,126 @@ fn a_relay_given_twice_is_listed_on_once() {
 }
 
 #[test]
+fn offer_serves_a_relay_at_its_public_url() {
+    let base = [
+        "offer",
+        "--price",
+        "1",
+        "--min-btc-amount",
+        "1",
+        "--max-btc-amount",
+        "2",
+        "--btc-fee",
+        "1",
+        "--nex-fee",
+        "1",
+    ];
+    let with = |extra: &[&str]| parse(&[&base[..], extra].concat());
+    let serve = ["--serve-relay", "0.0.0.0:7500"];
+    let url = ["--serve-relay-url", "https://seller.example"];
+    let Command::Offer(args) = with(&[&serve[..], &url[..]].concat()).unwrap().command else {
+        panic!("an offer");
+    };
+    assert_eq!(
+        args.serve.serve_relay,
+        Some("0.0.0.0:7500".parse().unwrap())
+    );
+    assert_eq!(
+        args.serve.serve_relay_url.as_deref(),
+        Some("https://seller.example")
+    );
+    assert!(args.listen.is_none() && args.relay.is_empty());
+    let both = [&serve[..], &url[..], &["--relay", "http://r"]].concat();
+    assert!(with(&both).is_ok());
+    assert!(with(&serve).is_err(), "no URL");
+    assert!(with(&url).is_err(), "no relay to name");
+    let listening = [&serve[..], &url[..], &["--listen", "127.0.0.1:0"]].concat();
+    assert!(with(&listening).is_err());
+}
+
+/// A relay on loopback, as `swap-relay` runs one: its URL.
+fn other_relay() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    listener.set_nonblocking(true).unwrap();
+    std::thread::spawn(move || {
+        let relay = Arc::new(swap_relay::Relay {
+            board: swap_relay::board::Board::new(10),
+            rejoins: swap_relay::board::Board::new(10),
+        });
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            swap_relay::serve(listener, relay).await.unwrap();
+        });
+    });
+    url
+}
+
+fn listed(url: &str) -> Vec<Value> {
+    ureq::get(&format!("{url}/offers"))
+        .call()
+        .unwrap()
+        .into_json()
+        .unwrap()
+}
+
+fn wait_listed(url: &str, count: usize) {
+    for _ in 0..200 {
+        if listed(url).len() == count {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!("{count} offers never listed on {url}");
+}
+
+/// The relay the seller serves itself lists its offer naming the public
+/// URL, beside another relay; a buyer that takes it there withdraws it from
+/// the other, and the seller is not taken twice.
+#[test]
+fn a_seller_lists_on_the_relay_it_serves_and_another() {
+    let served = serve_relay("0.0.0.0:0".parse().unwrap()).unwrap();
+    assert!(served.starts_with("http://127.0.0.1:"), "{served}");
+    let other = other_relay();
+    let key = SigningKey::from_bytes(&[1; 32]);
+    let public = "https://seller.example".to_string();
+    let offer = offer_of(
+        &small_args(16),
+        Network::Bitcoin,
+        Place::Relay(other.clone()),
+        &key,
+    );
+    let copies = listed_on(&offer, &[other.clone(), public.clone()]);
+    let encoded: Vec<String> = copies.iter().map(Offer::encode).collect();
+    let buyer_key = SigningKey::from_bytes(&offer.buyer_session);
+    let buyer = ivy::Config::new(buyer_key.clone()).peer_key();
+    let (at, served_at) = (other.clone(), served.clone());
+    let seller = std::thread::spawn(move || {
+        let listings = [
+            (&at[..], &encoded[0][..]),
+            (&served_at[..], &encoded[1][..]),
+        ];
+        let config = ivy::Config::new(key);
+        Ivy::accept_relayed_on(&listings, &config, buyer, TIMEOUT, TIMEOUT)
+    });
+    wait_listed(&served, 1);
+    wait_listed(&other, 1);
+    assert_eq!(listed(&served)[0]["relay"], public.as_str());
+
+    let id = hex::encode(offer.template.swap_id);
+    let config = ivy::Config::new(buyer_key);
+    let seller_key = offer.seller_key().unwrap();
+    let mut buyer = Ivy::connect_relayed(&served, &id, &config, seller_key, TIMEOUT).unwrap();
+    let (taken, mut seller) = seller.join().unwrap().unwrap();
+    assert_eq!(taken, 1, "through the relay it serves");
+    wait_listed(&other, 0);
+    let again = Ivy::connect_relayed(&other, &id, &config, seller_key, TIMEOUT).err();
+    assert_eq!(again.map(|e| e.kind()), Some(io::ErrorKind::NotFound));
+    buyer.send(b"request").unwrap();
+    assert_eq!(seller.recv(TIMEOUT).unwrap().unwrap(), b"request");
+}
+
+#[test]
 fn an_offer_names_an_address_or_a_relay() {
     let key = SigningKey::from_bytes(&[1; 32]);
     let mut offer = offer_of(&small_args(16), Network::Bitcoin, address(), &key);
@@ -852,7 +972,7 @@ fn only_a_swap_exits_zero() {
 #[test]
 fn a_failure_after_the_swap_file_exists_says_how_to_resume() {
     let file = tempfile::NamedTempFile::new().unwrap();
-    let hinted = resume_hint(file.path(), "lost".into()).to_string();
+    let hinted = resume_hint(file.path(), "", "lost".into()).to_string();
     let hint = format!(
         "lost\nto carry on, run with the same flags, the node and key flags and \
          --max-fee-rate, --fallback-fee-rate, --max-fee-fraction, --max-tip-age and \
@@ -861,8 +981,18 @@ fn a_failure_after_the_swap_file_exists_says_how_to_resume() {
         file.path().display()
     );
     assert_eq!(hinted, hint);
+    // A seller that serves its relay is told to serve it again.
+    let serve = ServeRelayArgs {
+        serve_relay: Some("0.0.0.0:7500".parse().unwrap()),
+        serve_relay_url: Some("https://seller.example".into()),
+    };
+    let hinted = resume_hint(file.path(), &serve.flags(), "lost".into()).to_string();
+    assert_eq!(
+        hinted,
+        format!("{hint} --serve-relay 0.0.0.0:7500 --serve-relay-url https://seller.example")
+    );
     let missing = file.path().with_extension("gone");
-    assert_eq!(resume_hint(&missing, "lost".into()).to_string(), "lost");
+    assert_eq!(resume_hint(&missing, "", "lost".into()).to_string(), "lost");
 }
 
 #[test]
@@ -1445,7 +1575,7 @@ fn the_bump_settings_default_to_the_drivers() {
     let mut bump = offer_args(&[]).bump;
     bump.max_fee_fraction = f64::NAN;
     let driver = Driver::<Seller, _, Ivy>::resume(bitcoin(), nexus(), None, store());
-    let refused = run(Path::new(&path), driver, &bump, None)
+    let refused = run(Path::new(&path), "", driver, &bump, None)
         .unwrap_err()
         .to_string();
     assert!(refused.contains("max_fee_fraction NaN"), "{refused}");
@@ -1568,6 +1698,59 @@ fn resume_exits_with_the_outcome_and_needs_no_key_once_signed() {
         3,
         "a done swap names no address"
     );
+}
+
+/// `resume --serve-relay` serves the seller's relay again, where a buyer
+/// that took the offer there meets it again; one the swap does not meet at
+/// is refused before anything is served.
+#[cfg(unix)]
+#[test]
+fn resume_serves_the_relay_the_swap_meets_at() {
+    let (_directory, path) = swap_file(Seller::Done(Outcome::Refunded));
+    let public = "https://seller.example";
+    let mut offer = takeable();
+    offer.address = None;
+    offer.relay = Some(public.into());
+    let session = SessionFile {
+        offer,
+        key: None,
+        listen: None,
+    };
+    session
+        .save(&swap_store(Path::new(&path)).unwrap())
+        .unwrap();
+    let listen = {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().to_string()
+    };
+    let cookie = tempfile::NamedTempFile::new().unwrap();
+    let cookie = cookie.path().to_str().unwrap();
+    let url = bitcoind(Value::Null);
+    let run = |served_at: &str| {
+        let mut args = vec!["lattice-swap", "resume", &path, "--btc-url", &url];
+        args.extend(["--btc-wallet", "w", "--btc-cookie", cookie]);
+        args.extend(["--nexus-url", "http://127.0.0.1:1"]);
+        args.extend(["--nexus-cookie", cookie, "--serve-relay", &listen]);
+        args.extend(["--serve-relay-url", served_at]);
+        exit_status(Cli::try_parse_from(&args).unwrap().command)
+    };
+
+    let refused = run("https://other.example").unwrap_err().to_string();
+    assert!(
+        refused.contains("meets the other party at https://seller.example"),
+        "{refused}"
+    );
+    assert!(ureq::get(&format!("http://{listen}/offers"))
+        .call()
+        .is_err());
+
+    assert_eq!(run(public).unwrap(), 3);
+    let offers: Vec<Value> = ureq::get(&format!("http://{listen}/offers"))
+        .call()
+        .unwrap()
+        .into_json()
+        .unwrap();
+    assert!(offers.is_empty());
 }
 
 /// lattice-node removes its cookie file when it stops: a swap resumed
@@ -2277,6 +2460,273 @@ fn a_resumed_seller_takes_the_buyer_back_over_tcp_and_no_one_else() {
         seller.recv(TIMEOUT).unwrap().as_deref(),
         Some(&b"again"[..])
     );
+}
+
+/// A seller resumed with `--serve-relay` meets the buyer again on the
+/// relay it serves, dialling it on its own machine, though its session file
+/// names the public URL, which need not reach it from there; the buyer
+/// comes to that relay from outside, here on loopback in its place.
+#[test]
+fn a_resumed_seller_rejoins_through_the_relay_it_serves() {
+    let served = serve_relay("127.0.0.1:0".parse().unwrap()).unwrap();
+    let key = SigningKey::from_bytes(&random32());
+    // Nothing answers here.
+    let public = "http://127.0.0.1:1".to_string();
+    let offer = offer_of(
+        &small_args(40),
+        Network::Regtest,
+        Place::Relay(public.clone()),
+        &key,
+    );
+    let session = SessionFile {
+        offer: offer.clone(),
+        key: Some(hex::encode(key.to_bytes())),
+        listen: None,
+    };
+    let session = session.through(Some(served.clone()));
+    assert_eq!(session.offer.relay.as_deref(), Some(&served[..]));
+    let mut seller = session.reconnect(None).unwrap();
+    let mut buyer = SessionFile {
+        offer: Offer {
+            relay: Some(served),
+            ..offer
+        },
+        key: None,
+        listen: None,
+    }
+    .reconnect(None)
+    .unwrap();
+    let rejoin = swap::Rejoin {
+        id: [3; 32],
+        key: [4; 32],
+    };
+    let mut seller_session = None;
+    let mut buyer_session = None;
+    for _ in 0..1_000 {
+        if seller_session.is_none() {
+            seller_session = seller(&rejoin).and_then(|opened| opened.ok());
+        }
+        if buyer_session.is_none() {
+            buyer_session = buyer(&rejoin).and_then(|opened| opened.ok());
+        }
+        if seller_session.is_some() && buyer_session.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let (mut seller, mut buyer) = (seller_session.unwrap(), buyer_session.unwrap());
+    buyer.send(b"again").unwrap();
+    assert_eq!(
+        seller.recv(TIMEOUT).unwrap().as_deref(),
+        Some(&b"again"[..])
+    );
+    // Not given a relay, the session goes where its offer says.
+    let unchanged = SessionFile {
+        offer: offer_of(
+            &small_args(40),
+            Network::Regtest,
+            Place::Relay(public.clone()),
+            &key,
+        ),
+        key: None,
+        listen: None,
+    }
+    .through(None);
+    assert_eq!(unchanged.offer.relay, Some(public));
+}
+
+/// While `offer` runs, a seller whose buyer took the offer on the relay it
+/// serves meets the buyer again there through its own machine, though the
+/// session file it saves names the public URL, as the buyer's does.
+#[test]
+fn a_started_seller_rejoins_through_the_relay_it_serves() {
+    struct Quiet;
+    impl Transport for Quiet {
+        fn send(&mut self, _: &[u8]) -> io::Result<()> {
+            Ok(())
+        }
+        fn recv(&mut self, _: Duration) -> io::Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+    }
+    let served = serve_relay("127.0.0.1:0".parse().unwrap()).unwrap();
+    let key = SigningKey::from_bytes(&random32());
+    // Nothing answers here.
+    let public = "http://127.0.0.1:1".to_string();
+    let offer = offer_of(
+        &small_args(40),
+        Network::Regtest,
+        Place::Relay(public.clone()),
+        &key,
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::new(directory.path(), [7; 32]);
+    let unreachable = "http://127.0.0.1:1";
+    let driver = swap::session::start_through(
+        Seller::Done(Outcome::Refunded),
+        vec![],
+        Bitcoind::new(unreachable, "u:p", Network::Regtest, TIMEOUT),
+        Client::new(unreachable, "c", TIMEOUT),
+        MAINNET,
+        Box::new(Quiet),
+        Store::new(directory.path(), [7; 32]),
+        SessionFile {
+            offer: offer.clone(),
+            key: Some(hex::encode(key.to_bytes())),
+            listen: None,
+        },
+        None,
+        Some(served.clone()),
+    )
+    .unwrap();
+    let saved = SessionFile::load(&store).unwrap().unwrap();
+    assert_eq!(
+        saved.offer.relay,
+        Some(public),
+        "saved as the offer names it"
+    );
+
+    let mut seller = driver.reconnect.unwrap();
+    let mut buyer = SessionFile {
+        offer: Offer {
+            relay: Some(served),
+            ..offer
+        },
+        key: None,
+        listen: None,
+    }
+    .reconnect(None)
+    .unwrap();
+    let rejoin = swap::Rejoin {
+        id: [5; 32],
+        key: [6; 32],
+    };
+    let (mut seller_session, mut buyer_session) = (None, None);
+    for _ in 0..1_000 {
+        if seller_session.is_none() {
+            seller_session = seller(&rejoin).and_then(|opened| opened.ok());
+        }
+        if buyer_session.is_none() {
+            buyer_session = buyer(&rejoin).and_then(|opened| opened.ok());
+        }
+        if seller_session.is_some() && buyer_session.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let (mut seller, mut buyer) = (seller_session.unwrap(), buyer_session.unwrap());
+    buyer.send(b"again").unwrap();
+    assert_eq!(
+        seller.recv(TIMEOUT).unwrap().as_deref(),
+        Some(&b"again"[..])
+    );
+}
+
+/// The relay served is listed on once, as served, though a --relay names
+/// its server too: listed on as given, the seller would dial its own
+/// relay out and back in, and be refused the second listing.
+#[test]
+fn the_relay_served_is_listed_on_once() {
+    let relays = [
+        "https://relay.example".to_string(),
+        "HTTPS://Seller.Example/".into(),
+    ];
+    let local = "http://127.0.0.1:7500".to_string();
+    assert_eq!(
+        relays_dialled(&relays, Some((local.clone(), "https://seller.example"))),
+        [
+            (
+                "https://relay.example".to_string(),
+                "https://relay.example".to_string()
+            ),
+            (local, "https://seller.example".to_string()),
+        ]
+    );
+    assert_eq!(
+        relays_dialled(&relays, None),
+        [
+            (
+                "https://relay.example".to_string(),
+                "https://relay.example".to_string()
+            ),
+            (
+                "HTTPS://Seller.Example/".to_string(),
+                "HTTPS://Seller.Example/".to_string()
+            ),
+        ]
+    );
+}
+
+/// What `offer` runs the swap with once a buyer takes it: on the relay it
+/// serves, the rejoin through its own machine and the --serve-relay flags
+/// in the resume hint; on another, neither, as `resume` refuses to serve a
+/// relay the swap does not meet at.
+#[test]
+fn only_a_swap_taken_on_the_relay_served_resumes_serving_it() {
+    let serve = ServeRelayArgs {
+        serve_relay: Some("0.0.0.0:7500".parse().unwrap()),
+        serve_relay_url: Some("https://seller.example".into()),
+    };
+    let local = "http://127.0.0.1:7500".to_string();
+    let relays = relays_dialled(
+        &["https://relay.example".to_string()],
+        Some((local.clone(), "https://seller.example")),
+    );
+    assert_eq!(rejoin_through(&relays, 0, &serve), (None, String::new()));
+    let (through, flags) = rejoin_through(&relays, 1, &serve);
+    assert_eq!(through, Some(local));
+    assert_eq!(
+        flags,
+        " --serve-relay 0.0.0.0:7500 --serve-relay-url https://seller.example"
+    );
+    // A URL that is the very address it is dialled at is the relay served
+    // all the same.
+    let loopback = "http://127.0.0.1:7500".to_string();
+    let serve = ServeRelayArgs {
+        serve_relay: Some("127.0.0.1:7500".parse().unwrap()),
+        serve_relay_url: Some(loopback.clone()),
+    };
+    let relays = relays_dialled(
+        &["https://relay.example".to_string()],
+        Some((loopback.clone(), &loopback)),
+    );
+    assert_eq!(rejoin_through(&relays, 0, &serve), (None, String::new()));
+    assert_eq!(
+        rejoin_through(&relays, 1, &serve),
+        (
+            Some(loopback),
+            " --serve-relay 127.0.0.1:7500 --serve-relay-url http://127.0.0.1:7500".into()
+        )
+    );
+}
+
+/// A buyer serves no relay: `resume --serve-relay` on a buyer's swap is
+/// refused before anything is served.
+#[cfg(unix)]
+#[test]
+fn resume_refuses_to_serve_a_relay_for_a_buyer() {
+    let (buyer, _) = Buyer::start(small(16), ScriptBuf::new(), "b".into()).unwrap();
+    let (_directory, path) = swap_file(buyer);
+    let listen = {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().to_string()
+    };
+    let args = [
+        "lattice-swap",
+        "resume",
+        &path,
+        "--serve-relay",
+        &listen,
+        "--serve-relay-url",
+        "https://seller.example",
+    ];
+    let refused = exit_status(Cli::try_parse_from(args).unwrap().command)
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("a buyer's swap"), "{refused}");
+    assert!(ureq::get(&format!("http://{listen}/offers"))
+        .call()
+        .is_err());
 }
 
 /// The lattice-node writes a new cookie at every restart: the client

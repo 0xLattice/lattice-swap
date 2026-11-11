@@ -392,6 +392,22 @@ again.
 lattice-swap offer --relay https://relay.example --relay https://other.example ... > offer
 ```
 
+A seller with a reachable address can run a relay of its own, in the
+`offer` process, and list there as well as on any `--relay`.
+`--serve-relay` is the address that relay listens on, and
+`--serve-relay-url` is the URL buyers reach it at (put TLS in front for
+`https://`). The offer listed there names that URL. It is the same relay as
+`swap-relay`, so anyone can list on it. It runs only while `offer` runs.
+The two parties meet again on the relay where the buyer took the offer. If
+that was this one and `offer` has ended, give `resume` the same
+`--serve-relay` and `--serve-relay-url` so it serves the relay again; it
+refuses a URL the swap does not meet at.
+
+```sh
+lattice-swap offer --serve-relay 0.0.0.0:7500 --serve-relay-url https://seller.example \
+  --relay https://relay.example ... > offer
+```
+
 `take` on an offer that names a relay reaches the seller through it, and
 both meet there again whenever their session is lost: on the relay the
 buyer took it on. The relay holds
