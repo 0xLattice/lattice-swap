@@ -23,6 +23,25 @@ jobs:
       # The machines without the native I/O, natively.
       - run: cargo test -p swap --no-default-features
 
+  # The relay directory's policy, a workspace of its own: its tests, and the
+  # module chain/spec.json names, built again and compared byte for byte.
+  relay-dir-policy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: crates/relay-dir-policy
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add wasm32-unknown-unknown && rustup component add rustfmt clippy
+      - run: cargo fmt --check
+      # Natively the module is only its tests: without them it is no_std,
+      # with no panic handler but the wasm one.
+      - run: cargo clippy --tests -- -D warnings
+      - run: cargo clippy --target wasm32-unknown-unknown -- -D warnings
+      - run: cargo test --lib
+      - run: ./build.sh && cmp target/wasm32-unknown-unknown/release/relay_dir_policy.wasm chain/relay_dir_policy.wasm
+
   # The machines without the native I/O, built for the browser, and every
   # machine test run again in wasm under node; then the browser's buyer,
   # web/driver, against fake servers. `secp256k1-sys` needs a clang with the

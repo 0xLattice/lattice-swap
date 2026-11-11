@@ -2,3 +2,4 @@
 **/*.rs.bk
 .DS_Store
 /interop/.build
+/crates/relay-dir-policy/target

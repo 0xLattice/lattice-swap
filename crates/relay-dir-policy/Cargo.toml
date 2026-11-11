@@ -1,0 +1,27 @@
+[package]
+name = "relay-dir-policy"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "The validity policy of the swap relay directory chain"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+lattice-policy-rules = { git = "https://github.com/adalinxx/moniker", rev = "b5f52e0" }
+
+[dev-dependencies]
+# Encodes the transaction bodies the tests feed the policy.
+ciborium = "0.2"
+
+# Its own workspace, out of the swap's: the module is built small, and these
+# settings would otherwise apply to every crate's release build.
+[workspace]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
