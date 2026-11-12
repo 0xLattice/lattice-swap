@@ -362,22 +362,46 @@ pub fn list_hosted(node: &Client, chain: &[String]) -> Result<Vec<Relay>, String
 }
 
 /// A fetch of a node by CID from the Volumes `node` holds for the chain
-/// `chain`. A Volume holds many nodes: one already read is not asked for
-/// again.
+/// `chain`. A Volume holds many nodes: the others are kept, by [`held`], so
+/// they are not asked for again.
 #[cfg(feature = "native")]
 pub fn hosted_volumes<'a>(
     node: &'a Client,
     chain: &'a [String],
 ) -> impl FnMut(&str) -> Result<Vec<u8>, String> + 'a {
-    let mut held = std::collections::BTreeMap::new();
-    move |cid| {
-        if !held.contains_key(cid) {
-            held.extend(node.volume(cid, chain).map_err(|e| e.to_string())?);
+    let mut kept = std::collections::BTreeMap::new();
+    move |cid| match kept.remove(cid) {
+        Some(bytes) => Ok(bytes),
+        None => {
+            let volume = node.volume(cid, chain).map_err(|e| e.to_string())?;
+            held(&mut kept, cid, volume).ok_or(format!("the node's Volume {cid} lacks its root"))
         }
-        held.get(cid)
-            .cloned()
-            .ok_or(format!("the node's Volume {cid} lacks its root"))
     }
+}
+
+/// The node `cid` names out of `volume`, a Volume rooted at it, keeping its
+/// other nodes in `kept`. The node serving the Volume picks what else it
+/// holds, so a node is kept only if it could be read, at most
+/// [`MAX_NODE_BYTES`] bytes that are the ones its CID names, and only while
+/// `kept` holds fewer than [`MAX_NODES`], as many as a listing reads: a
+/// hostile node's filler costs at most that much memory, however many
+/// answers it pads. A node dropped is asked for again if read.
+#[cfg(any(feature = "native", test))]
+fn held(
+    kept: &mut std::collections::BTreeMap<String, Vec<u8>>,
+    cid: &str,
+    mut volume: std::collections::BTreeMap<String, Vec<u8>>,
+) -> Option<Vec<u8>> {
+    let root = volume.remove(cid)?;
+    for (other, bytes) in volume {
+        if kept.len() == MAX_NODES {
+            break;
+        }
+        if bytes.len() <= MAX_NODE_BYTES && self::cid(&bytes) == other {
+            kept.insert(other, bytes);
+        }
+    }
+    Some(root)
 }
 
 /// The value of `key` in the general state the block `block` enters, or
@@ -960,6 +984,37 @@ mod tests {
         assert_eq!(a.len(), MAX_ENTRIES);
         assert_ne!(a, b, "two listings cut the same entries");
         assert_ne!(a, first_by_key);
+    }
+
+    /// A Volume's other nodes are kept only if they are the bytes their CIDs
+    /// name, of at most [`MAX_NODE_BYTES`], and only up to [`MAX_NODES`].
+    #[test]
+    fn a_volume_keeps_only_nodes_it_could_read() {
+        let bytes = |i: usize| format!("node {i}").into_bytes();
+        let node = |i: usize| (cid(&bytes(i)), bytes(i));
+        let (root, root_bytes) = node(0);
+        let (good, good_bytes) = node(1);
+        let big = vec![b'x'; MAX_NODE_BYTES + 1];
+        let mut volume = BTreeMap::from([
+            (root.clone(), root_bytes.clone()),
+            (good.clone(), good_bytes.clone()),
+            (node(2).0, bytes(3)),
+            (cid(&big), big),
+        ]);
+        let mut kept = BTreeMap::new();
+        assert_eq!(held(&mut kept, &root, volume.clone()), Some(root_bytes));
+        assert_eq!(kept, BTreeMap::from([(good, good_bytes)]));
+        volume.remove(&root);
+        assert_eq!(held(&mut kept, &root, volume), None, "no root");
+
+        // Filler past MAX_NODES is dropped, however many answers bring it.
+        let mut kept = BTreeMap::new();
+        for answer in 0..3 {
+            let filler = (0..MAX_NODES).map(|i| node(1 + answer * MAX_NODES + i));
+            let volume = filler.chain([node(0)]).collect();
+            held(&mut kept, &root, volume).unwrap();
+            assert_eq!(kept.len(), MAX_NODES);
+        }
     }
 
     #[test]

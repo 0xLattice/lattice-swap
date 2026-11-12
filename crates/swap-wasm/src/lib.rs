@@ -420,10 +420,11 @@ pub fn sign_nex(seed: &str, body: &str) -> Result<String> {
 
 /// The relays the relay directory lists in the block `block` names, a block
 /// CID: the directory chain's tip as a node hosting it reports it, the
-/// user's own node if there is one. A listing step, `{"state", "wants", "relays"}`: the page fetches the
-/// nodes `wants` names, by CID from any host, and hands each to
-/// [`give_relay_node`] with `state`; once `wants` is empty, `relays`
-/// (`[{"account", "url"}]`) is the list ([`swap::relay_dir`]).
+/// user's own node if there is one. A listing step,
+/// `{"state", "wants", "relays"}`: the page fetches the nodes `wants`
+/// names, by CID from any host, and hands each to [`give_relay_node`] with
+/// `state`; once `wants` is empty, `relays` (`[{"account", "url"}]`) is the
+/// list ([`swap::relay_dir`]).
 #[wasm_bindgen(js_name = listRelays)]
 pub fn list_relays(block: &str) -> Result<String> {
     listed(&relay_dir::Listing::new(block)?)
