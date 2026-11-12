@@ -38,8 +38,8 @@ no Nexus consensus change is required.
   node test, they are ignored by default and need `NEXUS_NODE_IMAGE` and
   `-- --ignored`.
   `swap::relay_dir` lists the relays on the relay directory chain from a
-  block Nexus commits, each node fetched by CID from any host and checked
-  against it.
+  block CID, the chain's tip as a node hosting it reports it, each node
+  fetched by CID from any host and checked against it.
 - `swap-wasm`: the machines built for a browser, with JSON in and out: no
   I/O, which the page does. `swap` and `swap-nexus-tx` keep their native I/O
   behind the default `native` feature, so without it they build for
@@ -455,6 +455,23 @@ It prints the transaction's CID and the fee paid once the node takes it.
 The entry changes only once a block holds the write, and the chain refuses
 it if the entry changed since it was read: a stale or false tip from the
 node makes the write fail, not land wrong.
+
+`relay-dir list` prints the relays the directory lists, one
+`<account> <url>` a line, read from the chain's tip as a node hosting it
+reports it:
+
+```sh
+lattice-swap relay-dir list --nexus-url http://127.0.0.1:8080 \
+  --nexus-cookie ~/.lattice/.cookie
+```
+
+Each node of the list is checked against its CID, so whoever serves it
+cannot change what that block lists, but the tip is the node's word, not
+tied to Nexus's proof of work: a node can name an old block or one it made
+up, so the list is as good as the node asked. A false list can hide relays
+or name useless ones, never move funds: every offer is signed by its
+seller. So ask your own node when you have one, and keep relays of your
+own to fall back to.
 
 ## License
 

@@ -3362,6 +3362,17 @@ fn relay_dir_node(
     account: &str,
     listed: Option<&str>,
 ) -> (String, Arc<std::sync::Mutex<Vec<Value>>>) {
+    relay_dir_node_with(floor, account, listed, |_, _| {})
+}
+
+/// [`relay_dir_node`], its chain info and the nodes of the block's Volume,
+/// the block first, as `tweak` leaves them.
+fn relay_dir_node_with(
+    floor: u64,
+    account: &str,
+    listed: Option<&str>,
+    tweak: impl FnOnce(&mut Value, &mut Vec<(String, Vec<u8>)>),
+) -> (String, Arc<std::sync::Mutex<Vec<Value>>>) {
     use ciborium::Value as Cbor;
     use std::io::BufRead;
     use std::sync::Mutex;
@@ -3408,15 +3419,17 @@ fn relay_dir_node(
         archive
     };
     let (block_node, state_nodes) = nodes.split_last().unwrap();
-    let volumes = [
-        (block.clone(), archive(std::slice::from_ref(block_node))),
-        (state.clone(), archive(state_nodes)),
-    ];
     let chain: Vec<&str> = RELAY_DIR_CHAIN.split('/').collect();
-    let info = json!({
+    let mut info = json!({
         "chain": chain, "tipCID": block, "height": "5",
         "acceptsSubmit": true, "minRelayFee": floor.to_string(),
     });
+    let mut block_volume = vec![block_node.clone()];
+    tweak(&mut info, &mut block_volume);
+    let volumes = [
+        (block.clone(), archive(&block_volume)),
+        (state.clone(), archive(state_nodes)),
+    ];
     let account = account.to_string();
     let submitted = Arc::new(Mutex::new(Vec::new()));
     let recorded = submitted.clone();
@@ -3579,6 +3592,82 @@ fn relay_dir_writes_from_the_value_listed() {
     let (result, submitted) = run(None, &["remove", "--chain", "Nexus/other"]);
     assert!(result.unwrap_err().contains("404"));
     assert!(submitted.is_empty());
+}
+
+/// `relay-dir list` reads the relays at the tip the node reports, from the
+/// node's Volumes; a node not hosting --chain lists nothing.
+#[test]
+fn relay_dir_lists_from_the_tip_the_node_reports() {
+    let account = SecretBytes([5; 32]).nex_address();
+    let parse = |args: &[&str]| {
+        let cli =
+            Cli::try_parse_from(["lattice-swap", "relay-dir", "list"].iter().chain(args)).unwrap();
+        let Command::RelayDir(RelayDirCommand::List(args)) = cli.command else {
+            unreachable!()
+        };
+        args
+    };
+    let chain: Vec<String> = RELAY_DIR_CHAIN.split('/').map(String::from).collect();
+    let (url, _) = relay_dir_node(0, &account, Some("https://relay.example"));
+    let node = Client::public(&url, TIMEOUT);
+    assert_eq!(
+        relay_dir::list_hosted(&node, &chain).unwrap(),
+        [relay_dir::Relay {
+            account: account.clone(),
+            url: "https://relay.example/".into()
+        }]
+    );
+    relay_dir_list(parse(&["--nexus-url", &url])).unwrap();
+    let (url, _) = relay_dir_node(0, &account, None);
+    let node = Client::public(&url, TIMEOUT);
+    assert_eq!(relay_dir::list_hosted(&node, &chain).unwrap(), []);
+    relay_dir_list(parse(&["--nexus-url", &url])).unwrap();
+    let refused = relay_dir_list(parse(&["--nexus-url", &url, "--chain", "Nexus/other"]));
+    assert!(refused.unwrap_err().to_string().contains("404"));
+
+    // A node answering for another chain, or with no tip or a tip that is
+    // no CID, lists nothing.
+    let list = |tweak: &dyn Fn(&mut Value)| {
+        let (url, _) = relay_dir_node_with(0, &account, None, |info, _| tweak(info));
+        relay_dir::list_hosted(&Client::public(&url, TIMEOUT), &chain).unwrap_err()
+    };
+    let refused = list(&|info| info["chain"] = json!(["Nexus", "other"]));
+    assert!(refused.contains("answered for another chain"), "{refused}");
+    let refused = list(&|info| info["tipCID"] = Value::Null);
+    assert!(refused.contains("no tip yet"), "{refused}");
+    let refused = list(&|info| info["tipCID"] = json!("x@y"));
+    assert!(refused.contains("not a block CID"), "{refused}");
+}
+
+/// A Volume's nodes besides its root are kept only if they are the bytes
+/// their CIDs name, at most `MAX_NODE_BYTES`: a node padding the block's
+/// Volume with a false copy of the state, or with an oversized node, does
+/// not change the list.
+#[test]
+fn relay_dir_lists_past_a_padded_volume() {
+    let account = SecretBytes([5; 32]).nex_address();
+    let chain: Vec<String> = RELAY_DIR_CHAIN.split('/').map(String::from).collect();
+    let (url, _) =
+        relay_dir_node_with(0, &account, Some("https://relay.example"), |info, nodes| {
+            // A false copy of the block's state, `{postState: {rawCID}}`, which
+            // would fail the walk if kept.
+            let block: Value = {
+                let block: ciborium::Value = ciborium::from_reader(&nodes[0].1[..]).unwrap();
+                serde_json::to_value(block).unwrap()
+            };
+            let state = block["postState"]["rawCID"].as_str().unwrap().to_string();
+            assert!(info["tipCID"] != state);
+            nodes.push((state, b"\xa0".to_vec()));
+            let big = vec![0xf6; relay_dir::MAX_NODE_BYTES + 1];
+            nodes.push((swap_nexus_tx::cid(&big), big));
+        });
+    assert_eq!(
+        relay_dir::list_hosted(&Client::public(&url, TIMEOUT), &chain).unwrap(),
+        [relay_dir::Relay {
+            account,
+            url: "https://relay.example/".into()
+        }]
+    );
 }
 
 /// `relay-dir --key` reads a seed in hex or a key file `lattice key
