@@ -12,10 +12,10 @@
 //! restart and `status` reads.
 //!
 //! A relay's operator runs `relay-dir add` to list the relay on the relay
-//! directory, where takers find relays, and `relay-dir remove` to unlist it.
+//! directory, where takers find relays, and `relay-dir remove` to unlist it;
+//! `relay-dir list` prints what the directory lists.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener};
@@ -102,8 +102,9 @@ enum Command {
         swap_file: PathBuf,
     },
     /// Lists a relay on the relay directory, the chain takers find relays
-    /// on, under the key's account, or unlists it. Each account lists one
-    /// relay, and only the account's key writes it.
+    /// on, under the key's account, or unlists it; or prints the relays it
+    /// lists. Each account lists one relay, and only the account's key
+    /// writes it.
     #[command(subcommand)]
     RelayDir(RelayDirCommand),
 }
@@ -120,6 +121,25 @@ enum RelayDirCommand {
     },
     /// Unlists the account's relay.
     Remove(RelayDirArgs),
+    /// Prints the relays listed at the chain's tip, as the node says it is,
+    /// one `<account> <url>` a line.
+    List(RelayDirListArgs),
+}
+
+/// A read of the relay directory from a node that hosts its chain.
+#[derive(Args)]
+struct RelayDirListArgs {
+    /// The relay directory's chain path.
+    #[arg(long, default_value = RELAY_DIR_CHAIN)]
+    chain: String,
+    /// The URL of a node that hosts --chain, required as no default node
+    /// does: a public read port, or with --nexus-cookie your own
+    /// lattice-node's RPC. The list is as good as this node.
+    #[arg(long)]
+    nexus_url: String,
+    /// Your own lattice-node's RPC cookie file, with its --nexus-url.
+    #[arg(long, requires = "nexus_url")]
+    nexus_cookie: Option<PathBuf>,
 }
 
 /// A write to the relay directory, paid for by the account that makes it,
@@ -1616,6 +1636,7 @@ fn relay_dir_write(command: RelayDirCommand) -> Result<()> {
             (write, Some(url))
         }
         RelayDirCommand::Remove(write) => (write, None),
+        RelayDirCommand::List(_) => unreachable!("relay_dir_list reads"),
     };
     let key = relay_dir_key(&args.key)?;
     let account = key.nex_address();
@@ -1642,17 +1663,8 @@ fn relay_dir_write(command: RelayDirCommand) -> Result<()> {
         )
         .into());
     }
-    // A Volume holds many nodes: one already read is not asked for again.
-    let mut held = BTreeMap::new();
     let key_name = format!("{}{account}", relay_dir::PREFIX);
-    let current = relay_dir::value(&tip, &key_name, |cid| {
-        if !held.contains_key(cid) {
-            held.extend(nexus.volume(cid, &chain).map_err(|e| e.to_string())?);
-        }
-        held.get(cid)
-            .cloned()
-            .ok_or(format!("the node's Volume {cid} lacks its root"))
-    })?;
+    let current = relay_dir::value(&tip, &key_name, relay_dir::hosted_volumes(&nexus, &chain))?;
     let Some(action) = relay_dir_action(&account, current, url) else {
         println!(
             "unchanged: {account}'s entry on {} already holds that",
@@ -1685,6 +1697,24 @@ fn relay_dir_write(command: RelayDirCommand) -> Result<()> {
         "submitted: {cid}, fee {fee}; unconfirmed until a block holds it, and refused \
          there if the entry changed since it was read"
     );
+    Ok(())
+}
+
+/// Prints the relays the directory lists at its chain's tip, as the node
+/// at --nexus-url reports it: [`relay_dir::list_hosted`].
+fn relay_dir_list(args: RelayDirListArgs) -> Result<()> {
+    let chain: Vec<String> = args.chain.split('/').map(String::from).collect();
+    let nexus = match &args.nexus_cookie {
+        Some(cookie) => Client::from_cookie_file(&args.nexus_url, cookie, TIMEOUT),
+        None => Client::public(&args.nexus_url, TIMEOUT),
+    };
+    let relays = relay_dir::list_hosted(&nexus, &chain)?;
+    if relays.is_empty() {
+        println!("no relays listed on {}", args.chain);
+    }
+    for relay in relays {
+        println!("{} {}", relay.account, relay.url);
+    }
     Ok(())
 }
 
@@ -1802,6 +1832,7 @@ fn exit_status(command: Command) -> Result<u8> {
         Command::Resume(args) => resume(args).map(exit_code),
         Command::Wallet(args) => wallet(args).map(|()| 0),
         Command::Status { swap_file } => status(&swap_file).map(|()| 0),
+        Command::RelayDir(RelayDirCommand::List(args)) => relay_dir_list(args).map(|()| 0),
         Command::RelayDir(command) => relay_dir_write(command).map(|()| 0),
     }
 }

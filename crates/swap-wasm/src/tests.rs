@@ -1270,8 +1270,9 @@ fn a_relay_listing_crosses_as_json() {
     let state = link_node("generalState", &swap_nexus_tx::cid(&root));
     let block = link_node("postState", &swap_nexus_tx::cid(&state));
     let block_cid = swap_nexus_tx::cid(&block);
-    assert!(list_relays("not a commitment").is_err());
-    let mut step = json(&list_relays(&format!("{block_cid}@x")).unwrap());
+    assert!(list_relays("not a block CID").is_err());
+    assert!(list_relays(&format!("{block_cid}@x")).is_err());
+    let mut step = json(&list_relays(&block_cid).unwrap());
     assert_eq!(step["wants"], json!([block_cid]));
     assert!(give_relay_node(&text(&step["state"]).unwrap(), &block_cid, &state).is_err());
     for node in [block, state, root] {

@@ -1,23 +1,25 @@
 //! The relay directory: the relays listed on its chain, read from one of its
 //! blocks by CID, from whoever serves it.
 //!
-//! Nexus commits a child chain's block under `child/<directory>` as
-//! `<block CID>@<parent state CID>`. Given that value, as read from a Nexus
-//! state the caller trusts, a [`Listing`] asks for the block, then its post
+//! Given a block CID, a [`Listing`] asks for the block, then its post
 //! state, then the general-state trie down to [`PREFIX`] and every node under
 //! it, and takes a node only if its bytes are the ones its CID names, so
-//! whoever served them cannot change the list. It does no I/O: the caller
-//! fetches what [`Listing::wants`] names and hands it over by
-//! [`Listing::give`], or [`list`] does both with a fetch it is given.
+//! whoever served them cannot change what that block lists. It does no I/O:
+//! the caller fetches what [`Listing::wants`] names and hands it over by
+//! [`Listing::give`], or [`list`] does both with a fetch it is given, and
+//! [`list_hosted`] starts from the tip a node hosting the directory's chain
+//! reports.
 //!
-//! What it checks is that the block is the one Nexus commits, not that the
-//! block follows the directory's rules: Nexus checks only that the block
-//! carrying the commitment holds that child block and enters that parent
-//! state. So the list is what the committed block says, trusted to Nexus's
-//! proof of work, and the directory's policy holds for it only when the
-//! reader's own node hosts the directory chain. A false list can hide relays
-//! or name useless ones, which is a matter of finding offers, not of funds:
-//! every offer is signed by its seller.
+//! Which block to start from is the word of the node asked for the tip: it
+//! is not tied to Nexus's proof of work, as merged mining commits a child
+//! block only in each parent block's children, not in a state a reader can
+//! ask about. A node cannot change the bytes of a block it names, but it can
+//! name an old block or one it made up, so the list is as good as the node
+//! asked, and the directory's policy holds for it only when that node checks
+//! the chain. A false list can hide relays or name useless ones, which is a
+//! matter of finding offers, not of funds: every offer is signed by its
+//! seller. So a reader asks its user's own node when it has one, and falls
+//! back to relays of its own.
 //!
 //! The trie is cashew's Merkle dictionary: the root is `{count, children}`
 //! and every other node `{prefix, value?, children}`, a child
@@ -45,6 +47,8 @@ use std::net::{IpAddr, Ipv4Addr};
 use ciborium::Value;
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "native")]
+use swap_nexus_tx::rpc::{parse, Client};
 use swap_nexus_tx::{cid, is_cid};
 use url::{Host, Url};
 
@@ -124,22 +128,18 @@ enum Node {
 }
 
 impl Listing {
-    /// A listing of the block `commitment` names: `<block CID>@<parent state
-    /// CID>`, split as Lattice splits it, at its one `@`.
-    pub fn new(commitment: &str) -> Result<Self, String> {
-        let parts: Vec<_> = commitment.split('@').collect();
-        match parts[..] {
-            [block, parent] if is_cid(block) && !parent.is_empty() => Ok(Self {
-                pending: vec![(block.into(), Node::Block)],
-                queued: BTreeSet::from([block.into()]),
-                nodes: 0,
-                entries: 0,
-                relays: Vec::new(),
-            }),
-            _ => Err(format!(
-                "{commitment} is not a child commitment, <block CID>@<parent state CID>"
-            )),
+    /// A listing of the directory's block `block` names, a block CID.
+    pub fn new(block: &str) -> Result<Self, String> {
+        if !is_cid(block) {
+            return Err(format!("{block} is not a block CID"));
         }
+        Ok(Self {
+            pending: vec![(block.into(), Node::Block)],
+            queued: BTreeSet::from([block.into()]),
+            nodes: 0,
+            entries: 0,
+            relays: Vec::new(),
+        })
     }
 
     /// The CIDs of the nodes still to read, the next first; none once the
@@ -333,19 +333,51 @@ fn public_v4(ip: Ipv4Addr) -> bool {
         || ip.is_multicast())
 }
 
-/// The relays listed in the block `commitment` names, each node fetched by
+/// The relays listed in the block `block` names, each node fetched by
 /// `fetch` from its CID.
 pub fn list(
-    commitment: &str,
+    block: &str,
     mut fetch: impl FnMut(&str) -> Result<Vec<u8>, String>,
 ) -> Result<Vec<Relay>, String> {
-    let mut listing = Listing::new(commitment)?;
+    let mut listing = Listing::new(block)?;
     while let Some((cid, _)) = listing.pending.last() {
         let cid = cid.clone();
         let bytes = fetch(&cid)?;
         listing.give(&cid, &bytes)?;
     }
     Ok(listing.relays)
+}
+
+/// The relays listed at the tip of the directory's chain `chain`, as `node`,
+/// which hosts it, reports the tip, each node read from its Volumes by
+/// [`hosted_volumes`] and checked against its CID.
+#[cfg(feature = "native")]
+pub fn list_hosted(node: &Client, chain: &[String]) -> Result<Vec<Relay>, String> {
+    let info = node.chain_info_of(chain).map_err(|e| e.to_string())?;
+    if info["chain"] != serde_json::json!(chain) {
+        return Err(format!("the node answered for another chain: {info}"));
+    }
+    let tip = parse::tip(&info)?.1.ok_or("the chain has no tip yet")?;
+    list(&tip, hosted_volumes(node, chain))
+}
+
+/// A fetch of a node by CID from the Volumes `node` holds for the chain
+/// `chain`. A Volume holds many nodes: one already read is not asked for
+/// again.
+#[cfg(feature = "native")]
+pub fn hosted_volumes<'a>(
+    node: &'a Client,
+    chain: &'a [String],
+) -> impl FnMut(&str) -> Result<Vec<u8>, String> + 'a {
+    let mut held = std::collections::BTreeMap::new();
+    move |cid| {
+        if !held.contains_key(cid) {
+            held.extend(node.volume(cid, chain).map_err(|e| e.to_string())?);
+        }
+        held.get(cid)
+            .cloned()
+            .ok_or(format!("the node's Volume {cid} lacks its root"))
+    }
 }
 
 /// The value of `key` in the general state the block `block` enters, or
@@ -514,33 +546,31 @@ mod tests {
             self.put(map(fields))
         }
 
-        /// A block whose general state holds `entries`, and its commitment.
+        /// A block whose general state holds `entries`, and its CID.
         fn block(&mut self, entries: &[(String, String)]) -> String {
             let children = self.children(entries);
             self.commit(children)
         }
 
-        /// A block whose general state's root has `children`, and its
-        /// commitment.
+        /// A block whose general state's root has `children`, and its CID.
         fn commit(&mut self, children: Value) -> String {
             let count = Value::Integer(0.into());
             let root = self.put(map(vec![("count", count), ("children", children)]));
             let state = self.put(map(vec![("generalState", to_link(&root))]));
-            let block = self.put(map(vec![
+            self.put(map(vec![
                 ("postState", to_link(&state)),
                 ("height", Value::Integer(1.into())),
-            ]));
-            format!("{block}@{state}")
+            ]))
         }
 
-        fn list(&self, commitment: &str) -> Result<Vec<Relay>, String> {
-            self.counted(commitment).map(|(relays, _)| relays)
+        fn list(&self, block: &str) -> Result<Vec<Relay>, String> {
+            self.counted(block).map(|(relays, _)| relays)
         }
 
         /// The relays listed, and how many nodes were fetched.
-        fn counted(&self, commitment: &str) -> Result<(Vec<Relay>, usize), String> {
+        fn counted(&self, block: &str) -> Result<(Vec<Relay>, usize), String> {
             let mut fetched = 0;
-            let relays = list(commitment, |cid| {
+            let relays = list(block, |cid| {
                 fetched += 1;
                 self.0.get(cid).cloned().ok_or(format!("no {cid}"))
             })?;
@@ -575,8 +605,8 @@ mod tests {
             entry("child/x", "https://child.example"),
         ];
         let mut store = Store::default();
-        let commitment = store.block(&entries);
-        let mut relays = store.list(&commitment).unwrap();
+        let block = store.block(&entries);
+        let mut relays = store.list(&block).unwrap();
         relays.sort_by(|a, b| a.account.cmp(&b.account));
         let mut expected = vec![
             Relay {
@@ -592,8 +622,8 @@ mod tests {
         assert_eq!(relays, expected);
 
         // An empty directory lists nothing.
-        let commitment = store.block(&[entry("child/x", "1")]);
-        assert_eq!(store.list(&commitment).unwrap(), []);
+        let block = store.block(&[entry("child/x", "1")]);
+        assert_eq!(store.list(&block).unwrap(), []);
     }
 
     #[test]
@@ -606,10 +636,9 @@ mod tests {
             entry(format!("user/{two}"), "x"),
         ];
         let mut store = Store::default();
-        let commitment = store.block(&entries);
-        let block = commitment.split('@').next().unwrap();
+        let block = store.block(&entries);
         let read = |key: &str| {
-            super::value(block, key, |cid| {
+            super::value(&block, key, |cid| {
                 store.0.get(cid).cloned().ok_or(format!("no {cid}"))
             })
         };
@@ -633,7 +662,7 @@ mod tests {
         }
 
         // Bytes that are not the node's are refused.
-        let refused = super::value(block, "relay/", |_| Ok(b"\xa0".to_vec()));
+        let refused = super::value(&block, "relay/", |_| Ok(b"\xa0".to_vec()));
         assert!(refused.unwrap_err().contains("not the ones it names"));
     }
 
@@ -658,8 +687,7 @@ mod tests {
                 ]));
             }
             let child = map(vec![("key", text("r")), ("value", to_link(&at))]);
-            let commitment = store.commit(Value::Array(vec![child]));
-            commitment.split('@').next().unwrap().to_string()
+            store.commit(Value::Array(vec![child]))
         };
         let read = |store: &Store, block: &str| {
             super::value(block, &key, |cid| {
@@ -758,8 +786,8 @@ mod tests {
                 ("children", Value::Array(children)),
             ]));
         }
-        let commitment = under_prefix(&mut store, vec![child("z", &below)]);
-        let (relays, fetched) = store.counted(&commitment).unwrap();
+        let block = under_prefix(&mut store, vec![child("z", &below)]);
+        let (relays, fetched) = store.counted(&block).unwrap();
         assert_eq!(relays, []);
         // The block, its state, the root, `relay/` and the 21 levels.
         assert_eq!(fetched, 25);
@@ -778,8 +806,8 @@ mod tests {
                 ("children", Value::Array(vec![child("q", &below)])),
             ]));
         }
-        let commitment = under_prefix(&mut store, vec![child("q", &below)]);
-        let (relays, fetched) = store.counted(&commitment).unwrap();
+        let block = under_prefix(&mut store, vec![child("q", &below)]);
+        let (relays, fetched) = store.counted(&block).unwrap();
         assert_eq!(relays, []);
         // The block, its state, the root, `relay/`, and one node a byte down
         // to the first key longer than the longest.
@@ -803,8 +831,8 @@ mod tests {
                 child(&key[..1], &middle)
             })
             .collect();
-        let commitment = under_prefix(&mut store, middles);
-        let (relays, fetched) = store.counted(&commitment).unwrap();
+        let block = under_prefix(&mut store, middles);
+        let (relays, fetched) = store.counted(&block).unwrap();
         assert_eq!(relays, []);
         assert_eq!(fetched, MAX_NODES);
     }
@@ -826,7 +854,7 @@ mod tests {
     fn a_node_over_the_caps_is_refused() {
         let mut store = Store::default();
         let big = store.put(map(vec![("padding", text(&"x".repeat(MAX_NODE_BYTES)))]));
-        let mut listing = Listing::new(&format!("{big}@x")).unwrap();
+        let mut listing = Listing::new(&big).unwrap();
         assert!(listing.give(&big, &store.0[&big]).is_err());
 
         let leaf = trie_node(&mut store, "q", None, vec![]);
@@ -854,8 +882,8 @@ mod tests {
         for _ in 0..20 {
             below = trie_node(&mut store, &step, None, vec![child("q", &below)]);
         }
-        let commitment = under_prefix(&mut store, vec![child("q", &below)]);
-        let (relays, fetched) = store.counted(&commitment).unwrap();
+        let block = under_prefix(&mut store, vec![child("q", &below)]);
+        let (relays, fetched) = store.counted(&block).unwrap();
         assert_eq!(relays, []);
         // The block, its state, the root, `relay/`, and the chain down to
         // the first node whose key is longer than the longest.
@@ -874,7 +902,7 @@ mod tests {
         );
         let number = trie_node(&mut store, "d", Some(Value::Integer(1.into())), vec![]);
         let shapeless = store.put(text("not a node"));
-        let commitment = under_prefix(
+        let block = under_prefix(
             &mut store,
             vec![
                 child(&good[..1], &leaf),
@@ -883,22 +911,21 @@ mod tests {
                 child("e", &shapeless),
             ],
         );
-        let relays = store.list(&commitment).unwrap();
+        let relays = store.list(&block).unwrap();
         assert_eq!(relays.len(), 1);
         assert_eq!(relays[0].account, good);
 
         // Above it, a node of the wrong shape is still refused.
         let wrong = store.put(map(vec![("prefix", Value::Integer(1.into()))]));
-        let commitment = store.commit(Value::Array(vec![child("r", &wrong)]));
-        assert!(store.list(&commitment).is_err());
+        let block = store.commit(Value::Array(vec![child("r", &wrong)]));
+        assert!(store.list(&block).is_err());
     }
 
     #[test]
     fn a_node_is_only_the_bytes_its_cid_names() {
         let mut store = Store::default();
-        let commitment =
-            store.block(&[entry(format!("relay/{}", account(1)), "https://a.example")]);
-        let mut listing = Listing::new(&commitment).unwrap();
+        let block = store.block(&[entry(format!("relay/{}", account(1)), "https://a.example")]);
+        let mut listing = Listing::new(&block).unwrap();
         let block = listing.wants().remove(0);
         let (other, bytes) = store.0.iter().find(|(cid, _)| **cid != block).unwrap();
         assert!(listing.give(&block, bytes).is_err());
@@ -906,7 +933,7 @@ mod tests {
         listing.give(&block, &store.0[&block]).unwrap();
         assert_ne!(listing.wants(), [block]);
         // A node in the block's place that is no block.
-        let mut listing = Listing::new(&format!("{other}@x")).unwrap();
+        let mut listing = Listing::new(other).unwrap();
         assert!(listing.give(other, bytes).is_err());
     }
 
@@ -916,9 +943,9 @@ mod tests {
             .map(|i| entry(format!("relay/{}", account(i)), "https://r.example"))
             .collect();
         let mut store = Store::default();
-        let commitment = store.block(&entries);
+        let block = store.block(&entries);
         let listed = || -> BTreeSet<String> {
-            let relays = store.list(&commitment).unwrap();
+            let relays = store.list(&block).unwrap();
             assert_eq!(relays.len(), MAX_ENTRIES);
             relays.into_iter().map(|relay| relay.account).collect()
         };
@@ -936,18 +963,17 @@ mod tests {
     }
 
     #[test]
-    fn a_commitment_is_a_block_cid_and_a_parent_state() {
+    fn a_listing_starts_from_a_block_cid() {
         let block = account(1);
-        assert!(Listing::new(&format!("{block}@{block}")).is_ok());
-        for commitment in [
+        assert!(Listing::new(&block).is_ok());
+        for block in [
             String::new(),
-            block.clone(),
+            "x".into(),
+            format!("{block}@{block}"),
             format!("{block}@"),
             format!("@{block}"),
-            format!("{block}@{block}@{block}"),
-            format!("x@{block}"),
         ] {
-            assert!(Listing::new(&commitment).is_err(), "{commitment}");
+            assert!(Listing::new(&block).is_err(), "{block}");
         }
     }
 }

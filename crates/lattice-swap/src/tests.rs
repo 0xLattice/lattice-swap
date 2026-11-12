@@ -3581,6 +3581,38 @@ fn relay_dir_writes_from_the_value_listed() {
     assert!(submitted.is_empty());
 }
 
+/// `relay-dir list` reads the relays at the tip the node reports, from the
+/// node's Volumes; a node not hosting --chain lists nothing.
+#[test]
+fn relay_dir_lists_from_the_tip_the_node_reports() {
+    let account = SecretBytes([5; 32]).nex_address();
+    let parse = |args: &[&str]| {
+        let cli =
+            Cli::try_parse_from(["lattice-swap", "relay-dir", "list"].iter().chain(args)).unwrap();
+        let Command::RelayDir(RelayDirCommand::List(args)) = cli.command else {
+            unreachable!()
+        };
+        args
+    };
+    let chain: Vec<String> = RELAY_DIR_CHAIN.split('/').map(String::from).collect();
+    let (url, _) = relay_dir_node(0, &account, Some("https://relay.example"));
+    let node = Client::public(&url, TIMEOUT);
+    assert_eq!(
+        relay_dir::list_hosted(&node, &chain).unwrap(),
+        [relay_dir::Relay {
+            account: account.clone(),
+            url: "https://relay.example/".into()
+        }]
+    );
+    relay_dir_list(parse(&["--nexus-url", &url])).unwrap();
+    let (url, _) = relay_dir_node(0, &account, None);
+    let node = Client::public(&url, TIMEOUT);
+    assert_eq!(relay_dir::list_hosted(&node, &chain).unwrap(), []);
+    relay_dir_list(parse(&["--nexus-url", &url])).unwrap();
+    let refused = relay_dir_list(parse(&["--nexus-url", &url, "--chain", "Nexus/other"]));
+    assert!(refused.unwrap_err().to_string().contains("404"));
+}
+
 /// `relay-dir --key` reads a seed in hex or a key file `lattice key
 /// generate` writes, `{address, privateKey, publicKey}`, refusing one whose
 /// public key is not its private key's; `--nexus-url` has no default.
