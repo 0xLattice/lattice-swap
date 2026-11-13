@@ -3547,10 +3547,7 @@ fn relay_dir_writes_from_the_value_listed() {
     );
     assert_eq!(body["nonce"], "6");
     assert_eq!(body["signers"], json!([account]));
-    assert_eq!(
-        body["chainPath"],
-        json!(["Nexus", "swap-relays"])
-    );
+    assert_eq!(body["chainPath"], json!(["Nexus", "swap-relays"]));
 
     let (result, submitted) = run(None, &["add", "--url", old, "--fee", "10"]);
     result.unwrap();
