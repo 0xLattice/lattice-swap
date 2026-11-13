@@ -420,9 +420,9 @@ nothing of the swap: a buyer that gives up must itself be online, with
 
 ### Listing a relay on the relay directory
 
-The relay directory is a child chain, `Nexus/testnet/swap-relays` for now,
-where each relay's operator lists its URL under `relay/<account>`, for
-takers to find. Its policy lets only `<account>` write that key, so one
+The relay directory is a child chain, `Nexus/swap-relays`, where each
+relay's operator lists its URL under `relay/<account>`, for takers to
+find. Its policy lets only `<account>` write that key, so one
 account lists one relay. An operator lists, or moves, its relay with
 `relay-dir add` and unlists it with `relay-dir remove`:
 
@@ -438,7 +438,7 @@ Ed25519 seed in hex, as `--nex-key-file` does, or a key file
 `lattice key generate` writes. `--nexus-url` is required: the node, your own
 lattice-node with `--nexus-cookie` or a public read port that takes
 submits, must host the directory's chain (`--chain`,
-`Nexus/testnet/swap-relays` by default), and no default node is known to.
+`Nexus/swap-relays` by default), and no default node is known to.
 Each command reads the account's entry at the chain's tip, as the node
 says it is, and writes it from that value, so `add` replaces a URL listed
 before; it sends nothing if the entry already holds what was asked. `add`
