@@ -50,8 +50,8 @@ const BTC_PASSWORD_ENV: &str = "LATTICE_SWAP_BTC_PASSWORD";
 const FEE_TARGET: u16 = 6;
 /// The public Nexus node read by default: a read port that takes submits.
 const PUBLIC_NEXUS: &str = "https://lattice-mainnet-read.fly.dev";
-/// The relay directory's chain, by default: testnet's.
-const RELAY_DIR_CHAIN: &str = "Nexus/testnet/swap-relays";
+/// The relay directory's chain, by default: mainnet's.
+const RELAY_DIR_CHAIN: &str = "Nexus/swap-relays";
 /// What a seller is told without its Nexus key.
 const NO_KEY: &str = "the seller needs its Nexus key: --nex-key-file or LATTICE_SWAP_NEX_KEY";
 

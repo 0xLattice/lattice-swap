@@ -3455,7 +3455,7 @@ fn relay_dir_node_with(
             stream.read_exact(&mut body).unwrap();
             let target = line.split(' ').nth(1).unwrap();
             let (path, query) = target.split_once('?').unwrap_or((target, ""));
-            let chained = query == "chainPath=Nexus%2Ftestnet%2Fswap-relays";
+            let chained = query == "chainPath=Nexus%2Fswap-relays";
             let found: Option<Vec<u8>> = match path.strip_prefix("/volumes/") {
                 _ if path == "/transactions" => {
                     recorded
@@ -3549,7 +3549,7 @@ fn relay_dir_writes_from_the_value_listed() {
     assert_eq!(body["signers"], json!([account]));
     assert_eq!(
         body["chainPath"],
-        json!(["Nexus", "testnet", "swap-relays"])
+        json!(["Nexus", "swap-relays"])
     );
 
     let (result, submitted) = run(None, &["add", "--url", old, "--fee", "10"]);
